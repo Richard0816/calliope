@@ -1,0 +1,265 @@
+"""calliope.tabs.qc.tab - Tab 2: QC preview.
+
+Animated GIF of the shifted movie + blob detection overlaid on the mean
+image. Driven entirely by the AppState ``result`` set by the preprocess
+tab; "Reload from folder..." re-loads outputs from disk for an existing
+recording without re-running preprocessing.
+"""
+
+from __future__ import annotations
+
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from PIL import Image, ImageTk
+
+from . import logic as preprocessing
+from .logic import PreprocessResult
+
+from ...gui_common import AppState, attach_fig_toolbar
+
+
+class QcTab(ttk.Frame):
+
+    FRAME_MS = 66   # ~15 fps gif playback in the viewer
+
+    def __init__(self, master, state: AppState) -> None:
+        super().__init__(master, padding=10)
+        self.state = state
+        self._gif_frames: list[ImageTk.PhotoImage] = []
+        self._gif_index = 0
+        self._gif_job: Optional[str] = None
+        # Remember the GIF source so we can re-materialise frames after
+        # the user switches away from this tab and comes back, or after
+        # they manually toggle the "Animate" checkbox back on. Also tracks
+        # whether we're currently in "frozen" (single-frame) mode.
+        self._gif_path: Optional[Path] = None
+        self._gif_frozen = False
+        # User-driven master switch. Default ON; flipping OFF drops the
+        # frame buffer to a single still image, flipping back ON reloads.
+        self._gif_animate_var = tk.BooleanVar(value=True)
+
+        self._build_ui()
+        state.subscribe(self._on_result)
+
+    # -- UI -----------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        header = ttk.Frame(self)
+        header.pack(fill="x", pady=(0, 6))
+        self.header_var = tk.StringVar(
+            value="No preprocessing result yet. Run it in the first tab.")
+        ttk.Label(header, textvariable=self.header_var,
+                  font=("", 10, "italic")).pack(side="left")
+        ttk.Button(header, text="Reload from folder...",
+                   command=self._reload_from_folder).pack(side="right")
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1, uniform="cols")
+        body.columnconfigure(1, weight=1, uniform="cols")
+        body.rowconfigure(0, weight=1)
+
+        gif_frame = ttk.LabelFrame(body, text="QC movie (GIF)", padding=6)
+        gif_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        # Animate-toggle row at the top: unchecking drops the frame buffer
+        # to a single still (saves ~1 MB per 512x512 frame); rechecking
+        # reloads the GIF from disk and resumes playback.
+        toggle_row = ttk.Frame(gif_frame)
+        toggle_row.pack(anchor="w", pady=(0, 4))
+        ttk.Checkbutton(
+            toggle_row,
+            text="Animate (uncheck to free frame buffer; still image stays)",
+            variable=self._gif_animate_var,
+            command=self._on_animate_toggle,
+        ).pack(side="left")
+        self.gif_label = ttk.Label(gif_frame, anchor="center")
+        self.gif_label.pack(fill="both", expand=True)
+        self.gif_status = tk.StringVar(value="")
+        ttk.Label(gif_frame, textvariable=self.gif_status).pack(anchor="w",
+                                                                pady=(4, 0))
+
+        blob_frame = ttk.LabelFrame(body, text="Mean image + blob detection",
+                                    padding=6)
+        blob_frame.grid(row=0, column=1, sticky="nsew")
+
+        self.fig = plt.Figure(figsize=(5, 5), tight_layout=True)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_axis_off()
+        self.ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                     transform=self.ax.transAxes)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=blob_frame)
+        attach_fig_toolbar(self.canvas, blob_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    # -- Reload helper ------------------------------------------------------
+
+    def _reload_from_folder(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select an already-preprocessed recording folder")
+        if not path:
+            return
+        result = preprocessing.load_existing_preprocess(path)
+        if result is None:
+            messagebox.showwarning(
+                "No outputs",
+                f"Folder {path} doesn't contain the expected "
+                "shifted tiff / qc.gif / mean.npy.")
+            return
+        self.state.set_result(result)
+
+    # -- AppState listener --------------------------------------------------
+
+    def _on_result(self, result: PreprocessResult) -> None:
+        self.header_var.set(
+            f"Recording: {result.out_dir.name}   "
+            f"({result.shape_yx[0]} x {result.shape_yx[1]})")
+        self._load_gif(result.qc_gif)
+        self._draw_blob_preview(result)
+
+    # -- GIF playback -------------------------------------------------------
+
+    def _load_gif(self, gif_path: Path) -> None:
+        if self._gif_job is not None:
+            self.after_cancel(self._gif_job)
+            self._gif_job = None
+        self._gif_frames = []
+        self._gif_index = 0
+        self._gif_path = gif_path
+        self._gif_frozen = False
+
+        if not gif_path.exists():
+            self.gif_status.set("GIF missing.")
+            return
+
+        # If the user has the Animate toggle off, only decode the first
+        # frame -- enough to display a still without paying the full
+        # PhotoImage frame-buffer cost.
+        animate = self._gif_animate_var.get()
+        try:
+            im = Image.open(str(gif_path))
+            if not animate:
+                self._gif_frames.append(ImageTk.PhotoImage(im.copy()))
+            else:
+                while True:
+                    self._gif_frames.append(ImageTk.PhotoImage(im.copy()))
+                    im.seek(im.tell() + 1)
+        except EOFError:
+            pass
+        except Exception as e:
+            self.gif_status.set(f"GIF load error: {e}")
+            return
+
+        if not self._gif_frames:
+            self.gif_status.set("GIF has no frames.")
+            return
+
+        if not animate:
+            # Show the single still and stay frozen; toggling Animate on
+            # later will reload the full GIF.
+            self._gif_frozen = True
+            frame = self._gif_frames[0]
+            self.gif_label.configure(image=frame)
+            self.gif_label.image = frame
+            self.gif_status.set("Animate off (single frame)")
+            return
+
+        self.gif_status.set(f"{len(self._gif_frames)} frames")
+        self._advance_gif()
+
+    def _advance_gif(self) -> None:
+        if not self._gif_frames:
+            return
+        frame = self._gif_frames[self._gif_index]
+        self.gif_label.configure(image=frame)
+        self.gif_label.image = frame
+        self._gif_index = (self._gif_index + 1) % len(self._gif_frames)
+        self._gif_job = self.after(self.FRAME_MS, self._advance_gif)
+
+    # -- Animate toggle + tab visibility hooks -----------------------------
+
+    def _freeze_to_still(self, status: str) -> None:
+        """Stop the animation and drop every cached frame except the one
+        currently on screen. ``self.gif_label.image`` holds the kept
+        frame, so the still stays visible without a full frame buffer.
+        """
+        if self._gif_job is not None:
+            self.after_cancel(self._gif_job)
+            self._gif_job = None
+        if len(self._gif_frames) <= 1:
+            return
+        kept = self._gif_frames[self._gif_index]
+        self._gif_frames = [kept]
+        self._gif_index = 0
+        self._gif_frozen = True
+        import gc
+        gc.collect()
+        self.gif_status.set(status)
+
+    def _on_animate_toggle(self) -> None:
+        """Master switch driven by the ``Animate`` checkbox.
+
+        OFF -> freeze to a single still image and free the frame buffer.
+        ON  -> reload the GIF from disk (if we know its path) and resume
+        playback.
+        """
+        if self._gif_animate_var.get():
+            if self._gif_path is not None and self._gif_path.exists():
+                self._load_gif(self._gif_path)
+            elif len(self._gif_frames) > 1 and self._gif_job is None:
+                self._advance_gif()
+        else:
+            self._freeze_to_still(
+                "Paused by user (single frame held to save memory)")
+
+    def on_tab_hidden(self) -> None:
+        """Called by ``PipelineApp`` when the user switches off this tab.
+
+        Always freezes the animation so PhotoImage memory is released;
+        if the user has the ``Animate`` toggle on, the next ``on_tab_shown``
+        re-materialises the buffer.
+        """
+        self._freeze_to_still(
+            "Paused (single frame held to save memory)")
+
+    def on_tab_shown(self) -> None:
+        """Called when the user switches back to this tab.
+
+        Honours the user's ``Animate`` toggle: if it's off, we leave the
+        still image in place. If it's on and we previously dropped the
+        frame buffer, re-materialise it from ``self._gif_path``.
+        """
+        if not self._gif_animate_var.get():
+            return
+        if self._gif_frozen and self._gif_path is not None and self._gif_path.exists():
+            self._load_gif(self._gif_path)
+            return
+        if len(self._gif_frames) > 1 and self._gif_job is None:
+            self._advance_gif()
+
+    # -- Blob preview plot --------------------------------------------------
+
+    def _draw_blob_preview(self, result: PreprocessResult) -> None:
+        mean = np.load(str(result.mean_image_path))
+        blobs = (np.load(str(result.blobs_path))
+                 if result.blobs_path.exists() else np.zeros((0, 3)))
+
+        self.ax.clear()
+        self.ax.set_axis_off()
+        vmax = float(np.quantile(mean, 0.995))
+        self.ax.imshow(mean, cmap="gray", vmax=vmax)
+        for row in np.atleast_2d(blobs):
+            if row.size < 3:
+                continue
+            y, x, r = float(row[0]), float(row[1]), float(row[2])
+            self.ax.add_patch(
+                plt.Circle((x, y), r, color="cyan", fill=False, linewidth=1.2))
+        self.ax.set_title(f"{len(blobs)} preview blobs")
+        self.canvas.draw_idle()

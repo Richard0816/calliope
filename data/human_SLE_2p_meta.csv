@@ -1,0 +1,79 @@
+human_ID,area,slice_ID,AAV,DIV,1P_2P,video,min_start,baseline_min,frames,fs,solution,Pos#,region,good_bad_meh,Notes
+35,Hip,4,rg8M_dlxTdT,7,2P,2024-06-03-00001,0.00,2.00,15000,15.07,lowMg,1,Sub,good,good!
+35,Hip,4,rg8M_dlxTdT,7,2P,2024-06-03-00002,17.00,0.00,10000,15.07,lowMg,1,Sub,good,got another 
+35,Hip,5,rg6f_dlxTdT,7,2P,2024-06-03-00003,0.00,2.00,15000,15.07,lowMg,1,Sub,good,SLE! Good
+35,Hip,5,rg6f_dlxTdT,7,2P,2024-06-03-00004,15.00,0.00,10000,15.07,lowMg,1,Sub,good,SLE again! Good
+35,Hip,2,rg8M_dlxTdT,7,2P,2024-06-03-00007,0.00,2.00,15000,15.07,lowMg,1,Sub,good,AMAZING
+35,Hip,2,rg8M_dlxTdT,7,2P,2024-06-03-00008,15.00,0.00,10000,15.07,lowMg,1,Sub,good,still going!
+35,Hip,3,rg6f_dlxTdT,7,2P,2024-06-03-00009,0.00,2.00,15000,15.07,lowMg,1,Sub,meh,"small but ok, best check suite2p first"
+35,Hip,3,rg6f_dlxTdT,7,2P,2024-06-03-00010,15.00,0.00,10000,15.07,lowMg,1,Sub,?,was thinking of going on but will stop here
+35,Cx,6,rg8M_dlxTdT,7,2P,2024-06-03-00012,0.00,2.00,15000,15.07,lowMg,1,Cx,meh,SLE but position not great
+35,Cx,6,rg8M_dlxTdT,7,2P,2024-06-03-00013,15.00,0.00,10000,15.07,lowMg,1,Cx,meh,it is still going but can't do much about position so not sure if good to do FISH
+35,Hip,1,rg6f_dlxTdT,8,2P,2024-06-04-00001,0.00,2.00,15000,15.07,lowMg,1,Sub,good,great!
+35,Hip,1,rg6f_dlxTdT,8,2P,2024-06-04-00002,15.00,0.00,10000,15.07,lowMg,1,Sub,good,"great but esp in beginning, not sure if cut off"
+35,Cx,7,rg6f_dlxTdT,8,2P,2024-06-04-00006,0.00,2.00,15000,15.07,lowMg,1,Cx,good,something at 10min
+35,Hip,7,rg6f_dlxTdT,8,2P,2024-06-04-00009,0.00,3.00,15000,15.07,lowMg,1,Sub/CA1,good,amazing!
+35,Hip,7,rg6f_dlxTdT,8,2P,2024-06-04-00010,15.00,0.00,10000,15.07,lowMg,1,Sub/CA1,good,amazing!
+35,Cx,2,rg8M_dlxTdT,9,2P,2024-06-05-00001,0.00,2.00,15000,15.07,lowMg,1,Cx,good,ok
+35,Cx,2,rg8M_dlxTdT,9,2P,2024-06-05-00002,14.79,0.00,10000,15.07,lowMg,1,Cx,good,ok
+35,Cx,3,rg6f_dlxTdT,9,2P,2024-06-05-00006,0.00,2.00,15000,15.07,lowMg,1,Cx,good,amazing!
+35,Cx,3,rg6f_dlxTdT,9,2P,2024-06-05-00007,15.00,0.00,10000,15.07,lowMg,1,Cx,?,
+37,Hip,1,rg8M,7,2P,2024-07-01-00001,0,2.00,15000,15.07,lowMg,1,sub,good,
+37,Hip,1,rg8M,7,2P,2024-07-01-00002,17,0.00,10000,15.07,lowMg,1,sub,good,
+37,Hip,3,rg8M,7,2P,2024-07-01-00005,0,2.00,15000,15.07,lowMg,1,sub,good,
+37,Hip,3,rg8M,7,2P,2024-07-01-00006,17,0.00,10000,15.07,lowMg,1,sub,good,
+37,Hip,5,rg8M,7,2P,2024-07-01-00012,0,2.00,15000,15.07,lowMg,1,sub,good,
+37,Hip,5,rg8M,7,2P,2024-07-01-00013,17,0.00,10000,15.07,lowMg,1,sub,good,
+37,Cx,4,rg8M,7,2P,2024-07-01-00016,4,0,12409,15.07,lowMg,1,L5_6,good,great! But I think z shift again so aborted early
+37,Cx,4,rg8M,7,2P,2024-07-01-00017,19,0,11808,15.07,lowMg,1,L5_6,good,z-shifting
+37,Cx,2,rg8M,7,2P,2024-07-01-00018,0,2.00,15000,15.07,lowMg,1,L5_6,good,
+37,Cx,2,rg8M,7,2P,2024-07-01-00019,17,0.00,10000,15.07,lowMg,1,L5_6,good,
+37,Cx,3,rg8M,8,2P,2024-07-02-00001,0,2.00,15000,15.07,lowMg,1,L5_6,good,
+37,Cx,3,rg8M,8,2P,2024-07-02-00002,17,0.00,10000,15.07,lowMg,1,L5_6,good,z-shift
+37,Cx,6,rg8M,8,2P,2024-07-02-00005,0,2.00,15000,15.07,lowMg,1,L5_6,good,
+37,Cx,6,rg8M,8,2P,2024-07-02-00006,17,0.00,10000,15.07,lowMg,1,L5_6,good,
+37,Cx,7,rg8M,8,2P,2024-07-02-00007,0,2.00,15000,15.07,lowMg,1,L5_6,good,
+37,Cx,7,rg8M,8,2P,2024-07-02-00008,15,0.00,10000,15.07,lowMg,1,L5_6,good,z-shift
+37,Cx,10,rg8M,8,2P,2024-07-02-00012,0,2,15000,15.07,lowMg,1,L5_6,?,
+37,Cx,10,rg8M,8,2P,2024-07-02-00013,17,0,10000,15.07,lowMg,1,L5_6,good,
+38,Cx,1,rg8M,6,2p,2024-08-20-0001,0,2.00,15000,15.07,lowMg,1,L5_6,meh,"def something, but not sure how good"
+38,Cx,5,rg8M,6,2p,2024-08-20-0002,0,2,15000,15.07,lowMg,1,L5_6,meh,"not really anything, maybe a tiny twitch"
+38,Cx,7,rg8M,7,2p,2024-08-21-0001,0,2.00,15000,15.07,lowMg,1,L5_6,good,spot slightly off but is ok because of zoom wont be better
+38,Cx,12,rg8M,7,2p,2024-08-21-0002,0,2.00,15000,15.07,lowMg,1,L5_6,good,maybe meh
+38,Cx,6,rg8M,7,2p,2024-08-21-0003,0,2.00,15000,15.07,lowMg,1,L2_3?,good,"again meh expression, maybe meh angle but activity good"
+38,Cx,8,rg8M,8,2p,2024-08-22-0001,0,2.00,15000,15.07,lowMg,1,L5_6,meh,
+38,Cx,2,rg8M,8,2p,2024-08-22-0002,0,2.00,15000,15.07,lowMg,1,L2_3,meh,
+38,Cx,3,rg8M,8,2p,2024-08-22-0003,0,3.00,10000,15.07,lowMg,1,L5_6,good,
+38,Cx,3,rg8M,8,2p,2024-08-22-0004,9,0.00,10000,15.07,lowMg,1,L5_6,good,
+42,Hip,5,rg8M,9,2p,2024-10-30-0003,0,3,15000,15.07,lowMg,2,DG_CA4,good,
+42,Hip,4,rg8M,9,2p,2024-10-30-0005,21,0,5000,15.07,lowMg,2,CA3_4,good,
+42,Cx,5,rg8M,9,2p,2024-10-30-0010,0,1,15000,15.07,lowMg,1,L5,good,
+42,Hip,10,rg8M,9,2p,2024-10-30-0012,0,2,15000,15.07,lowMg,1,CA3_4,good,
+42,Hip,10,rg8M,9,2p,2024-10-30-0013,14,0,5000,15.07,lowMg,1,CA3_4,good,
+42,Hip,13,rg8M_dlxTdT,10,2p,2024-10-31-0001,0,3,15000,15.07,lowMg,1,DG_CA4,good,likely bursts not SLEs
+42,Hip,13,rg8M_dlxTdT,10,2p,2024-10-31-0002,17,0,5000,15.07,lowMg,1,DG_CA4,good,likely bursts not SLEs
+42,Hip,7,rg8M_dlxTdT,10,2p,2024-10-31-0003,0,2,15000,15.07,lowMg,1,CA1_sub,good,
+42,Hip,7,rg8M_dlxTdT,10,2p,2024-10-31-0004,16,0,10000,15.07,lowMg,1,CA1_sub,meh,maybe more?
+42,Hip,8,rg8M,10,2p,2024-10-31-0005,0,2,10000,15.07,lowMg,1,DG_CA4,good,
+43,Cx,5,rg8M,7,2P,2024-11-04-0003,0,1,10000,15.07,lowMg,1,L5,good,
+43,Cx,4,rg8M_dlxTdT,7,2P,2024-11-04-0004,0,2,15000,15.07,lowMg,1,L5,good,
+43,Cx,4,rg8M_dlxTdT,7,2P,2024-11-04-0005,17,0,15000,15.07,lowMg,1,L5,good,
+43,hip,6,8m+Dlx-tdT,7,2P,2024-11-04-0008,0,2,15000,15.07,lowMg,1,sub,meh,
+43,hip,7,8m+Dlx-tdT,7,2P,2024-11-04-0009,0,2,6755,15.07,lowMg,1,sub,bad,
+43,hip,7,8m+Dlx-tdT,7,2P,2024-11-04-0010,8,0,15000,15.07,lowMg,2,sub,good,
+43,Cx,1,8m+Dlx-tdT,8,2P,2024-11-05-0001,0,2,15000,15.07,lowMg,1,L5,good,
+43,Hip,4,8m+Dlx-tdT,8,2P,2024-11-05-0003,0,3,5700,15.07,lowMg,1,sub,meh,is baseline to next
+43,Hip,4,8m+Dlx-tdT,8,2P,2024-11-05-0004,7,0,15000,15.07,lowMg,1,sub,good,but again some shift so not sure
+43,Cx,10,8m+Dlx-tdT,8,2P,2024-11-05-0007,0,2,15000,15.07,lowMg,1,L5,good,
+44,Cx,6,8m+Dlx-tdT,7,2P,2024-11-18-0001,0,2,15000,15.07,lowMg,1,L5,meh,should analyse because of iCSF
+44,Cx,13,8m+Dlx-tdT,7,2P,2024-11-18-0002,0,2,15000,15.07,lowMg,1,L5,good,
+44,Cx,10,8m+Dlx-tdT,7,2P,2024-11-18-0003,0,2,15000,15.07,lowMg,1,L5,meh,"maybe good, maybe slightly off spot"
+44,Cx,7,8m+Dlx-tdT,7,2P,2024-11-18-0005,0,2,15000,15.07,lowMg,1,L5,good,
+44,Cx,8,8m+Dlx-tdT,7,2P,2024-11-18-0006,0,2,15000,15.07,lowMg,1,L5,good,
+44,Cx,8,8m+Dlx-tdT,7,2P,2024-11-18-0007,15,0,10000,15.07,lowMg,1,L5,good,
+44,Cx,9,8m+Dlx-tdT,7,2P,2024-11-18-0008,0,2,10000,15.07,lowMg,1,L5,good,
+44,Cx,18,8m+Dlx-tdT,9,2P,2024-11-20-0001,0,2,15000,15.07,lowMg,1,L3_5,good,"mhh maybe good, maybe meh"
+44,Cx,20,8m+Dlx-tdT,9,2P,2024-11-20-0002,0,2,15000,15.07,lowMg,1,L5,meh,
+44,Cx,21,8m+Dlx-tdT,9,2P,2024-11-20-0003,0,2,15000,15.07,lowMg,1,L5,good,
+44,Cx,22,8m+Dlx-tdT,9,2P,2024-11-20-0004,0,2,15000,15.07,lowMg,1,L5,good,
+,,,,,,,,,,,,,,,
