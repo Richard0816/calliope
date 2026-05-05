@@ -1,14 +1,19 @@
 # pyproject.toml for the standalone calliope GUI package.
 #
-# The current layout has pyproject.toml living INSIDE the calliope/ source
-# directory. Hatchling's `sources` table remaps the build root onto a
-# `calliope` package directory in the wheel so `import calliope` keeps
-# working without restructuring the source tree. To build a wheel, run
-# `python -m build` from inside this folder (or `pip install -e .`).
+# Standard "src layout":
 #
-# When you're ready to actually publish on PyPI, the conventional layout
-# is to add a parent project folder, move pyproject.toml + README up one
-# level, and drop the `[tool.hatch.build.targets.wheel.sources]` remapping.
+#   calliope/                 <- repo root (this directory)
+#   |-- pyproject.toml
+#   |-- README.md
+#   `-- src/
+#       `-- calliope/         <- the actual Python package
+#           |-- __init__.py
+#           |-- pipeline_gui.py
+#           |-- ...
+#
+# Hatchling auto-finds ``src/calliope`` because the project name matches.
+# This layout supports ``pip install -e .`` (editable installs) and
+# ``python -m build`` for sdist/wheel.
 
 [build-system]
 requires = ["hatchling"]
@@ -63,37 +68,21 @@ gpu = ["cupy"]
 calliope = "calliope.pipeline_gui:main"
 
 [project.urls]
-Homepage = "https://github.com/Richard0816/Calcium_imaging_suite2p"
+Homepage = "https://github.com/Richard0816/calliope"
 
-# ---------------------------------------------------------------------------
-# Hatchling: package the directory containing this pyproject.toml as the
-# `calliope` Python package in the wheel.
-# ---------------------------------------------------------------------------
+# Hatchling wheel/sdist config: src layout is auto-detected, but spelling
+# the package path out explicitly keeps things robust if someone renames
+# the project. Bundled resource files in src/calliope/data/ ship with the
+# wheel automatically because they live under the package directory.
 
 [tool.hatch.build.targets.wheel]
-include = [
-    "*.py",
-    "core/**/*.py",
-    "tabs/**/*.py",
-    "data/**",
-]
-exclude = [
-    "**/__pycache__/**",
-    "**/*.pyc",
-    "pyproject.toml",
-    "README.md",
-]
-
-[tool.hatch.build.targets.wheel.sources]
-"" = "calliope"
+packages = ["src/calliope"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "*.py",
-    "core/**/*.py",
-    "tabs/**/*.py",
-    "data/**",
+    "src/calliope/**",
     "pyproject.toml",
     "README.md",
+    ".gitignore",
 ]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
