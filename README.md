@@ -49,6 +49,8 @@ re-exporting just the slice of `calliope.core` the tab calls.
 
 ## Installing
 
+### Using pip
+
 Editable install (development), from the repo root:
 
 ```bash
@@ -68,6 +70,41 @@ pip install -e ".[gpu-cuda12]"
 
 GPU support is optional — the cross-correlation module falls back to
 NumPy automatically if CuPy isn't installed.
+
+### Using conda
+
+If you prefer conda (or `mamba`), create a fresh environment and then
+install the package with `pip` inside it. Suite2p, cellpose, and PyTorch
+all have well-tested conda-forge builds, so pulling them through conda
+first avoids the heaviest source builds:
+
+```bash
+# create + activate env (Python 3.10 is a known-good pin)
+conda create -n calliope python=3.10
+conda activate calliope
+
+# pull the heavy scientific stack from conda-forge
+conda install -c conda-forge numpy pandas scipy matplotlib seaborn \
+    scikit-image openpyxl pillow psutil tifffile pytorch
+
+# install calliope itself (editable install from the repo root)
+pip install -e .
+```
+
+For GPU cross-correlation inside a conda env, install the matching CuPy
+build from conda-forge instead of the pip extra:
+
+```bash
+# CUDA 11.x
+conda install -c conda-forge cupy cudatoolkit=11.8
+
+# CUDA 12.x
+conda install -c conda-forge cupy cuda-version=12
+```
+
+Tip: `mamba` is a drop-in replacement for `conda` that resolves the
+environment much faster — swap `conda` for `mamba` in any of the
+commands above if you have it installed.
 
 ## Running the GUI
 
