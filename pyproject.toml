@@ -62,7 +62,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["cupy"]
+# GPU cross-correlation needs a prebuilt CuPy wheel that matches the
+# host CUDA toolkit. The plain ``cupy`` source distribution would try to
+# compile from source and fails on anything older than CUDA 12, so split
+# the extra by CUDA major version. Pick the one that matches your
+# installed toolkit (``nvcc --version`` or ``CUDA_PATH``):
+#   pip install -e ".[gpu-cuda11]"   # CUDA 11.2 - 11.8
+#   pip install -e ".[gpu-cuda12]"   # CUDA 12.x
+gpu-cuda11 = ["cupy-cuda11x"]
+gpu-cuda12 = ["cupy-cuda12x"]
 
 [project.scripts]
 calliope = "calliope.pipeline_gui:main"

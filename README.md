@@ -55,11 +55,19 @@ Editable install (development), from the repo root:
 pip install -e .
 ```
 
-For GPU cross-correlation, install the optional `gpu` extras:
+For GPU cross-correlation, install the CuPy extra that matches your
+CUDA toolkit (`nvcc --version` or check `CUDA_PATH`):
 
 ```bash
-pip install -e ".[gpu]"
+# CUDA 11.2 - 11.8
+pip install -e ".[gpu-cuda11]"
+
+# CUDA 12.x
+pip install -e ".[gpu-cuda12]"
 ```
+
+GPU support is optional — the cross-correlation module falls back to
+NumPy automatically if CuPy isn't installed.
 
 ## Running the GUI
 
