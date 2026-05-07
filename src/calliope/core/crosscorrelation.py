@@ -1,16 +1,57 @@
 """Trimmed copy of ``crosscorrelation.py`` for the calliope GUI.
 
-Contains only the public symbols used by ``crosscorrelation_tab.py`` plus
-their transitive private helpers. Unrelated plotting helpers, CLI mains and
-legacy GPU/CPU per-pair routines have been dropped. Logic is preserved
-verbatim from the original module.
+What "cross-correlation" means here
+-----------------------------------
+Given two cell traces A(t) and B(t), the cross-correlation at lag k
+measures how strongly A leads / trails B by k samples. Conceptually,
+shift A by k frames, compute Pearson r against B, repeat for every
+``k`` in [-L, +L]. The result is a 1-D function of lag whose:
+
+* peak height = max correlation (how synchronous A and B are);
+* peak position = best lag in seconds (positive => A leads B);
+* value at lag 0 = "instantaneous" co-firing.
+
+For *cluster x cluster* analysis we compute that for every cell in
+cluster A vs every cell in cluster B. A naive implementation is
+``nA x nB`` cross-correlation calls -- too slow for hundreds of cells
+per cluster. This module's ``batch_xcorr_clusters`` does it all in
+**one matmul per lag**: shifting A by k frames simply means slicing
+the (T+2L, nA) zero-padded matrix, and one ``shifted_A.T @ B`` covers
+every (i, j) pair simultaneously. The whole thing runs on GPU when
+CuPy is installed, NumPy otherwise.
+
+Public surface
+--------------
+``batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, ...)``
+    The matmul-per-lag routine. Returns three (nA, nB) matrices:
+    ``best_lag_sec``, ``max_corr``, ``zero_lag_corr``.
+``run_cluster_xcorr_full(plane0, ..., progress_cb, abort_cb)``
+    Walk every cluster pair on disk and emit a CSV per pair, one row
+    per cell pair.
+``run_cluster_xcorr_per_event_fast(plane0, event_windows, ...)``
+    Same but cropped to each detected event window from Tab 5.
+``zscore_pair_traces`` and the ``xcorr_*`` helpers are used by the
+single-pair preview in Tab 7.
+
+What you'll see if you've never read CuPy code
+----------------------------------------------
+The pattern ``xp = cp if use_gpu else np`` lets the same algorithm
+run on either GPU or CPU: ``xp`` is "whichever array module we
+chose", and methods like ``xp.zeros(...)`` / ``xp.where(...)`` /
+``xp.asarray(...)`` exist on both libraries with the same signatures.
+Roughly the equivalent of swapping out ``base`` for ``data.table`` in
+R but keeping the same call shapes.
 """
 
+# Type-hint helper. ``Optional[X]`` == ``X or None``.
 from typing import Optional
 
 import numpy as np
 from pathlib import Path
 
+# CuPy is the GPU-accelerated drop-in for NumPy. We import it
+# defensively: not every machine has CUDA, and we'd rather print a
+# warning and fall back to CPU than crash on import.
 try:
     import cupy as cp
 except ImportError:
@@ -19,12 +60,36 @@ except ImportError:
 
 
 def _zscore_cols_xp(X, xp, eps=1e-12):
-    """Z-score each column on either numpy or cupy. Column with std==0 -> zeros."""
+    """Z-score each column independently using either NumPy or CuPy.
+
+    Z-scoring (subtract mean, divide by std) is the standard
+    preprocessing step before computing Pearson correlations -- once
+    you've z-scored both columns, the correlation reduces to a
+    simple inner product / T.
+
+    The ``xp`` argument is either ``numpy`` or ``cupy``; both
+    libraries support the same calls (``mean``, ``std``, ``where``).
+    Letting the caller pass it in lets the same code run on either
+    backend without an ``if use_gpu:`` ladder.
+
+    A column with std=0 (constant trace) would normally produce NaN
+    on division -- we guard against that with ``sd_safe`` and then
+    zero out the offending columns explicitly.
+    """
+    # ``axis=0`` -> reduce along rows -> one value per column.
+    # ``keepdims=True`` keeps the result shape ``(1, N)`` instead of
+    # ``(N,)`` so it broadcasts cleanly against ``X`` of shape
+    # ``(T, N)``.
     mu = X.mean(axis=0, keepdims=True)
     sd = X.std(axis=0, keepdims=True)
+    # ``xp.where(condition, a, b)`` is a vectorised if/else: pick a
+    # where condition is True, b otherwise. Replace zero stds with
+    # 1.0 to dodge the division-by-zero; we'll then explicitly zero
+    # the bad columns below.
     sd_safe = xp.where(sd == 0, xp.asarray(1.0, dtype=X.dtype), sd)
     Z = (X - mu) / sd_safe
-    # Mask zero-std columns to zero
+    # Mask zero-std columns to zero so they don't produce spurious
+    # correlations.
     bad = (sd == 0).reshape(-1)
     if bool(bad.any()):
         Z[:, bad] = 0
@@ -37,31 +102,59 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
     """Best-lag + zero-lag cross-correlation for ALL pairs (i, j) in
     ``X_A[:, i]`` x ``X_B[:, j]``.
 
+    Inputs
+    ------
+    X_A : (T, nA) ndarray  -- ROI traces in cluster A, columns are cells
+    X_B : (T, nB) ndarray  -- same for cluster B
+    fps : float            -- so we can convert lags to seconds at the end
+    max_lag_seconds : float -- search window radius in seconds
+
     Returns
     -------
     best_lag_sec : (nA, nB) ndarray
-    max_corr     : (nA, nB) ndarray  — biased Pearson r at best lag
-    zero_lag_corr: (nA, nB) ndarray  — Pearson r at lag 0
+        Lag in seconds at which each pair's Pearson r peaks.
+        Positive => A leads B.
+    max_corr     : (nA, nB) ndarray  -- (biased) Pearson r at best lag
+    zero_lag_corr: (nA, nB) ndarray  -- Pearson r at lag 0
 
-    Algorithm (one matmul per lag, all pairs at once):
-      1. Z-score columns of A and B.
-      2. Pad ZA on both ends with L zeros.
-      3. For each lag k in [-L, L]: shift = a strided view; one matmul
-         ``shift.T @ ZB`` returns the (nA, nB) correlation matrix at lag k.
-      4. Track running per-pair argmax across lags.
-      5. Return best_lag, max_corr, zero_lag_corr (the lag-0 matrix).
+    Algorithm: one matmul per lag, all pairs at once
+    ------------------------------------------------
+    The naive approach -- a separate cross-correlation call per
+    (i, j) pair -- is too slow for hundreds of cells per cluster.
+    Instead we exploit the fact that at lag k, the Pearson r between
+    z-scored ``A_i`` and ``B_j`` equals ``(1/T) * sum(Z_A_i_shifted
+    * Z_B_j)``. Stacking all of A as columns of a matrix turns the
+    per-pair sum into one big ``shifted_A.T @ Z_B`` matmul that
+    yields the entire (nA, nB) correlation matrix at lag k in one
+    shot. We do that for every lag in ``[-L, +L]`` and track the
+    running per-pair argmax.
 
-    The per-pair Python overhead is gone: cost is dominated by
-    ``(2L+1)`` GEMMs, each one giving the full (nA, nB) matrix.
+    Cost is dominated by ``(2L+1)`` GEMMs (matrix multiplies). Modern
+    BLAS implementations -- especially CuPy on a GPU -- chew through
+    these very fast, so a 100-lag search over 200 x 300 cells in a
+    cluster pair takes a couple of seconds.
+
+    ``ZA_pre`` / ``ZB_pre`` let the caller pre-compute the z-scored
+    matrices and reuse them across many cluster pairs (the full-
+    recording runner does this).
     """
+    # Decide whether to actually use the GPU. We need both the user's
+    # opt-in AND a working CuPy install. ``cp is None`` after the
+    # try-import at the top of the file marks an unavailable GPU.
     use_gpu = bool(use_gpu and cp is not None)
+    # ``xp`` is the array library we'll use throughout. NumPy/CuPy
+    # share their public API so the same code runs on either.
     xp = cp if use_gpu else np
 
+    # ``xp.asarray(..., dtype=...)`` is a no-op if the input is
+    # already on the right device + dtype, otherwise copies. Saves
+    # us from manually shipping data to/from the GPU.
     XA = xp.asarray(X_A, dtype=dtype)
     XB = xp.asarray(X_B, dtype=dtype)
     T, nA = XA.shape
     nB = XB.shape[1]
 
+    # Z-score each cluster's traces unless the caller already did.
     if ZA_pre is None:
         ZA = _zscore_cols_xp(XA, xp)
     else:
@@ -71,36 +164,64 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
     else:
         ZB = xp.asarray(ZB_pre, dtype=dtype)
 
+    # Convert max-lag from seconds to integer frames. ``np.floor``
+    # rounds toward zero. Clamp to [0, T-1] so we don't request
+    # negative or out-of-array lags.
     L = int(np.floor(max_lag_seconds * float(fps)))
     L = max(0, min(L, T - 1))
+    # Precompute 1/T as a same-dtype scalar; multiplying is faster
+    # than dividing on every iteration.
     inv_T = dtype(1.0 / float(T))
 
-    # Pad ZA along time with L zeros on each side; sliding view is cheap.
+    # Pad ZA along time with L zeros on each side. ``xp.concatenate``
+    # joins arrays along ``axis=0`` (rows); the result has shape
+    # ``(T + 2L, nA)``. We then take T-row slices of this padded
+    # matrix to "shift" ZA without copying any data.
     pad = xp.zeros((L, nA), dtype=ZA.dtype)
     ZA_pad = xp.concatenate([pad, ZA, pad], axis=0)  # (T+2L, nA)
 
+    # Running per-pair best so far. ``-inf`` means "anything is
+    # better than this" so the first iteration always wins.
     neg_inf = xp.asarray(-np.inf, dtype=ZA.dtype)
     best_corr = xp.full((nA, nB), float(neg_inf), dtype=ZA.dtype)
     best_lag_idx = xp.zeros((nA, nB), dtype=xp.int32)
     zero_lag_corr = None
 
-    # Determine zero-lag matrix index (j == L)
+    # Sweep every lag j in [0, 2L]. j corresponds to lag (j - L) in
+    # frames, so j = L is lag 0.
     for j in range(2 * L + 1):
+        # ``ZA_pad[j:j+T]`` is a view (no copy) of T rows starting
+        # at offset j -- effectively ZA shifted left by (j - L)
+        # frames.
         Zs = ZA_pad[j:j + T]                  # (T, nA)
+        # ``Zs.T @ ZB`` is matrix multiplication ``(nA, T) @ (T,
+        # nB) = (nA, nB)``. Each entry is the inner product of a
+        # column of Zs against a column of ZB -- the unscaled
+        # Pearson r contribution.
         C = (Zs.T @ ZB) * inv_T               # (nA, nB)
+        # Stash the lag-0 matrix the moment we hit it.
         if (j - L) == 0:
             zero_lag_corr = C.copy() if hasattr(C, "copy") else xp.array(C)
+        # Where this lag improved on the running best, update the
+        # running best and the recorded lag index. Vectorised --
+        # touches every (i, j) pair at once.
         mask = C > best_corr
         best_corr = xp.where(mask, C, best_corr)
         best_lag_idx = xp.where(mask, xp.int32(j), best_lag_idx)
 
+    # Defensive: if L was clamped to 0 we never iterated, so compute
+    # zero_lag_corr explicitly.
     if zero_lag_corr is None:
         Zs = ZA_pad[L:L + T]
         zero_lag_corr = (Zs.T @ ZB) * inv_T
 
+    # Convert the integer lag indices back to seconds.
     best_lag_sec = ((best_lag_idx.astype(ZA.dtype) - dtype(L))
                     / dtype(float(fps)))
 
+    # If we ran on GPU, copy the result matrices back to host RAM
+    # (NumPy) before returning -- the caller doesn't want to deal
+    # with CuPy arrays.
     if use_gpu:
         return (cp.asnumpy(best_lag_sec), cp.asnumpy(best_corr),
                 cp.asnumpy(zero_lag_corr))
@@ -111,13 +232,24 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
 def single_pair_xcorr_curve(sigA, sigB, fps, max_lag_seconds):
     """Full cross-correlation curve (Pearson r at every lag) for ONE pair.
 
+    Used by Tab 7's "single-pair preview" so the user can sanity-
+    check what the cross-correlation looks like for a particular
+    cell pair before committing to a full cluster x cluster sweep.
+
     Returns
     -------
     lags_sec : (2L+1,) ndarray
-    r        : (2L+1,) ndarray  — biased Pearson r at each lag
-        Uses the same convention as ``batch_xcorr_clusters``: z-score each
-        signal, then ``r[k] = sum(Z_A_shifted_by_k * Z_B) / T`` with
-        ``Z_A`` zero-padded by ``L`` samples on each side.
+    r        : (2L+1,) ndarray  -- biased Pearson r at each lag
+
+    Algorithm note
+    --------------
+    Same convention as ``batch_xcorr_clusters``: z-score each signal,
+    then ``r[k] = sum(Z_A_shifted_by_k * Z_B) / T`` with ``Z_A``
+    zero-padded by ``L`` samples on each side. The implementation
+    uses ``numpy.lib.stride_tricks.sliding_window_view`` -- a zero-
+    copy way to materialise every length-T shift of ``Za_pad`` as
+    rows of a ``(2L+1, T)`` matrix -- so the whole curve falls out
+    of one matmul.
     """
     a = np.asarray(sigA, dtype=np.float32).reshape(-1)
     b = np.asarray(sigB, dtype=np.float32).reshape(-1)

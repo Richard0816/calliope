@@ -1,8 +1,22 @@
 """Logic + calculations for the Clustering tab.
 
-Re-exports the slice of ``calliope.core`` modules the tab calls
-(``clustering_cmap`` for palettes, ``summary_writer`` for writing the
-Clusters sheet, plus the two ``utils`` helpers the tab uses).
+Re-export shim
+--------------
+Tab 6 imports three slices of ``calliope.core``:
+
+- ``clustering_cmap`` -- the actual hierarchical clustering
+  algorithm (``run_clustering``, ``recluster_branch``,
+  ``auto_choose_threshold``) + palette helpers.
+- ``summary_writer`` -- writes the Clusters sheet to
+  ``calliope_summary.xlsx``.
+- ``utils`` -- ``get_fps_from_notes`` and ``paint_spatial`` for the
+  spatial map below the dendrogram.
+
+Re-exporting whole modules (rather than picking individual names)
+keeps the call sites readable: ``clustering_cmap.run_clustering(...)``
+is more navigable than a dozen unbound symbol imports.
+
+See ``calliope.tabs.preprocess.logic`` for the shim pattern overview.
 """
 
 from __future__ import annotations

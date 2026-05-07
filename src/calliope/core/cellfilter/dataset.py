@@ -1,15 +1,42 @@
-"""
-Dataset builder for the cell filter.
+"""Dataset builder for the cell-filter CNN.
 
-One sample = (spatial_patch, trace, label)
-  spatial_patch : (3, H, W)  float32 - [mean, max_proj, roi_mask]
-  trace         : (1, T)     float32 - per-ROI z-scored dF/F
-  label         : 0 or 1
+What this file does
+-------------------
+Defines a PyTorch ``Dataset`` (``RoiDataset``) that yields one
+training sample per ROI. PyTorch's training loop calls
+``len(dataset)`` to know how many samples there are and
+``dataset[i]`` to fetch the i-th sample; the framework handles
+batching and shuffling automatically.
 
-Recordings are resolved by searching {DATA_ROOT}\\Cx\\<rec_id> and
-{DATA_ROOT}\\Hip\\<rec_id>. Per-recording tensors (mean, max, normalized
-traces, stat) are cached so repeated ROIs from the same recording don't
-reload from disk.
+One sample is the (spatial_patch, trace, label) triple the model
+needs:
+
+    spatial_patch : (3, H, W)  float32 - [mean, max_proj, roi_mask]
+    trace         : (1, T)     float32 - per-ROI z-scored dF/F
+    label         : 0 or 1     - human curation: real cell vs noise
+
+How a sample is built
+---------------------
+1. The dataset reads the curation CSV (one row per labelled ROI)
+   and stores ``(rec_id, roi_id, label)`` tuples internally.
+2. On ``dataset[i]``, we look up the recording on disk, slice out
+   the 32x32 patch around the ROI's median centroid, build the 3-
+   channel image, z-score the dF/F trace, and return the tensors.
+3. Per-recording tensors (mean image, max projection, dF/F memmap,
+   stat) are cached in ``_REC_TENSOR_CACHE`` so repeated ROIs from
+   the same recording don't reload from disk.
+
+R analogy: think of this as a custom data-frame iterator that
+encapsulates "given a row id, fetch the appropriate features from a
+collection of large files and return them as a list of arrays". The
+PyTorch ``DataLoader`` plays the role of ``data.table::split`` +
+``parallel::mclapply`` -- it batches and parallelises ``__getitem__``
+calls under the hood.
+
+Recordings are resolved by searching ``{DATA_ROOT}\\Cx\\<rec_id>``
+and ``{DATA_ROOT}\\Hip\\<rec_id>``. Per-recording tensors (mean,
+max, normalized traces, stat) are cached so repeated ROIs from the
+same recording don't reload from disk.
 """
 from __future__ import annotations
 
@@ -103,11 +130,39 @@ def _pad_to_patch(img: np.ndarray, cy: int, cx: int, size: int) -> tuple[np.ndar
 # ---------------- per-recording cache ----------------
 
 class _RecordingCache:
-    """Holds lazily-loaded arrays for a single recording."""
+    """One recording's worth of arrays, loaded once and re-used.
+
+    Why we cache
+    ------------
+    Training visits each ROI of a recording multiple times across
+    epochs. ROIs from the same recording all need the same mean image,
+    max projection, and dF/F memmap; loading those from disk on every
+    ``__getitem__`` would be wasteful. ``_RecordingCache``
+    consolidates them, exposes lazy-but-ready getters for the patch
+    and trace, and is shared across ROIs by ``ROIDataset``'s
+    ``_cache`` dict.
+
+    Attributes
+    ----------
+    stat       : ndarray of suite2p stat dicts.
+    mean_img_z : (H, W) float32 mean image, z-normalised.
+    max_img_z  : (H, W) float32 max projection, z-normalised. Padded
+                 to match the mean image's shape if Suite2p cropped
+                 it.
+    dff        : (T, N) float32 memmap of neuropil-corrected dF/F.
+    T, N       : trace length and ROI count.
+    H, W       : FOV dimensions (pixels).
+    """
     def __init__(self, rec_id: str, plane0: Optional[Path] = None):
         self.rec_id = rec_id
+        # Two ways to specify a recording: an explicit ``plane0``
+        # path (used by ``predict_recording`` from the GUI) or a
+        # bare ``rec_id`` that gets resolved through ``find_recording_root``
+        # (used by training).
         if plane0 is not None:
             self.plane0 = Path(plane0)
+            # ``plane0`` is ``<root>/suite2p/plane0`` -- two
+            # ``.parent`` calls reach the recording root.
             self.root = self.plane0.parent.parent
         else:
             self.root = find_recording_root(rec_id)
@@ -175,11 +230,44 @@ class _RecordingCache:
 # ---------------- dataset ----------------
 
 class ROIDataset(Dataset):
-    """
-    Each __getitem__ returns:
-      spatial : (3, H, W)
-      trace   : (1, T_crop) during training; (1, T_full) during eval
-      label   : float tensor, 0.0 or 1.0
+    """PyTorch Dataset adapter for the cell-filter training pipeline.
+
+    Why subclass ``torch.utils.data.Dataset``
+    -----------------------------------------
+    PyTorch's training infrastructure (``DataLoader``, batching,
+    shuffling, multiprocessing) all rely on the Dataset *protocol*:
+    a class that exposes ``__len__`` (how many samples) and
+    ``__getitem__(i)`` (fetch the i-th sample). Once you implement
+    those two, ``DataLoader(dataset, batch_size=32, shuffle=True)``
+    handles batching, shuffling and parallel preloading
+    automatically.
+
+    Each ``__getitem__`` returns:
+      spatial : (3, H, W) torch.Tensor
+          (mean, max-projection, ROI mask).
+      trace   : (1, T_crop) torch.Tensor during training,
+                 (1, T_full) during eval.
+      label   : torch.Tensor, scalar 0.0 or 1.0
+          The human curation: 1 = real cell, 0 = noise.
+
+    Constructor parameters
+    ----------------------
+    labels_df : pd.DataFrame
+        One row per ROI with columns ``recording_ID``, ``ROI_number``,
+        ``user_defined_cell``.
+    patch_size : int
+        Size of the spatial patch around the ROI centroid.
+    trace_crop : int or None
+        If set, return a randomly-cropped sub-trace this long during
+        training. ``None`` -> always return the full trace (for
+        inference / validation).
+    random_crop : bool
+        ``True`` for random training crops, ``False`` for centred
+        deterministic crops (validation).
+    cache : dict, optional
+        Pre-existing ``rec_id -> _RecordingCache`` dict. Pass the
+        same one to train and val Datasets so per-recording arrays
+        load only once across both.
     """
     def __init__(
         self,
@@ -235,6 +323,18 @@ class ROIDataset(Dataset):
 # ---------------- splits ----------------
 
 def load_labels(csv_path: Path = C.LABELS_CSV) -> pd.DataFrame:
+    """Load the curation CSV and clean it up.
+
+    The CSV is the human-labelled ground truth: lab members open
+    each recording's ROIs in a Suite2p-like browser and tick
+    "cell" / "not cell" based on visual inspection. This function:
+        1. Reads the CSV.
+        2. Coerces dtypes (recording id as string, others as int).
+        3. Drops duplicates -- keeps the LAST occurrence so a later
+           re-labelling overrides an earlier mistake.
+
+    Returns a DataFrame ready to feed to ``ROIDataset``.
+    """
     df = pd.read_csv(csv_path)
     df["recording_ID"] = df["recording_ID"].astype(str)
     df["ROI_number"] = df["ROI_number"].astype(int)
@@ -249,11 +349,27 @@ def split_by_recording(
     val_frac: float = C.VAL_FRAC,
     seed: int = C.RANDOM_SEED,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train/val split that keeps **whole recordings** in one or the
+    other set.
+
+    Why do it this way: ROIs from the same recording share the
+    background mean image, motion artefacts, focus level, etc.
+    Splitting at the ROI level (a random 80/20) would let
+    information leak between train and val -- the model could learn
+    "this is a cell because it's bright relative to the rest of
+    *this exact recording*" rather than a general rule. Splitting at
+    the recording level forces it to generalise across slices.
+    """
     rng = np.random.default_rng(seed)
+    # ``np.array`` + ``rng.shuffle`` shuffles in-place. ``sorted``
+    # first so the same seed gives the same split regardless of
+    # input dataframe ordering.
     recs = np.array(sorted(df["recording_ID"].unique()))
     rng.shuffle(recs)
     n_val = max(1, int(round(len(recs) * val_frac)))
+    # Slice the first n_val shuffled recordings for validation.
     val_recs = set(recs[:n_val].tolist())
+    # ``df.isin(set)`` returns a boolean Series; ``~`` negates.
     train_df = df[~df["recording_ID"].isin(val_recs)].reset_index(drop=True)
     val_df = df[df["recording_ID"].isin(val_recs)].reset_index(drop=True)
     return train_df, val_df
@@ -264,11 +380,13 @@ def split_by_roi(
     val_frac: float = C.VAL_FRAC,
     seed: int = C.RANDOM_SEED,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Random per-ROI split, stratified by label so val keeps class balance.
+    """Random per-ROI split, stratified by label.
 
-    Use this when there's only one (or very few) recordings, where
-    split_by_recording can't form a non-empty val set without losing all
-    positives or all negatives.
+    Use this when there's only one (or very few) recordings -- the
+    recording-level split would either drop every positive ROI into
+    val (and leave training with none) or vice versa.
+    Stratification guarantees both classes appear in train and val
+    in roughly the same proportion as the source df.
     """
     rng = np.random.default_rng(seed)
     parts_train, parts_val = [], []

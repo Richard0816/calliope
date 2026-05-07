@@ -1,8 +1,41 @@
 """Sparsery + Cellpose detection (no adaptive threshold search).
 
-Minimal pipeline — run sparsery once at a fixed threshold, run cellpose
-once, merge non-overlapping cellpose ROIs into the sparsery set, then
-extract fluorescence + deconvolve + classify + save.
+Why this file exists
+--------------------
+Suite2p ships with a detector called **Sparsery** that finds bright,
+sparse, time-varying spots -- it works very well on the kind of cells
+that fire often during a recording but misses cells that happen to
+stay quiet. To catch the quiet ones we run a second detector,
+**Cellpose** (a generalist deep-learning cell segmentation model from
+Stringer & Pachitariu), on the recording's *mean image* and merge any
+non-overlapping new ROIs into Suite2p's set. The combined ROI list
+then goes through Suite2p's normal extraction pipeline (fluorescence
+trace + neuropil + deconvolution + iscell classifier).
+
+Pipeline at a glance
+--------------------
+1. ``run_one_pass``    -- Suite2p's Sparsery detector, fixed ops (no
+                          binary search). Returns ``stat`` (a list,
+                          one per ROI) and ``ops`` (image dict).
+2. ``run_cellpose_pass`` -- Cellpose on ``ops['meanImg']``. Returns
+                          its own ``stat`` list.
+3. ``filter_non_overlapping_cellpose`` -- drop Cellpose ROIs whose
+                          pixels are already covered by a Sparsery
+                          ROI. Threshold = ``CELLPOSE_MERGE_MAX_OVERLAP``.
+4. ``merge_and_extract`` -- concatenate the two stat lists, run
+                          Suite2p ``extract`` to get F / Fneu / spks,
+                          run Suite2p's ``classify`` to label
+                          cell / not-cell, write everything to
+                          ``final_dir/suite2p/plane0``.
+
+Tab 3 calls this module's ``run_full_pipeline`` (defined later in the
+file) when the user clicks "Run detection". Inputs:
+
+- The shifted TIFF stack from Tab 1.
+- A base ops dict (``suite2p_2p_ops_240621.npy``) with sensible 2-photon
+  defaults.
+- The recording's tau (GCaMP decay constant) looked up from the AAV
+  metadata table.
 
 Compared to ``final_adaptive_detection.py``, this script skips the
 spatial-scale estimation and threshold binary search. Ops are whatever
@@ -14,20 +47,41 @@ Usage:
 
 from __future__ import annotations
 
+# ``sys.path.insert`` below lets us import sibling files when this
+# script is run directly (rather than as part of the calliope package).
 import sys
+# ``time`` is used for ad-hoc timing prints during long-running steps.
 import time
 from pathlib import Path
 
 import numpy as np
 
+# Compute *this file's parent folder* and add it to ``sys.path`` so a
+# bare ``python sparse_plus_cellpose.py`` invocation can resolve the
+# sibling files. Inside the calliope package this is harmless.
 WORKTREE = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORKTREE))
 
+# ``# noqa: F401`` is a linter hint meaning "don't warn about
+# 'imported but unused'". Suite2p's own ``__init__`` does some
+# environment setup we want to trigger even though we don't use the
+# top-level name directly.
 import suite2p   # noqa: F401
+# ``roi_stats``: recompute the per-ROI stat dict (npix, lam, ypix...)
+# after we mutate the ROI list. Needed because we splice Cellpose
+# ROIs into Sparsery's list mid-pipeline.
 from suite2p.detection.stats import roi_stats
+# ``extract``: pull each ROI's raw fluorescence trace + a surrounding
+# "neuropil" ring trace. ``dcnv``: run the OASIS deconvolution that
+# produces the spks.npy estimated-firing-rate trace.
 from suite2p.extraction import extract, dcnv
+# ``classification``: Suite2p's built-in cell/not-cell classifier
+# that writes iscell.npy.
 from suite2p import classification
 
+# Helpers re-used from the older adaptive-detection pipeline. Even
+# though we skip the binary-search loop here, we still need ops
+# loading, the registration cache, and the ROI-mask builder.
 from .adaptive_detection import (
     AdaptiveConfig,
     load_base_ops,
@@ -38,6 +92,8 @@ from .adaptive_detection import (
     visualize_audit,
 )
 
+# The Cellpose pass itself lives in the adjacent ``brute_force_ops``
+# module so it can be tested / re-run independently.
 from .brute_force_ops import run_cellpose_pass
 
 
@@ -90,18 +146,54 @@ def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
                                     Ly: int, Lx: int,
                                     max_overlap: float,
                                     verbose: bool = True):
-    """Keep cellpose ROIs with < ``max_overlap`` fraction covered by sparsery."""
+    """Keep cellpose ROIs whose pixels are mostly *not* covered by
+    Sparsery's existing ROI footprint.
+
+    Why we need this
+    ----------------
+    Sparsery and Cellpose often re-find the same cell. We don't want
+    duplicate ROIs in the final list -- one cell with two ROIs ends
+    up with two near-identical traces and corrupts every downstream
+    statistic (clustering, cross-correlation, etc.). The simplest fix
+    is to keep Sparsery's ROIs as canonical and drop any Cellpose ROI
+    whose pixels are mostly already accounted for.
+
+    Algorithm
+    ---------
+    1. Build a single ``(Ly, Lx)`` boolean image marking every pixel
+       belonging to *any* Sparsery ROI. This is what
+       ``build_roi_pixel_mask`` does under the hood.
+    2. For each Cellpose ROI, compute the fraction of its pixels that
+       fall inside that mask. Keep it if the fraction is below
+       ``max_overlap`` (default 0.3 in the GUI), otherwise drop.
+
+    Returns
+    -------
+    kept : list[dict]
+        The Cellpose stat entries that survived filtering. Will be
+        concatenated with ``sparsery_stat`` by ``merge_and_extract``.
+    """
+    # Single union-of-Sparsery-pixels mask, computed once for speed.
     sparsery_mask = build_roi_pixel_mask(sparsery_stat, Ly, Lx)
     kept = []
     dropped = 0
     for s in cellpose_stat:
+        # ``np.asarray(...).astype(int)`` defensively coerces whatever
+        # Cellpose returns (sometimes lists, sometimes int64) into the
+        # int dtype we'll use for indexing.
         yp = np.asarray(s['ypix']).astype(int)
         xp = np.asarray(s['xpix']).astype(int)
+        # Bounds check: ROIs near the FOV edge can have one or two
+        # pixels rounded slightly out of range; clip those.
         ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
         yp = yp[ok]; xp = xp[ok]
         if yp.size == 0:
             dropped += 1
             continue
+        # ``sparsery_mask[yp, xp]`` is fancy indexing -- a vector of
+        # 0/1 telling us, for each Cellpose pixel, whether it's
+        # already inside the Sparsery footprint. Its mean is the
+        # overlap fraction.
         overlap = float(sparsery_mask[yp, xp].sum()) / float(yp.size)
         if overlap < max_overlap:
             kept.append(s)
@@ -119,6 +211,32 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
                       verbose: bool = True):
     """Combine sparsery + non-overlapping cellpose ROIs, then extract
     fluorescence → dcnv → classify → save into ``final_dir/suite2p/plane0/``.
+
+    This is the heart of Tab 3's "Run detection" worker. Walking
+    through the steps:
+
+    1. **Reuse the registered movie.** Suite2p already wrote the
+       motion-corrected ``data.bin`` and ``ops.npy`` into the shared
+       Sparsery folder. Symlink (or copy) ``data.bin`` over to the
+       final folder so we don't have to re-register the movie.
+    2. **Drop overlapping Cellpose ROIs** with
+       ``filter_non_overlapping_cellpose``.
+    3. **Concatenate** the two stat lists into ``combined_raw``,
+       tagging each entry with ``_source`` so we can audit later.
+    4. **Build the final ops dict** by copying registration-time ops
+       and overlaying the trace-extraction knobs from ``base_ops``
+       (tau, fs, neucoeff, baseline window, etc.).
+    5. **Recompute per-ROI stats** with Suite2p's ``roi_stats`` so
+       every dict has the full set of fields (npix, lam normalisation,
+       med, ipix, etc.) that ``extract`` expects.
+    6. **Extract** F / Fneu using Suite2p's neuropil ring extractor.
+    7. **Deconvolve** spks via OASIS (``dcnv``).
+    8. **Classify** cell vs not-cell into ``iscell.npy``.
+    9. **Save** every output (F, Fneu, spks, stat, ops, iscell) into
+       ``final_dir/suite2p/plane0`` -- the same layout Tabs 4-8 expect.
+
+    Returns the path to the populated plane0 folder so callers can
+    publish it on ``AppState.plane0``.
     """
     final_plane0 = final_dir / 'suite2p' / 'plane0'
     final_plane0.mkdir(parents=True, exist_ok=True)
@@ -249,15 +367,65 @@ def run(
     max_overlap: float = CELLPOSE_MERGE_MAX_OVERLAP,
     aav_info_csv: str | None = None,
     tau_vals: dict | None = None,
+    tau_override: float | None = None,
     verbose: bool = True,
 ) -> Path:
     """Sparsery + cellpose detection. Returns the final ``suite2p/plane0`` path.
 
-    `tiff_folder` can hold one TIFF or many (multi-TIFF groups are read by
-    suite2p as one continuous recording via natsort on data_path).
-    Unspecified `sparsery_ops` / `cellpose_cfg` fall back to the module-level
-    defaults; `aav_info_csv` / `tau_vals` are forwarded to ``AdaptiveConfig``
-    so ``load_base_ops`` can look up tau by GCaMP variant."""
+    This is the single-call public API Tab 3's worker uses. The full
+    flow:
+
+    1. Build an ``AdaptiveConfig`` (the legacy detection's config
+       dataclass; we still piggy-back on it for the AAV / tau lookup
+       and for the shared-registration cache).
+    2. ``load_base_ops`` reads the base 2-photon ops file
+       (``suite2p_2p_ops_240621.npy``) and overlays the recording's
+       tau looked up from the AAV CSV.
+    3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
+       correction once and caches ``data.bin`` + ``ops.npy`` so both
+       Sparsery and Cellpose can reuse it.
+    4. ``run_one_pass`` -- Sparsery detection on the registered movie
+       at the fixed ops up top.
+    5. ``run_cellpose_pass`` -- Cellpose on the mean image, also using
+       the shared registration cache.
+    6. ``merge_and_extract`` -- drop overlapping Cellpose ROIs,
+       concatenate, run Suite2p extract / dcnv / classify, save into
+       ``<save_folder>/final/suite2p/plane0``.
+    7. ``visualize_audit`` -- optional ``audit.png`` overlay of all
+       final ROIs on the mean image.
+
+    Parameters
+    ----------
+    tiff_folder : str | Path
+        Folder containing the shifted TIFF(s). Multi-TIFF groups are
+        read as one continuous recording.
+    save_folder : str | Path
+        Where to write ``sparsery_pass``, ``cellpose_pass`` and the
+        final merged ``final/suite2p/plane0`` outputs.
+    path_to_ops : str | Path, optional
+        Override for the base ops .npy file. Defaults to the lab's
+        2-photon ops profile.
+    sparsery_ops, cellpose_cfg : dict, optional
+        Per-detector overrides; fall back to module-level defaults.
+    hard_cap : int, optional
+        Maximum number of Sparsery ROIs to keep before bailing.
+        ``None`` disables the cap.
+    max_overlap : float
+        Cellpose ROIs whose pixels are >= this fraction inside an
+        existing Sparsery ROI are dropped during merge.
+    aav_info_csv, tau_vals : optional
+        Forwarded to ``AdaptiveConfig`` for the GCaMP-variant tau
+        lookup.
+    verbose : bool
+        Print step-by-step progress.
+
+    Returns
+    -------
+    final_plane0 : Path
+        The populated ``suite2p/plane0`` folder. Tab 3 publishes this
+        on ``AppState.plane0`` so downstream tabs (lowpass, event
+        detection, ...) can pick it up.
+    """
     save_root = Path(save_folder)
     save_root.mkdir(parents=True, exist_ok=True)
 
@@ -279,6 +447,10 @@ def run(
         cfg_kwargs["aav_info_csv"] = aav_info_csv
     if tau_vals:
         cfg_kwargs["tau_vals"] = dict(tau_vals)
+    # Explicit tau wins over the AAV CSV lookup. ``None`` (the
+    # default) lets the legacy filename-based resolver run.
+    if tau_override is not None:
+        cfg_kwargs["tau_override"] = float(tau_override)
     cfg = AdaptiveConfig(**cfg_kwargs)
 
     if verbose:
@@ -357,9 +529,19 @@ def run(
 # ============================================================================
 
 def main():
-    """Run with the module-level config constants. Callers that mutate
-    TIFF_FOLDER / SAVE_FOLDER / PATH_TO_OPS before calling main() (e.g.
-    run_full_pipeline.run_detection) keep working unchanged."""
+    """Run with the module-level config constants.
+
+    The intent is that lab members can edit ``TIFF_FOLDER``,
+    ``SAVE_FOLDER``, ``PATH_TO_OPS`` etc. at the top of this file,
+    save, and run ``python sparse_plus_cellpose.py`` for a one-shot
+    detection without writing any code. The Tab 3 GUI calls
+    ``run(...)`` directly with parameters from its form, so it
+    bypasses this function entirely.
+
+    Callers that monkey-patch the module-level constants before
+    calling ``main()`` (e.g. ``run_full_pipeline.run_detection``)
+    also keep working unchanged.
+    """
     run(
         TIFF_FOLDER, SAVE_FOLDER, PATH_TO_OPS,
         sparsery_ops=SPARSERY_OPS,
@@ -371,5 +553,8 @@ def main():
     )
 
 
+# Standard "if this file is the program being run, do this" guard.
+# When the GUI imports the module instead, ``__name__`` is the
+# import path and ``main()`` doesn't fire.
 if __name__ == '__main__':
     main()

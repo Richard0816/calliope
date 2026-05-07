@@ -1,22 +1,40 @@
-"""Brute-force ops sweep for Suite2p detection.
+"""Brute-force ops sweep + Cellpose pass for Suite2p detection.
 
-Steps:
-  1. Register the TIFF stack ONCE (reuses adaptive_detection's shared-reg
-     helper and hardlinks data.bin into each pass folder).
-  2. For every combination in PARAMETER_GRID, run suite2p detection-only
-     with `max_rois_hard_cap=HARD_CAP` so noise blowups abort mid-pass.
-  3. Keep a persistent JSON ledger of every config tried + its outcome.
-     Reruns skip configs already in the ledger (delete the file to retry).
-  4. Delete the pass folder for any run that produced 0 ROIs or hit the
-     hard cap. Only keep folders for runs that actually returned ROIs.
-  5. Rank successful runs by residual-image metric (lower = more image
-     content explained by ROIs).
+Two roles for this file
+-----------------------
+1. **Standalone parameter sweep** (legacy use case): given a grid of
+   Suite2p ops combinations, register the movie once and run each
+   detection config in turn. Persists a JSON ledger of every config
+   tried + its outcome so you can resume after a crash; ranks the
+   successful runs by a residual-image metric.
 
-NO blob augmentation. NO residual-seeded ROIs. NO classifier filtering.
-Just raw sparsery output ranked by how much of the mean image is left
-unmodeled after masking detected ROI pixels.
+2. **Cellpose pass helper** (current GUI use case): exports
+   ``run_cellpose_pass(...)`` which is what
+   ``sparse_plus_cellpose.run`` calls to do its second-opinion
+   Cellpose detection on the mean image. The standalone sweep above
+   is no longer wired into the GUI -- but the Cellpose pass is.
 
-Usage:
+Standalone-sweep flow
+---------------------
+  1. Register the TIFF stack ONCE (reuses adaptive_detection's
+     shared-reg helper and hardlinks data.bin into each pass folder).
+  2. For every combination in PARAMETER_GRID, run suite2p detection-
+     only with ``max_rois_hard_cap=HARD_CAP`` so noise blowups abort
+     mid-pass.
+  3. Keep a persistent JSON ledger of every config tried + its
+     outcome. Reruns skip configs already in the ledger (delete the
+     file to retry).
+  4. Delete the pass folder for any run that produced 0 ROIs or hit
+     the hard cap. Only keep folders for runs that actually returned
+     ROIs.
+  5. Rank successful runs by residual-image metric (lower = more
+     image content explained by ROIs).
+
+NO blob augmentation. NO residual-seeded ROIs. NO classifier
+filtering. Just raw sparsery output ranked by how much of the mean
+image is left unmodeled after masking detected ROI pixels.
+
+Usage (standalone):
     python brute_force_ops.py
 
 Edit the CONFIGURATION block below to change the parameter grid, input
@@ -384,9 +402,34 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
                       verbose: bool = True):
     """Run Cellpose on the mean image from the shared registration.
 
-    Returns ``(stat, ops_out, plane0)`` with the same shape/semantics as
-    ``run_one_pass`` so the rest of the sweep loop (residual_metrics,
-    eviction, leaderboard) works unchanged.
+    Why we do this on the mean image, not the movie
+    -----------------------------------------------
+    Cellpose is a 2-D segmentation model -- it doesn't know about
+    time. We feed it the recording's mean image (a steady spatial
+    snapshot of the cells) and treat the resulting masks as
+    candidate ROIs. This catches cells that Suite2p's Sparsery
+    detector misses because they're real but didn't fire enough
+    during the recording.
+
+    Steps
+    -----
+    1. Load the shared registration's ``meanImg`` (or whichever
+       ``cellpose_channel_input`` key the user picked -- e.g.
+       ``meanImgE`` for the enhanced version).
+    2. Rescale to ``[0, 1]`` based on the 1st / 99.9th percentiles
+       so Cellpose's internal normalisation gets reasonable input
+       regardless of the raw mean image's brightness scale.
+    3. Run ``CellposeModel.eval``. The function feature-detects the
+       Cellpose major version and adjusts the call accordingly.
+    4. Convert each integer mask label into a Suite2p-style
+       ``stat`` dict (ypix / xpix / lam / med / npix) so downstream
+       merging code can treat Cellpose ROIs identically to Sparsery
+       ones.
+    5. Save ``stat.npy`` + ``masks.npy`` for audit.
+
+    Returns ``(stat, ops_out, plane0)`` with the same shape/semantics
+    as ``run_one_pass`` so the rest of the sweep loop
+    (residual_metrics, eviction, leaderboard) works unchanged.
 
     The plane0 directory contains:
       - ops.npy       (copy of the shared registered ops)

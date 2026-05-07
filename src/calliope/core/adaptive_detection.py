@@ -1,9 +1,48 @@
-"""
-Adaptive Suite2p detection pipeline.
+"""Adaptive Suite2p detection pipeline (legacy).
 
-Designed as a drop-in replacement for main.py that iteratively runs Suite2p
-with progressively more aggressive detection parameters, auditing the mean
-image after each pass to decide whether cells are still being missed.
+Why this file exists
+--------------------
+This is the *original* detection pipeline -- ``sparse_plus_cellpose``
+is the simpler successor. The adaptive version runs Sparsery in a
+binary-search loop, dialling ``threshold_scaling`` up or down until
+the number of detected ROIs lands in a sweet spot. It also keeps a
+shared registration cache so the search loop doesn't re-register the
+movie every iteration.
+
+It's still used in CalLIOPE for two reasons:
+
+1. ``AdaptiveConfig`` carries the AAV / tau lookup logic that
+   ``sparse_plus_cellpose.run`` depends on.
+2. ``load_base_ops``, ``_get_or_create_shared_registration``,
+   ``_link_or_copy``, ``run_one_pass``, ``build_roi_pixel_mask`` and
+   ``visualize_audit`` are imported by ``sparse_plus_cellpose.py``.
+
+The "adaptive" loop itself is no longer wired into the GUI -- Tab 3
+calls ``sparse_plus_cellpose.run`` instead -- but the helpers below
+are too useful to remove.
+
+Public-ish surface (used elsewhere in the package)
+--------------------------------------------------
+``AdaptiveConfig``
+    Dataclass bundling the inputs (tiff folder, save folder, base ops
+    path, optional AAV info CSV, optional tau lookup).
+``load_base_ops(cfg)``
+    Read the base ops .npy and overlay the recording's tau (looked up
+    by GCaMP variant from the AAV CSV).
+``_get_or_create_shared_registration(cfg, base_ops)``
+    Run Suite2p registration once; subsequent detection passes re-use
+    the cached ``data.bin`` + ``ops.npy`` from the returned plane0.
+``_link_or_copy(src, dst)``
+    Hard-link if possible (fast, no extra disk), fall back to copy.
+``run_one_pass(tiff_folder, out_dir, ops, ...)``
+    One Sparsery detection pass on the shared registration. Returns
+    ``stat``, ``ops``, plane0 path.
+``build_roi_pixel_mask(stat, Ly, Lx)``
+    Boolean ``(Ly, Lx)`` image marking every pixel that belongs to
+    *any* ROI in ``stat``.
+``visualize_audit(plane0, ...)``
+    Save a PNG with the mean image and every ROI footprint outlined
+    -- the "did detection do something sane?" debugging picture.
 
 User only needs to specify:
     - tiff_folder: where the raw TIFF stack lives
@@ -13,8 +52,6 @@ User only needs to specify:
 
 The goal is to wrap this behind a minimal app where the user never touches
 the Suite2p GUI or config files directly.
-
-Note: relocated from the project root into calliope.core during the GUI-package self-containment effort.
 """
 
 from __future__ import annotations
@@ -41,7 +78,21 @@ from typing import Optional
 # cap is crossed — aborting mid-detection without touching suite2p source.
 
 class _RoiHardCapExceeded(Exception):
-    """Raised from inside sparsery when the ROI count crosses the cap."""
+    """Raised from inside sparsery when the ROI count crosses the cap.
+
+    Why a custom exception class
+    ----------------------------
+    Python lets you subclass ``Exception`` to carry typed state along
+    with the error message. Doing so lets callers do
+    ``except _RoiHardCapExceeded as e: ... e.count ...`` to recover
+    the diagnostic numbers without parsing the string. Equivalent to
+    R's ``simpleCondition`` / ``stop`` with a custom class slot.
+
+    We raise this from inside Suite2p's own detection loop via the
+    print-monkey-patch trick below, which lets us abort *mid-detection*
+    when ``threshold_scaling`` is too low and Sparsery starts finding
+    spurious noise blobs.
+    """
     def __init__(self, count: int, cap: int):
         super().__init__(f"sparsery produced {count} ROIs (>= cap={cap}); "
                          f"threshold is almost certainly detecting noise")
@@ -89,7 +140,34 @@ def _restore_sparsery_print(original_print):
 
 @dataclass
 class AdaptiveConfig:
-    """All parameters controlling the adaptive loop in one place."""
+    """All parameters controlling the adaptive Suite2p detection loop.
+
+    Why this is a dataclass
+    -----------------------
+    The legacy adaptive pipeline takes ~50 tunable parameters --
+    sparsery thresholds, registration reuse flags, residual-blob
+    augmentation, spatial-scale fallback, audit-PNG generation, etc.
+    Bundling them in a dataclass means:
+
+    * Functions take one ``cfg`` argument instead of 50 keywords.
+    * Defaults live with the field declarations so any forgotten
+      parameter still has a sensible value.
+    * Every field can carry its own inline comment (see below) so a
+      reader can scroll through the dataclass to understand what
+      each knob does without hunting through call sites.
+
+    What still uses this in CalLIOPE
+    --------------------------------
+    The full adaptive loop is no longer wired into the GUI -- Tab 3
+    calls ``sparse_plus_cellpose.run`` instead -- but the helpers
+    that ``run`` reuses (``load_base_ops``, the shared-registration
+    cache, ``run_one_pass``) all consume an ``AdaptiveConfig``.
+
+    Most callers will only set the first few fields (paths + AAV
+    metadata) and leave the rest at their defaults. The decay-mode
+    schedule, residual-blob augmentation, etc. are exposed for
+    backward compat with old scripts.
+    """
 
     # ---- Required paths ----
     tiff_folder: str = ""                         # folder containing TIFFs
@@ -101,6 +179,11 @@ class AdaptiveConfig:
     tau_vals: dict = field(default_factory=lambda: {
         "6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137,
     })
+    # If set, ``load_base_ops`` will use this tau directly and skip the
+    # AAV CSV lookup. Tab 3 sets this when the user picks an explicit
+    # GCaMP variant from the dropdown ("Auto (from AAV CSV)" leaves it
+    # ``None`` so the legacy lookup runs).
+    tau_override: Optional[float] = None
 
     # ---- Spatial scale pinning ----
     # 0 = defer to auto_estimate_spatial_scale below (our pre-flight blob
@@ -599,15 +682,36 @@ def _render_spatial_scale_qc(qc_path, mean_img, scale_data, winner, top_n):
 # ============================================================================
 
 def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
-    """
-    Load starting ops either from a user-supplied .npy or from Suite2p defaults.
-    Apply sample-specific adjustments (tau via GCaMP lookup, batch size, etc.)
-    following the same convention as main.py.
+    """Load Suite2p ops (the giant detection-config dict) and tweak
+    them for the recording at hand.
 
-    If ``return_scale_data=True``, also returns the ``scale_data`` dict from
-    the pre-flight estimator (or ``None`` if estimation was skipped / failed).
-    This is used by blob-seeded detection to reuse the detected blobs as
-    ROI seeds without re-running the estimator.
+    Sources, in priority order
+    --------------------------
+    1. ``config.path_to_ops`` (a saved .npy of an ops dict the user
+       picked) -- start from those values.
+    2. ``suite2p.default_ops()`` if no override was supplied.
+    Either way the pipeline overlays mandatory keys (sparse_mode,
+    preclassify, etc.) and recording-specific values on top:
+
+    * **tau** : the GCaMP-variant decay constant. Looked up via
+      ``utils.file_name_to_aav_to_dictionary_lookup`` from the AAV
+      metadata CSV in ``config.aav_info_csv`` and the dict in
+      ``config.tau_vals``.
+    * **batch_size** : auto-scaled to free RAM by
+      ``utils.change_batch_according_to_free_ram``.
+    * **spatial_scale** : optionally pre-estimated from the first
+      ~500 frames via ``estimate_spatial_scale_from_tiff`` (a LoG
+      blob detector that maps median blob diameter to a Suite2p
+      scale bin).
+    * **nbinned** : capped via
+      ``utils.change_nbinned_according_to_free_ram`` to keep the
+      Sparsery peak intermediate inside the RAM budget.
+
+    If ``return_scale_data=True``, also returns the ``scale_data``
+    dict from the pre-flight estimator (or ``None`` if estimation
+    was skipped / failed). Used by blob-seeded detection so it can
+    re-use the detected blobs as ROI seeds without re-running the
+    estimator.
     """
     if config.path_to_ops is not None and os.path.exists(config.path_to_ops):
         if config.verbose:
@@ -670,19 +774,31 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
                 print(f"  enforcing ops['{k}'] = {v}  (was {prev!r})")
     ops.update(pipeline_required)
 
-    # Apply sample-specific tau if metadata is available
-    file_name = os.path.basename(os.path.normpath(config.tiff_folder))
-    if os.path.exists(config.aav_info_csv):
-        try:
-            tau = utils.file_name_to_aav_to_dictionary_lookup(
-                file_name, config.aav_info_csv, config.tau_vals
-            )
-            ops['tau'] = tau
-            if config.verbose:
-                print(f"Set tau={tau} based on AAV lookup for {file_name}")
-        except Exception as e:
-            if config.verbose:
-                print(f"tau lookup failed ({e}); keeping existing tau={ops.get('tau')}")
+    # Apply sample-specific tau.
+    # Priority order:
+    #   1. Explicit tau_override on the config (set by Tab 3 when the
+    #      user picks a specific GCaMP variant from the dropdown).
+    #   2. AAV CSV lookup keyed by recording filename (legacy path).
+    #   3. Whatever tau was already in ops (from the base ops file
+    #      or suite2p defaults).
+    if config.tau_override is not None:
+        ops['tau'] = float(config.tau_override)
+        if config.verbose:
+            print(f"Set tau={ops['tau']} from explicit override "
+                  f"(skipping AAV lookup)")
+    else:
+        file_name = os.path.basename(os.path.normpath(config.tiff_folder))
+        if os.path.exists(config.aav_info_csv):
+            try:
+                tau = utils.file_name_to_aav_to_dictionary_lookup(
+                    file_name, config.aav_info_csv, config.tau_vals
+                )
+                ops['tau'] = tau
+                if config.verbose:
+                    print(f"Set tau={tau} based on AAV lookup for {file_name}")
+            except Exception as e:
+                if config.verbose:
+                    print(f"tau lookup failed ({e}); keeping existing tau={ops.get('tau')}")
 
     # Dynamic batch size (same logic as main.py)
     ops['batch_size'] = utils.change_batch_according_to_free_ram()
@@ -718,7 +834,18 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
 # ============================================================================
 
 def build_roi_pixel_mask(stat, Ly: int, Lx: int) -> np.ndarray:
-    """Binary mask of all pixels belonging to any detected ROI."""
+    """Binary ``(Ly, Lx)`` mask of all pixels belonging to any ROI in
+    ``stat``.
+
+    Used both as a deduplication tool (``filter_non_overlapping_cellpose``
+    in ``sparse_plus_cellpose``) and as the foundation for "residual
+    image" generation -- the mean image with every detected ROI's
+    pixels masked out -- so we can run a follow-up blob detector on
+    cells the first pass missed.
+
+    ``stat`` is Suite2p's per-ROI dict list; each entry exposes
+    ``ypix`` / ``xpix`` arrays.
+    """
     mask = np.zeros((Ly, Lx), dtype=bool)
     for s in stat:
         ypix = np.asarray(s['ypix'])
@@ -916,7 +1043,14 @@ def _load_cached_pass(save_dir: Path, expected_ops: dict, verbose: bool = True):
 
 
 def _link_or_copy(src: Path, dst: Path):
-    """Hardlink src -> dst (cheap), fall back to copy on cross-device / perm error."""
+    """Hardlink src -> dst, falling back to a real copy if the OS
+    refuses (cross-device, missing FS support, no permissions, etc.).
+
+    Why hardlink: registered movie files (``data.bin``) are huge (8+
+    GiB for a 10-min recording). Copying them per detection pass
+    burns time and disk; a hardlink is one inode reference -- no
+    extra bytes. ``shutil.copy2`` is the slow safety net.
+    """
     if dst.exists():
         return
     try:
@@ -927,15 +1061,26 @@ def _link_or_copy(src: Path, dst: Path):
 
 def _get_or_create_shared_registration(config: 'AdaptiveConfig',
                                        base_ops: dict) -> Path:
-    """
-    Ensure a single canonical registered binary exists at
-    ``{save_folder}/_shared_reg/suite2p/plane0/`` and return that plane0
-    path. All subsequent detection passes hardlink ``data.bin`` from here
-    instead of re-registering the TIFF each time.
+    """Ensure a single canonical registered binary exists at
+    ``{save_folder}/_shared_reg/suite2p/plane0/`` and return that
+    plane0 path.
 
-    If a shared registration already exists, returns immediately.
-    Otherwise runs ``suite2p.run_s2p`` with ``roidetect=False`` once to
-    produce it.
+    Why this exists
+    ---------------
+    Suite2p's motion correction (registration) is by far the most
+    expensive step -- minutes per recording. The adaptive loop and
+    ``sparse_plus_cellpose`` both want to run *detection* multiple
+    times against the same registered movie (different threshold,
+    different detector). Re-registering each time is wasteful, so
+    this helper:
+
+    1. Checks for an existing ``_shared_reg/suite2p/plane0/data.bin``.
+    2. If present, returns its plane0 path immediately.
+    3. Otherwise runs ``suite2p.run_s2p`` once with ``roidetect=False``
+       (registration only, no detection) to produce the binary.
+
+    Subsequent detection passes get the binary via ``_link_or_copy``
+    -- one hardlink per pass folder, no copies.
     """
     save_root = Path(config.save_folder)
     shared_dir = save_root / '_shared_reg'
@@ -969,9 +1114,24 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
                  verbose: bool = True, use_cache: bool = True,
                  shared_plane0: Optional[Path] = None,
                  hard_cap: int = 0):
-    """
-    Run Suite2p once with the given ops, saving to save_dir. Returns the
-    loaded stat list, ops dict, and path to the plane0 directory.
+    """Run Suite2p once with the given ops and return its detection
+    output.
+
+    Steps
+    -----
+    1. Compare ``ops`` with any cached ``ops.npy`` already in
+       ``save_dir``. If keys match, skip the run and re-use the
+       cached ``stat.npy`` -- speeds up repeated parameter sweeps.
+    2. If a ``shared_plane0`` was passed (the shared-registration
+       cache), hardlink its ``data.bin`` + ``ops.npy`` into
+       ``save_dir`` and set ``do_registration=0`` so Suite2p skips
+       its registration step.
+    3. (Optional) install the ROI-hard-cap monkey-patch on
+       ``suite2p.detection.sparsedetect.print`` so a sparsery run
+       that finds more than ``hard_cap`` ROIs aborts mid-iteration.
+    4. Run ``suite2p.run_s2p(ops=ops, db={'data_path': [tiff_folder]})``.
+    5. Load ``stat.npy`` and ``ops.npy`` from the resulting plane0
+       and return both alongside the plane0 path.
 
     If ``use_cache`` is True and ``save_dir`` already contains a completed
     suite2p run whose ops match this pass's ops, the cached output is
@@ -2594,14 +2754,26 @@ def visualize_audit(plane0_dir: str, config: Optional[AdaptiveConfig] = None,
                     title_prefix: Optional[str] = None,
                     stat_file: str = 'stat.npy',
                     ops_file: str = 'ops.npy'):
-    """Three-panel audit figure:
+    """Three-panel "did detection do something sane?" audit figure.
 
-      1. Mean image with detected-ROI contours overlaid (green)
-      2. Residual image after masking out ROI pixels (magma colormap)
-      3. Mean image with missed-cell blob candidates (cyan circles)
+    The three panels in order
+    -------------------------
+    1. Mean image with detected-ROI contours outlined in green --
+       answers "are the ROIs we found in plausible cell-shaped
+       locations?"
+    2. Residual image (mean with every ROI's pixels masked out) on
+       a magma colormap -- answers "what did detection miss? Bright
+       blobs in the residual are likely cells that need a second
+       pass."
+    3. Mean image again, with the blobs detected on the residual
+       drawn as cyan circles -- the proposed missed cells, ready for
+       sanity check.
 
-    Works even if the pass has zero ROIs (aborted / empty pass) — panel 1
-    degrades gracefully and panel 3 still shows every residual blob.
+    Works even if the pass has zero ROIs (aborted / empty pass)
+    -- panel 1 degrades gracefully and panel 3 still shows every
+    residual blob. ``sparse_plus_cellpose.run`` calls this at the
+    end of each detection so the user can scroll through a folder of
+    audit PNGs without re-opening matplotlib.
     """
     import matplotlib.pyplot as plt
     from matplotlib import patches as mpatches

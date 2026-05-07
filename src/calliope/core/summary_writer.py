@@ -1,29 +1,50 @@
-"""
-summary_writer.py - cross-recording XLSX summary file.
+"""summary_writer.py - cross-recording XLSX summary file.
 
-Each pipeline tab writes (or refreshes) one or more sheets in
-``<plane0>/calliope_summary.xlsx``. Sheets written by other tabs are
-preserved on rewrite, so the workbook accumulates state as the user
-moves through the pipeline.
+What this file does, in one paragraph
+-------------------------------------
+As the user works through the pipeline, each tab incrementally adds
+or refreshes a sheet in a single Excel workbook,
+``<plane0>/calliope_summary.xlsx``. Tab 3 fills in the ROI table, Tab
+4 stamps the lowpass parameters, Tab 5 writes the event windows and
+per-ROI onset times, Tab 6 writes cluster assignments. Sheets written
+by other tabs are preserved on rewrite, so the workbook is the single
+source of truth for "what did we do to this recording".
+
+Why a workbook and not just NumPy files?
+- Lab members often want to reopen the data in Excel / GraphPad to
+  sanity-check it.
+- The sheet layout is also the cross-recording comparison format: a
+  separate analysis script can glob every recording's
+  ``calliope_summary.xlsx`` and stack the EventOnsets sheets into a
+  single tidy table.
 
 Sheet conventions
 -----------------
-- "Recording": single key/value table (recording_id, plane0, prefix,
+- ``Recording``: single key/value table (recording_id, plane0, prefix,
   fps, T, N, generated_at). Updated by every tab.
-- "ROIs": one row per ROI from the Suite2p detection tab.
-- "FilterParams": filter knobs from the Low-pass tab (key/value).
-- "EventWindows": one row per detected population event window.
-- "EventOnsets": long format, one row per (event_id, roi, onset_s).
-- "RoiEventTimes": wide format, one column per ROI with every detected
-  onset time in seconds (NaN-padded). Includes onsets that fall outside
-  any population event window.
-- "Clusters": one row per ROI with cluster_id, cluster_color, threshold.
+- ``ROIs``: one row per ROI from the Suite2p detection tab.
+- ``FilterParams``: filter knobs from the Low-pass tab (key/value).
+- ``EventWindows``: one row per detected population event window
+  (event_id, start_s, end_s, ...).
+- ``EventOnsets``: long format, one row per (event_id, roi, onset_s).
+  This is the sheet most downstream analyses consume.
+- ``RoiEventTimes``: wide format, one column per ROI with every
+  detected onset time in seconds (NaN-padded). Includes onsets that
+  fall outside any population event window.
+- ``Clusters``: one row per ROI with cluster_id, cluster_color,
+  threshold.
 
-Cross-recording comparison
---------------------------
-Sheet names + column names are stable so a separate analysis script can
-glob ``F:/data/.../calliope_summary.xlsx`` and stack them into a single
-multi-recording table without per-recording adjustments.
+Public surface
+--------------
+``summary_path(plane0)`` -> resolve the workbook path.
+``update_recording_meta(plane0, fps, T, N)`` -> stamp the
+``Recording`` sheet.
+``write_rois_sheet(plane0, ...)`` -> Tab 3 calls this on completion.
+``write_filter_params_sheet(plane0, ...)`` -> Tab 4.
+``write_events_sheets(plane0, event_windows, onsets_by_roi, fps)``
+    -> Tab 5; produces the EventWindows + EventOnsets + RoiEventTimes
+    triple in one call.
+``write_clusters_sheet(plane0, ...)`` -> Tab 6.
 """
 
 from __future__ import annotations
@@ -51,6 +72,17 @@ def summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
 
 def _to_dataframe(data) -> pd.DataFrame:
     """Coerce ``data`` to a DataFrame without copying when possible."""
+    """Coerce ``data`` to a pandas DataFrame.
+
+    Handles the three idioms callers use:
+        * already a DataFrame -> return as-is.
+        * dict ``{column_name: sequence}`` -> wide DataFrame.
+        * list of dicts (one record per dict) -> long DataFrame.
+        * anything else -> defer to pandas' constructor.
+
+    Encapsulating the conversion lets every writer below stay
+    agnostic about how the caller chose to assemble its rows.
+    """
     if isinstance(data, pd.DataFrame):
         return data
     if isinstance(data, dict):
@@ -67,20 +99,33 @@ def write_sheet(
     data,
     filename: str = DEFAULT_FILENAME,
 ) -> Path:
-    """Replace (or create) one sheet, leaving the rest of the workbook intact.
+    """Replace (or create) one sheet of the workbook in place.
 
-    Caller is responsible for retrying on PermissionError if Excel has the
-    file open. We surface the OS error rather than swallowing it.
+    The interesting bit
+    -------------------
+    pandas' ``ExcelWriter`` with ``mode="a"`` + ``if_sheet_exists=
+    "replace"`` lets us write **one** sheet without trampling other
+    sheets that another tab wrote earlier. So Tab 4 stamping the
+    FilterParams sheet doesn't erase the ROIs sheet that Tab 3
+    wrote.
+
+    Caller is responsible for retrying on ``PermissionError`` if
+    Excel has the file open. We surface the OS error rather than
+    swallowing it -- silent failure here would corrupt the
+    accumulated state of the workbook.
     """
     path = summary_path(plane0, filename)
     df = _to_dataframe(data)
 
     if path.exists():
+        # Append-mode writer keeps the existing workbook contents
+        # and only touches the named sheet.
         with pd.ExcelWriter(
             path, engine="openpyxl", mode="a", if_sheet_exists="replace"
         ) as w:
             df.to_excel(w, sheet_name=sheet_name, index=False)
     else:
+        # Fresh workbook -- create parents and write in mode="w".
         path.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
             df.to_excel(w, sheet_name=sheet_name, index=False)
@@ -121,9 +166,26 @@ def update_recording_meta(
     extra: Optional[dict] = None,
     filename: str = DEFAULT_FILENAME,
 ) -> Path:
-    """Write/update the "Recording" sheet (key/value)."""
+    """Write/update the "Recording" sheet (key/value pairs).
+
+    Every tab calls this on completion -- the sheet acts as a single-
+    row description of the recording and a "last touched" timestamp.
+    Subsequent calls overwrite the sheet rather than append, so the
+    Recording sheet always reflects the most recent state.
+
+    The ``*`` in the parameter list separates positional from
+    keyword-only arguments: callers must specify ``fps=...``,
+    ``T=...`` etc. by name. Pythonic way to enforce explicit naming
+    on a long call site.
+    """
     plane0 = Path(plane0)
+    # If the caller didn't pass a recording id, infer it from the
+    # path (``F:/data/Cx/2024-07-01_00018/suite2p/plane0`` ->
+    # ``2024-07-01_00018``).
     rid = recording_id or _infer_recording_id(plane0)
+    # List of (key, value) tuples becomes the two-column "Recording"
+    # sheet. Empty strings (rather than NaN) when a value wasn't
+    # supplied so the cells render cleanly in Excel.
     rows = [
         ("recording_id", rid),
         ("plane0", str(plane0)),
@@ -142,11 +204,24 @@ def update_recording_meta(
 
 
 def _infer_recording_id(plane0: Path) -> str:
-    """`<recording_id>/suite2p/plane0` -> `<recording_id>`."""
-    p = Path(plane0)
-    if p.name == "plane0" and p.parent.name == "suite2p":
-        return p.parent.parent.name
-    return p.name
+    """Recover the human-readable recording id from a plane0 path.
+
+    The pipeline used to assume ``<recording_id>/suite2p/plane0/...``
+    so two ``.parent`` calls reached the recording root. The newer
+    ``sparse_plus_cellpose`` layout writes plane0 deeper:
+    ``<recording_id>/detection/final/suite2p/plane0/...`` -- in that
+    layout, the old "two parents up" walk lands on ``final`` instead
+    of the recording id.
+
+    Defer to ``utils.infer_recording_id`` (in ``core/utils.py``) for
+    the robust resolution: it tries the canonical date-pattern regex
+    first, falls back to skipping known intermediate folder names
+    (``suite2p`` / ``plane0`` / ``detection`` / ``final`` /
+    ``_shared_reg`` / etc.), and finally to the legacy two-parents-up
+    behaviour.
+    """
+    from .utils import infer_recording_id
+    return infer_recording_id(plane0)
 
 
 # ---------------------------------------------------------------------------

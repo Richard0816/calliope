@@ -1,8 +1,56 @@
 """calliope.tabs.suite2p.tab - Tab 3: Suite2p detection.
 
-Runs sparse_plus_cellpose -> dF/F -> cell filter on the preprocessed
-shifted TIFF and renders three panels: live console, raw detected ROIs,
-and ROIs surviving the cell-filter prediction mask.
+What this tab does, end to end
+------------------------------
+The biggest workhorse tab in the GUI. Drives the entire detection +
+trace-extraction pipeline:
+
+    shifted TIFF (from Tab 1)
+        |
+        v
+    Sparsery + Cellpose ROI detection
+        (calliope.core.sparse_plus_cellpose.run)
+        |
+        v
+    Suite2p extract -> F.npy / Fneu.npy / spks.npy / iscell.npy / stat.npy
+        |
+        v
+    dF/F computation with neuropil correction
+        (writes r0p7_dff*.memmap.float32)
+        |
+        v
+    Cell-filter CNN prediction
+        (calliope.core.cellfilter.predict.predict_recording)
+        writes predicted_cell_prob.npy + predicted_cell_mask.npy
+        |
+        v
+    Filtered dF/F memmap (r0p7_filtered_dff*.memmap.float32) for the
+        ROIs that passed the keep mask.
+
+When the worker finishes, the tab publishes the populated plane0
+folder onto ``AppState.plane0`` so Tabs 4-8 can pick up the work
+without re-running anything.
+
+What the user sees
+------------------
+- An ops profile dropdown + paths to the suite2p ops .npy file, the
+  cell-filter checkpoint, and the AAV metadata CSV.
+- An Advanced... dialog with every Sparsery, Cellpose, dF/F and
+  classifier knob.
+- A "Run detection" button that kicks off the worker thread.
+- Three panels:
+    * top: live console (stdout/stderr captured via ``QueueWriter``)
+    * bottom-left:  raw detected ROIs over the chosen background image
+    * bottom-right: ROIs that *passed* the cell-filter mask
+- A "Reload from folder..." button to load a previously-detected
+  recording without re-running anything.
+
+Threading
+---------
+Detection takes minutes. The button handler ``_on_run`` snapshots
+form values, swaps stdout/stderr to a ``QueueWriter`` so library
+prints land in the GUI log, and launches a worker thread. The main
+thread polls the queue every POLL_MS and updates the log + figures.
 
 Writes r0p7_dff and r0p7_filtered_dff memmaps under <out_dir>/detection/
 final/suite2p/plane0/.
@@ -44,6 +92,27 @@ class Suite2pTab(ttk.Frame):
     """Runs sparse_plus_cellpose -> dF/F -> cell filter on the preprocessed
     shifted TIFF and renders three panels: live console, raw detected ROIs,
     and ROIs surviving the cell-filter prediction mask.
+
+    Class-attribute layout
+    ----------------------
+    ``DEFAULT_OPS_PATH`` / ``DEFAULT_CKPT_PATH`` / ``DEFAULT_AAV_CSV``
+        File paths the form is pre-populated with on startup. Users
+        can override via the Browse... buttons. The ops file ships
+        bundled in ``calliope/data``; the checkpoint and AAV CSV
+        live on the lab F: drive.
+
+    ``KNOWN_BG_IMAGES``
+        Background-image options shown in the dropdown above the
+        spatial map (mean, max projection, correlation map, etc.).
+        Each option is a (suite2p ops key, display label) pair.
+
+    ``PARAM_SPEC``
+        The full list of Sparsery / Cellpose / dF/F / classifier knobs
+        the Advanced... dialog will expose.
+
+    ``POLL_MS``
+        Main-thread polling interval for draining the worker's log
+        queue.
     """
 
     POLL_MS = 80
@@ -51,6 +120,21 @@ class Suite2pTab(ttk.Frame):
     DEFAULT_OPS_PATH = _DATA_DIR / "suite2p_2p_ops_240621.npy"
     DEFAULT_CKPT_PATH = Path(r"F:\cellfilter_checkpoints\best.pt")
     DEFAULT_AAV_CSV = _DATA_DIR / "human_SLE_2p_meta.csv"
+
+    # ---- GCaMP variant -> tau lookup table ----
+    # The Suite2p deconvolution step needs a tau (calcium decay
+    # constant in seconds) that matches the GECI variant in the
+    # recording. Picking it wrong throws off the per-cell spike
+    # estimate. The user can either pick a variant explicitly
+    # (skipping the AAV CSV lookup) or stay on "Auto" to let the
+    # legacy lookup run.
+    GCAMP_OPTIONS: list[tuple[str, Optional[float]]] = [
+        ("Auto (from AAV CSV)", None),     # default
+        ("GCaMP6f  (tau = 0.7 s)", 0.7),
+        ("GCaMP6m  (tau = 1.0 s)", 1.0),
+        ("GCaMP6s  (tau = 1.3 s)", 1.3),
+        ("GCaMP8m  (tau = 0.137 s)", 0.137),
+    ]
 
     KNOWN_BG_IMAGES: list[tuple[str, str]] = [
         ("meanImg",       "Mean"),
@@ -175,6 +259,27 @@ class Suite2pTab(ttk.Frame):
         ttk.Entry(row, textvariable=self.baseline_min_var,
                   width=6).pack(side="left", padx=(4, 2))
         ttk.Label(row, text="min").pack(side="left")
+
+        # ---- GCaMP variant picker (drives Suite2p's tau) ----
+        # Default keeps the legacy AAV-CSV-driven lookup for users
+        # who haven't migrated. Picking a specific variant short-
+        # circuits the lookup and writes its tau directly into the
+        # Suite2p ops dict. See GCAMP_OPTIONS class attribute above.
+        row = ttk.Frame(header); row.pack(fill="x", pady=2)
+        ttk.Label(row, text="GCaMP variant:", width=14).pack(side="left")
+        self.gcamp_var = tk.StringVar(value=self.GCAMP_OPTIONS[0][0])
+        gcamp_combo = ttk.Combobox(
+            row, textvariable=self.gcamp_var, state="readonly",
+            values=[label for label, _tau in self.GCAMP_OPTIONS],
+            width=28,
+        )
+        gcamp_combo.pack(side="left", padx=(0, 8))
+        ttk.Label(
+            row,
+            text=("Pick the GECI you injected; \"Auto\" reads the AAV "
+                  "metadata CSV by recording filename."),
+            foreground="gray", font=("", 8, "italic"),
+        ).pack(side="left")
 
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         self.csv_dff_var = tk.BooleanVar(value=False)
@@ -371,6 +476,19 @@ class Suite2pTab(ttk.Frame):
                     f"(got {self.baseline_min_var.get()!r}): {e}")
                 return
 
+        # Resolve the GCaMP picker into a tau scalar (or ``None`` to
+        # let the AAV-CSV lookup run as before). Picker rows are
+        # ``(label, tau)`` pairs; we look up the user-chosen label.
+        tau_override: Optional[float] = None
+        gcamp_label = self.gcamp_var.get()
+        for label, tau in self.GCAMP_OPTIONS:
+            if label == gcamp_label:
+                tau_override = tau
+                break
+        if tau_override is not None:
+            self._append_log(
+                f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
+
         tiff_folder = result.shifted_tiff.parent
         save_folder = result.out_dir / "detection"
         rec_id = result.out_dir.name
@@ -393,6 +511,7 @@ class Suite2pTab(ttk.Frame):
                     rec_id=rec_id,
                     baseline_mode=baseline_mode,
                     baseline_min=baseline_min,
+                    tau_override=tau_override,
                 )
                 self._log_queue.put(("done", None))
             except Exception as e:
@@ -413,6 +532,7 @@ class Suite2pTab(ttk.Frame):
         rec_id: str,
         baseline_mode: str,
         baseline_min: float,
+        tau_override: Optional[float] = None,
     ) -> None:
         writer = QueueWriter(self._log_queue)
         params = dict(self._params)
@@ -455,6 +575,7 @@ class Suite2pTab(ttk.Frame):
                 max_overlap=max_overlap,
                 aav_info_csv=aav_csv,
                 tau_vals=spc.DEFAULT_TAU_VALS,
+                tau_override=tau_override,
                 verbose=True,
             )
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
