@@ -1,13 +1,19 @@
 """Logic + calculations for the Suite2p detection tab.
 
-Re-exports the slice of ``calliope.core`` modules the tab calls
-(`PreprocessResult` for state typing, `summary_writer` for writing the
-ROIs sheet to ``calliope_summary.xlsx``).
+Re-export shim
+--------------
+Tab 3 is the heaviest tab in the GUI -- it pulls in Suite2p, Cellpose
+and the cell-filter PyTorch model. To keep import time low for users
+who never touch detection (e.g. they're loading an existing recording
+to look at clusters), we lazy-import the detection functions inside
+the worker thread rather than at module load. This file only needs:
 
-The detection worker also lazy-imports ``sparse_plus_cellpose`` from the
-project root inside the worker thread; that import resolves via the
-``sys.path`` bootstrap in ``calliope/__init__.py`` so we don't have to
-copy its (heavy) cellpose / suite2p dependency graph into the package.
+- ``PreprocessResult``: the type hint for ``state.result`` -- Tab 3
+  reads ``state.result.shifted_tiff`` to know what to feed to Suite2p.
+- ``summary_writer``: writes the per-ROI table to the recording's
+  ``calliope_summary.xlsx`` once detection completes.
+
+See ``calliope.tabs.preprocess.logic`` for the shim pattern overview.
 """
 
 from __future__ import annotations

@@ -1,9 +1,23 @@
 """Logic + calculations for the Event detection tab.
 
-Re-exports the slice of ``calliope.core.utils`` and
-``calliope.core.summary_writer`` the tab calls. The tab module imports
-this as ``utils`` so existing call sites (``utils.detect_event_windows``
-etc.) stay unchanged.
+Re-export shim
+--------------
+Tab 5 needs:
+
+- The per-ROI onset detector (``mad_z``, ``hysteresis_onsets``).
+- The population-event detector
+  (``EventDetectionParams``, ``detect_event_windows``).
+- Diagnostic plotting helpers (``plot_event_detection``,
+  ``shade_event_windows``).
+- ``get_fps_from_notes`` for reading the recording's frame rate.
+- ``summary_writer`` for stamping the EventWindows / EventOnsets
+  sheets into ``calliope_summary.xlsx`` after every render.
+
+The tab module imports this as ``utils`` (yes, despite also being
+named ``logic`` -- the ``as`` rename keeps the math-y call sites
+short).
+
+See ``calliope.tabs.preprocess.logic`` for the shim pattern overview.
 """
 
 from __future__ import annotations

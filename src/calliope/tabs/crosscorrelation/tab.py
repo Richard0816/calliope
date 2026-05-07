@@ -1,16 +1,65 @@
-"""calliope.tabs.crosscorrelation.tab - GUI tab for cluster x cluster cross-correlation.
+"""calliope.tabs.crosscorrelation.tab - Tab 7: cluster x cluster
+cross-correlation.
 
-Lives next to the Clustering tab. Two modes:
-  - Full recording: run cross-correlation on each ROI pair using the
-    entire dF/F trace.
-  - Per event: re-run cross-correlation on each ROI pair, cropped to each
-    detected event window.
+What this tab is for
+--------------------
+Tab 6 told us *which* cells co-fire (ensembles). Tab 7 tells us
+*who leads whom*: for each pair of clusters Cᵢ x Cⱼ, and for each
+pair of cells (one from each cluster), we shift cell A's trace by
+every lag from -L..+L frames, take the Pearson r against B at each
+shift, and record:
 
-Both modes use the batched cross-correlation in
-``crosscorrelation.batch_xcorr_clusters``: one matmul per lag covers every
-ROI pair in the cluster pair, so we never build the full +/- max_lag
-distribution per pair. Outputs are CSV summaries with ``best_lag_sec``,
-``max_corr`` (Pearson r at peak) and ``zero_lag_corr`` (Pearson r at 0).
+* **best_lag_sec**: the lag at which correlation peaks (positive ->
+  A leads B).
+* **max_corr**: that peak Pearson r.
+* **zero_lag_corr**: Pearson r at lag 0 (instantaneous co-firing).
+
+Two modes
+---------
+* **Full recording** -- one cross-correlation pass over every pair
+  using the entire dF/F trace.
+* **Per event** -- repeat the analysis cropped to each event window
+  detected by Tab 5 (so we can ask "during *this* seizure, who led
+  whom?"). Event windows arrive live via
+  ``AppState.event_results`` (Tab 5 publishes after every render);
+  the on-disk EventWindows xlsx sheet acts as a cold-start fallback
+  when no Tab 5 publish exists yet.
+
+Both modes use the batched implementation in
+``calliope.core.crosscorrelation.batch_xcorr_clusters``:
+*one matmul per lag* covers every ROI pair in a cluster pair
+simultaneously. So a 5x10 cluster pair x 100 lags is 100 matmuls,
+not 5000 individual cross-correlations.
+
+What the user sees
+------------------
+- Path / prefix / cluster folder / fps entries.
+- Search parameters (max lag, zero-lag toggle, GPU toggle).
+- Two big "Run" buttons -- one for each mode -- plus an Abort.
+- A progress bar driven by the worker's progress callback.
+- A live console at the bottom showing per-batch timing.
+- Two extra buttons:
+    * **Show violins** opens a separate window summarising the
+      per-pair best-lag and zero-lag distributions across cluster
+      pairs as violin plots, with a sign-flip permutation test for
+      "is this lead-lag significantly nonzero".
+    * **Single-pair preview** plots the cross-correlation curve for
+      one ROI pair you pick from a dropdown -- handy for sanity
+      checks.
+
+Outputs
+-------
+For each (Cᵢ x Cⱼ) the tab writes one CSV per pair under
+``<prefix>cluster_results/<cluster_folder>/cross_correlation_full/``.
+Per-event mode writes parallel folders per event window. Each row
+has best_lag_sec, max_corr, zero_lag_corr for one ROI pair.
+
+Threading
+---------
+Heavy lifting runs on a worker thread; the worker calls a progress
+callback that polls a ``threading.Event`` set by the Abort button so
+long runs can be cancelled cleanly via the ``RunAborted`` exception
+defined below.
 """
 
 from __future__ import annotations
@@ -50,6 +99,18 @@ class RunAborted(Exception):
     Propagates out of the cross-correlation routine, gets caught by the
     worker's outer try/except, and surfaces as an ``aborted`` queue
     message instead of an error dialog.
+
+    Implementation note
+    -------------------
+    The cross-correlation routines in ``core.crosscorrelation`` accept
+    an optional ``progress_cb(done, total)`` callback they invoke
+    after every batch. The Abort button sets a
+    ``threading.Event``; the callback checks it and raises this
+    exception when the flag is set, unwinding out of the heavy loop
+    cleanly. Subclassing ``Exception`` (instead of ``BaseException``)
+    means it gets caught by ordinary ``except Exception:`` blocks --
+    important so we don't accidentally trigger a "hard" abort that
+    propagates past the worker thread's outer ``except``.
     """
     pass
 
@@ -259,8 +320,18 @@ class ViolinWindow(tk.Toplevel):
         self.geometry("1000x740")
 
         self._xcorr_root = xcorr_root
-        self._recording_label = (
-            recording_label or xcorr_root.parent.parent.name)
+        # Recording label = human-readable name shown in the title
+        # bar. ``xcorr_root`` lives at
+        # ``<plane0>/<prefix>cluster_results/<cluster_folder>/cross_correlation_full``
+        # so two ``.parent`` walks land on plane0 -- and from plane0
+        # the recording id is no longer always two more parents up
+        # (the sparse_plus_cellpose layout adds ``detection/final``
+        # in between). Use the robust resolver instead.
+        if recording_label:
+            self._recording_label = recording_label
+        else:
+            from ...core.utils import infer_recording_id
+            self._recording_label = infer_recording_id(xcorr_root)
         self._pair_data = _load_pair_data(xcorr_root)
 
         if not self._pair_data:
@@ -538,10 +609,14 @@ class CrossCorrelationTab(ttk.Frame):
             try:
                 state.subscribe_plane0(self._on_plane0_broadcast)
                 state.subscribe_lowpass_ready(self._on_plane0_broadcast)
+                state.subscribe_event_results(
+                    self._on_event_results_broadcast)
                 if getattr(state, "lowpass_plane0", None) is not None:
                     self._on_plane0_broadcast(state.lowpass_plane0)
                 elif getattr(state, "plane0", None) is not None:
                     self._on_plane0_broadcast(state.plane0)
+                if getattr(state, "event_results", None) is not None:
+                    self._on_event_results_broadcast(state.event_results)
             except Exception:
                 pass
 
@@ -885,17 +960,40 @@ class CrossCorrelationTab(ttk.Frame):
 
     def _on_refresh_events(self) -> None:
         if self._plane0 is None:
-            self._event_windows = []
-            self.event_count_var.set("events: -")
-            self.sp_event_combo.config(values=["full recording"])
-            self.sp_event_var.set("full recording")
+            self._apply_event_windows([])
             return
-        evts = _read_event_windows_from_summary(self._plane0)
+        # Prefer the in-memory publish from Tab 5 if it matches the
+        # currently-loaded plane0 -- it's the freshest source. Otherwise
+        # fall back to the EventWindows sheet on disk (cold-start path).
+        evts = self._event_windows_from_state()
+        if evts is None:
+            evts = _read_event_windows_from_summary(self._plane0)
+        self._apply_event_windows(evts)
+
+    def _event_windows_from_state(self):
+        """Return Tab 5's in-memory ``[(start_s, end_s), ...]`` for the
+        current plane0, or None if no matching publish is cached."""
+        results = getattr(self.state, "event_results", None) if self.state \
+            else None
+        if not results:
+            return None
+        if Path(results.get("plane0", "")) != Path(self._plane0):
+            return None
+        ev = results.get("event_windows")
+        if ev is None or len(ev) == 0:
+            return []
+        return [(float(t0), float(t1)) for t0, t1 in ev]
+
+    def _apply_event_windows(self, evts) -> None:
+        """Update ``_event_windows`` and the dependent UI bits."""
+        evts = list(evts) if evts else []
         self._event_windows = evts
-        self.event_count_var.set(f"events: {len(evts)}")
+        if not evts and self._plane0 is None:
+            self.event_count_var.set("events: -")
+        else:
+            self.event_count_var.set(f"events: {len(evts)}")
         self.per_event_btn.config(
             state="normal" if (self._inputs_ready() and evts) else "disabled")
-        # Refresh the single-pair event picker.
         labels = ["full recording"] + [
             f"event {i:04d}  [{s:.2f}-{e:.2f}s]"
             for i, (s, e) in enumerate(evts)
@@ -903,6 +1001,18 @@ class CrossCorrelationTab(ttk.Frame):
         self.sp_event_combo.config(values=labels)
         if self.sp_event_var.get() not in labels:
             self.sp_event_var.set("full recording")
+
+    def _on_event_results_broadcast(self, results: dict) -> None:
+        """Tab 5 just published a fresh event-detection result. If it's
+        for the plane0 we're showing, refresh in-memory."""
+        if not results or self._plane0 is None:
+            return
+        if Path(results.get("plane0", "")) != Path(self._plane0):
+            return
+        ev = results.get("event_windows")
+        evts = ([(float(t0), float(t1)) for t0, t1 in ev]
+                if ev is not None else [])
+        self._apply_event_windows(evts)
 
     def _on_violin(self) -> None:
         """Open a violin-plot window over the per-pair summary CSVs from the
@@ -921,7 +1031,11 @@ class CrossCorrelationTab(ttk.Frame):
                 f"Expected:\n{xcorr_root}")
             return
         try:
-            recording_label = self._plane0.parent.parent.name
+            # Resolve recording id robustly (handles both old
+            # ``<rec>/suite2p/plane0`` and new
+            # ``<rec>/detection/final/suite2p/plane0`` layouts).
+            from ...core.utils import infer_recording_id
+            recording_label = infer_recording_id(self._plane0)
         except Exception:
             recording_label = ""
         try:

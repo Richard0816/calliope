@@ -1,0 +1,295 @@
+# CalLIOPE — Pipeline Walkthrough for the Curious Neuroscientist
+
+**CalLIOPE** = **Cal**cium **L**ive-imaging **O**utput **P**ipeline for **E**piletiform-recordings.
+
+This document is a high-level tour of the GUI for someone who has taken intro neuroscience but is new to calcium imaging analysis. It explains, for each of the eight tabs, **what biological signal we're chasing, what the tab does to the data, and why a working neuroscientist would care about the result**. The deeper "how the math works" lives in the `README.md` inside each tab's folder.
+
+---
+
+## What's in the input file?
+
+Every analysis starts from a multi-page TIFF: a stack of 2D images captured at ~15 frames/second by a two-photon microscope. Each pixel reports the brightness of a calcium-sensitive fluorescent protein (a **GCaMP** or similar GECI) in a small chunk of brain tissue. When neurons fire, intracellular Ca²⁺ rises, GCaMP brightens, and that pixel gets brighter. So **brightness over time at a neuron's location = a proxy for neural firing**.
+
+The recordings here are from human/animal brain slices in conditions that drive **epileptiform** activity (synchronized seizure-like bursts). The whole pipeline is designed to answer questions like:
+
+- Which cells fired, and when?
+- Were they synchronised? In what spatial pattern?
+- Did one population consistently lead another?
+- Did seizure-like population events have a stereotyped propagation pattern?
+
+---
+
+## The pipeline at a glance
+
+```
+TIFF stack
+   │
+   ▼
+[1] Preprocess ─── shift intensities to uint16, build mean image, find candidate cell bodies
+   │
+   ▼
+[2] QC Preview ── animated GIF + mean image with circles around the candidate cells
+   │
+   ▼
+[3] Suite2p Detection ─── find ROIs (cell footprints), extract raw fluorescence,
+                          compute dF/F (relative change in brightness),
+                          apply a learned cell/non-cell classifier
+   │
+   ▼
+[4] Low-pass filter ─── smooth each ROI's dF/F to suppress shot noise and
+                        compute its first time-derivative (rate of brightening)
+   │
+   ▼
+[5] Event detection ─── find when each cell fires (per-ROI onsets) and
+                        find population-wide events (when many cells fire together)
+   │
+   ▼
+[6] Clustering ─── group cells whose dF/F traces co-vary (similar activity = similar ensemble)
+   │
+   ▼
+[7] Cross-correlation ─── for each pair of clusters, ask "does cluster A lead cluster B,
+                          and by how much?" — both across the whole recording and within
+                          each detected event
+   │
+   ▼
+[8] Spatial propagation ── per event, paint a map of who fired earliest (cyan) → latest (red)
+                           and click through events one at a time
+```
+
+Each stage writes its outputs to disk so later tabs can re-load without recomputing.
+
+---
+
+## Tab 1 — Input & Preprocess
+
+**What it does (biology-first).** Raw TIFFs from a microscope can have negative pixel values (because of dark-current correction) and inconsistent dynamic ranges across files. Tab 1 *shifts* the intensities so the minimum value is 0 (without distorting the relative differences that carry the biology), packs them into 16-bit unsigned integers (Suite2p's expected format), then makes:
+
+- A **mean image** — averaging every frame in time gives you the steady spatial picture of the slice. Cell bodies become visible because they're slightly brighter and rounder than neuropil.
+- A **QC GIF** — a downsampled animated preview so you can eyeball whether the recording moved, drifted, or has obvious motion artefacts before investing in detection.
+- **Preview blobs** — a quick Laplacian-of-Gaussian blob detector on the mean image, drawn on Tab 2 as cyan circles. *This is not the final ROI list*; it's a sanity check that "yes, there are cell-shaped things in this field of view, and they're roughly the diameter you set."
+
+**Why it matters.** Two-photon recordings can be noisy. If your mean image looks blurry or your QC GIF shows the field of view sliding, no amount of downstream cleverness will save you — better to know now and either re-register or reshoot. Also, choosing the wrong soma diameter here is a common source of "Suite2p missed all my cells" complaints.
+
+**Biological output of this stage.** None on its own. Tab 1 is a hygiene step.
+
+→ See `tabs/preprocess/README.md` for the streaming intensity shift, blob detector, and QC GIF code paths.
+
+---
+
+## Tab 2 — QC Preview
+
+**What it does.** Pure visualization. Plays the GIF from Tab 1 next to the mean image with the preview blobs circled.
+
+**Why it matters.** This is where you catch:
+
+- **Z-drift** — if the whole field appears to brighten/dim or focus changes mid-recording, your "neuron" might be the same cell sliding through focus, not actual activity.
+- **XY motion** — if cells visibly translate, ROIs assigned in frame 1 won't match the cells in frame N. Tab 1 doesn't motion-correct (Suite2p does that in Tab 3), but blatant motion is worth knowing.
+- **Photobleaching** — overall intensity decay over the recording.
+- **Bubbles, debris, dead patches** — biological/optical artefacts that should mask out regions.
+
+**Biological output.** Confidence (or lack of it) in the recording. If this tab looks bad, fix the experiment, not the analysis.
+
+→ See `tabs/qc/README.md` for the (very small) GIF-playback and blob-overlay logic.
+
+---
+
+## Tab 3 — Suite2p Detection
+
+**What it does.** This is the workhorse. It runs **Suite2p** (a popular calcium-imaging detection package; Pachitariu et al., Janelia) plus an in-house **Cellpose** pass and produces:
+
+1. **ROIs** — for each detected cell body, a list of pixels (a *footprint*) plus a per-pixel weight (a *lambda* mask) saying "this pixel is 0.7-of-a-cell, this one is 1.0-of-a-cell." Two algorithms run:
+   - **Sparsery** (the default Suite2p detector) — finds bright, sparse, time-varying spots.
+   - **Cellpose** (cyto2) — a generalist deep-learning cell-segmentation model, run on the mean image as a "second opinion" to catch cells that didn't fire enough during the recording for Sparsery to find them. Cellpose ROIs that overlap >30% with Sparsery ROIs are dropped to avoid double-counting.
+2. **Raw traces F and Fneu** — per-ROI fluorescence over time, plus the surrounding "neuropil" trace which contains contamination from out-of-focus cells.
+3. **dF/F** — `(F − r·Fneu − F₀) / F₀` per ROI. This is the **biologically meaningful** signal: relative change from baseline brightness. We subtract `0.7 × neuropil` to remove contamination (`r=0.7` is a community standard from Chen et al. 2013), then divide by a baseline `F₀` (either rolling 10th percentile or the mean of the first few minutes) so a 50% increase in fluorescence reads as `0.5` regardless of how bright the original cell was.
+4. **Low-pass dF/F + first derivative** — pre-computed at default settings so Tabs 4–7 have a starting point.
+5. **Cell filter** — a small PyTorch CNN (`cellfilter/`) trained on hand-labelled ROIs that scores each ROI 0–1 as "this is a real cell" vs "this is an artefact / bright pixel / blood vessel." The user sees both panels: all detected ROIs, and only those that pass the classifier.
+
+**Why it matters biologically.** ROIs are how the entire pipeline anthropomorphises pixels into cells. Get this wrong and:
+
+- **Too many ROIs**: noise traces dominate clustering and event detection.
+- **Too few ROIs**: real cells get excluded, lowering statistical power.
+- **dF/F mis-baselined**: a slow drift gets read as a sustained event.
+
+The cell-filter step gives you a reproducible "is this really a cell?" decision instead of relying on Suite2p's built-in `iscell.npy` (which is noisy across recordings).
+
+**Biological output.** A clean per-cell trace of *relative firing-related fluorescence* over the whole recording, for every cell that the classifier thinks is real.
+
+→ See `tabs/suite2p/README.md` for: Sparsery + Cellpose merge logic, neuropil-correction math, the two dF/F baseline modes (rolling vs first-N-minutes), the GPU dF/F path (CuPy), and how the cell-filter CNN is loaded and applied.
+
+---
+
+## Tab 4 — Low-pass filter
+
+**What it does.** Lets you interactively pick a **low-pass cutoff** (in Hz) and watch three panels update:
+
+1. The **FFT power spectrum** of the chosen trace (mean across cells, median, best cell, or a manual subset). The cutoff line is a vertical dashed marker.
+2. The **raw** dF/F trace.
+3. The **low-pass-filtered** dF/F trace at the chosen cutoff.
+
+When you click *Compute*, it writes per-cell low-pass and derivative arrays to disk for Tab 5.
+
+**Why it matters biologically.** GCaMP has slow kinetics (rise ~50–200 ms, decay ~hundreds of ms to seconds), so calcium events look like smoothed bumps regardless of how briefly the underlying spikes fired. We want to:
+
+- Suppress **shot noise** (frame-to-frame photon-counting jitter), which is high-frequency.
+- Preserve the actual transient (which lives at frequencies up to maybe 5 Hz for fast GCaMPs).
+
+If the cutoff is **too low**, you smear real events together and miss short bursts. **Too high**, and noise drives spurious "events" in Tab 5. The FFT panel is your tool for picking a cutoff at the elbow between signal and noise.
+
+The first **derivative** of the low-pass trace (Savitzky-Golay smoothed) is what Tab 5 uses for onset detection — *we don't threshold on dF/F itself; we threshold on its rate of rise*, because that detects the moment a cell starts firing rather than the moment its calcium has decayed back to baseline.
+
+**Biological output.** A cleaned per-cell trace and its derivative, ready for event detection.
+
+→ See `tabs/lowpass/README.md` for the causal Butterworth SOS filter, the SG-derivative formula, and the on-disk memmap layout.
+
+---
+
+## Tab 5 — Event detection
+
+**What it does.** Two levels of "what's happening?":
+
+1. **Per-ROI onsets.** For each cell, it computes a robust z-score of the derivative (using median + MAD instead of mean + std, which is robust to outliers — see Stern et al. 2024) and runs **hysteresis thresholding**: a cell starts firing when its derivative-z crosses the *enter* threshold (default `3.5σ`), and stops when it falls below the *exit* threshold (default `1.5σ`). The dual threshold prevents flickering at the boundary. Onsets within `0.1 s` are merged.
+2. **Population events.** Once you have onsets for every cell, you build a histogram across time (`bin_sec=0.025` → 25 ms bins), Gaussian-smooth it (`sigma=1.5 bins`), then `find_peaks` on the smoothed density to find moments where many cells fired in a narrow window. Around each peak, the algorithm walks outward until the density falls back to baseline + `k·noise`, then enforces a hard physiological cap (default `0.5 s` — anything longer than this in epileptiform recordings is probably two events fused). If two walked windows overlap, they get *watershed-split* at the local minimum between their peaks.
+
+The three panels show: (1) sorted-by-activity heatmap of the low-pass dF/F, (2) sorted event raster (one dot per onset), (3) the smoothed density with detected event windows shaded.
+
+**Why it matters biologically.** This is the bridge from "calcium signals" to "events that a neurophysiologist would talk about." A **per-ROI onset** is the closest you get to a spike train without doing deconvolution. A **population event** is the calcium-imaging equivalent of an EEG ictal/interictal spike — the kind of thing you'd point to in a paper and say "the slice seized for 0.4 seconds, here are the cells that participated."
+
+The defaults are tuned for **short epileptiform events** (<0.5 s). If you're studying a slower phenomenon (e.g. spreading depolarization, tens of seconds), you'd loosen the duration cap and lengthen the rolling baseline window.
+
+**Biological output.** (a) Per-cell spike-train-like onset times, (b) population event windows in seconds, (c) for every event × cell combination, did that cell participate?
+
+→ See `tabs/event_detection/README.md` for the full mathematical specification of MAD-z, hysteresis, the density-based detector, and every parameter in `EventDetectionParams`.
+
+---
+
+## Tab 6 — Clustering
+
+**What it does.** Computes the pairwise Pearson correlation between every pair of cells' dF/F traces, treats `1 − r` as a distance, and runs **hierarchical clustering** (average linkage). Output: a dendrogram + a spatial map where every cell is colored by its cluster.
+
+The user can:
+- Slide a horizontal "cut" line up/down the dendrogram to control how fine or coarse the clustering is. Auto mode picks a target of 4–5 clusters.
+- Pick a categorical or continuous palette, or set per-cluster colors manually.
+- "Recluster" a selected branch (or branches) in a separate window — useful when one cluster is huge and looks heterogeneous.
+- Export each cluster's ROI ids to `.npy` files for Tab 7.
+
+**Why it matters biologically.** Cells in a slice are not independent. They form **functional ensembles**: groups whose firing patterns are tightly correlated, often because they share inputs or are synaptically coupled. Identifying these ensembles is half of what circuit neuroscience cares about.
+
+In epileptiform tissue specifically, you often see:
+- A **core cluster** of cells that participate in nearly every seizure-like event.
+- **Satellite clusters** that only join during particular events.
+- **Quiet clusters** that look correlated only because they share the same low-amplitude noise (these are the ones a manual recluster usually splits up).
+
+The spatial map then asks the obvious follow-up: *do these functional clusters correspond to anatomical structure?* If cluster colors form contiguous patches, you're seeing local micro-circuits. If they're salt-and-pepper, you're seeing distributed networks.
+
+**Biological output.** Per-cell cluster assignments + a per-cluster ROI list, ready to ask "does cluster A lead cluster B?"
+
+→ See `tabs/clustering/README.md` for the correlation-distance metric, average-linkage algorithm, the `auto_choose_threshold` heuristic, and the export format consumed by Tab 7.
+
+---
+
+## Tab 7 — Cross-correlation
+
+**What it does.** For each pair of clusters (Cᵢ, Cⱼ), and for each pair of cells (one from Cᵢ, one from Cⱼ), it computes the **time-lagged Pearson correlation**: shift cell-A's trace by `k` frames, ask "how correlated is shifted-A with B?", repeat for `k ∈ [−L, +L]`, and report:
+
+- `best_lag_sec`: the lag at which correlation is highest (in seconds; positive ⇒ A leads B by that many seconds).
+- `max_corr`: the correlation value at that lag.
+- `zero_lag_corr`: correlation at `lag = 0` (instantaneous co-firing).
+
+Two modes:
+- **Full recording** — uses the entire dF/F trace.
+- **Per event** — re-runs cross-correlation cropped to each event window from Tab 5, so you can ask "during *this* seizure, who led whom?"
+
+A **violin plot** window summarises the distribution of best lags and zero-lag correlations across all cell pairs in each cluster pair. Pairs whose mean lag is significantly non-zero (sign-flip permutation test, `p < 0.05`) are coloured **blue (lead)** or **red (lag)**; ns pairs are **gray**.
+
+**Why it matters biologically.** Synchronisation is necessary but not sufficient. *Direction* matters:
+
+- Two cells firing together at lag = 0 may share an input.
+- Cell A consistently leading cell B by 30 ms suggests A → B.
+- A cluster that consistently leads other clusters during seizures is a **candidate initiation zone** — the place where ictal activity is born and from which it propagates. This is the kind of finding that maps directly onto clinical questions about which brain region to target with surgery or stimulation.
+
+The pipeline's purpose, in the end, is to take a dish full of neurons firing chaotically on a microscope slide and turn it into a directed graph: *this region drives that region, in these events, with this latency.*
+
+**Biological output.** Per cluster pair, distributions of lead/lag latency and synchrony strength — both globally and event-by-event.
+
+→ See `tabs/crosscorrelation/README.md` for the batched matmul algorithm (one matrix multiply per lag covers every cell pair in a cluster pair), the GPU/CPU paths (CuPy), the sign-flip permutation test for significance, and the per-event windowing logic.
+
+---
+
+## Tab 8 — Spatial propagation
+
+**What it does.** For each population event detected in Tab 5, shows four figures: a top pair of side-by-side activation-order maps, a centred vectors-only panel below them, and a full-width "distance vs Δt frame" violin underneath. The **top-left** is the plain activation-order map: each cell is coloured by *when it fired within that event*, on a continuous cyan → blue → red scale (cyan = earliest, red = latest), with non-participating ROIs left grey — useful as a clean reference image. The **top-right** is the same map with white arrows overlaid that connect the centroid of the cells firing in each frame to the centroid for the next active frame, so you can read the temporal trajectory directly off the spatial layout. The **middle panel** strips out the cells and shows just the propagation vectors, with each frame's centroid drawn as a circle whose radius is the 2D RMS standard deviation of the contributing cells around the group centroid (so a tight, focal frame looks like a small circle and a diffuse one looks like a large blob). The **bottom panel** answers "as the wave moves through time, how does its spatial reach grow?" by treating *every* participating cell as a seed in turn (except cells in the last active frame, which would only see same-frame peers): for each seed, it accumulates distances to every other cell whose first onset lands in the same or a later frame, binned by `Δframe = (other_frame - seed_frame)`. The result is one violin per Δframe — `Δframe = 0` is the within-frame spread, larger Δframes show how far the population reaches `k` frames after any given cell fires. This averages out the bias of any single seed and gives a propagation-spread profile of the whole event. A spinner and Prev / Next buttons let you flip through events one at a time.
+
+This tab is a **pure consumer of Tab 5**: it doesn't re-detect anything. Tab 5 publishes its event windows, active-mask, and per-ROI first-onset times via the shared `AppState`, and Tab 8 subscribes. Whatever knobs you tuned on Tab 5 (manual ROI subset, advanced parameters, etc.) are exactly what gets visualised — re-render Tab 5 and Tab 8 updates automatically.
+
+**Why it matters biologically.** Tab 7 tells you "cluster A consistently leads cluster B by 47 ms". Tab 8 tells you what that *looks like* in space — the very thing that's missing from the violin plots. If event after event lights up cyan in the upper-left and progresses to red in the lower-right, you're seeing a stereotyped propagation wave: the kind of result that lets you point at a specific anatomical region as the seizure-initiation zone. Per-event maps also expose **heterogeneity**: maybe most events propagate left-to-right, but a few flip direction — that's a meaningful biological observation that gets averaged away in a single summary plot.
+
+V1 ships only the activation-order map. Future view modes (planned, ported from the legacy `spatial_heatmap_updated.py` reference): per-event propagation arrows + speed/angle CSV, per-ROI relative-lag violin plots, and scalar feature maps (event rate, peak ΔF/F, peak derivative-z) painted on the same canvas.
+
+**Biological output.** A click-through atlas of "who fired first, who fired last" for every detected population event in the recording.
+
+→ See `tabs/spatial_propagation/README.md` for the inputs, the order-rank → painted-image pipeline (two helpers in `core/spatial.py`), the PARAM_SPEC defaults, and the planned roadmap of additional view modes.
+
+---
+
+## Putting it all together — a worked example
+
+You record a 10-minute, 15 fps calcium movie of a brain slice in low-magnesium aCSF (a classic seizure-induction protocol). What does the pipeline tell you?
+
+| Tab | What you learn |
+|---|---|
+| 1–2 | The recording is stable, no obvious drift, ~200 candidate cell-shaped objects in the field of view. |
+| 3 | Suite2p + Cellpose find 312 ROIs; the cell filter accepts 187 as real cells. dF/F is computed; baseline is a rolling 10th-percentile over 45 s. |
+| 4 | The FFT shows clear signal up to ~3 Hz and white noise above. You pick a 1 Hz cutoff. |
+| 5 | 187 cells produce 4,200 onsets across the recording. The population-event detector finds 23 events, mean duration 0.32 s, well under the 0.5 s cap — consistent with brief interictal spikes. |
+| 6 | Hierarchical clustering at the auto cut groups the cells into 4 clusters. The spatial map shows cluster C1 is a tight clump in the upper-left quadrant; C2 is a more diffuse ring; C3 and C4 are scattered. |
+| 7 | Across all 23 events, C1 leads C2 by a mean of 47 ms (`p < 0.001`), and C2 leads C3 by 22 ms (`p < 0.01`). C4's lags are not significantly different from zero — it follows the population without driving it. |
+| 8 | Clicking through the 23 per-event activation-order maps, the upper-left quadrant lights up cyan in 19/23 events with red trailing toward the lower-right — a stereotyped propagation pattern that visualises the C1 → C2 → C3 lead/lag found in Tab 7. |
+
+**Biological story.** The slice has a focal seizure-initiation zone (C1, upper-left), which recruits a peri-focal ring (C2), which then drives a more distributed downstream cluster (C3), while a fourth cluster (C4) participates passively. **This is the kind of result that justifies a paper.**
+
+---
+
+## Where to look in the code
+
+```
+src/calliope/
+├── pipeline_gui.py            ← top-level Tk app, builds the 8 tabs
+├── pipeline_gui_walkthrough.md  ← (this file)
+├── core/                       ← pure-Python algorithms shared across tabs
+│   ├── preprocessing.py        ← shift / mean / blobs / QC GIF
+│   ├── sparse_plus_cellpose.py ← Suite2p + Cellpose merge
+│   ├── utils.py                ← dF/F, lowpass, mad_z, event detection, fps lookup
+│   ├── crosscorrelation.py     ← batched + single-pair xcorr
+│   ├── clustering_cmap.py      ← palettes + auto-threshold
+│   ├── spatial.py              ← cyan→red colormap + order-rank painting
+│   ├── adaptive_detection.py   ← (legacy) residual blob detection
+│   └── cellfilter/             ← PyTorch CNN for the keep/drop classifier
+└── tabs/
+    ├── preprocess/             ← Tab 1
+    ├── qc/                     ← Tab 2
+    ├── suite2p/                ← Tab 3
+    ├── lowpass/                ← Tab 4
+    ├── event_detection/        ← Tab 5
+    ├── clustering/             ← Tab 6
+    ├── crosscorrelation/       ← Tab 7
+    └── spatial_propagation/    ← Tab 8
+```
+
+Each tab folder contains:
+- `tab.py` — the Tk widgets, threading, plotting, and disk I/O.
+- `logic.py` — a re-export shim that pulls computational functions from `core/`.
+- `README.md` — the math + reproducibility notes for that tab (read these in order to recreate the pipeline from scratch).
+
+---
+
+## Suggested reading order
+
+1. **This file**, end-to-end. Get the biology in your head.
+2. `tabs/preprocess/README.md` and `tabs/suite2p/README.md` — the data flow from TIFF to dF/F.
+3. `tabs/lowpass/README.md` and `tabs/event_detection/README.md` — how raw fluorescence becomes spike-like events.
+4. `tabs/clustering/README.md` and `tabs/crosscorrelation/README.md` — how events become circuit-level statements.
+5. `tabs/spatial_propagation/README.md` — how those statements translate back into pictures of the slice.
+6. `tabs/qc/README.md` — last (it's the smallest tab).
+
+By the end, you should be able to re-implement any single stage of the pipeline from scratch given the math and parameter values in its README.

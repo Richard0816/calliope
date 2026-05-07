@@ -1,5 +1,54 @@
-"""
-calliope.tabs.clustering.tab - GUI for cross-correlation hierarchical clustering.
+"""calliope.tabs.clustering.tab - Tab 6: hierarchical clustering of
+ROI traces.
+
+What this tab does
+------------------
+Cells in a slice are not independent -- groups of them have tightly
+correlated firing patterns ("functional ensembles"). Tab 6 finds
+those ensembles by:
+
+1. Computing the **pairwise correlation distance** ``1 - Pearson r``
+   between every pair of ROI dF/F traces (``scipy.spatial.distance.
+   pdist`` with metric="correlation").
+2. Running **average-linkage hierarchical agglomerative clustering**
+   on that distance vector (``scipy.cluster.hierarchy.linkage``).
+3. **Cutting the tree** at a user-selectable height to produce flat
+   cluster labels (``fcluster``).
+4. Rendering a **dendrogram** + a **spatial map** of the FOV with
+   ROIs coloured by cluster. The two stay in sync as the user slides
+   the threshold.
+
+The colour palette can be a built-in seaborn / matplotlib palette
+(categorical or continuous) or a per-cluster hand-picked set via a
+small colour-picker dialog.
+
+What the user sees
+------------------
+- Path / prefix entry + Browse...
+- "Run analysis" button: kicks off the worker that computes
+  pdist + linkage (seconds for typical recordings).
+- A vertical slider next to the dendrogram for manual threshold
+  adjustment; "Manual threshold" toggle to switch between manual and
+  auto modes (auto picks a height that lands ~4-5 clusters).
+- Palette dropdown + "Per-cluster colors..." dialog.
+- Export buttons:
+    * "Export *_rois.npy"  -> writes one ROI list per cluster into
+      ``<prefix>cluster_results/gui_recluster/Ci_rois.npy``. Tab 7
+      reads those files for cluster x cluster cross-correlation.
+    * "Reload clusters" -> restore a previously-saved linkage +
+      threshold without recomputing.
+    * "Recluster within branch" -> open the picked branch in a
+      fresh window with its own dendrogram so a fat cluster can be
+      sub-divided.
+
+What gets written
+-----------------
+- ``<prefix>cluster_results/gui_recluster/Ci_rois.npy`` -- per-
+  cluster ROI lists in Suite2p ROI ids.
+- ``<prefix>cluster_results/gui_recluster/linkage.npy`` and
+  ``threshold_used.npy`` -- so "Reload clusters" can restore the
+  state.
+- ``Clusters`` sheet of ``calliope_summary.xlsx``.
 
 Workflow
 --------
@@ -58,6 +107,8 @@ from scipy.spatial.distance import pdist
 from .logic import clustering_cmap as cmap_mod
 from .logic import summary_writer
 from .logic import utils
+
+from ...gui_common import format_roi_indices
 
 
 DEFAULT_PREFIX = "r0p7_filtered_"
@@ -517,6 +568,10 @@ class ClusteringTab(ttk.Frame):
         self.run_btn = ttk.Button(
             row2, text="Run analysis", command=self._on_run, state="disabled")
         self.run_btn.pack(side="left")
+        self.reload_btn = ttk.Button(
+            row2, text="Reload clusters",
+            command=self._on_reload_clusters, state="disabled")
+        self.reload_btn.pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(row2, mode="indeterminate", length=140)
         self.progress.pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="Pick a plane0 folder.")
@@ -543,6 +598,23 @@ class ClusteringTab(ttk.Frame):
             row3, text="Recluster (new window)", command=self._on_recluster,
             state="disabled")
         self.recluster_btn.pack(side="left", padx=(8, 0))
+
+        # ROI list of the currently-picked clusters (Suite2p ROI ids).
+        # Read-only display + Copy button so the user can paste into Tab 4
+        # / Tab 5 manual-ROI entries or external scripts. Auto-refreshes on
+        # every menu toggle and every threshold/palette change.
+        row3b = ttk.Frame(head); row3b.pack(fill="x", pady=2)
+        ttk.Label(row3b, text="ROIs in picked clusters (Suite2p ids):").pack(
+            side="left")
+        self.roi_list_var = tk.StringVar(value="")
+        self.roi_list_entry = ttk.Entry(
+            row3b, textvariable=self.roi_list_var, state="readonly")
+        self.roi_list_entry.pack(side="left", fill="x", expand=True,
+                                 padx=(8, 4))
+        self.copy_rois_btn = ttk.Button(
+            row3b, text="Copy", command=self._on_copy_roi_list,
+            state="disabled")
+        self.copy_rois_btn.pack(side="left")
 
         # Body: dendrogram + slider + spatial.
         body = ttk.Frame(self); body.pack(fill="both", expand=True)
@@ -648,6 +720,7 @@ class ClusteringTab(ttk.Frame):
         self._plane0 = plane0
         ok = self._inputs_ready(plane0, self.prefix_var.get())
         self.run_btn.config(state="normal" if ok else "disabled")
+        self._refresh_reload_btn()
         if ok:
             self.status_var.set(f"Ready. ({plane0})")
         else:
@@ -660,6 +733,23 @@ class ClusteringTab(ttk.Frame):
             if not (plane0 / name).exists():
                 return False
         return True
+
+    def _existing_cluster_dir(self, plane0: Path, prefix: str) -> Path:
+        return plane0 / f"{prefix}cluster_results" / EXPORT_SUBDIR
+
+    def _has_existing_clusters(self, plane0: Path, prefix: str) -> bool:
+        d = self._existing_cluster_dir(plane0, prefix)
+        return ((d / "linkage.npy").exists()
+                and (d / "threshold_used.npy").exists())
+
+    def _refresh_reload_btn(self) -> None:
+        if self._plane0 is None:
+            self.reload_btn.config(state="disabled")
+            return
+        prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
+        ok = (self._inputs_ready(self._plane0, prefix)
+              and self._has_existing_clusters(self._plane0, prefix))
+        self.reload_btn.config(state="normal" if ok else "disabled")
 
     # -- Run worker --------------------------------------------------------
 
@@ -702,15 +792,84 @@ class ClusteringTab(ttk.Frame):
             "T": T, "N": N,
         }
 
+    def _on_reload_clusters(self) -> None:
+        """Restore linkage + threshold from a previous Export *_rois.npy run.
+
+        Skips the (expensive) correlation-linkage computation and snaps the
+        slider to the saved threshold in manual mode. dF/F + stat + ops are
+        still loaded fresh from disk so reclustering and the spatial map
+        keep working.
+        """
+        if self._worker is not None and self._worker.is_alive():
+            messagebox.showinfo("Busy", "Analysis already running.")
+            return
+        plane0 = Path(self.path_var.get())
+        prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
+        if not self._inputs_ready(plane0, prefix):
+            messagebox.showerror(
+                "Not ready", f"plane0 missing required files: {plane0}")
+            return
+        if not self._has_existing_clusters(plane0, prefix):
+            messagebox.showerror(
+                "No saved clusters",
+                f"Expected {self._existing_cluster_dir(plane0, prefix)} "
+                f"with linkage.npy + threshold_used.npy. Run analysis "
+                f"first and click 'Export *_rois.npy'.")
+            return
+
+        self._prefix = prefix
+        self.run_btn.config(state="disabled")
+        self.reload_btn.config(state="disabled")
+        self.progress.start(12)
+        self.status_var.set("Reloading saved clusters...")
+
+        def worker():
+            try:
+                payload = self._reload_compute(plane0, prefix)
+                self._q.put(("reloaded", payload))
+            except Exception as e:
+                self._q.put(("error", f"{e}\n{traceback.format_exc()}"))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+
+    def _reload_compute(self, plane0: Path, prefix: str) -> dict:
+        cluster_dir = self._existing_cluster_dir(plane0, prefix)
+        Z = np.load(cluster_dir / "linkage.npy")
+        thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
+                               dtype=float).ravel()[0])
+        dff_mm, T, N, _ = _load_filtered_dff(plane0, prefix)
+        # The loaded linkage was computed on N_kept ROIs; if the cell-filter
+        # mask has changed since the export the shapes won't agree and any
+        # downstream recolouring would be silently wrong.
+        n_leaves = int(Z.shape[0]) + 1
+        if n_leaves != int(N):
+            raise ValueError(
+                f"Saved linkage has {n_leaves} leaves but the current "
+                f"dF/F memmap has {N} columns. Re-run analysis instead "
+                f"of reloading.")
+        stat, _ = _stat_for_prefix(plane0, prefix)
+        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        Lx, Ly = int(ops["Lx"]), int(ops["Ly"])
+        zmax = float(np.max(Z[:, 2]))
+        return {
+            "Z": Z, "dff": dff_mm, "dff_shape": dff_mm.shape, "stat": stat,
+            "Lx": Lx, "Ly": Ly, "saved_threshold": thr, "zmax": zmax,
+            "T": T, "N": N, "cluster_dir": cluster_dir,
+        }
+
     def _drain_queue(self) -> None:
         try:
             while True:
                 kind, payload = self._q.get_nowait()
                 if kind == "done":
                     self._on_done(payload)
+                elif kind == "reloaded":
+                    self._on_reloaded(payload)
                 elif kind == "error":
                     self.progress.stop()
                     self.run_btn.config(state="normal")
+                    self._refresh_reload_btn()
                     self.status_var.set("Analysis failed.")
                     messagebox.showerror(
                         "Analysis failed", payload.split("\n", 1)[0])
@@ -761,6 +920,58 @@ class ClusteringTab(ttk.Frame):
             f"OK. N_rois={data['N']}  T={data['T']}  "
             f"auto cut={auto_frac:.2f}xmax  -> {n_clusters} clusters. "
             f"Toggle 'Manual threshold' + slider to tune.")
+        self._refresh_reload_btn()
+
+    def _on_reloaded(self, data: dict) -> None:
+        self.progress.stop()
+        self.run_btn.config(state="normal")
+
+        self._Z = data["Z"]
+        self._stat = data["stat"]
+        self._dff = data["dff"]
+        self._Lx = data["Lx"]
+        self._Ly = data["Ly"]
+        self._zmax = float(data["zmax"])
+
+        saved_T = float(data["saved_threshold"])
+        # Clamp to the slider range so an out-of-band saved threshold (after
+        # editing the dF/F memmap, etc.) doesn't wedge the slider.
+        saved_T = max(0.0, min(self._zmax, saved_T))
+        self._manual_T = saved_T
+        self._auto_threshold = (saved_T / self._zmax) if self._zmax > 0 else 0.7
+
+        # Restored runs land in manual mode at the saved cut so the slider
+        # tracks the same threshold the user committed to disk.
+        self.manual_var.set(True)
+        self._slider_user_driven = False
+        self.threshold_scale.config(from_=self._zmax, to=0.0,
+                                    resolution=max(self._zmax / 1000.0, 1e-6),
+                                    state="normal")
+        self.threshold_scale.set(self._manual_T)
+        self._slider_user_driven = True
+
+        self._custom_colors = None
+        self.export_btn.config(state="normal")
+        self.summary_btn.config(state="normal")
+        self.recluster_btn.config(state="normal")
+        self.cluster_menu_btn.config(state="normal")
+        self.recluster_thr_var.set(f"{self._manual_T / 2.0:.3f}")
+
+        self._render_all()
+        try:
+            self._write_summary()
+        except Exception as e:
+            print(f"[GUI] cluster summary write failed: {e}")
+
+        n_clusters = int(np.unique(
+            fcluster(self._Z, t=self._current_threshold(),
+                     criterion="distance")).size)
+        cluster_dir = data.get("cluster_dir")
+        loc = f" from {cluster_dir}" if cluster_dir else ""
+        self.status_var.set(
+            f"Reloaded{loc}. N_rois={data['N']}  T={data['T']}  "
+            f"saved cut={saved_T:.3f}  ({n_clusters} clusters).")
+        self._refresh_reload_btn()
 
     # -- Threshold + palette -----------------------------------------------
 
@@ -963,6 +1174,63 @@ class ClusteringTab(ttk.Frame):
         else:
             text = f"{len(picked)} picked  (C{picked[0]}..C{picked[-1]})"
         self.cluster_menu_btn.config(text=text)
+        self._refresh_roi_list_var()
+
+    def _picked_cluster_roi_ids(self) -> list[int]:
+        """Suite2p ROI indices belonging to the currently-picked clusters,
+        sorted ascending. Empty list if nothing is picked or analysis hasn't
+        been run yet.
+        """
+        if self._Z is None:
+            return []
+        picked = self._picked_visual_ids()
+        if not picked:
+            return []
+        T = self._current_threshold()
+        labels = fcluster(self._Z, t=T, criterion="distance")
+        target_labels = [self._visual_to_label.get(v) for v in picked]
+        target_labels = [l for l in target_labels if l is not None]
+        if not target_labels:
+            return []
+        local_mask = np.isin(
+            labels, np.array(target_labels, dtype=labels.dtype))
+        local_idx = np.where(local_mask)[0].astype(int)
+        # Translate filtered-list positions to Suite2p ROI ids when the
+        # active prefix is filtered (mirrors _export_clusters).
+        if ("filtered" in self._prefix.split("_")
+                and self._plane0 is not None):
+            mask = _load_filter_mask(self._plane0)
+            if mask is not None and int(mask.sum()) == len(labels):
+                translator = np.where(
+                    np.asarray(mask, dtype=bool))[0].astype(int)
+                return sorted(int(i) for i in translator[local_idx])
+        return sorted(int(i) for i in local_idx)
+
+    def _refresh_roi_list_var(self) -> None:
+        ids = self._picked_cluster_roi_ids()
+        if not ids:
+            self.roi_list_var.set("")
+            self.copy_rois_btn.config(state="disabled")
+            return
+        self.roi_list_var.set(format_roi_indices(ids))
+        self.copy_rois_btn.config(state="normal")
+
+    def _on_copy_roi_list(self) -> None:
+        text = self.roi_list_var.get()
+        if not text:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            # Force the clipboard to retain its contents after the Tk app
+            # exits — without this, a quick run-and-quit loses the copy on
+            # some Windows builds.
+            self.update()
+        except tk.TclError as e:
+            print(f"[GUI] clipboard copy failed: {e}")
+            return
+        self.status_var.set(
+            f"Copied {len(self._picked_cluster_roi_ids())} ROI ids to clipboard.")
 
     def _cluster_pick_all(self) -> None:
         for v in self._cluster_vars.values():
@@ -1147,6 +1415,11 @@ class ClusteringTab(ttk.Frame):
         ax.set_xlabel("x (px)")
         ax.set_ylabel("y (px)")
         self.s_canvas.draw_idle()
+
+        # Cluster numbering / ROI->cluster assignment may have changed
+        # (threshold drag, palette change). Refresh the picked-clusters
+        # ROI list so the displayed Suite2p ids stay in sync.
+        self._refresh_roi_list_var()
 
     # -- Export + cross-correlation ----------------------------------------
 

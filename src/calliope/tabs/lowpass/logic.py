@@ -1,9 +1,15 @@
 """Logic + calculations for the Low-pass filter tab.
 
-Re-exports the slice of ``calliope.core.utils`` the tab calls
-(``get_fps_from_notes``, ``lowpass_causal_1d``, ``sg_first_derivative_1d``).
-The tab module imports this as ``utils`` so its existing call sites
-(``utils.lowpass_causal_1d(...)``) keep working.
+Re-export shim
+--------------
+Tab 4 only needs three signal-processing functions from
+``calliope.core.utils``: ``lowpass_causal_1d`` (the Butterworth SOS
+filter), ``sg_first_derivative_1d`` (the Savitzky-Golay first
+derivative), and ``get_fps_from_notes`` (to look up the frame rate).
+The tab module imports this file as ``utils`` so it can call them
+with their original names.
+
+See ``calliope.tabs.preprocess.logic`` for the shim pattern overview.
 """
 
 from __future__ import annotations

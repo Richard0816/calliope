@@ -1,27 +1,97 @@
 """calliope.tabs.preprocess.tab - Tab 1: Input & Preprocess.
 
-Pick working directory (with optional BFS subfolder search depth for
-nested TIFFs), choose one or more TIFFs (multi-selection groups them
-into a single recording), and run preprocessing (shift + QC). Reuses
-existing outputs when present; "Force rerun" overwrites them.
+What the user sees
+------------------
+A simple form with three rows: pick a working directory, pick one or
+more TIFFs inside it (multi-selection groups them into a single
+recording), and click Run. While the worker thread runs, status
+messages stream into the log panel below. When Run finishes, a
+``PreprocessResult`` is published on ``AppState`` so Tab 2 can
+display the QC GIF and Tab 3 can pick up the shifted TIFF.
+
+Why a worker thread
+-------------------
+Preprocessing a 10-minute movie can take 30+ seconds. If we ran it
+on the main (Tk) thread the GUI would freeze. The pattern used here
+shows up in every "long-running" tab in CalLIOPE:
+
+    1. ``_on_run`` (main thread) snapshots the form values into
+       plain Python types.
+    2. It launches a ``threading.Thread`` whose target is a worker
+       function defined inline. That function calls into
+       ``preprocessing.preprocess_tiff(...)`` and pushes log lines
+       and a final result onto a thread-safe ``queue.Queue``.
+    3. ``_drain_log_queue`` (main thread, scheduled with
+       ``self.after(...)``) wakes up every POLL_MS, drains the
+       queue, and writes lines into the log panel. When it sees the
+       "done" sentinel it publishes the result on ``AppState``.
+
+For an R user: same idea as launching a ``future`` in the
+``promises`` package and polling it from Shiny's reactive event
+loop.
+
+Module layout
+-------------
+``PreprocessTab`` (subclass of ``ttk.Frame``)
+    The actual tab widget. ``ttk.Frame`` is just "a container for
+    other widgets" -- subclassing it gives us a Tk widget that *is*
+    a frame and adds our own state + methods on top.
+
+``PARAM_SPEC`` (class attribute)
+    A list of dicts describing every Advanced... knob. Used to
+    auto-build the dialog (see ``gui_common.AdvancedDialog``) and to
+    seed ``self._params`` with default values. Editing the list in
+    one place adds a knob to the dialog AND wires it through to the
+    worker.
+
+Lifecycle
+---------
+    __init__        -- build widgets, subscribe to AppState, prime defaults.
+    _build_ui       -- lay out the Tk widgets.
+    _on_browse      -- folder picker -> update the working directory.
+    _on_run         -- snapshot params, launch the worker thread.
+    _on_advanced    -- pop up the Advanced... dialog.
+    _drain_log_queue-- main-thread polling loop draining the log queue.
 """
 
+# Type-hint forward-reference shim (see pipeline_gui.py).
 from __future__ import annotations
 
+# Threading + queue: the long-running preprocess step runs on a
+# worker thread; we communicate with the GUI thread via a thread-
+# safe FIFO queue.
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
+# ``filedialog`` for the Browse... folder picker;
+# ``messagebox`` for error pop-ups; ``ttk`` for themed widgets.
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+# Re-export shim (see logic.py for what this is). We rename it to
+# ``preprocessing`` so the call sites read like normal code:
+# ``preprocessing.preprocess_tiff(...)``.
 from . import logic as preprocessing
 from .logic import PreprocessResult
 
+# Shared helpers from the top-level GUI common module: the state bus,
+# the advanced-dialog opener, and the "build a defaults dict from
+# PARAM_SPEC" helper.
 from ...gui_common import AppState, open_advanced, spec_defaults
 
 
 class PreprocessTab(ttk.Frame):
+    """Tab 1: pick TIFFs and run the shift + QC preprocess.
+
+    Inherits from ``ttk.Frame`` so an instance is usable as a Tk
+    widget that holds children and can be packed/gridded into the
+    parent notebook.
+    """
+
+    # ``POLL_MS`` is how often (ms) the main-thread log-drain runs.
+    # 80ms ≈ 12 Hz, fast enough to look smooth, slow enough not to
+    # eat CPU.
     POLL_MS = 80
 
     PARAM_SPEC: list = [
@@ -54,13 +124,36 @@ class PreprocessTab(ttk.Frame):
     ]
 
     def __init__(self, master, state: AppState) -> None:
+        """Build the tab.
+
+        ``master`` is the parent Tk widget (the scrollable container
+        wrapper from ``pipeline_gui._make_scrollable_tab``).
+        ``state`` is the shared ``AppState`` event bus -- we'll
+        publish the ``PreprocessResult`` onto it when Run finishes.
+        """
+        # Initialise the parent ``ttk.Frame`` with 10 px of internal
+        # padding. ``super().__init__`` is the standard way to call
+        # the parent class's constructor.
         super().__init__(master, padding=10)
+        # Stash the state bus so the worker callback can publish onto
+        # it later.
         self.state = state
+        # The log queue: worker pushes ('log', line) tuples and a
+        # final ('done', result) sentinel; main thread's
+        # ``_drain_log_queue`` reads them.
         self._log_queue: queue.Queue = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        # ``self._params`` starts as the dict of defaults pulled out
+        # of ``PARAM_SPEC``. The Advanced... dialog mutates this dict
+        # in place when the user clicks OK.
         self._params: dict = spec_defaults(self.PARAM_SPEC)
 
+        # Lay out the widgets.
         self._build_ui()
+        # ``after(ms, callback)`` schedules ``callback`` to run on
+        # the Tk main thread ``ms`` milliseconds from now. We use
+        # this to start the polling loop that drains the log queue
+        # without ever blocking the GUI.
         self.after(self.POLL_MS, self._drain_log_queue)
 
     # -- UI -----------------------------------------------------------------

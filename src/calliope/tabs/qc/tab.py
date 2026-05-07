@@ -1,9 +1,44 @@
 """calliope.tabs.qc.tab - Tab 2: QC preview.
 
-Animated GIF of the shifted movie + blob detection overlaid on the mean
-image. Driven entirely by the AppState ``result`` set by the preprocess
-tab; "Reload from folder..." re-loads outputs from disk for an existing
-recording without re-running preprocessing.
+What the user sees
+------------------
+Two side-by-side panels: an animated GIF of the shifted movie on the
+left, and the mean image with detected blob candidates circled on
+the right. There's a checkbox to pause the animation (which also
+frees the frame buffer for memory-strapped machines) and a "Reload
+from folder..." button to re-load an already-preprocessed recording
+from disk.
+
+How this tab is driven
+----------------------
+Tab 1 publishes a ``PreprocessResult`` on the shared
+``AppState`` whenever it finishes a preprocess run. Tab 2 subscribes
+to that channel in ``__init__`` -- ``state.subscribe(self._on_result)``
+registers ``_on_result`` as a callback that will be invoked from
+Tab 1's worker. ``_on_result`` then materialises the GIF frames into
+``ImageTk.PhotoImage`` objects, displays the mean image, and
+overlays the blob circles.
+
+Memory note
+-----------
+A 5-minute GIF can occupy ~50 MB once each frame has been turned
+into a Tk PhotoImage. The "Animate" checkbox flips between
+"playing animation" (frame buffer in RAM) and "still image only"
+(buffer freed); the ``on_tab_hidden`` hook also unloads the buffer
+when the user switches away.
+
+Class layout
+------------
+``QcTab(ttk.Frame)``
+    The whole tab. Lifecycle:
+        __init__               build widgets, subscribe to AppState.
+        _on_result             callback: arrange the GIF + mean panels.
+        _start_animation       schedule successive ``self.after`` calls
+                                that flip frames in the Label widget.
+        _reload_from_folder    "Reload..." button handler.
+        on_tab_hidden / on_tab_shown
+                                free / re-materialise the frame buffer
+                                when the user navigates between tabs.
 """
 
 from __future__ import annotations
@@ -14,10 +49,14 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 import matplotlib
+# Tell matplotlib to use the Tk-Agg backend BEFORE pyplot is
+# imported; needed so the figure canvas integrates cleanly into Tk.
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+# ``ImageTk.PhotoImage`` is Pillow's bridge into a Tk-displayable
+# image. Each animation frame becomes one PhotoImage.
 from PIL import Image, ImageTk
 
 from . import logic as preprocessing
@@ -27,14 +66,24 @@ from ...gui_common import AppState, attach_fig_toolbar
 
 
 class QcTab(ttk.Frame):
+    """QC preview: GIF playback on the left, mean+blobs on the right."""
 
-    FRAME_MS = 66   # ~15 fps gif playback in the viewer
+    # Inter-frame delay in milliseconds. 66 ms ≈ 15 fps.
+    FRAME_MS = 66
 
     def __init__(self, master, state: AppState) -> None:
         super().__init__(master, padding=10)
         self.state = state
+        # Pre-materialised list of Tk PhotoImage frames; populated
+        # when the GIF loads, cleared when the user pauses animation
+        # or hides the tab. List is cheap; PhotoImage objects are
+        # not.
         self._gif_frames: list[ImageTk.PhotoImage] = []
+        # Index of the next frame to display.
         self._gif_index = 0
+        # Handle returned by ``self.after(...)`` for the next frame
+        # tick. We hold onto it so we can cancel the pending tick if
+        # the user pauses or hides the tab.
         self._gif_job: Optional[str] = None
         # Remember the GIF source so we can re-materialise frames after
         # the user switches away from this tab and comes back, or after
@@ -46,7 +95,12 @@ class QcTab(ttk.Frame):
         # frame buffer to a single still image, flipping back ON reloads.
         self._gif_animate_var = tk.BooleanVar(value=True)
 
+        # Build the widgets...
         self._build_ui()
+        # ...and subscribe to the preprocess result channel. The
+        # callback will fire when Tab 1 publishes its result, even
+        # if that happens long before the user clicks over to this
+        # tab.
         state.subscribe(self._on_result)
 
     # -- UI -----------------------------------------------------------------

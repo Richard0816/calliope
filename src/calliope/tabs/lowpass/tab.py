@@ -1,9 +1,60 @@
 """calliope.tabs.lowpass.tab - Tab 4: Low-pass filter.
 
-Three panels driven by a cutoff slider (0.01 - 10 Hz):
-    1. FFT power spectrum of the chosen trace.
-    2. Raw dF/F.
-    3. Low-pass dF/F at the slider cutoff.
+What this tab is for
+--------------------
+Calcium imaging traces are noisy at the per-frame level (shot noise
+from photon counting), but real GCaMP transients live at frequencies
+below ~5 Hz. So we low-pass filter to suppress the noise and keep
+the signal. The right cutoff depends on the recording's frame rate,
+the GCaMP variant, and how brief the events of interest are -- so
+this tab makes that choice interactive.
+
+What the user sees
+------------------
+Three panels updating live as you move a cutoff slider:
+    1. FFT power spectrum of the chosen trace, with the cutoff
+       marked as a vertical line. Used to pick the cutoff at the
+       elbow between signal and noise.
+    2. The raw dF/F trace.
+    3. The same trace passed through a causal Butterworth low-pass
+       at the slider cutoff.
+
+The "trace source" radio buttons let the user pick which trace to
+inspect: population mean, median, the most-active ROI, or a manual
+list of Suite2p ROI ids (mean / median aggregation).
+
+When the user is happy, "Compute" runs the same filter + Savitzky-
+Golay first derivative on **every** kept ROI and writes two
+``(T, N_kept)`` memmaps:
+    r0p7_filtered_dff_lowpass.memmap.float32
+    r0p7_filtered_dff_dt.memmap.float32
+Then it publishes ``state.set_lowpass_ready(plane0)`` so Tab 5 picks
+up automatically.
+
+Class layout
+------------
+``LowpassTab(ttk.Frame)``
+    ``CUTOFF_MIN`` / ``CUTOFF_MAX`` / ``CUTOFF_DEFAULT``
+        Slider bounds and starting value (also exposed in PARAM_SPEC
+        so power users can override).
+    ``PARAM_SPEC``
+        Butterworth order, SG window length / polynomial, slider
+        bounds.
+    ``__init__``
+        Subscribes to ``state.subscribe_plane0`` so it knows when a
+        Suite2p detection has finished and the dF/F memmap is on
+        disk.
+    ``_on_slider_drag``
+        Slider callback: redraws panel 3 + panel 1 cutoff line in
+        real time. Debounced via ``_slider_job`` so dragging doesn't
+        recompute on every pixel of motion.
+    ``_on_compute``
+        Worker-thread launcher that filters every ROI and writes the
+        memmaps. Same threading pattern as Tabs 1 / 3.
+
+Default 0.01 - 7 Hz cutoff range; the slider bounds themselves are
+user-tunable from the Advanced dialog (``cutoff_min``/``cutoff_max``
+in PARAM_SPEC).
 
 Trace source can be the population mean, median, the highest-scoring
 ROI, or a user-supplied list / range of original Suite2p ROI ids
@@ -42,13 +93,15 @@ class LowpassTab(ttk.Frame):
         1. FFT power spectrum of the population-mean filtered dF/F.
         2. Population-mean dF/F (raw).
         3. Population-mean dF/F passed through a causal low-pass at
-           the slider's cutoff (0.01 - 10 Hz, default 1 Hz).
+           the slider's cutoff (default 0.01 - 7 Hz, default 1 Hz; the
+           bounds are governed by the ``cutoff_min`` / ``cutoff_max``
+           PARAM_SPEC entries).
     Panel 3 (and the cutoff line on panel 1) update live as the slider
     moves; panels 1 and 2 are computed once when the data loads.
     """
 
     CUTOFF_MIN = 0.01
-    CUTOFF_MAX = 10.0
+    CUTOFF_MAX = 7.0
     CUTOFF_DEFAULT = 1.0
 
     POLL_MS = 80
@@ -63,7 +116,7 @@ class LowpassTab(ttk.Frame):
         {"name": "cutoff_min", "label": "Slider min (Hz)",
          "type": "float", "default": 0.01, "group": "Slider bounds"},
         {"name": "cutoff_max", "label": "Slider max (Hz)",
-         "type": "float", "default": 10.0, "group": "Slider bounds"},
+         "type": "float", "default": 7.0, "group": "Slider bounds"},
     ]
 
     def __init__(self, master, state: AppState) -> None:
@@ -354,8 +407,10 @@ class LowpassTab(ttk.Frame):
 
         self._fps = float(utils.get_fps_from_notes(str(plane0)))
 
-        from fft_all_rois import compute_fft
-        self._fft_xf, self._fft_power = compute_fft(self._mean_dff, self._fps)
+        N = self._mean_dff.size
+        yf = np.fft.rfft(self._mean_dff)
+        self._fft_xf = np.fft.rfftfreq(N, 1.0 / self._fps)
+        self._fft_power = np.abs(yf) ** 2
 
     # -- Slider / entry binding --------------------------------------------
 

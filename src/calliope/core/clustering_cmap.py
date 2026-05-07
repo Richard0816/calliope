@@ -1,15 +1,46 @@
-"""
-Hierarchical clustering with a user-selectable colormap / palette.
+"""Hierarchical clustering of ROI dF/F traces (Tab 6 backend).
 
-Designed as a backend for GUI integration: each step is a small function
-that accepts parameters and returns plain data, so a GUI layer can call
-them independently (load -> cluster -> plot) without re-running work.
+What this file does, in one paragraph
+-------------------------------------
+Cells in a slice are not independent -- groups of them have tightly
+correlated firing patterns ("functional ensembles"). To find those
+groups we (1) compute the pairwise correlation matrix between every
+pair of ROIs, (2) treat ``1 - r`` as a distance, (3) run scipy's
+hierarchical agglomerative clustering with average linkage, and (4)
+either auto-pick a flat-cluster count or let the user slide a
+threshold along the dendrogram. The output is per-cell cluster
+labels -- the same colours then drive both the dendrogram and a
+spatial map of the FOV.
 
-The `palette` argument drives BOTH the dendrogram branch colors and the
-spatial ROI map (they stay in sync). The palette is sampled across its
-full range so that the first and last clusters (furthest apart in the
-dendrogram) land on opposite ends of the colormap and the rest are
-spread in between. The heatmap uses its own `heatmap_cmap`.
+Where to look in the source if you've never used SciPy clustering
+-----------------------------------------------------------------
+* ``scipy.spatial.distance.pdist`` produces a *condensed* distance
+  vector (length ``n*(n-1)/2``); each entry is the distance between
+  one pair of items.
+* ``scipy.cluster.hierarchy.linkage`` consumes that vector and
+  returns a ``(n-1, 4)`` array describing the merge tree -- the
+  agglomerative history. R users will recognise this as the same
+  output ``stats::hclust`` produces.
+* ``scipy.cluster.hierarchy.fcluster`` cuts the tree at a chosen
+  threshold and returns flat cluster labels.
+
+Public surface
+--------------
+``run_clustering(traces, ...)``
+    The end-to-end "compute one clustering" function Tab 6's Render
+    button calls.
+``recluster_branch(linkage_Z, branch_id, ...)``
+    Re-cluster a single dendrogram branch in isolation, used when
+    the user picks one fat cluster and asks for a finer split.
+``auto_choose_threshold(linkage_Z, target_n_clusters)``
+    Heuristic for "find a height that splits the dendrogram into ~N
+    clusters". Used as the default when the user hits Render.
+
+Designed as a backend for GUI integration: each step is a small
+function that accepts parameters and returns plain data, so the GUI
+can call them independently (load -> cluster -> plot) without re-
+running work. For an R reader this layout mirrors ``hclust`` ->
+``cutree`` -> ``plot.dendrogram`` style pipelines.
 """
 
 from __future__ import annotations
@@ -20,13 +51,20 @@ from typing import Iterable, Optional, Sequence, Union
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+# seaborn provides categorical / continuous colour palettes that look
+# nicer than matplotlib's defaults for cluster colouring.
 import seaborn as sns
+# SciPy's hierarchical-clustering primitives. ``linkage`` builds the
+# tree; ``dendrogram`` plots it; ``fcluster`` cuts it at a height;
+# ``set_link_color_palette`` lets us colour branches consistently.
 from scipy.cluster.hierarchy import (
     linkage,
     dendrogram,
     fcluster,
     set_link_color_palette,
 )
+# ``pdist`` returns the condensed pairwise-distance vector consumed
+# by ``linkage``.
 from scipy.spatial.distance import pdist
 
 from . import utils
@@ -45,23 +83,38 @@ CONTINUOUS_PALETTES = [
 AVAILABLE_PALETTES = CATEGORICAL_PALETTES + CONTINUOUS_PALETTES
 
 
+#: Type alias for "anything we'll accept as a palette spec".
+#: Used in function signatures throughout this module so the API
+#: docs stay readable. ``Union[A, B, C]`` is "any of these types";
+#: in Python 3.10+ you can also write ``A | B | C``.
 PaletteLike = Union[str, Iterable[str], mpl.colors.Colormap]
 
 
 def resolve_palette(palette: PaletteLike, n_colors: int = 10) -> list[str]:
-    """
-    Normalize a palette spec into a list of hex color strings spanning
-    the full range of the colormap.
+    """Normalise a palette spec into a list of hex colour strings.
 
-    Accepts:
-      - matplotlib colormap name (e.g. "viridis", "tab10")
-      - a matplotlib Colormap instance
-      - an iterable of color strings (hex, named, RGB tuples)
+    Why we need this
+    ----------------
+    Tab 6 lets the user pick a palette from a dropdown that mixes
+    continuous matplotlib colormaps ("viridis"), categorical seaborn
+    palettes ("tab10"), and explicit user-supplied colour lists.
+    Each of those needs slightly different handling. This helper
+    swallows them all and emits a flat list of ``n_colors`` hex
+    strings spanning the palette's full range -- so the FIRST and
+    LAST clusters in the dendrogram get the most visually different
+    colours.
 
-    For continuous colormaps, `n_colors` samples are drawn evenly from 0
-    to 1, so the first sample lands on one end of the cmap and the last
-    on the other. For qualitative colormaps, colors are taken in order
-    and spread out across the available entries.
+    Accepts
+    -------
+    - ``"viridis"``, ``"tab10"`` etc. -- matplotlib colormap name.
+    - A matplotlib ``Colormap`` instance.
+    - An iterable of colour strings: hex (``"#ff0000"``), named
+      (``"red"``), or RGB tuples.
+
+    For continuous colormaps, ``n_colors`` samples are drawn evenly
+    across [0, 1]. For qualitative ones (``.colors`` attribute), we
+    take entries in order, downsampled if the user asked for fewer
+    than the cmap provides.
     """
     if not isinstance(palette, (str, mpl.colors.Colormap)):
         colors = [mpl.colors.to_hex(c) for c in palette]
@@ -105,7 +158,16 @@ def _resolve_pix_to_um(root: Path, ops: dict) -> Optional[float]:
     if px is not None:
         return float(px)
     try:
-        folder_for_notes = str(Path(root).parent.parent.parent)
+        # Pre-fix this call assumed plane0 sat at
+        # ``<recording_root>/suite2p/plane0`` so three ``.parent``
+        # walks reached the data root that contains the lab notes.
+        # The newer ``sparse_plus_cellpose`` layout puts plane0 at
+        # ``<rec>/detection/final/suite2p/plane0`` so the same walk
+        # would land on the recording's ``detection`` subfolder
+        # instead. Use the robust resolver: walk up to the recording
+        # root, then take its parent (the data root).
+        rec_root = utils.find_recording_root(root)
+        folder_for_notes = str(rec_root.parent)
         zoom = utils.get_zoom_from_notes(folder_for_notes)
         zoom = float(zoom) if zoom else 1.0
         fov_um_x = 3080.90169 / zoom
@@ -115,6 +177,11 @@ def _resolve_pix_to_um(root: Path, ops: dict) -> Optional[float]:
 
 
 def load_dff(root: Path, prefix: str = "r0p7_filtered_") -> np.ndarray:
+    """Open the ``(T, N_kept)`` filtered dF/F memmap for a recording.
+
+    Convenience wrapper around ``utils.s2p_open_memmaps`` that picks
+    just the dF/F array (not the lowpass + derivative siblings).
+    """
     dff, _, _ = utils.s2p_open_memmaps(root, prefix=prefix)[:3]
     if dff.ndim != 2:
         raise ValueError(f"Expected (T, N) ΔF/F array, got shape {dff.shape}")
@@ -126,21 +193,66 @@ def run_clustering(
     method: str = "ward",
     metric: str = "euclidean",
 ) -> np.ndarray:
-    """Z-score per ROI, then linkage on the ROI-by-ROI distance matrix."""
+    """Compute the linkage matrix used to draw a dendrogram.
+
+    Steps:
+        1. Z-score each ROI's trace independently so cells with
+           higher absolute brightness don't dominate the distance.
+        2. Compute the pairwise distance matrix between ROIs in
+           condensed form (``scipy.spatial.distance.pdist``).
+        3. Run hierarchical agglomerative clustering with the chosen
+           ``method`` (Ward by default; the GUI more typically
+           overrides this to "average" with the "correlation" metric
+           for the 1 - Pearson r distance described in the
+           module-level docstring).
+
+    Returns the linkage matrix Z -- shape ``(N-1, 4)`` -- where each
+    row records one merge: ``[cluster_a, cluster_b, distance,
+    cluster_size]``. R users will recognise this as the same data
+    structure ``stats::hclust`` returns under ``$merge`` + ``$height``.
+    """
+    # ``+ 1e-8`` is a tiny epsilon that avoids dividing by zero on a
+    # constant trace (which would otherwise become NaN and poison
+    # the distance matrix).
     dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
+    # ``.T`` transposes (T, N) -> (N, T); ``pdist`` operates on rows.
     dist_matrix = pdist(dff_z.T, metric=metric)
     return linkage(dist_matrix, method=method)
 
 
 def count_leaf_color_groups(Z: np.ndarray, color_threshold: float) -> int:
+    """Count how many distinct branch colours the dendrogram would
+    use at the given cut height fraction.
+
+    ``color_threshold`` is a fraction of ``max(Z[:, 2])`` -- the
+    deepest merge -- so that a single "cut depth" parameter scales
+    naturally across recordings.
+
+    Used internally by ``auto_choose_threshold`` to find a height
+    that produces a target cluster count. ``no_plot=True`` makes
+    ``dendrogram`` skip the actual rendering and just return its
+    metadata.
+    """
     r = dendrogram(Z, no_plot=True, color_threshold=color_threshold * np.max(Z[:, 2]))
+    # ``set(...)`` deduplicates the per-leaf colour assignment to
+    # give a colour count.
     return len(set(r["leaves_color_list"]))
 
 
 def count_clusters(Z: np.ndarray, color_threshold: float) -> int:
-    """Number of distinct clusters below `color_threshold * max(linkage)`."""
+    """Number of distinct flat clusters below ``color_threshold *
+    max(linkage)``.
+
+    Differs from ``count_leaf_color_groups`` because matplotlib's
+    dendrogram renderer can chunk small clusters into a single
+    "above_threshold_color" group; ``fcluster`` gives the actual
+    cluster count.
+    """
+    # Convert fractional cut to absolute distance.
     T = color_threshold * np.max(Z[:, 2])
     labels = fcluster(Z, t=T, criterion="distance")
+    # ``np.unique`` returns sorted unique values; ``len(...)`` is
+    # the count.
     return int(len(np.unique(labels)))
 
 
@@ -151,8 +263,22 @@ def auto_choose_threshold(
     stop: float = 0.05,
     step: float = 0.01,
 ) -> float:
-    """Sweep the cut fraction downward until group count lands in target_counts."""
+    """Heuristic: walk the cut fraction down from ``start`` until the
+    branch-colour count lands in ``target_counts``.
+
+    The default targets (4, 5) match what the lab finds visually
+    useful for typical brain-slice recordings. Returns the fractional
+    cut height; if no value in the sweep produces a target count, we
+    return ``start`` (the user can then drag the slider).
+
+    Tab 6 calls this on first Render so the user sees something
+    reasonable without having to touch the slider.
+    """
+    # ``set(...)`` for fast ``in`` lookup below.
     target_counts = set(target_counts)
+    # Walk from start downward in ``step``-sized decrements.
+    # ``stop - 1e-9`` is a hair below the lower bound so np.arange
+    # actually visits ``stop``.
     for ct in np.arange(start, stop - 1e-9, -step):
         if count_leaf_color_groups(Z, float(ct)) in target_counts:
             return float(ct)

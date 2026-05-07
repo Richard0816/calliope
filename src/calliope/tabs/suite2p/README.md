@@ -1,0 +1,248 @@
+# Tab 3 — Suite2p Detection
+
+**Goal.** Take the shifted TIFF from Tab 1 and produce, per cell:
+- a spatial footprint (which pixels belong to it, with weights),
+- a fluorescence trace `F[t]` over time,
+- a neuropil trace `Fneu[t]` (out-of-focus contamination),
+- a relative-change-from-baseline trace `dF/F[t]`,
+- a default low-pass dF/F and its first time-derivative,
+- a learned "is this really a cell?" classifier verdict.
+
+This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computation (CPU or CuPy GPU), the cell-filter CNN inference, and finally rasterises everything onto the mean image for visual review.
+
+---
+
+## 1. Inputs
+
+- `result.shifted_tiff` (and its sibling shifted TIFFs in the same folder) from Tab 1.
+- A **base ops file** (`<calliope/data>/suite2p_2p_ops_240621.npy`) — the Suite2p ops dictionary that defines per-pixel size, registration knobs, etc. It's *base*; the user's Advanced parameters override individual fields at runtime.
+- A **cell-filter checkpoint** (`.pt`) for the trained `CellFilter` model. Default path is `F:\cellfilter_checkpoints\best.pt`. If absent, the third panel falls back to Suite2p's `iscell.npy`.
+- An **AAV-info CSV** mapping recording stems to AAV/expression metadata (`<calliope/data>/human_SLE_2p_meta.csv`).
+
+---
+
+## 2. Pipeline steps
+
+The tab worker (`Suite2pTab._run_pipeline`) is roughly:
+
+```python
+final_plane0 = sparse_plus_cellpose.run(...)   # ROI detection
+_run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative
+if ckpt_path:
+    _run_cellfilter(final_plane0, ckpt_path)   # PyTorch keep/drop
+_run_filtered_dff(final_plane0)                # slice dF/F to kept ROIs
+```
+
+### Step 1 — `sparse_plus_cellpose.run` (ROI detection)
+
+A union of two complementary detectors. Sparsery is bright-and-bursty; Cellpose is a generalist segmenter that catches morphologically obvious cells which never fired enough during the recording for Sparsery to spot.
+
+**Sparsery (Suite2p built-in detector).** Driven by the ops dict:
+
+| ops key | Default | What it does |
+|---|---|---|
+| `threshold_scaling` | 0.85 | Lower = more ROIs (less stringent). |
+| `high_pass` | 100 frames | Frame-domain high-pass to suppress slow drift before detection. |
+| `smooth_sigma` | 1.0 | Spatial Gaussian smoothing applied during detection. |
+| `max_iterations` | 1500 | Detection loop iteration cap. |
+| `spatial_scale` | 0 (auto) | Suite2p's coarse-to-fine scale parameter. |
+| `preclassify` | 0.0 | Pre-detection classifier threshold (off by default). |
+| `sparse_mode` | True | Use Sparsery (vs the older Cellpose/anatomical pipeline). |
+
+The user can also set `hard_cap` — a safety abort that bails out if Sparsery returns more ROIs than this (default 60,000), since runaway detection usually means the parameters are wrong.
+
+**Cellpose pass.** Run on the **mean image** (default `cellpose_channel_input='meanImg'`). Parameters:
+
+| Param | Default | Notes |
+|---|---|---|
+| `cellpose_model_type` | `cyto2` | Generalist cytoplasm model. |
+| `cellpose_diameter` | 0 | 0 = let Cellpose auto-estimate. |
+| `cellpose_flow_threshold` | 0.8 | Standard Cellpose flow threshold. |
+| `cellpose_cellprob_threshold` | -1.0 | More inclusive than the default 0. |
+
+**Merge.** Each Cellpose ROI is dropped if its overlap with any Sparsery ROI exceeds `max_overlap` (default `0.3`, i.e. 30% of the Cellpose ROI's pixels covered by a Sparsery ROI). The remaining Cellpose ROIs are appended to Sparsery's output to form the final `stat.npy`.
+
+**dF/F per Suite2p convention** is computed downstream (Step 2). Suite2p also produces:
+- `F.npy` — `(N_total, T)` per-ROI raw fluorescence (sum over `xpix/ypix` weighted by `lam`).
+- `Fneu.npy` — `(N_total, T)` neuropil traces.
+- `stat.npy` — list of dicts; each carries `xpix`, `ypix`, `lam`, `med`, `radius`, etc.
+- `ops.npy` — the running ops with mean/max-projection images appended.
+- `iscell.npy` — Suite2p's built-in classifier output (binary + confidence).
+
+The result lives at `<out_dir>/detection/final/suite2p/plane0/`. From here on we call this `plane0`.
+
+### Step 2 — dF/F, low-pass, derivative
+
+The neuropil-corrected, baselined trace per ROI is:
+
+```
+F_corr[t]  = F[i, t] − r · Fneu[i, t]                      # neuropil correction
+F0[t]      = baseline of F_corr (rolling pct OR first-N-min mean)
+dF/F[t]    = (F_corr[t] − F0[t]) / F0[t]                   # relative change
+```
+
+Two **baseline modes** controlled by the radio buttons:
+
+- **Rolling**: `F0[t]` is a rolling 10th-percentile over a `win_sec=45 s` window (`utils.robust_df_over_f_1d`). Sliding-window percentile (`scipy.ndimage.percentile_filter`) tracks slow brightness changes (photobleaching, slice swelling) without being skewed by transients.
+- **First N minutes**: `F0` is a single scalar = the 10th percentile of the first `baseline_min · 60 · fps` frames (`utils.first_n_min_df_over_f_1d`). Best for short recordings where the baseline doesn't drift, and **required** for the GPU path.
+
+`r = 0.7` is the **neuropil correction coefficient** (Chen et al. 2013). Subtracting `0.7×Fneu` removes ~70% of out-of-focus contamination on average; the residual is what's actually from the soma.
+
+After dF/F, the tab pre-computes:
+
+- **Low-pass dF/F** at `default_lowpass_hz = 1.0 Hz`, order-2 causal Butterworth via `utils.lowpass_causal_1d` (see `tabs/lowpass/README.md` for the SOS state-space details).
+- **Savitzky-Golay first derivative** of the low-pass trace, window `default_sg_win_ms = 333 ms`, polynomial order `2`, via `utils.sg_first_derivative_1d`. The output dimension is `dF/F per second`.
+
+These three arrays are written as `(T, N_total)` `float32` memmaps in `plane0/`:
+
+- `r0p7_dff.memmap.float32`
+- `r0p7_dff_lowpass.memmap.float32`
+- `r0p7_dff_dt.memmap.float32`
+
+The `r0p7_` prefix encodes "neuropil coefficient r=0.7" and is hardcoded by older downstream tools (clustering, crosscorr, paper figures); changing it would require updating those.
+
+#### CPU loop
+
+```python
+for i in range(N):
+    trace = F[i] − r·Fneu[i]
+    dff   = first_n_min_df_over_f_1d(trace, ...)  or  robust_df_over_f_1d(trace, ...)
+    lp, _, sos = lowpass_causal_1d(dff, fps, cutoff_hz, order=2, sos=cached)
+    dt  = sg_first_derivative_1d(lp, fps, win_ms=333, poly=2)
+    dff_mm[:, i] = dff
+    lp_mm[:, i]  = lp
+    dt_mm[:, i]  = dt
+```
+
+The Butterworth `sos` is computed once and reused across ROIs.
+
+#### GPU path (`_maybe_run_dff_gpu`)
+
+If `use_gpu_dff` is true **and** `baseline_mode == 'first_n'` **and** `analyze_output_gpu` imports successfully **and** CuPy is available:
+
+```python
+gpu.process_suite2p_traces_gpu(
+    F, Fneu, fps=fps, r=r, baseline_sec=baseline_min*60,
+    cutoff_hz=cutoff_hz, sg_win_ms=..., sg_poly=...,
+    out_dir=plane0, prefix='r0p7_', roi_chunk=None_or_int,
+)
+```
+
+Vectorises the per-ROI loop on GPU and writes the same three memmaps. The rolling baseline is **not** supported on GPU because it requires a windowed percentile filter that doesn't have a clean CuPy implementation.
+
+`gpu_roi_chunk` lets the user split into smaller VRAM chunks if a recording overflows.
+
+### Step 3 — Cell-filter CNN (overview)
+
+Suite2p's built-in `iscell.npy` classifier is noisy across recordings — it tends to keep blood vessels, dendritic clutter, and bright-pixel artefacts. The cell filter is an in-house, hand-trained replacement.
+
+**What it is.** A small **two-branch convolutional neural network** (PyTorch, ~250k parameters) that scores each detected ROI from 0 (artefact) to 1 (real cell). It looks at two things per ROI:
+
+- **Spatial branch** — a 32×32 pixel patch around the ROI's centroid, three channels: the **mean image**, the **max-projection image**, and a **binary mask** showing which pixels Suite2p assigned to this ROI. A 2D CNN compresses this to a 64-d embedding. Real cells look round, bright, and locally distinct; vessels are elongated, dendrites are stringy.
+- **Temporal branch** — the ROI's z-scored dF/F trace. A 1D CNN compresses it to a 64-d embedding. Real cells have transient calcium events; artefacts look like flat noise or slow drift.
+
+The two embeddings are concatenated (128-d) and passed through a small MLP head that outputs a single logit; `sigmoid` gives the cell probability.
+
+**How it's trained.** A `roi_curation.csv` of hand-labelled ROIs (from this lab's recordings) provides positive/negative examples. The training loop uses BCE loss with a positive-class weight to handle class imbalance, splits validation by ROI, augments by random temporal cropping, and selects the best checkpoint by validation AUROC.
+
+**How it's applied here.** The Tab 3 worker:
+
+```python
+from calliope.core.cellfilter.model import CellFilter
+from calliope.core.cellfilter.predict import predict_recording
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+model = CellFilter().to(device); model.load_state_dict(ckpt['model']); model.eval()
+predict_recording(rec_id, model, device, plane0=plane0)
+```
+
+`predict_recording` walks every ROI in the recording and writes:
+- `predicted_cell_prob.npy` — float, length `N_total`, the model's score in `[0, 1]`.
+- `predicted_cell_mask.npy` — boolean, length `N_total`, `True` iff `prob >= 0.5`.
+
+If the checkpoint is missing, the tab logs a warning and the third panel falls back to Suite2p's `iscell.npy[:, 0] > 0`.
+
+→ See [`core/cellfilter/README.md`](../../core/cellfilter/README.md) for the full architecture, dataset construction, training procedure, and inference details.
+
+### Step 4 — Filtered dF/F
+
+`_run_filtered_dff(plane0)`: load `r0p7_dff.memmap.float32` of shape `(T, N_total)`, slice columns by the keep mask, write `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)`. Done in 4096-frame chunks to bound memory.
+
+Also writes `r0p7_cell_mask_bool.npy` (a copy of the keep mask under the legacy filename) so older downstream tools (clustering scripts, paper figures) that hardcode that name keep working.
+
+If the **Also write filtered dF/F as CSV** checkbox is on, `_write_filtered_dff_csv` mirrors the memmap into `r0p7_filtered_dff.csv` with one column per kept ROI, headed `roi_<i>` (the Suite2p index), in 4096-frame chunks. The frame index is preserved as the CSV index.
+
+---
+
+## 3. Outputs (in `plane0/`)
+
+| File | Shape | Notes |
+|---|---|---|
+| `stat.npy` | `(N_total,)` object array of dicts | per-ROI footprint + statistics |
+| `ops.npy` | dict | Suite2p ops + projection images |
+| `F.npy` | `(N_total, T)` | raw per-ROI fluorescence |
+| `Fneu.npy` | `(N_total, T)` | neuropil trace |
+| `iscell.npy` | `(N_total, 2)` | Suite2p classifier (binary + confidence) |
+| `r0p7_dff.memmap.float32` | `(T, N_total)` | dF/F (note: time-major) |
+| `r0p7_dff_lowpass.memmap.float32` | `(T, N_total)` | low-pass at default 1 Hz |
+| `r0p7_dff_dt.memmap.float32` | `(T, N_total)` | SG first derivative |
+| `predicted_cell_mask.npy` | `(N_total,)` bool | cell-filter keep mask |
+| `predicted_cell_prob.npy` | `(N_total,)` float | cell-filter confidence |
+| `r0p7_filtered_dff.memmap.float32` | `(T, N_kept)` | dF/F restricted to kept ROIs |
+| `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | legacy duplicate of the keep mask |
+| `r0p7_filtered_dff.csv` | optional | per-frame CSV view of filtered dF/F |
+
+A summary workbook (`<rec>_summary.xlsx`) with an ROIs sheet is also written via `summary_writer.write_rois_sheet`.
+
+---
+
+## 4. UI panels
+
+1. **Suite2p console** — captures stdout/stderr from the worker (`QueueWriter` + `contextlib.redirect_stdout`).
+2. **Detected ROIs (raw Suite2p output)** — overlays a `nipy_spectral` label image on a chosen background (`meanImgE` by default; user can switch to `meanImg`, `max_proj`, `Vcorr`, `refImg`, `meanImg_chan2`).
+3. **After cell-filter** — same background; if `predicted_cell_prob.npy` is present, overlays a `viridis` heatmap of `prob ∈ [0.5, 1.0]` so you can see *how confident* the classifier is per ROI. Otherwise overlays the keep set in `nipy_spectral`.
+
+---
+
+## 5. Parameters (full list)
+
+```
+Sparsery:
+  threshold_scaling=0.85, high_pass=100, smooth_sigma=1.0,
+  max_iterations=1500, spatial_scale=0, preclassify=0.0,
+  hard_cap=60000
+
+Cellpose:
+  model=cyto2, diameter=0, flow_threshold=0.8,
+  cellprob_threshold=-1.0
+Merge:
+  max_overlap=0.3
+
+dF/F:
+  fps_override=0 (0=auto from notes via get_fps_from_notes; falls back to 15.07),
+  neuropil_coef r = 0.7, baseline_pct = 10, win_sec = 45 (rolling)
+
+Default lowpass / derivative:
+  cutoff = 1.0 Hz, sg_win_ms = 333, sg_poly = 2
+
+GPU:
+  use_gpu_dff = True, gpu_roi_chunk = 0 (0=all)
+```
+
+Baseline mode (radio): `rolling` (45 s rolling 10th pct) or `first_n` (first N minutes mean of 10th pct).
+
+---
+
+## 6. Re-implementation checklist
+
+1. Wire up Suite2p (https://github.com/MouseLand/suite2p) and Cellpose (https://github.com/MouseLand/cellpose). The merge needs a per-ROI footprint set (each cell knows its `xpix`, `ypix`, `lam`).
+2. Compute the union with the overlap drop: for each Cellpose ROI, if any Sparsery ROI shares >`max_overlap` of its pixels, discard the Cellpose ROI; otherwise append it to the final ROI list.
+3. Implement both dF/F baselines:
+   - **Rolling**: `scipy.ndimage.percentile_filter(F_corr, size=(45·fps)|1, percentile=10, mode='nearest')`, eps = `max(percentile(F0, 1), 1e-9)`.
+   - **First-N-minute**: scalar `F0 = percentile(F_corr[:N_baseline], 10)` where `N_baseline = round(baseline_min · 60 · fps)`; eps = `max(F0, 1e-9)`.
+4. Implement the causal Butterworth low-pass via `scipy.signal.butter(order=2, btype='low', output='sos')` + `sosfilt`, initialising `zi` to the first sample to avoid a startup transient.
+5. Implement the SG derivative via `scipy.signal.savgol_filter(x, window_length=odd, polyorder=2, deriv=1, delta=1/fps)`.
+6. Train (or load) a small CNN that takes the dF/F + footprint of an ROI and outputs `P(real cell)`. Save mask and prob to `predicted_cell_mask.npy`, `predicted_cell_prob.npy`. Fall back to `iscell.npy[:,0] > 0` if no model.
+7. Slice the dF/F memmap by the keep mask in chunks (≤ 4096 frames at a time) to write `r0p7_filtered_dff.memmap.float32`.
+8. Honour the on-disk filename conventions exactly — every later tab and figure script reads `r0p7_filtered_dff.memmap.float32` and `predicted_cell_mask.npy` by name.
