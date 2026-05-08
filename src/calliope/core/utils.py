@@ -1546,6 +1546,65 @@ def s2p_load_raw(root: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, int, i
     return F, Fneu, num_frames, num_rois, time_major
 
 
+def s2p_load_spks(plane0: Union[str, Path],
+                  kept_idx: np.ndarray) -> np.ndarray:
+    """Read Suite2p's ``spks.npy`` and subset it to a chosen set of
+    ROIs.
+
+    What ``spks.npy`` is
+    --------------------
+    Suite2p's deconvolution step (OASIS) produces a per-ROI sparse
+    estimate of when each cell fired. Mostly zero with isolated
+    non-zero peaks marking the deconvolved spikes. Tabs 5 and 8 both
+    expose toggles to use this signal instead of the hysteresis-onset
+    detector.
+
+    Layout / orientation
+    --------------------
+    Modern Suite2p saves ``(N_total, T)``; some older variants save
+    the transpose ``(T, N_total)``. We auto-detect by which axis can
+    accommodate ``kept_idx.max()``.
+
+    Parameters
+    ----------
+    plane0 : path-like
+        The Suite2p plane0 folder.
+    kept_idx : 1-D int array
+        Suite2p ROI ids to keep -- typically the cell-filter pass
+        intersected with any manual subset Tab 5 applied. ``spks_full``
+        is sliced along the ROI axis by this array.
+
+    Returns
+    -------
+    spks : (T, N_kept) float32 ndarray
+        Always ``(T, N_kept)``-shaped regardless of the on-disk
+        orientation. ``np.ascontiguousarray`` so subsequent vectorised
+        slicing isn't slowed down by stride pessimism.
+
+    Raises
+    ------
+    FileNotFoundError if ``spks.npy`` is missing.
+    ValueError if its shape doesn't have exactly two axes.
+    """
+    plane0 = Path(plane0)
+    spks_path = plane0 / "spks.npy"
+    if not spks_path.exists():
+        raise FileNotFoundError(spks_path)
+    kept_idx = np.asarray(kept_idx, dtype=int)
+    spks_full = np.load(spks_path)
+    if spks_full.ndim != 2:
+        raise ValueError(
+            f"Unexpected spks.npy shape {spks_full.shape}")
+    # Pick whichever axis matches the kept-ROI range.
+    n_rois_axis = (0 if spks_full.shape[0] >= int(kept_idx.max()) + 1
+                   else 1)
+    if n_rois_axis == 0:
+        spks = spks_full[kept_idx, :].T            # (T, N_kept)
+    else:
+        spks = spks_full[:, kept_idx]              # (T, N_kept)
+    return np.ascontiguousarray(spks, dtype=np.float32)
+
+
 def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.memmap, np.memmap, np.memmap, int, int]:
     """Open the three dF/F memmaps written by Tab 3 / Tab 4.
 

@@ -1,0 +1,415 @@
+"""Headless Suite2p detection pipeline (Tab 3) for batch execution.
+
+Why this module exists
+----------------------
+Tab 3's ``_run_pipeline`` chains five steps -- sparse_plus_cellpose
+detection, pix_to_um stamping, dF/F + low-pass, cell-filter
+prediction, filtered-dF/F slicing -- with all logic living on the
+``Suite2pTab`` class. Tab 0's batch runner needs the same pipeline
+without a Tk window, so we lift the chain into module-level
+functions.
+
+Public surface
+--------------
+``run_detection(tiff_folder, save_folder, params, *, ckpt_path=None,
+                rec_id=None, baseline_mode='first_n', baseline_min=2.0,
+                figures_dir=None, progress_cb=None)``
+    End-to-end Tab 3 pipeline. Returns ``{plane0, output_files}``.
+``compute_dff_memmaps(plane0, params, ...)``
+    The dF/F + low-pass + derivative loop.
+``compute_filtered_dff(plane0)``
+    Slice the cell-filter mask out of the per-ROI dF/F into the
+    "filtered" memmap consumed by Tabs 4-8.
+``predict_cell_filter(plane0, ckpt_path, rec_id)``
+    Run the cell-filter CNN. Optional step.
+``stamp_pix_to_um(plane0, params)``
+    Resolve ``params['scope_zoom']`` / ``params['um_per_pixel']`` and
+    write ``ops['pix_to_um']`` for downstream tabs.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+
+from . import utils
+from . import scale as scale_mod
+from . import sparse_plus_cellpose as spc
+
+
+def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
+    """Resolve and store the µm/pixel calibration on ``ops.npy``.
+    Returns the resolved scalar (or None when both inputs were 0).
+    """
+    zoom = params.get("scope_zoom", 0.0) or None
+    um_px = params.get("um_per_pixel", 0.0) or None
+    if zoom is None and um_px is None:
+        return None
+    ops_path = plane0 / "ops.npy"
+    if not ops_path.exists():
+        return None
+    ops = np.load(ops_path, allow_pickle=True).item()
+    try:
+        resolved = scale_mod.resolve_pix_to_um(
+            ops, zoom=zoom, um_per_pixel=um_px,
+        )
+    except (TypeError, ValueError):
+        return None
+    if resolved is None:
+        return None
+    ops["pix_to_um"] = float(resolved)
+    np.save(ops_path, ops, allow_pickle=True)
+    return float(resolved)
+
+
+def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
+                      baseline_mode: str, baseline_min: float,
+                      fps: float, cutoff_hz: float, sg_win_ms: int,
+                      sg_poly: int, r: float) -> bool:
+    """GPU dF/F via ``analyze_output_gpu``. Returns True on success.
+
+    Mirrors ``Suite2pTab._maybe_run_dff_gpu``: only kicks in when
+    ``use_gpu_dff`` is set, the baseline is ``first_n``, and CuPy is
+    importable.
+    """
+    if not bool(params.get("use_gpu_dff", True)):
+        return False
+    if baseline_mode != "first_n":
+        return False
+    try:
+        import analyze_output_gpu as gpu
+    except Exception:
+        return False
+    if not getattr(gpu, "_CUPY_OK", False):
+        return False
+
+    F = np.load(plane0 / "F.npy", allow_pickle=False)
+    Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
+    roi_chunk = int(params.get("gpu_roi_chunk", 0)) or None
+    try:
+        gpu.process_suite2p_traces_gpu(
+            F, Fneu, fps=fps, r=r,
+            baseline_sec=float(baseline_min) * 60.0,
+            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
+            out_dir=str(plane0), prefix="r0p7_",
+            roi_chunk=roi_chunk,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def compute_dff_memmaps(
+    plane0: Path,
+    params: dict,
+    *,
+    baseline_mode: str = "first_n",
+    baseline_min: float = 2.0,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Compute neuropil-corrected dF/F + low-pass + SG derivative for
+    every Suite2p ROI. Writes::
+
+        plane0/r0p7_dff.memmap.float32          (T, N)
+        plane0/r0p7_dff_lowpass.memmap.float32  (T, N)
+        plane0/r0p7_dff_dt.memmap.float32       (T, N)
+
+    Tries the GPU path first when ``params.use_gpu_dff`` is enabled
+    and the baseline is ``first_n``. Falls back to per-ROI CPU.
+    """
+    plane0 = Path(plane0)
+    F = np.load(plane0 / "F.npy", allow_pickle=False)
+    Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
+    if F.shape != Fneu.shape or F.ndim != 2:
+        raise ValueError(
+            f"unexpected F/Fneu shapes: {F.shape}, {Fneu.shape}")
+    F = np.asarray(F, dtype=np.float32, order="C")
+    Fneu = np.asarray(Fneu, dtype=np.float32, order="C")
+    N, T = F.shape
+
+    fps_override = float(params.get("fps_override", 0.0) or 0.0)
+    fps = (fps_override if fps_override > 0
+           else float(utils.get_fps_from_notes(str(plane0))))
+
+    cutoff_hz = float(params.get("default_lowpass_hz", 1.0))
+    sg_win_ms = int(params.get("default_sg_win_ms", 333))
+    sg_poly = int(params.get("default_sg_poly", 2))
+    r = float(params.get("neuropil_coef", 0.7))
+    perc = int(params.get("perc", 10))
+    win_sec = float(params.get("win_sec", 45.0))
+
+    if _maybe_run_dff_gpu(
+            plane0, params, baseline_mode=baseline_mode,
+            baseline_min=baseline_min, fps=fps,
+            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms,
+            sg_poly=sg_poly, r=r):
+        return {"fps": fps, "T": T, "N": N, "path": "gpu"}
+
+    shape = (T, N)
+    dff_path = plane0 / "r0p7_dff.memmap.float32"
+    lp_path = plane0 / "r0p7_dff_lowpass.memmap.float32"
+    dt_path = plane0 / "r0p7_dff_dt.memmap.float32"
+    dff_mm = np.memmap(str(dff_path), mode="w+", dtype="float32", shape=shape)
+    lp_mm = np.memmap(str(lp_path), mode="w+", dtype="float32", shape=shape)
+    dt_mm = np.memmap(str(dt_path), mode="w+", dtype="float32", shape=shape)
+
+    batch = max(8, utils.change_batch_according_to_free_ram() * 20)
+    sos = None
+    t0 = time.time()
+    for i0 in range(0, N, batch):
+        i1 = min(N, i0 + batch)
+        for i in range(i0, i1):
+            trace = (F[i, :] - r * Fneu[i, :]).astype(np.float32)
+            if baseline_mode == "first_n":
+                dff = utils.first_n_min_df_over_f_1d(
+                    trace, baseline_min=baseline_min,
+                    perc=perc, fps=fps)
+            else:
+                dff = utils.robust_df_over_f_1d(
+                    trace, win_sec=win_sec, perc=perc, fps=fps)
+            lp, _, sos = utils.lowpass_causal_1d(
+                dff, fps=fps, cutoff_hz=cutoff_hz,
+                order=2, zi=None, sos=sos)
+            dt = utils.sg_first_derivative_1d(
+                lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
+            dff_mm[:, i] = dff
+            lp_mm[:, i] = lp
+            dt_mm[:, i] = dt
+        dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
+        if progress_cb is not None:
+            progress_cb(
+                f"dF/F batch {i0}-{i1 - 1}/{N - 1} "
+                f"({time.time() - t0:.1f}s)")
+    del dff_mm, lp_mm, dt_mm
+    return {"fps": fps, "T": T, "N": N, "path": "cpu"}
+
+
+def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
+    """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
+    ``predicted_cell_prob.npy`` into ``plane0``.
+    """
+    import torch
+    from .cellfilter.model import CellFilter
+    from .cellfilter.predict import predict_recording
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model = CellFilter().to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    predict_recording(rec_id, model, device, plane0=plane0)
+
+
+def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
+    """predicted_cell_mask -> iscell -> all-ones."""
+    mask_path = plane0 / "predicted_cell_mask.npy"
+    if mask_path.exists():
+        return np.load(mask_path).astype(bool)
+    iscell_path = plane0 / "iscell.npy"
+    if iscell_path.exists():
+        ic = np.load(iscell_path)
+        return ((ic[:, 0] > 0) if ic.ndim == 2
+                else (ic > 0)).astype(bool)
+    return np.ones(n_total, dtype=bool)
+
+
+def compute_filtered_dff(plane0: Path) -> Optional[Path]:
+    """Slice ``r0p7_dff.memmap.float32`` down to ROIs that pass the
+    cell-filter mask and write ``r0p7_filtered_dff.memmap.float32``
+    plus the legacy ``r0p7_cell_mask_bool.npy`` keep-mask file.
+    Returns the filtered memmap path (or None if no ROIs survive).
+    """
+    plane0 = Path(plane0)
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+
+    mask = _load_keep_mask(plane0, N_total)
+    N_kept = int(mask.sum())
+    if N_kept == 0:
+        return None
+
+    dff_path = plane0 / "r0p7_dff.memmap.float32"
+    filtered_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    dff = np.memmap(str(dff_path), dtype="float32", mode="r",
+                    shape=(T, N_total))
+    filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
+                     shape=(T, N_kept))
+    chunk = max(1, min(T, 4096))
+    for t0 in range(0, T, chunk):
+        t1 = min(T, t0 + chunk)
+        filt[t0:t1, :] = dff[t0:t1, :][:, mask]
+    filt.flush()
+    del filt, dff
+    np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
+    return filtered_path
+
+
+def _build_sparsery_ops(params: dict) -> dict:
+    """Mirror ``Suite2pTab._run_pipeline`` Sparsery dict assembly."""
+    return {
+        "high_pass":         params.get("high_pass", 100),
+        "preclassify":       params.get("preclassify", 0.0),
+        "smooth_sigma":      params.get("smooth_sigma", 1.0),
+        "sparse_mode":       True,
+        "spatial_scale":     params.get("spatial_scale", 0),
+        "threshold_scaling": params.get("threshold_scaling", 0.85),
+        "max_iterations":    params.get("max_iterations", 1500),
+    }
+
+
+def _build_cellpose_cfg(params: dict) -> dict:
+    return {
+        "cellpose_model_type":
+            params.get("cellpose_model_type", "cyto2"),
+        "cellpose_diameter":
+            params.get("cellpose_diameter", 0),
+        "cellpose_flow_threshold":
+            params.get("cellpose_flow_threshold", 0.8),
+        "cellpose_cellprob_threshold":
+            params.get("cellpose_cellprob_threshold", -1.0),
+        "cellpose_channel_input": "meanImg",
+    }
+
+
+def _render_detection_panels(plane0: Path, figures_dir: Path) -> list[str]:
+    """Save the same detection-overlay panels Tab 3's ``_draw_panels``
+    produces (mean-image + ROI overlays) as PNGs. Falls back gracefully
+    if any background image is missing.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+    stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+    n_total = len(stat)
+    keep = _load_keep_mask(plane0, n_total)
+
+    bg = None
+    for key in ("meanImg", "meanImgE", "max_proj", "Vcorr"):
+        img = ops.get(key)
+        if isinstance(img, np.ndarray) and img.ndim == 2:
+            bg = np.asarray(img, dtype=np.float32)
+            break
+    if bg is None:
+        return written
+
+    for label, mask, color in (
+            ("all_rois", np.ones(n_total, dtype=bool), "tab:cyan"),
+            ("kept_rois", keep, "tab:orange"),
+    ):
+        fig = plt.Figure(figsize=(6, 6), tight_layout=True)
+        ax = fig.add_subplot(111)
+        lo, hi = np.percentile(bg, [1, 99])
+        ax.imshow(bg, cmap="gray", vmin=lo, vmax=hi, aspect="equal")
+        for i, s in enumerate(stat):
+            if not mask[i]:
+                continue
+            ys = np.asarray(s.get("ypix", []))
+            xs = np.asarray(s.get("xpix", []))
+            if ys.size == 0:
+                continue
+            ax.scatter(xs, ys, s=0.4, c=color, alpha=0.5,
+                       linewidths=0)
+        ax.set_title(f"{label}  (n={int(mask.sum())})")
+        ax.set_axis_off()
+        out = figures_dir / f"{label}.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        written.append(str(out))
+    return written
+
+
+def run_detection(
+    tiff_folder: str,
+    save_folder: str,
+    params: dict,
+    *,
+    path_to_ops: Optional[str] = None,
+    aav_info_csv: Optional[str] = None,
+    tau_override: Optional[float] = None,
+    ckpt_path: Optional[str] = None,
+    rec_id: Optional[str] = None,
+    baseline_mode: str = "first_n",
+    baseline_min: float = 2.0,
+    figures_dir: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Run the full Tab 3 pipeline for one recording.
+
+    Steps:
+      1. ``sparse_plus_cellpose.run`` -> plane0.
+      2. Stamp ``ops['pix_to_um']`` from ``params['scope_zoom']`` /
+         ``params['um_per_pixel']``.
+      3. ``compute_dff_memmaps`` -> r0p7_dff* memmaps.
+      4. ``predict_cell_filter`` -> predicted_cell_mask.npy / prob.
+         (skipped when ``ckpt_path`` is None or empty)
+      5. ``compute_filtered_dff`` -> r0p7_filtered_dff.memmap.
+
+    Returns ``{plane0: Path, fps: float, T: int, N: int,
+    pix_to_um: float|None, figures: list[str]}``.
+    """
+    if progress_cb is not None:
+        progress_cb("[detection] running sparse_plus_cellpose...")
+    sparsery_ops = _build_sparsery_ops(params)
+    cellpose_cfg = _build_cellpose_cfg(params)
+    hard_cap = int(params.get("hard_cap", 60000))
+    max_overlap = float(params.get("max_overlap", 0.3))
+
+    plane0 = spc.run(
+        tiff_folder=str(tiff_folder),
+        save_folder=str(save_folder),
+        path_to_ops=path_to_ops,
+        sparsery_ops=sparsery_ops,
+        cellpose_cfg=cellpose_cfg,
+        hard_cap=hard_cap,
+        max_overlap=max_overlap,
+        aav_info_csv=aav_info_csv,
+        tau_vals=spc.DEFAULT_TAU_VALS,
+        tau_override=tau_override,
+        verbose=True,
+    )
+    plane0 = Path(plane0)
+
+    pix_to_um = stamp_pix_to_um(plane0, params)
+
+    if progress_cb is not None:
+        progress_cb("[detection] computing dF/F + low-pass + derivative...")
+    dff_info = compute_dff_memmaps(
+        plane0, params,
+        baseline_mode=baseline_mode, baseline_min=baseline_min,
+        progress_cb=progress_cb,
+    )
+
+    if ckpt_path:
+        if progress_cb is not None:
+            progress_cb("[detection] running cell-filter prediction...")
+        predict_cell_filter(plane0, ckpt_path, rec_id or plane0.parent.name)
+
+    if progress_cb is not None:
+        progress_cb("[detection] writing filtered dF/F...")
+    compute_filtered_dff(plane0)
+
+    figs: list[str] = []
+    if figures_dir is not None:
+        try:
+            figs = _render_detection_panels(plane0, Path(figures_dir))
+        except Exception as e:
+            if progress_cb is not None:
+                progress_cb(f"[detection] figure render failed: {e}")
+
+    return {
+        "plane0": plane0,
+        "fps": dff_info["fps"],
+        "T": dff_info["T"],
+        "N": dff_info["N"],
+        "pix_to_um": pix_to_um,
+        "figures": figs,
+    }

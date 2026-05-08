@@ -20,7 +20,19 @@ From `plane0/` (after Tabs 3 + 4):
 
 ## 2. Pipeline steps
 
-The render worker (`EventDetectionTab._compute_render_data`) goes through these stages.
+The render worker (`EventDetectionTab._compute_render_data`) delegates the
+entire compute body to
+`core.event_detection_run.run_event_detection(plane0, params, *,
+figures_dir=None, write_summary=True, progress_cb=None)`. The same call
+is what Tab 0's batch worker invokes — there's a single source of truth
+for the per-ROI hysteresis + population-event detection.
+
+When `figures_dir` is set, `run_event_detection` saves
+`heatmap.png` / `raster.png` / `event_detection.png` (the same three
+plots the GUI shows live). When `write_summary` is True (default for
+batch; False inside the interactive tab, since the tab triggers its own
+`_write_summary` after rendering), it also appends the `EventWindows`,
+`EventOnsets`, and `RoiEventTimes` sheets to `<plane0>/calliope_summary.xlsx`.
 
 ### Step 0 — (Optional) manual ROI subset
 

@@ -25,6 +25,8 @@ If multiple TIFFs are selected, they are treated as **one continuous recording**
 
 The driver function for a single TIFF is `preprocess_tiff` in `core/preprocessing.py`. For groups it's `preprocess_tiff_group`. Both run the same four logical steps; the group version replaces step 1 with a two-pass scan-then-write, and step 3 sums frame-counts across files for the mean.
 
+> **Headless entry point.** `core/preprocess_run.py:run_preprocess(src_tiffs, data_root, params, *, recording_name=None, figures_dir=None, progress_cb=None)` picks single vs grouped automatically and copies the QC GIF into `figures_dir` if provided. Tab 0's batch pipeline calls this; the interactive Tab 1 still calls `preprocess_tiff{,_group}` directly.
+
 ### Step 1 — Shift to non-negative uint16
 
 For Suite2p, pixel values must fit in `uint16` (range `[0, 65535]`). Raw frames may have negative values, so we shift the entire stack by `−min(stack)` (which is `0` if the min is already non-negative).

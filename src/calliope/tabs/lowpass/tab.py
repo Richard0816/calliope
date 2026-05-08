@@ -582,48 +582,25 @@ class LowpassTab(ttk.Frame):
 
     def _run_compute(self, plane0: Path, T: int, N: int,
                      fps: float, cutoff: float) -> None:
-        """Causal lowpass + SG first derivative, per ROI, written into
-        r0p7_filtered_dff_lowpass.memmap.float32 and
-        r0p7_filtered_dff_dt.memmap.float32 (both shape (T, N) float32).
+        """Causal low-pass + SG first derivative for every kept ROI.
+
+        Delegates the actual work to
+        :func:`calliope.core.lowpass_run.compute_lowpass_and_dt` so the
+        same code path is used by Tab 0's batch runner. ``T``/``N``
+        are accepted for the existing signature but are re-resolved
+        inside the helper.
         """
-        from . import logic as utils
-        src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
-        if not src_path.exists():
-            raise FileNotFoundError(
-                f"Missing {src_path.name}; run tab 3 first.")
-        src = np.memmap(str(src_path), dtype="float32", mode="r",
-                        shape=(T, N))
-
-        lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
-        dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
-        lp_mm = np.memmap(str(lp_path), dtype="float32", mode="w+",
-                          shape=(T, N))
-        dt_mm = np.memmap(str(dt_path), dtype="float32", mode="w+",
-                          shape=(T, N))
-
-        sg_win_ms = int(self._params.get("sg_win_ms", 333))
-        sg_poly = int(self._params.get("sg_poly", 2))
-        order = int(self._params.get("filter_order", 2))
-        sos = None
-        report_every = max(1, N // 20)
-        t0 = time.time()
-        for i in range(N):
-            trace = np.asarray(src[:, i], dtype=np.float32)
-            lp, _, sos = utils.lowpass_causal_1d(
-                trace, fps=fps, cutoff_hz=cutoff, order=order,
-                zi=None, sos=sos)
-            dt = utils.sg_first_derivative_1d(
-                lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
-            lp_mm[:, i] = lp
-            dt_mm[:, i] = dt
-            if (i + 1) % report_every == 0:
-                self._compute_queue.put(
-                    ("status",
-                     f"{i + 1}/{N} ROIs ({time.time() - t0:.1f}s)"))
-
-        lp_mm.flush()
-        dt_mm.flush()
-        del lp_mm, dt_mm, src
+        del T, N  # re-derived inside the helper
+        from ...core.lowpass_run import compute_lowpass_and_dt
+        compute_lowpass_and_dt(
+            plane0,
+            fps=fps,
+            cutoff_hz=cutoff,
+            filter_order=int(self._params.get("filter_order", 2)),
+            sg_win_ms=int(self._params.get("sg_win_ms", 333)),
+            sg_poly=int(self._params.get("sg_poly", 2)),
+            progress_cb=lambda msg: self._compute_queue.put(("status", msg)),
+        )
 
     def _drain_compute_queue(self) -> None:
         try:

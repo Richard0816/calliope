@@ -21,6 +21,16 @@ From `plane0/`:
 
 ## 2. Pipeline steps
 
+> **Headless entry point.** The xcorr math (`run_cluster_xcorr_full_fast`
+> and `run_cluster_xcorr_per_event_fast` in `core/crosscorrelation.py`)
+> was already callable without Tk. `core/crosscorrelation_run.py` adds a
+> thin batch-friendly wrapper (`run_crosscorrelation(plane0, params, *,
+> event_windows=None, figures_dir=None, progress_cb=None)`) that drives
+> both the full-recording and per-event runs and saves `full.png` /
+> `per_event.png` violin plots (same layout the GUI shows in Tab 7).
+> Tab 0's batch worker uses this; Tab 7 still spawns its own worker
+> threads + interactive filters.
+
 ### Step 1 — Open dF/F and the cluster files
 
 `_open_dff_memmap(plane0, prefix)`:

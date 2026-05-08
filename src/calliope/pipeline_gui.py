@@ -67,6 +67,7 @@ from .gui_common import AppState
 # front so that PipelineApp.__init__ can wire them into the notebook.
 from .tabs.preprocess.tab import PreprocessTab
 from .tabs.qc.tab import QcTab
+from .tabs.batch.tab import BatchTab
 from .tabs.suite2p.tab import Suite2pTab
 from .tabs.lowpass.tab import LowpassTab
 from .tabs.event_detection.tab import EventDetectionTab
@@ -306,6 +307,7 @@ class PipelineApp(tk.Tk):
         # Build all eight tabs. Each ``add(...)`` call returns the tab
         # *instance*, which we keep on ``self`` so that other code (or
         # tests) can poke at it later.
+        self.batch_tab = add(BatchTab, "0. Batch runner")
         self.preprocess_tab = add(PreprocessTab, "1. Input & Preprocess")
         self.qc_tab = add(QcTab, "2. QC Preview")
         self.detection_tab = add(Suite2pTab, "3. Suite2p Detection")
@@ -320,6 +322,7 @@ class PipelineApp(tk.Tk):
         # buffer) when the user switches away. Tabs without these methods
         # are simply skipped.
         self._tabs_in_order = [
+            self.batch_tab,
             self.preprocess_tab, self.qc_tab, self.detection_tab,
             self.lowpass_tab, self.event_tab, self.clustering_tab,
             self.xcorr_tab, self.spatial_tab,

@@ -23,6 +23,14 @@ The tab subscribes to the AppState `plane0` broadcast so it auto-loads when Tab 
 
 ## 2. Pipeline steps
 
+> **Headless entry point.** `core/lowpass_run.py` exposes
+> `compute_lowpass_and_dt(plane0, fps, cutoff_hz, ...)` (the per-ROI compute
+> loop), `render_lowpass_figures(plane0, ..., figures_dir)` (saves
+> `fft.png` / `raw_dff.png` / `lowpass_dff.png` for the population-mean
+> trace), and `run_lowpass(plane0, params, figures_dir=None, progress_cb=None)`
+> (compute + figures). Tab 4's `_run_compute` delegates to
+> `compute_lowpass_and_dt`, so the GUI and batch worker share one code path.
+
 ### Step 1 — Choose a representative trace
 
 The "Trace source" radio + entry chooses what to compute the FFT and live previews on:

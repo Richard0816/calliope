@@ -196,6 +196,17 @@ class Suite2pTab(ttk.Frame):
          "type": "int", "default": 333, "group": "Default low-pass"},
         {"name": "default_sg_poly", "label": "SG polynomial order",
          "type": "int", "default": 2, "group": "Default low-pass"},
+        # Pixel <-> micrometre calibration (written to ops['pix_to_um']
+        # after detection so Tabs 6 & 7 render spatial plots in µm).
+        # Direct override wins over zoom; leave both at 0 to skip and
+        # render in raw pixels.
+        {"name": "scope_zoom", "label": "Scope zoom (0=skip)",
+         "type": "float", "default": 0.0, "group": "Pixel scale",
+         "help": "compute pix_to_um as (FOV_um / zoom) / Lx using the "
+                 "lab reference FOV (3080.9 µm at 1x)"},
+        {"name": "um_per_pixel", "label": "µm per pixel direct (0=skip)",
+         "type": "float", "default": 0.0, "group": "Pixel scale",
+         "help": "explicit calibration; takes priority over scope_zoom"},
         # GPU dF/F via analyze_output_gpu (CuPy)
         {"name": "use_gpu_dff", "label": "Use GPU for dF/F",
          "type": "bool", "default": True, "group": "GPU",
@@ -581,6 +592,8 @@ class Suite2pTab(ttk.Frame):
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
             self._log_queue.put(("plane0", final_plane0))
 
+            self._stamp_pix_to_um(final_plane0, params)
+
             self._run_dff(final_plane0, baseline_mode, baseline_min)
 
             if ckpt_path:
@@ -589,6 +602,42 @@ class Suite2pTab(ttk.Frame):
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
+
+    def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
+        """Write the resolved µm-per-pixel onto ``plane0/ops.npy``.
+
+        Tabs 6 (clustering colormap) and 7 (spatial propagation) read
+        ``ops['pix_to_um']`` to render spatial axes in µm. We resolve
+        from either the user-supplied direct calibration or the scope
+        zoom (combined with the recording's ``Lx``) and stamp the
+        result so downstream tabs are oblivious to the source.
+
+        Skipped silently if the user left both inputs at 0.
+        """
+        from ...core.scale import resolve_pix_to_um
+        zoom = params.get("scope_zoom", 0.0) or None
+        um_px = params.get("um_per_pixel", 0.0) or None
+        if zoom is None and um_px is None:
+            return
+        ops_path = plane0 / "ops.npy"
+        if not ops_path.exists():
+            print(f"[GUI] pix_to_um: ops.npy not found at {ops_path}; "
+                  "skipping calibration stamp")
+            return
+        ops = np.load(ops_path, allow_pickle=True).item()
+        try:
+            resolved = resolve_pix_to_um(
+                ops, zoom=zoom, um_per_pixel=um_px,
+            )
+        except (TypeError, ValueError) as e:
+            print(f"[GUI] pix_to_um: invalid calibration ({e}); skipping")
+            return
+        if resolved is None:
+            return
+        ops["pix_to_um"] = float(resolved)
+        np.save(ops_path, ops, allow_pickle=True)
+        source = "direct µm/px" if um_px is not None else f"zoom {zoom}"
+        print(f"[GUI] pix_to_um = {resolved:.4f} µm/px (source: {source})")
 
     def _run_dff(
         self, plane0: Path, baseline_mode: str, baseline_min: float,

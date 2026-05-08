@@ -468,28 +468,17 @@ class SpatialPropagationTab(ttk.Frame):
         ROIs, and transpose to ``(T, N_kept)``.
 
         Cached by ``(plane0, tuple(kept_idx))`` so repeated event-
-        navigation clicks don't re-read the file.
+        navigation clicks don't re-read the file. The actual
+        orientation-detect + slicing logic lives in
+        ``core.utils.s2p_load_spks``; this method just adds caching
+        on top.
         """
         cache_key = (str(plane0), tuple(int(i) for i in kept_idx))
         cached = self._spks_cache.get(cache_key)
         if cached is not None:
             return cached
-        spks_path = Path(plane0) / "spks.npy"
-        if not spks_path.exists():
-            raise FileNotFoundError(spks_path)
-        spks_full = np.load(spks_path)
-        # Suite2p saves spks as (N_total, T). Older variants saved
-        # (T, N_total); detect by which axis matches kept_idx range.
-        if spks_full.ndim != 2:
-            raise ValueError(
-                f"Unexpected spks.npy shape {spks_full.shape}")
-        n_rois_axis = (0 if spks_full.shape[0] >= int(kept_idx.max()) + 1
-                       else 1)
-        if n_rois_axis == 0:
-            spks_kept = spks_full[kept_idx, :].T  # (T, N_kept)
-        else:
-            spks_kept = spks_full[:, kept_idx]    # (T, N_kept)
-        spks_kept = np.ascontiguousarray(spks_kept, dtype=np.float32)
+        from ...core.utils import s2p_load_spks
+        spks_kept = s2p_load_spks(plane0, kept_idx)
         self._spks_cache[cache_key] = spks_kept
         return spks_kept
 

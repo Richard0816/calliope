@@ -134,10 +134,19 @@ def shift_tiff_to_uint16(
         # Fast path: read the whole stack into RAM as int32 (so we
         # can hold negative values), shift so min becomes 0, then
         # cast down to uint16 (Suite2p's expected dtype).
+        _log(f"[shift] reading {src_tiff.name} (in-RAM)")
         data = tifffile.imread(str(src_tiff)).astype(np.int32)
+        gmin = int(data.min()); gmax = int(data.max())
+        _log(f"[shift] read shape={tuple(data.shape)} dtype=int32 "
+             f"min={gmin} max={gmax}")
         # ``+= int(abs(data.min()))`` is in-place: if min was -10,
         # we add 10 to every pixel.
-        data += int(abs(data.min()))
+        shift = int(abs(gmin)) if gmin < 0 else 0
+        if shift:
+            data += shift
+        shifted_max = gmax + shift
+        _log(f"[shift] global min={gmin} max={gmax}  -> shift+={shift}  "
+             f"(shifted max={shifted_max})")
         if data.max() >= 65535:
             # uint16's max is 65535. If the dynamic range is wider
             # than that we'd alias high values back to zero -- bail
@@ -147,7 +156,9 @@ def shift_tiff_to_uint16(
                 f"raw dynamic range too wide."
             ) #todo create alternative solution for this case
         data = data.astype(np.uint16)
+        _log(f"[shift] writing {dst_tiff.name} ({data.shape[0]} pages)")
         tifffile.imwrite(str(dst_tiff), data)
+        _log(f"[shift] done -> {dst_tiff.name}")
         return data
     except MemoryError:
         # Slow path: very large recordings (10+ GB raw) won't fit in

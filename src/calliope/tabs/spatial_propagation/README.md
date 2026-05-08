@@ -119,6 +119,22 @@ All helpers (`order_map_for_event`, `paint_order_map`,
 [`core/spatial.py`](../../core/spatial.py) so other tabs / scripts can
 paint the same maps.
 
+## Headless figure rendering
+
+Tab 8 has no analysis to run headlessly — every panel is a pure render
+of the data Tab 5 publishes. For batch mode, `core/spatial_run.py`
+exposes `render_spatial_event_figures(plane0, event_data, *,
+figures_dir)` which loops over every event in `event_data['event_windows']`
+and saves the order-map-with-arrows panel (the most informative single
+view) as `event_001.png`, `event_002.png`, … in `figures_dir`. The
+`event_data` dict is exactly what `core.event_detection_run.run_event_detection`
+returns (`event_windows`, `A`, `first_time`, `kept_idx`, `fps`), so the
+batch orchestrator hands one stage's output straight to the next.
+
+The interactive Tab 8 still owns the full four-panel view + dist-vs-Δframe
+violin and listens to `state.event_results` — those panels stay in
+`tabs/spatial_propagation/tab.py`.
+
 ## UI
 
 - **Status label** — tells the user when Tab 5 events are available
