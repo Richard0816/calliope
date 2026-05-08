@@ -68,6 +68,7 @@ from scipy.cluster.hierarchy import (
 from scipy.spatial.distance import pdist
 
 from . import utils
+from .scale import resolve_pix_to_um
 
 
 # Handy presets a GUI dropdown can offer directly.
@@ -149,31 +150,17 @@ def resolve_palette(palette: PaletteLike, n_colors: int = 10) -> list[str]:
 
 
 def _resolve_pix_to_um(root: Path, ops: dict) -> Optional[float]:
+    """Read the µm-per-pixel scale that Tab 3 stored on ``ops``.
+
+    Thin wrapper around :func:`calliope.core.scale.resolve_pix_to_um`
+    kept here for backward compatibility -- callers in this module
+    pass the recording root by convention but the new resolver only
+    needs the ops dict (Tab 3 is responsible for writing
+    ``ops['pix_to_um']`` based on the user's zoom or direct
+    calibration). ``root`` is unused.
     """
-    Same pix_to_um resolution used elsewhere in the codebase:
-    prefer ops['pix_to_um'] when present; otherwise derive from the
-    recording's zoom notes (matches Fig1.get_pix_to_um_from_zoom).
-    """
-    px = ops.get("pix_to_um", None)
-    if px is not None:
-        return float(px)
-    try:
-        # Pre-fix this call assumed plane0 sat at
-        # ``<recording_root>/suite2p/plane0`` so three ``.parent``
-        # walks reached the data root that contains the lab notes.
-        # The newer ``sparse_plus_cellpose`` layout puts plane0 at
-        # ``<rec>/detection/final/suite2p/plane0`` so the same walk
-        # would land on the recording's ``detection`` subfolder
-        # instead. Use the robust resolver: walk up to the recording
-        # root, then take its parent (the data root).
-        rec_root = utils.find_recording_root(root)
-        folder_for_notes = str(rec_root.parent)
-        zoom = utils.get_zoom_from_notes(folder_for_notes)
-        zoom = float(zoom) if zoom else 1.0
-        fov_um_x = 3080.90169 / zoom
-        return float(fov_um_x) / float(ops["Lx"])
-    except Exception:
-        return None
+    del root  # historical signature; ops carries the scale now
+    return resolve_pix_to_um(ops)
 
 
 def load_dff(root: Path, prefix: str = "r0p7_filtered_") -> np.ndarray:

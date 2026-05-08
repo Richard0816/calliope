@@ -27,11 +27,49 @@ The tab worker (`Suite2pTab._run_pipeline`) is roughly:
 
 ```python
 final_plane0 = sparse_plus_cellpose.run(...)   # ROI detection
+self._stamp_pix_to_um(final_plane0, params)    # ops['pix_to_um'] from zoom or direct
 _run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative
 if ckpt_path:
     _run_cellfilter(final_plane0, ckpt_path)   # PyTorch keep/drop
 _run_filtered_dff(final_plane0)                # slice dF/F to kept ROIs
 ```
+
+The same chain is also exposed as a single headless callable:
+`core.detection_run.run_detection(tiff_folder, save_folder, params, ...)`.
+That's what Tab 0's batch runner invokes — both the tab and the batch
+worker share one code path, so anything tested via the GUI behaves
+identically when batched.
+
+### suite2p 1.0 adapter
+
+Suite2p 1.0.0.1 (PyPI 2026-02-11) made two breaking changes the rest of
+this tab is shielded from:
+
+1. `run_s2p` no longer accepts the flat `ops=` kwarg; it takes a nested
+   `db=` + `settings=` schema, with renames such as
+   `ops['nbinned'] -> settings['detection']['nbins']`,
+   `ops['high_pass'] -> settings['detection']['highpass_time']`, and
+   `ops['roidetect'] -> settings['run']['do_detection']`.
+2. Registration / detection progress moved from `print()` to
+   `logging.getLogger('suite2p')`.
+
+`core/adaptive_detection.py` carries the translation: the
+`_OPS_TO_SETTINGS` + `_OPS_RENAMES` tables map flat keys to their new
+nested locations, `_coerce_to_default_type` converts legacy
+float-stored bools (`two_step_registration`, `nonrigid`,
+`do_bidiphase`, `look_one_level_down`, …) to real `bool`/`int` so
+`range(1 + settings['two_step_registration'])` doesn't crash, and an
+empty-list normalisation rewrites `subfolders=[]` / `file_list=[]`
+to `None` so the new `get_file_list` doesn't shortcut into "no files
+found". `_ensure_s2p_logger` rebinds the suite2p logger's stream to
+the current `sys.stderr` on each `_run_s2p` call so registration
+progress reaches the GUI's `redirect_stderr` capture.
+
+CalLIOPE keeps a flat ops dict as its internal lingua franca because
+the on-disk base ops `.npy` is shaped that way and downstream tabs
+read `ops['Ly']` / `ops['spatial_scale']` / `ops['pix_to_um']`
+straight from suite2p's own output. Translation only happens at the
+`run_s2p` call boundary.
 
 ### Step 1 — `sparse_plus_cellpose.run` (ROI detection)
 
@@ -228,9 +266,18 @@ Default lowpass / derivative:
 
 GPU:
   use_gpu_dff = True, gpu_roi_chunk = 0 (0=all)
+
+Pixel scale (µm calibration written to ops['pix_to_um']):
+  scope_zoom = 0.0    (0 = skip; uses lab reference FOV 3080.9 µm at 1×)
+  um_per_pixel = 0.0  (0 = skip; explicit calibration; wins over zoom)
 ```
 
 Baseline mode (radio): `rolling` (45 s rolling 10th pct) or `first_n` (first N minutes mean of 10th pct).
+
+The pixel-scale knobs are resolved through `core.scale.resolve_pix_to_um`
+after detection and stamped onto `plane0/ops.npy['pix_to_um']` so Tabs 6
+(spatial cluster map) and 8 (per-event order maps) render axes in µm
+without any further user input.
 
 ---
 

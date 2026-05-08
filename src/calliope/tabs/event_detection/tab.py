@@ -256,6 +256,11 @@ class EventDetectionTab(ttk.Frame):
         self._render_worker: Optional[threading.Thread] = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
+        # Onset source: 'derivative' (default, MAD-z + hysteresis on
+        # the SG derivative of the lowpass dF/F) or 'spks' (MAD-z +
+        # hysteresis on Suite2p's deconvolved spike trace from
+        # ``spks.npy``). The radio buttons in the header drive this.
+        self.onset_source_var = tk.StringVar(value="derivative")
 
         self._build_ui()
         self.after(self.POLL_MS, self._drain_render_queue)
@@ -295,6 +300,31 @@ class EventDetectionTab(ttk.Frame):
         self.summary_btn.pack(side="right", padx=(0, 6))
         ttk.Button(row, text="Reload from folder...",
                    command=self._reload_from_folder).pack(side="right")
+
+        # ---- Onset source row ----
+        # Default uses MAD-z + hysteresis on the Savitzky-Golay
+        # derivative of the lowpass dF/F (everything Tab 4 produced).
+        # The "spks" alternative loads Suite2p's deconvolved
+        # ``spks.npy`` and runs the same MAD-z + hysteresis on it.
+        # Same parameter knobs (z_enter / z_exit / min_sep_s) apply
+        # to either; downstream population-event detection and
+        # AppState publish are identical.
+        src_row = ttk.Frame(header); src_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(src_row, text="Onset source:").pack(side="left")
+        ttk.Radiobutton(
+            src_row, text="Derivative (default; MAD-z hysteresis on dt)",
+            value="derivative", variable=self.onset_source_var,
+        ).pack(side="left", padx=(8, 12))
+        ttk.Radiobutton(
+            src_row, text="Suite2p spks (deconvolved)",
+            value="spks", variable=self.onset_source_var,
+        ).pack(side="left")
+        ttk.Label(
+            src_row,
+            text="  -- spks mode reads <plane0>/spks.npy (one onset "
+                 "per MAD-z hysteresis crossing on the spike trace).",
+            foreground="gray", font=("", 8, "italic"),
+        ).pack(side="left", padx=(8, 0))
 
         # Manual ROI subset row: when enabled, only those Suite2p ROI ids
         # (intersected with the cell-filter keep mask) feed the heatmap,
@@ -428,6 +458,17 @@ class EventDetectionTab(ttk.Frame):
         self._params["manual_subset_enabled"] = bool(
             self.manual_subset_var.get())
         self._params["manual_roi_spec"] = self.manual_roi_var.get()
+        # Onset source: 'derivative' or 'spks'. Spks mode reads
+        # ``<plane0>/spks.npy`` instead of the ``_dt`` memmap.
+        self._params["onset_source"] = self.onset_source_var.get()
+        if (self._params["onset_source"] == "spks"
+                and not (plane0 / "spks.npy").exists()):
+            messagebox.showerror(
+                "Spks not available",
+                f"{plane0}/spks.npy does not exist. Run Suite2p "
+                f"detection on Tab 3 first, or switch back to the "
+                f"Derivative onset source.")
+            return
 
         self.render_btn.config(state="disabled")
         self.render_progress.start(12)
@@ -445,166 +486,21 @@ class EventDetectionTab(ttk.Frame):
         self._render_worker.start()
 
     def _compute_render_data(self, plane0: Path) -> dict:
-        from . import logic as utils
-        F = np.load(plane0 / "F.npy", mmap_mode="r")
-        N_total, T = F.shape
+        """Run the full per-ROI hysteresis + population-event detection.
 
-        mask_path = plane0 / "predicted_cell_mask.npy"
-        if mask_path.exists():
-            mask = np.load(mask_path).astype(bool)
-        else:
-            iscell_path = plane0 / "iscell.npy"
-            if iscell_path.exists():
-                ic = np.load(iscell_path)
-                mask = ((ic[:, 0] > 0) if ic.ndim == 2
-                        else (ic > 0)).astype(bool)
-            else:
-                mask = np.ones(N_total, dtype=bool)
-        N_kept_full = int(mask.sum())
-        if N_kept_full == 0:
-            raise RuntimeError("No ROIs survive the cell-filter mask.")
+        Delegates the actual computation to
+        :func:`calliope.core.event_detection_run.run_event_detection`
+        so Tab 0's batch runner uses the same code path. The summary
+        write is suppressed here because the existing tab flow calls
+        ``_write_summary`` separately on the rendered payload.
+        """
+        from ...core.event_detection_run import run_event_detection
+        return run_event_detection(
+            plane0, dict(self._params),
+            figures_dir=None,
+            write_summary=False,
+        )
 
-        lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
-        dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
-        lowpass = np.memmap(str(lp_path), dtype="float32", mode="r",
-                            shape=(T, N_kept_full))
-        derivative = np.memmap(str(dt_path), dtype="float32", mode="r",
-                               shape=(T, N_kept_full))
-
-        # kept_full_idx[i] is the Suite2p ROI id of column i in the
-        # filtered memmaps. ``pos_in_memmap`` is the list of those columns
-        # we actually iterate over: by default all of them, or the manual
-        # subset when the user has it enabled.
-        kept_full_idx = np.flatnonzero(mask)
-        pos_in_memmap = np.arange(N_kept_full)
-        kept_idx = kept_full_idx.copy()
-
-        if self._params.get("manual_subset_enabled"):
-            spec = self._params.get("manual_roi_spec", "")
-            try:
-                manual_ids = parse_manual_roi_spec(spec, N_total)
-            except ValueError as e:
-                raise RuntimeError(
-                    f"Manual ROI spec invalid: {e!s} (input {spec!r})")
-            sid_to_pos = {int(sid): pos
-                          for pos, sid in enumerate(kept_full_idx)}
-            valid: list[tuple[int, int]] = []  # (suite2p_id, memmap_pos)
-            skipped: list[int] = []
-            for sid in manual_ids:
-                if sid in sid_to_pos:
-                    valid.append((sid, sid_to_pos[sid]))
-                else:
-                    skipped.append(sid)
-            if not valid:
-                raise RuntimeError(
-                    f"None of the manual ROI ids survive the keep mask "
-                    f"(skipped: {skipped[:8]}"
-                    + (' ...' if len(skipped) > 8 else '') + ').')
-            if skipped:
-                print(f"[GUI] manual ROI ids not in keep mask, "
-                      f"skipping: {format_roi_indices(skipped)}")
-            kept_idx = np.array([sid for sid, _ in valid], dtype=int)
-            pos_in_memmap = np.array([pos for _, pos in valid], dtype=int)
-
-        N_kept = int(pos_in_memmap.size)
-
-        fps = float(utils.get_fps_from_notes(str(plane0)))
-
-        z_enter = float(self._params.get("z_enter", 3.5))
-        z_exit = float(self._params.get("z_exit", 1.5))
-        min_sep_s = float(self._params.get("min_sep_s", 0.1))
-        time_cols_target = int(
-            self._params.get("time_cols_target", 1200))
-
-        downsample = max(1, T // time_cols_target)
-        num_cols = T // downsample
-        heatmap = np.zeros((N_kept, num_cols), dtype=np.uint8)
-        raster = np.zeros((N_kept, num_cols), dtype=np.uint8)
-        event_counts = np.zeros(N_kept, dtype=np.int32)
-        onsets_by_roi: list = []
-
-        for i in range(N_kept):
-            mem_col = int(pos_in_memmap[i])
-            lp_i = np.asarray(lowpass[:, mem_col], dtype=np.float32)
-            dt_i = np.asarray(derivative[:, mem_col], dtype=np.float32)
-            z, _, _ = utils.mad_z(dt_i)
-            onsets = utils.hysteresis_onsets(
-                z, z_enter, z_exit, fps, min_sep_s=min_sep_s)
-            event_counts[i] = onsets.size
-            onsets_by_roi.append(
-                np.asarray(onsets, dtype=np.float64) / fps)
-
-            if downsample > 1:
-                trimmed = lp_i[:num_cols * downsample].reshape(
-                    num_cols, downsample)
-                lp_ds = trimmed.mean(axis=1)
-                if onsets.size:
-                    bins = (onsets // downsample).clip(0, num_cols - 1)
-                    raster[i, np.unique(bins)] = 1
-            else:
-                lp_ds = lp_i
-                if onsets.size:
-                    raster[i, onsets.clip(0, num_cols - 1)] = 1
-
-            lo, hi = np.percentile(lp_ds, [1, 99])
-            if hi <= lo:
-                heatmap[i, :] = 0
-            else:
-                norm = np.clip((lp_ds - lo) / (hi - lo), 0, 1)
-                heatmap[i, :] = (norm * 255.0 + 0.5).astype(np.uint8)
-
-        order = np.argsort(-event_counts)
-        heatmap = heatmap[order]
-        raster = raster[order]
-
-        # All 18 PARAM_SPEC knobs map 1:1 to EventDetectionParams fields.
-        ed_kwargs: dict = {}
-        try:
-            from .logic import EventDetectionParams
-            params_obj = EventDetectionParams()
-            for field_name in (
-                "bin_sec", "smooth_sigma_bins", "normalize_by_num_rois",
-                "min_prominence", "min_width_bins", "min_distance_bins",
-                "prominence_wlen_s",
-                "baseline_mode", "baseline_percentile",
-                "baseline_window_s", "noise_quiet_percentile",
-                "noise_mad_factor", "end_threshold_k",
-                "max_walk_duration_s", "max_event_duration_s",
-                "enable_watershed_split", "enforce_symmetric_clamp",
-                "merge_gap_s",
-                "use_gaussian_boundary", "gaussian_quantile",
-                "gaussian_fit_pad_s", "gaussian_min_sigma_s",
-            ):
-                if field_name in self._params:
-                    setattr(params_obj, field_name,
-                            self._params[field_name])
-            ed_kwargs["params"] = params_obj
-        except Exception as e:
-            print(f"[GUI] EventDetectionParams build failed: {e}")
-
-        event_windows, A, first_time, diagnostics = \
-            utils.detect_event_windows(
-                onsets_by_roi, T=T, fps=fps,
-                return_diagnostics=True, **ed_kwargs,
-            )
-
-        return {
-            "heatmap": heatmap,
-            "raster": raster,
-            "kept_idx": kept_idx,
-            "pos_in_memmap": pos_in_memmap,
-            "N_kept_full": N_kept_full,
-            "event_counts": event_counts,
-            "diagnostics": diagnostics,
-            "event_windows": event_windows,
-            "A": A,
-            "first_time": first_time,
-            "onsets_by_roi": onsets_by_roi,
-            "fps": fps,
-            "T": T,
-            "N_kept": N_kept,
-            "downsample": downsample,
-        }
 
     def _drain_render_queue(self) -> None:
         try:

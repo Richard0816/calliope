@@ -19,6 +19,16 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 
 ## 2. Pipeline steps
 
+> **Headless entry point.** `core/clustering_run.py:run_clustering(plane0,
+> params, *, figures_dir=None, write_summary=True)` runs the linkage,
+> picks a threshold (auto via `clustering_cmap.auto_choose_threshold` when
+> `params['threshold']` is `None` or 0), cuts to flat clusters, exports
+> `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `threshold_used.npy` +
+> `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
+> `spatial_clusters.png`. Tab 6 still owns the interactive recluster /
+> palette / picker UI; the headless module is what Tab 0's batch worker
+> calls and what you'd reach for in a script.
+
 ### Step 1 — Distance matrix
 
 `_correlation_linkage(dff, method='average')`:

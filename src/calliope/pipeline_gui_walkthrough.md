@@ -1,4 +1,4 @@
-# CalLIOPE — Pipeline Walkthrough for the Curious Neuroscientist
+# CalLIOPE — Pipeline Walkthrough 
 
 **CalLIOPE** = **Cal**cium **L**ive-imaging **O**utput **P**ipeline for **E**piletiform-recordings.
 
@@ -57,6 +57,22 @@ TIFF stack
 ```
 
 Each stage writes its outputs to disk so later tabs can re-load without recomputing.
+
+A separate **Tab 0 (Batch runner)** sits in front of all of this and chains the same per-stage code paths headlessly across many recordings — see the next section.
+
+---
+
+## Tab 0 — Batch runner
+
+**What it does (operationally).** Tab 0 is a queue runner. You point it at a working directory, click *Scan*, and it auto-creates one row per TIFF-containing folder at the configured search depth. Each row holds an identifier, a list of TIFFs, and a per-row parameter override dialog. Hit **Run all** and the worker drives the same code paths the interactive Tabs 1, 3, 4, 5, 6, 7, 8 do — concretely the `core.batch_pipeline.run_recording` orchestrator, which calls `core.preprocess_run` → `core.detection_run` → `core.lowpass_run` → `core.event_detection_run` → `core.clustering_run` → `core.crosscorrelation_run` → `core.spatial_run` in sequence.
+
+The per-row **Edit parameters** button opens a unified Advanced dialog with every PARAM_SPEC entry from Tabs 1 + 3 + 4 + 5 plus the clustering / xcorr knobs (74 in total), grouped in pipeline order: `1. Preprocess - …` → `2. Detection - …` → `3. Low-pass - …` → `4. Events - …` → `5. Clustering` → `6. Cross-correlation` → `7. Pipeline-wide`. The top-level **Apply defaults to all rows** button opens the same dialog and writes its output into every row's params, so per-row dialogs are only needed when one recording wants different settings.
+
+**What lands on disk.** For each row, every figure each tab would normally show in the GUI is rendered headlessly to PNG under `<output>/<recording_id>/calliope_figures/<stage>/` (subfolders: `preprocess`, `detection`, `lowpass`, `event_detection`, `clustering`, `crosscorrelation`, `spatial_propagation`). The queue + per-row params snapshot to `<output>/calliope_batch.json` on every Run All so closing the GUI doesn't lose the work; a **Reload queue** button restores it. After every Run All, `<output>/batch_report.csv` summarises status / duration per stage per recording, with continue-on-error semantics so one bad recording doesn't stop the queue.
+
+**Why it matters.** Sitting in front of the GUI to drive 78 recordings through seven tabs each is unscalable. Tab 0 lets you set sensible defaults once, queue everything overnight, and come back to a folder of figures and a CSV report you can sanity-check the next morning.
+
+→ See `tabs/batch/README.md` for the row state machine, the JSON-persistence schema, and the `core/batch_pipeline.py` orchestrator.
 
 ---
 
@@ -254,18 +270,28 @@ You record a 10-minute, 15 fps calcium movie of a brain slice in low-magnesium a
 
 ```
 src/calliope/
-├── pipeline_gui.py            ← top-level Tk app, builds the 8 tabs
+├── pipeline_gui.py            ← top-level Tk app, builds the 9 tabs (0-8)
 ├── pipeline_gui_walkthrough.md  ← (this file)
 ├── core/                       ← pure-Python algorithms shared across tabs
 │   ├── preprocessing.py        ← shift / mean / blobs / QC GIF
 │   ├── sparse_plus_cellpose.py ← Suite2p + Cellpose merge
+│   ├── adaptive_detection.py   ← register-only + sparsery loops; suite2p 1.0 db/settings adapter
 │   ├── utils.py                ← dF/F, lowpass, mad_z, event detection, fps lookup
 │   ├── crosscorrelation.py     ← batched + single-pair xcorr
-│   ├── clustering_cmap.py      ← palettes + auto-threshold
+│   ├── clustering_cmap.py      ← palettes + auto-threshold + dendrogram + spatial paint
 │   ├── spatial.py              ← cyan→red colormap + order-rank painting
-│   ├── adaptive_detection.py   ← (legacy) residual blob detection
+│   ├── scale.py                ← pix↔µm helpers (zoom-based + direct override)
+│   ├── preprocess_run.py       ← headless wrapper for Tab 1
+│   ├── detection_run.py        ← headless Tab 3 pipeline (spc + dF/F + cellfilter + filtered_dff)
+│   ├── lowpass_run.py          ← headless Tab 4 (compute + figures)
+│   ├── event_detection_run.py  ← headless Tab 5 (compute + figures + summary write)
+│   ├── clustering_run.py       ← headless Tab 6 (linkage + cluster export + figures)
+│   ├── crosscorrelation_run.py ← thin batch wrapper over the existing xcorr core
+│   ├── spatial_run.py          ← headless per-event PNG renderer for Tab 8
+│   ├── batch_pipeline.py       ← run_recording orchestrator (Tabs 1+3-8 chained)
 │   └── cellfilter/             ← PyTorch CNN for the keep/drop classifier
 └── tabs/
+    ├── batch/                  ← Tab 0 (BatchTab + BatchRow + Tab 1-style TIFF picker)
     ├── preprocess/             ← Tab 1
     ├── qc/                     ← Tab 2
     ├── suite2p/                ← Tab 3
@@ -281,6 +307,8 @@ Each tab folder contains:
 - `logic.py` — a re-export shim that pulls computational functions from `core/`.
 - `README.md` — the math + reproducibility notes for that tab (read these in order to recreate the pipeline from scratch).
 
+Each interactive Tab in 1, 3-8 delegates its actual computation to the matching `core/<tab>_run.py` so Tab 0's batch worker uses identical code. If you want to run a single stage from a Python script without the GUI, the `core/*_run.py` modules are the entry points.
+
 ---
 
 ## Suggested reading order
@@ -290,6 +318,7 @@ Each tab folder contains:
 3. `tabs/lowpass/README.md` and `tabs/event_detection/README.md` — how raw fluorescence becomes spike-like events.
 4. `tabs/clustering/README.md` and `tabs/crosscorrelation/README.md` — how events become circuit-level statements.
 5. `tabs/spatial_propagation/README.md` — how those statements translate back into pictures of the slice.
-6. `tabs/qc/README.md` — last (it's the smallest tab).
+6. `tabs/batch/README.md` — once you understand any single stage, this shows you how to run all of them across many recordings without touching the GUI.
+7. `tabs/qc/README.md` — last (it's the smallest tab).
 
 By the end, you should be able to re-implement any single stage of the pipeline from scratch given the math and parameter values in its README.

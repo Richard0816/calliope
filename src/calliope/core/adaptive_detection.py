@@ -9,6 +9,19 @@ the number of detected ROIs lands in a sweet spot. It also keeps a
 shared registration cache so the search loop doesn't re-register the
 movie every iteration.
 
+Suite2p 1.0 adaptation (2026-05)
+--------------------------------
+Suite2p 1.0.0.1 (PyPI 2026-02-11) replaced the flat ``ops=`` kwarg on
+``suite2p.run_s2p`` with a nested ``db=`` + ``settings=`` schema, and
+moved registration/detection progress output from ``print()`` to
+``logging.getLogger('suite2p')``. CalLIOPE still maintains a flat
+legacy-style ``ops`` dict as its internal pipeline state because the
+on-disk base ops .npy is shaped that way and downstream code reads
+``ops['Ly']`` / ``ops['spatial_scale']`` straight from suite2p's own
+output. Translation to the new nested schema happens at the
+``run_s2p`` call boundary -- see :func:`_build_db_and_settings`,
+:func:`_ensure_s2p_logger`, and :func:`_run_s2p`.
+
 It's still used in CalLIOPE for two reasons:
 
 1. ``AdaptiveConfig`` carries the AAV / tau lookup logic that
@@ -48,7 +61,7 @@ User only needs to specify:
     - tiff_folder: where the raw TIFF stack lives
     - save_folder: where Suite2p output should be written
     - path_to_ops (optional): starting ops.npy to build from; if None, uses
-      suite2p.default_ops() with sensible defaults for human 2p GCaMP data
+      _suite2p_default_ops() with sensible defaults for human 2p GCaMP data
 
 The goal is to wrap this behind a minimal app where the user never touches
 the Suite2p GUI or config files directly.
@@ -62,9 +75,357 @@ import shutil
 import numpy as np
 import suite2p
 from . import utils
+
+
+def _suite2p_default_ops() -> dict:
+    """Return suite2p's legacy flat default-ops dict.
+
+    Suite2p 1.0 dropped the package-level ``suite2p.default_ops()``
+    shortcut but kept the function inside the ``suite2p.default_ops``
+    submodule. We still build flat ops dicts internally and translate
+    at the ``run_s2p`` boundary (see :func:`_build_db_and_settings`),
+    so we just need a working default-ops factory regardless of
+    suite2p version.
+    """
+    try:
+        from suite2p.default_ops import default_ops
+        return default_ops()
+    except (ImportError, AttributeError):
+        # Pre-1.0 suite2p exposed it as a top-level attribute.
+        return suite2p.default_ops()  # type: ignore[attr-defined]
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# ============================================================================
+# Suite2p 1.0 db / settings translation
+# ============================================================================
+#
+# Suite2p 1.0.0.1 (uploaded to PyPI 2026-02-11) made two breaking changes:
+#
+# 1. ``run_s2p`` no longer accepts ``ops=``; it takes a nested
+#    ``settings=`` dict plus an enriched ``db=`` dict. Old keys live in
+#    different locations now -- e.g. ``ops['nbinned']`` ->
+#    ``settings['detection']['nbins']``, ``ops['high_pass']`` ->
+#    ``settings['detection']['highpass_time']``, ``ops['batch_size']``
+#    (a registration knob in the old flat dict) ->
+#    ``settings['registration']['batch_size']``. ``roidetect``/``spikedetect``
+#    move into ``settings['run']['do_detection']`` /
+#    ``settings['run']['do_deconvolution']``.
+#
+# 2. ``run_s2p`` switched from ``print()`` to Python ``logging``
+#    (``logging.getLogger('suite2p')``), but only suite2p's own GUI/CLI
+#    entry points install handlers. Programmatic callers must run
+#    ``run_s2p.logger_setup`` themselves or registration progress goes
+#    nowhere.
+#
+# CalLIOPE's pipeline still keeps a flat legacy-style ops dict as its
+# internal lingua franca because (a) the on-disk base-ops .npy is in
+# that shape, (b) downstream code reads ``ops['Ly']``,
+# ``ops['spatial_scale']`` etc. straight from the ops.npy that suite2p
+# *itself* still writes, and (c) the binary-search detection loops
+# tweak threshold_scaling / max_iterations / spatial_scale on a flat
+# dict between passes. We translate to the new structure at the
+# ``run_s2p`` call boundary only.
+
+# Map of legacy flat ``ops`` keys to where they live in the new nested
+# ``settings`` dict. Keys NOT in this map either go to ``db`` (handled
+# below) or have specialised translation logic (e.g. ``sparse_mode`` ->
+# ``detection.algorithm``). Anything still missing is silently dropped,
+# which matches suite2p's own behaviour for unknown keys.
+_OPS_TO_SETTINGS = {
+    # top-level
+    'tau':                      (),
+    'fs':                       (),
+    'diameter':                 (),
+    'torch_device':             (),
+    # run flags (the renames roidetect/spikedetect handled separately)
+    'do_registration':          ('run',),
+    'multiplane_parallel':      ('run',),
+    # io
+    'combined':                 ('io',),
+    'save_mat':                 ('io',),
+    'save_NWB':                 ('io',),
+    'delete_bin':               ('io',),
+    'move_bin':                 ('io',),
+    # registration
+    'nimg_init':                ('registration',),
+    'maxregshift':              ('registration',),
+    'do_bidiphase':             ('registration',),
+    'bidiphase':                ('registration',),
+    'batch_size':               ('registration',),  # legacy flat = reg batch_size
+    'nonrigid':                 ('registration',),
+    'maxregshiftNR':            ('registration',),
+    'block_size':               ('registration',),  # legacy flat = nonrigid block
+    'smooth_sigma':             ('registration',),
+    'smooth_sigma_time':        ('registration',),
+    'spatial_taper':            ('registration',),
+    'th_badframes':             ('registration',),
+    'norm_frames':              ('registration',),
+    'snr_thresh':               ('registration',),
+    'subpixel':                 ('registration',),
+    'two_step_registration':    ('registration',),
+    'reg_tif':                  ('registration',),
+    'reg_tif_chan2':            ('registration',),
+    # detection (renamed keys land via explicit aliases below)
+    'denoise':                  ('detection',),
+    'threshold_scaling':        ('detection',),
+    'max_overlap':              ('detection',),
+    'soma_crop':                ('detection',),
+    # detection.sparsery_settings
+    'spatial_scale':            ('detection', 'sparsery_settings'),
+    # detection.sourcery_settings
+    'connected':                ('detection', 'sourcery_settings'),
+    'max_iterations':           ('detection', 'sourcery_settings'),
+    # detection.cellpose_settings
+    'flow_threshold':           ('detection', 'cellpose_settings'),
+    'cellprob_threshold':       ('detection', 'cellpose_settings'),
+    # classification
+    'preclassify':              ('classification',),
+    'classifier_path':          ('classification',),
+    'use_builtin_classifier':   ('classification',),
+    # extraction
+    'neuropil_extract':         ('extraction',),
+    'inner_neuropil_radius':    ('extraction',),
+    'min_neuropil_pixels':      ('extraction',),
+    'lam_percentile':           ('extraction',),
+    'allow_overlap':            ('extraction',),
+    # deconvolution preprocess
+    'baseline':                 ('dcnv_preprocess',),
+    'win_baseline':             ('dcnv_preprocess',),
+    'sig_baseline':             ('dcnv_preprocess',),
+    'prctile_baseline':         ('dcnv_preprocess',),
+}
+
+# Legacy keys whose *name* changed in 1.0.
+_OPS_RENAMES = {
+    'nbinned':          (('detection',),                 'nbins'),
+    'high_pass':        (('detection',),                 'highpass_time'),
+    'chan2_thres':      (('detection',),                 'chan2_threshold'),
+    'neucoeff':         (('extraction',),                'neuropil_coefficient'),
+    'pretrained_model': (('detection', 'cellpose_settings'), 'cellpose_model'),
+}
+
+# Keys that belong on ``db`` rather than ``settings``. Includes the
+# post-registration runtime fields (``nframes``, ``Ly``, ``Lx``,
+# ``reg_file``, ``raw_file``, ``*_chan2``) because ``run_plane`` reads
+# them off ``db`` directly. ``run_s2p`` populates them itself, so for
+# the full-pipeline path the loop simply skips them when absent.
+_OPS_DB_KEYS = (
+    'data_path', 'look_one_level_down', 'input_format', 'keep_movie_raw',
+    'nplanes', 'nrois', 'nchannels', 'swap_order', 'functional_chan',
+    'lines', 'dy', 'dx', 'ignore_flyback', 'subfolders', 'file_list',
+    'save_path0', 'fast_disk', 'save_folder', 'h5py_key', 'nwb_driver',
+    'nwb_series', 'force_sktiff', 'bruker_bidirectional',
+    'nframes', 'Ly', 'Lx', 'reg_file', 'reg_file_chan2',
+    'raw_file', 'raw_file_chan2', 'save_path',
+)
+
+
+def _coerce_to_default_type(value, default):
+    """Coerce ``value`` to ``type(default)`` when the legacy ops .npy
+    stored a bool/int field as a numpy float (0.0 / 1.0).
+
+    Suite2p 1.0 does arithmetic / ``range()`` on these fields and
+    rejects floats. We only coerce numeric primitives; lists, strings,
+    None, and unknown defaults pass through unchanged.
+
+    Order matters: bool is a subclass of int, so check bool first.
+    """
+    if value is None or default is None:
+        return value
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        try:
+            return bool(value)
+        except (TypeError, ValueError):
+            return value
+    if isinstance(default, int) and not isinstance(default, bool):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        try:
+            iv = int(value)
+            return iv if float(iv) == float(value) else value
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+def _build_db_and_settings(ops: dict, db_extra: dict):
+    """Translate a legacy-flat ops dict + extra db keys into suite2p
+    1.0's ``(db, settings)`` pair.
+
+    See module-level comment for why we keep the flat ops dict as the
+    internal lingua franca. ``db_extra`` wins over ``ops`` on shared
+    keys (typical use: caller passes ``{'data_path': [...]}``).
+    """
+    from suite2p.parameters import default_db, default_settings
+    db_out = default_db()
+    settings = default_settings()
+
+    merged = {**ops, **db_extra}
+
+    # db_out keys
+    for k in _OPS_DB_KEYS:
+        if k in merged:
+            db_out[k] = merged[k]
+    # Legacy ops files often carry ``subfolders=[]`` / ``file_list=[]``
+    # meaning "none". The new ``get_file_list`` does an ``is not None``
+    # check so [] would land us in a "no files found" branch.
+    for k in ('subfolders', 'file_list', 'fast_disk', 'ignore_flyback'):
+        if db_out.get(k) in ([], '', ()):
+            db_out[k] = None
+
+    # Old ops .npy files store bool-meaning fields as numpy floats
+    # (0.0 / 1.0). Suite2p 1.0 does e.g.
+    # ``range(1 + settings["two_step_registration"])`` which crashes
+    # with ``TypeError: 'float' object cannot be interpreted as an
+    # integer``. Coerce to the schema's expected type as we copy.
+    db_defaults = default_db()
+    for k in list(db_out):
+        db_out[k] = _coerce_to_default_type(db_out[k], db_defaults.get(k))
+
+    # settings keys -- direct mappings
+    for k, path in _OPS_TO_SETTINGS.items():
+        if k not in merged:
+            continue
+        node = settings
+        for p in path:
+            node = node[p]
+        node[k] = _coerce_to_default_type(merged[k], node.get(k))
+    # settings keys -- renamed
+    for old_key, (path, new_key) in _OPS_RENAMES.items():
+        if old_key not in merged:
+            continue
+        node = settings
+        for p in path:
+            node = node[p]
+        node[new_key] = _coerce_to_default_type(merged[old_key],
+                                                node.get(new_key))
+
+    # Run flags: roidetect/spikedetect were renamed to do_detection/
+    # do_deconvolution.
+    if 'roidetect' in merged:
+        settings['run']['do_detection'] = bool(merged['roidetect'])
+    if 'spikedetect' in merged:
+        settings['run']['do_deconvolution'] = bool(merged['spikedetect'])
+
+    # Detection algorithm: legacy ``sparse_mode`` (bool) and
+    # ``anatomical_only`` (truthy = use cellpose) collapse into a
+    # single ``detection.algorithm`` string in 1.0.
+    if merged.get('anatomical_only'):
+        settings['detection']['algorithm'] = 'cellpose'
+    elif 'sparse_mode' in merged:
+        settings['detection']['algorithm'] = (
+            'sparsery' if merged['sparse_mode'] else 'sourcery'
+        )
+
+    return db_out, settings
+
+
+def _ensure_s2p_logger(save_path=None):
+    """Route suite2p 1.0's ``logging.getLogger('suite2p')`` output to
+    the current ``sys.stderr`` (so Tab 3 picks it up via its
+    ``contextlib.redirect_stderr`` capture) and tee a ``run.log`` file
+    next to the suite2p output, mirroring suite2p's own
+    ``run_s2p.logger_setup``.
+
+    Why we don't just call ``logger_setup`` once
+    --------------------------------------------
+    Suite2p's helper installs a ``StreamHandler()`` that captures
+    ``sys.stderr`` at construction time. Tab 3 redirects ``sys.stderr``
+    to a fresh ``QueueWriter`` per run, so a one-shot setup binds the
+    handler to a stale stream and the second run's log goes nowhere.
+    Instead we maintain our own handler tagged with ``_calliope`` and
+    rebind ``handler.stream`` on every call.
+    """
+    import logging
+    import sys
+    import pathlib
+
+    s2p = logging.getLogger('suite2p')
+    s2p.setLevel(logging.INFO)
+    # Don't double-print via the root logger if anything else attaches
+    # to it.
+    s2p.propagate = False
+
+    stream_h = next(
+        (h for h in s2p.handlers
+         if getattr(h, '_calliope', None) == 'stream'),
+        None,
+    )
+    if stream_h is None:
+        stream_h = logging.StreamHandler(sys.stderr)
+        stream_h._calliope = 'stream'
+        stream_h.setLevel(logging.INFO)
+        stream_h.setFormatter(logging.Formatter("[s2p] %(message)s"))
+        s2p.addHandler(stream_h)
+    else:
+        # Tab 3 swaps sys.stderr per run via contextlib.redirect_stderr;
+        # rebind so this run's writer receives the log.
+        stream_h.stream = sys.stderr
+
+    if save_path is None:
+        return
+    save_dir = pathlib.Path(save_path)
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    log_file = save_dir / 'run.log'
+    existing = next(
+        (h for h in s2p.handlers
+         if getattr(h, '_calliope', None) == 'file'),
+        None,
+    )
+    if (existing is not None
+            and getattr(existing, '_calliope_path', None) == str(log_file)):
+        return
+    if existing is not None:
+        s2p.removeHandler(existing)
+        existing.close()
+    try:
+        log_file.unlink()
+    except FileNotFoundError:
+        pass
+    file_h = logging.FileHandler(log_file, mode='w')
+    file_h._calliope = 'file'
+    file_h._calliope_path = str(log_file)
+    file_h.setLevel(logging.INFO)
+    file_h.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    s2p.addHandler(file_h)
+
+
+def _run_s2p(ops: dict, db_extra: dict):
+    """Run suite2p 1.0 from CalLIOPE's flat-ops pipeline state.
+
+    Translates ``ops`` + ``db_extra`` into 1.0's nested
+    ``db``/``settings`` shape via :func:`_build_db_and_settings`,
+    ensures the suite2p logger has handlers, and dispatches to
+    ``suite2p.run_s2p``.
+    """
+    db_out, settings = _build_db_and_settings(ops, db_extra)
+    _ensure_s2p_logger(db_out.get('save_path0'))
+    return suite2p.run_s2p(db=db_out, settings=settings)
+
+
+def _run_plane(ops: dict, db_extra: dict):
+    """Run suite2p 1.0 ``run_plane`` from a flat-ops dict.
+
+    Mirrors :func:`_run_s2p` but dispatches to ``suite2p.run_plane``
+    (the single-plane entrypoint that skips TIFF->binary conversion
+    and reuses an existing registered ``data.bin``). Required when a
+    pass shares registration with a prior pass.
+    """
+    db_out, settings = _build_db_and_settings(ops, db_extra)
+    _ensure_s2p_logger(db_out.get('save_path0'))
+    return suite2p.run_plane(db_out, settings)
 
 
 # ============================================================================
@@ -689,7 +1050,8 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
     --------------------------
     1. ``config.path_to_ops`` (a saved .npy of an ops dict the user
        picked) -- start from those values.
-    2. ``suite2p.default_ops()`` if no override was supplied.
+    2. ``suite2p.default_ops.default_ops()`` (via
+       :func:`_suite2p_default_ops`) if no override was supplied.
     Either way the pipeline overlays mandatory keys (sparse_mode,
     preclassify, etc.) and recording-specific values on top:
 
@@ -720,7 +1082,7 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
     else:
         if config.verbose:
             print("No base ops provided, starting from suite2p defaults")
-        ops = suite2p.default_ops()
+        ops = _suite2p_default_ops()
         # Data-specific defaults (can be overridden by a loaded .npy)
         ops.update({
             'fs': 15.07,
@@ -1091,6 +1453,17 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
             print(f"  > reusing shared registration at {shared_plane0}")
         return shared_plane0
 
+    # A previous attempt may have crashed mid-write, leaving a
+    # ``plane0/`` with db.npy / settings.npy but no usable data.bin.
+    # Suite2p 1.0's ``_find_existing_binaries`` would then match on the
+    # partial folder and skip the binary-conversion step entirely,
+    # silently reusing whatever stale settings.npy was on disk. Wipe
+    # the directory so register-only starts clean.
+    if shared_dir.exists():
+        if config.verbose:
+            print(f"  > clearing partial shared registration at {shared_dir}")
+        shutil.rmtree(shared_dir, ignore_errors=True)
+
     if config.verbose:
         print(f"  > no shared registration yet; running suite2p register-only "
               f"into {shared_dir}")
@@ -1100,7 +1473,7 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
     reg_ops['save_folder'] = 'suite2p'
     reg_ops['roidetect'] = False
     db = {'data_path': [config.tiff_folder]}
-    suite2p.run_s2p(ops=reg_ops, db=db)
+    _run_s2p(reg_ops, db)
 
     if not (shared_plane0 / 'data.bin').exists():
         raise RuntimeError(
@@ -1182,8 +1555,16 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
         pass_ops['do_registration'] = 0
         pass_ops['save_path0'] = str(save_dir)
         pass_ops['save_folder'] = 'suite2p'
+        pass_ops['save_path'] = str(plane0)
         pass_ops['reg_file'] = str(plane0 / 'data.bin')
-        pass_ops['ops_path'] = str(plane0 / 'ops.npy')
+        # ``raw_file`` from the shared register-only run points at the
+        # _shared_reg folder; clear it (we hardlink only data.bin) and
+        # force keep_movie_raw=False so suite2p's
+        # ``raw = keep_movie_raw and os.path.isfile(raw_file)`` doesn't
+        # crash on a missing path.
+        pass_ops.pop('raw_file', None)
+        pass_ops.pop('raw_file_chan2', None)
+        pass_ops['keep_movie_raw'] = False
         # roidetect defaults to True; make it explicit.
         pass_ops.setdefault('roidetect', True)
 
@@ -1198,7 +1579,7 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
         _orig_print = (_install_sparsery_roi_cap(hard_cap)
                        if hard_cap and hard_cap > 0 else None)
         try:
-            suite2p.run_plane(pass_ops, ops_path=str(plane0 / 'ops.npy'))
+            _run_plane(pass_ops, {})
         except _RoiHardCapExceeded as e:
             if verbose:
                 print(f"  > ABORT: {e} -- returning empty pass")
@@ -1250,7 +1631,7 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
     _orig_print = (_install_sparsery_roi_cap(hard_cap)
                    if hard_cap and hard_cap > 0 else None)
     try:
-        suite2p.run_s2p(ops=ops, db=db)
+        _run_s2p(ops, db)
     except _RoiHardCapExceeded as e:
         if verbose:
             print(f"  > ABORT: {e} -- returning empty pass")
@@ -1400,7 +1781,7 @@ def run_blob_seeded_detection(config: AdaptiveConfig, save_dir: Path,
               f"only (roidetect=False)")
 
     db = {'data_path': [config.tiff_folder]}
-    suite2p.run_s2p(ops=reg_ops, db=db)
+    _run_s2p(reg_ops, db)
 
     # Load the ops that suite2p wrote (contains Ly, Lx, reg_file, nframes, ...)
     ops = np.load(plane0 / 'ops.npy', allow_pickle=True).item()
