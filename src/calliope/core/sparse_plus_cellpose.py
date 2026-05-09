@@ -84,13 +84,15 @@ from suite2p import classification
 # loading, the registration cache, and the ROI-mask builder.
 from .adaptive_detection import (
     AdaptiveConfig,
-    load_base_ops,
+    load_base_settings,
     _get_or_create_shared_registration,
     _link_or_copy,
     run_one_pass,
     build_roi_pixel_mask,
     visualize_audit,
+    apply_settings_overrides,
 )
+from . import utils
 
 # The Cellpose pass itself lives in the adjacent ``brute_force_ops``
 # module so it can be tested / re-run independently.
@@ -206,7 +208,7 @@ def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
 
 
 def merge_and_extract(sparsery_stat, cellpose_stat,
-                      shared_plane0: Path, base_ops: dict,
+                      shared_plane0: Path, base_settings: dict,
                       final_dir: Path, max_overlap: float,
                       verbose: bool = True):
     """Combine sparsery + non-overlapping cellpose ROIs, then extract
@@ -243,9 +245,11 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
 
     _link_or_copy(Path(shared_plane0) / 'data.bin',
                   final_plane0 / 'data.bin')
-    reg_ops = np.load(Path(shared_plane0) / 'ops.npy',
-                      allow_pickle=True).item()
-    Ly, Lx = int(reg_ops['Ly']), int(reg_ops['Lx'])
+    # Load the shared registration's runtime view (Ly, Lx, meanImg, ...)
+    # via load_plane_view so we work off the new db.npy / settings.npy /
+    # reg_outputs.npy on disk (with a fallback to legacy ops.npy).
+    reg_view = utils.load_plane_view(shared_plane0)
+    Ly, Lx = int(reg_view['Ly']), int(reg_view['Lx'])
 
     cellpose_kept = filter_non_overlapping_cellpose(
         sparsery_stat, cellpose_stat, Ly, Lx,
@@ -281,11 +285,25 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     if not combined_raw:
         raise RuntimeError('merge produced 0 ROIs — nothing to extract')
 
-    final_ops = dict(reg_ops)
-    for k in ('tau', 'fs', 'neucoeff', 'baseline', 'win_baseline',
-              'sig_baseline', 'prctile_baseline', 'batch_size'):
-        if k in base_ops:
-            final_ops[k] = base_ops[k]
+    # Build the flat ops dict that suite2p's extract.create_masks_and_extract
+    # still consumes. Start from the shared-registration's view and overlay
+    # the trace-extraction knobs we care about, pulled from base_settings.
+    from .adaptive_detection import get_setting
+    final_ops = dict(reg_view)
+    final_ops['tau'] = float(base_settings.get('tau', final_ops.get('tau', 1.0)))
+    final_ops['fs'] = float(base_settings.get('fs', final_ops.get('fs', 15.0)))
+    final_ops['neucoeff'] = float(
+        get_setting(base_settings, 'neuropil_coefficient',
+                    final_ops.get('neucoeff', 0.7))
+    )
+    for k in ('baseline', 'win_baseline', 'sig_baseline',
+              'prctile_baseline'):
+        v = get_setting(base_settings, k)
+        if v is not None:
+            final_ops[k] = v
+    bs = get_setting(base_settings, 'batch_size')
+    if bs is not None:
+        final_ops['batch_size'] = bs
     final_ops['save_path0'] = str(final_dir)
     final_ops['save_folder'] = 'suite2p'
     final_ops['reg_file']    = str(final_plane0 / 'data.bin')
@@ -342,6 +360,12 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     np.save(final_plane0 / 'Fneu.npy',   Fneu)
     np.save(final_plane0 / 'spks.npy',   spks)
     np.save(final_plane0 / 'iscell.npy', iscell)
+    # Persist the merged-output ops snapshot. Suite2p 1.0's full pipeline
+    # would write its own ops.npy (when settings.io.save_ops_orig=True),
+    # but here we ran extract/dcnv/classify by hand on the shared
+    # registration, so we drop the merged ops ourselves so downstream
+    # readers (utils.load_plane_view, Tab 6/7 spatial overlays, the
+    # cellfilter dataset loader) see a complete view.
     np.save(final_plane0 / 'ops.npy',    final_ops, allow_pickle=True)
 
     if verbose:
@@ -454,28 +478,36 @@ def run(
     cfg = AdaptiveConfig(**cfg_kwargs)
 
     if verbose:
-        print(f'[s+cp] loading base ops from {ops_path}')
-    base_ops = load_base_ops(cfg)
+        print(f'[s+cp] loading base settings from {ops_path}')
+    base_db, base_settings = load_base_settings(cfg)
 
     if verbose:
         print(f'[s+cp] shared registration')
     t0 = time.time()
-    shared_plane0 = _get_or_create_shared_registration(cfg, base_ops)
+    shared_plane0 = _get_or_create_shared_registration(
+        cfg, base_db, base_settings,
+    )
     if verbose:
         print(f'[s+cp] shared reg ready at {shared_plane0}  '
               f'({time.time() - t0:.1f}s)')
 
-    # ---- sparsery (one shot, fixed ops) ----
+    # ---- sparsery (one shot, fixed settings) ----
     if verbose:
         print(f'[s+cp] sparsery pass '
               f'(threshold_scaling={sp_ops["threshold_scaling"]})')
     sparsery_dir = save_root / 'sparsery_pass'
-    ops = dict(base_ops)
-    ops.update(sp_ops)
-    ops['roidetect'] = True
+    sp_settings = {
+        # _deep_copy via dict comprehension over top-level keys; nested
+        # dicts get cloned by apply_settings_overrides as needed.
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in base_settings.items()
+    }
+    apply_settings_overrides(sp_settings, sp_ops)
+    apply_settings_overrides(sp_settings, {'roidetect': True})
+    sp_db = dict(base_db)
     t_sp = time.time()
-    sp_stat, _sp_ops_out, _sp_plane0 = run_one_pass(
-        str(tiff_folder), sparsery_dir, ops,
+    sp_stat, _sp_view, _sp_plane0 = run_one_pass(
+        str(tiff_folder), sparsery_dir, sp_db, sp_settings,
         verbose=verbose, use_cache=False,
         shared_plane0=shared_plane0,
         hard_cap=(hard_cap or 0),
@@ -501,7 +533,7 @@ def run(
         print(f'[s+cp] merging + extracting')
     final_dir = save_root / 'final'
     stat_arr, _final_ops, final_plane0 = merge_and_extract(
-        sp_stat, cp_stat, shared_plane0, base_ops, final_dir,
+        sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
         max_overlap=max_overlap, verbose=verbose,
     )
 
