@@ -32,8 +32,8 @@ Tab 3 calls this module's ``run_full_pipeline`` (defined later in the
 file) when the user clicks "Run detection". Inputs:
 
 - The shifted TIFF stack from Tab 1.
-- A base ops dict (``suite2p_2p_ops_240621.npy``) with sensible 2-photon
-  defaults.
+- A base settings dict (``updated_settings.npy``) with sensible 2-photon
+  defaults in suite2p 1.0's nested settings format.
 - The recording's tau (GCaMP decay constant) looked up from the AAV
   metadata table.
 
@@ -105,7 +105,7 @@ from .brute_force_ops import run_cellpose_pass
 
 TIFF_FOLDER = r'D:\2024-11-20_00003'
 SAVE_FOLDER = r'D:\sparse_plus_cellpose\2024-11-20_00003'
-PATH_TO_OPS = r'suite2p_2p_ops_240621.npy'
+PATH_TO_OPS = r'updated_settings.npy'
 
 # Fixed sparsery ops — no binary search, just one pass with these values.
 SPARSERY_OPS = {
@@ -402,9 +402,9 @@ def run(
     1. Build an ``AdaptiveConfig`` (the legacy detection's config
        dataclass; we still piggy-back on it for the AAV / tau lookup
        and for the shared-registration cache).
-    2. ``load_base_ops`` reads the base 2-photon ops file
-       (``suite2p_2p_ops_240621.npy``) and overlays the recording's
-       tau looked up from the AAV CSV.
+    2. ``load_base_settings`` reads the base 2-photon settings file
+       (``updated_settings.npy``, suite2p 1.0 nested format) and
+       overlays the recording's tau looked up from the AAV CSV.
     3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
        correction once and caches ``data.bin`` + ``ops.npy`` so both
        Sparsery and Cellpose can reuse it.

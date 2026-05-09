@@ -1081,6 +1081,44 @@ def _render_spatial_scale_qc(qc_path, mean_img, scale_data, winner, top_n):
 # Ops loading / preparation
 # ============================================================================
 
+# Top-level keys that distinguish a suite2p 1.0 nested settings dict from a
+# legacy flat-ops dict. If any of these appear at the top level *and* their
+# value is itself a dict, the file is nested.
+_NESTED_SETTINGS_TOP_KEYS = frozenset((
+    'run', 'io', 'registration', 'detection',
+    'classification', 'extraction', 'dcnv_preprocess',
+))
+
+
+def _looks_like_nested_settings(loaded: dict) -> bool:
+    """Return True if ``loaded`` is a suite2p 1.0 nested settings dict.
+
+    Heuristic: at least one of the canonical sub-system keys
+    (``run``, ``detection``, ``registration``, ...) must be present
+    *as a dict*. A legacy flat-ops file has these keys absent (or, in
+    the rare case ``detection`` was a scalar, not a dict).
+    """
+    if not isinstance(loaded, dict):
+        return False
+    return any(
+        isinstance(loaded.get(k), dict)
+        for k in _NESTED_SETTINGS_TOP_KEYS
+    )
+
+
+def _deep_merge(dst: dict, src: dict) -> None:
+    """In-place deep-merge ``src`` into ``dst``.
+
+    Keys in ``src`` overwrite ``dst``. Nested dicts are merged
+    recursively; leaves are replaced wholesale (no list-append etc.).
+    """
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
 def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
     """Build a suite2p 1.0 ``(db, settings)`` pair tailored to the recording.
 
@@ -1126,13 +1164,17 @@ def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
         if config.verbose:
             print(f"Loading base ops from {config.path_to_ops}")
         loaded = np.load(config.path_to_ops, allow_pickle=True).item()
-        # The on-disk file might be either a legacy flat ops dict (from
-        # pre-1.0 suite2p) or an already-nested settings/db pair stored
-        # together. We treat it as a flat overrides bag either way:
-        # apply_settings_overrides routes each known key to the right
-        # nested location, apply_db_overrides catches the db-side ones.
-        apply_db_overrides(db, loaded)
-        apply_settings_overrides(settings, loaded)
+        # The on-disk file might be either:
+        #   (a) a legacy flat ops dict (pre-1.0 suite2p, e.g.
+        #       suite2p_2p_ops_240621.npy) -- treat as flat overrides
+        #       and route each known key to its nested location;
+        #   (b) an already-nested suite2p 1.0 settings dict
+        #       (updated_settings.npy) -- deep-merge directly.
+        if _looks_like_nested_settings(loaded):
+            _deep_merge(settings, loaded)
+        else:
+            apply_db_overrides(db, loaded)
+            apply_settings_overrides(settings, loaded)
     else:
         if config.verbose:
             print("No base ops provided, starting from suite2p defaults")
@@ -2313,7 +2355,7 @@ if __name__ == '__main__':
     config = AdaptiveConfig(
         tiff_folder=r'D:\2024-11-20_00003',
         save_folder=r'D:\adaptive_runs\2024-11-20_00003',
-        path_to_ops=r"suite2p_2p_ops_240621.npy",  # set to None to use defaults
+        path_to_ops=r"updated_settings.npy",  # set to None to use suite2p defaults
 
         # Seed from the already-known-good pass 0 (17 real cells at sc=1,
         # thr=1.0). Reuses its data.bin as the shared registration too, so
