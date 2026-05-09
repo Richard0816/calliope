@@ -99,19 +99,19 @@ from typing import Optional
 
 
 # ============================================================================
-# Suite2p 1.0 db / settings translation
+# Suite2p 1.0 db / settings model
 # ============================================================================
 #
 # Suite2p 1.0.0.1 (uploaded to PyPI 2026-02-11) made two breaking changes:
 #
 # 1. ``run_s2p`` no longer accepts ``ops=``; it takes a nested
-#    ``settings=`` dict plus an enriched ``db=`` dict. Old keys live in
-#    different locations now -- e.g. ``ops['nbinned']`` ->
+#    ``settings=`` dict plus an enriched ``db=`` dict. Old flat keys
+#    now live in different locations -- e.g. ``ops['nbinned']`` ->
 #    ``settings['detection']['nbins']``, ``ops['high_pass']`` ->
 #    ``settings['detection']['highpass_time']``, ``ops['batch_size']``
 #    (a registration knob in the old flat dict) ->
-#    ``settings['registration']['batch_size']``. ``roidetect``/``spikedetect``
-#    move into ``settings['run']['do_detection']`` /
+#    ``settings['registration']['batch_size']``. ``roidetect`` /
+#    ``spikedetect`` move into ``settings['run']['do_detection']`` /
 #    ``settings['run']['do_deconvolution']``.
 #
 # 2. ``run_s2p`` switched from ``print()`` to Python ``logging``
@@ -120,44 +120,46 @@ from typing import Optional
 #    ``run_s2p.logger_setup`` themselves or registration progress goes
 #    nowhere.
 #
-# CalLIOPE's pipeline still keeps a flat legacy-style ops dict as its
-# internal lingua franca because (a) the on-disk base-ops .npy is in
-# that shape, (b) downstream code reads ``ops['Ly']``,
-# ``ops['spatial_scale']`` etc. straight from the ops.npy that suite2p
-# *itself* still writes, and (c) the binary-search detection loops
-# tweak threshold_scaling / max_iterations / spatial_scale on a flat
-# dict between passes. We translate to the new structure at the
-# ``run_s2p`` call boundary only.
+# CalLIOPE pipeline state now lives natively in the new nested form:
+# the GUI tab and ``sparse_plus_cellpose`` build ``(db, settings)``
+# pairs and pass them through ``run_one_pass`` /
+# ``_get_or_create_shared_registration``. We no longer translate from
+# a flat ops dict at the call boundary -- helper utilities below
+# (``set_setting``, ``get_setting``, ``apply_settings_overrides``)
+# manipulate the nested settings directly.
 
-# Map of legacy flat ``ops`` keys to where they live in the new nested
-# ``settings`` dict. Keys NOT in this map either go to ``db`` (handled
-# below) or have specialised translation logic (e.g. ``sparse_mode`` ->
-# ``detection.algorithm``). Anything still missing is silently dropped,
-# which matches suite2p's own behaviour for unknown keys.
-_OPS_TO_SETTINGS = {
+# Map of legacy flat-ops names to their new nested settings location.
+# Used by ``apply_settings_overrides`` so callers can still pass
+# user-friendly flat dicts (e.g. {'threshold_scaling': 0.85}) without
+# remembering whether each key landed in ``detection`` or
+# ``detection.sparsery_settings``.
+_SETTINGS_PATHS: dict = {
     # top-level
     'tau':                      (),
     'fs':                       (),
     'diameter':                 (),
     'torch_device':             (),
-    # run flags (the renames roidetect/spikedetect handled separately)
+    # run flags
     'do_registration':          ('run',),
     'multiplane_parallel':      ('run',),
+    'do_detection':             ('run',),
+    'do_deconvolution':         ('run',),
     # io
     'combined':                 ('io',),
     'save_mat':                 ('io',),
     'save_NWB':                 ('io',),
     'delete_bin':               ('io',),
     'move_bin':                 ('io',),
+    'save_ops_orig':            ('io',),
     # registration
     'nimg_init':                ('registration',),
     'maxregshift':              ('registration',),
     'do_bidiphase':             ('registration',),
     'bidiphase':                ('registration',),
-    'batch_size':               ('registration',),  # legacy flat = reg batch_size
+    'batch_size':               ('registration',),
     'nonrigid':                 ('registration',),
     'maxregshiftNR':            ('registration',),
-    'block_size':               ('registration',),  # legacy flat = nonrigid block
+    'block_size':               ('registration',),
     'smooth_sigma':             ('registration',),
     'smooth_sigma_time':        ('registration',),
     'spatial_taper':            ('registration',),
@@ -168,11 +170,15 @@ _OPS_TO_SETTINGS = {
     'two_step_registration':    ('registration',),
     'reg_tif':                  ('registration',),
     'reg_tif_chan2':            ('registration',),
-    # detection (renamed keys land via explicit aliases below)
+    # detection
     'denoise':                  ('detection',),
     'threshold_scaling':        ('detection',),
     'max_overlap':              ('detection',),
     'soma_crop':                ('detection',),
+    'algorithm':                ('detection',),
+    'nbins':                    ('detection',),
+    'highpass_time':            ('detection',),
+    'chan2_threshold':          ('detection',),
     # detection.sparsery_settings
     'spatial_scale':            ('detection', 'sparsery_settings'),
     # detection.sourcery_settings
@@ -181,6 +187,7 @@ _OPS_TO_SETTINGS = {
     # detection.cellpose_settings
     'flow_threshold':           ('detection', 'cellpose_settings'),
     'cellprob_threshold':       ('detection', 'cellpose_settings'),
+    'cellpose_model':           ('detection', 'cellpose_settings'),
     # classification
     'preclassify':              ('classification',),
     'classifier_path':          ('classification',),
@@ -191,28 +198,28 @@ _OPS_TO_SETTINGS = {
     'min_neuropil_pixels':      ('extraction',),
     'lam_percentile':           ('extraction',),
     'allow_overlap':            ('extraction',),
-    # deconvolution preprocess
+    'neuropil_coefficient':     ('extraction',),
+    # dcnv preprocess
     'baseline':                 ('dcnv_preprocess',),
     'win_baseline':             ('dcnv_preprocess',),
     'sig_baseline':             ('dcnv_preprocess',),
     'prctile_baseline':         ('dcnv_preprocess',),
 }
 
-# Legacy keys whose *name* changed in 1.0.
-_OPS_RENAMES = {
-    'nbinned':          (('detection',),                 'nbins'),
-    'high_pass':        (('detection',),                 'highpass_time'),
-    'chan2_thres':      (('detection',),                 'chan2_threshold'),
-    'neucoeff':         (('extraction',),                'neuropil_coefficient'),
-    'pretrained_model': (('detection', 'cellpose_settings'), 'cellpose_model'),
+# Legacy flat-ops names whose suite2p 1.0 nested-settings counterpart
+# uses a different key name. Callers can still pass the legacy name
+# and ``apply_settings_overrides`` will translate it.
+_LEGACY_KEY_ALIASES: dict = {
+    'nbinned':          'nbins',
+    'high_pass':        'highpass_time',
+    'chan2_thres':      'chan2_threshold',
+    'neucoeff':         'neuropil_coefficient',
+    'pretrained_model': 'cellpose_model',
 }
 
-# Keys that belong on ``db`` rather than ``settings``. Includes the
-# post-registration runtime fields (``nframes``, ``Ly``, ``Lx``,
-# ``reg_file``, ``raw_file``, ``*_chan2``) because ``run_plane`` reads
-# them off ``db`` directly. ``run_s2p`` populates them itself, so for
-# the full-pipeline path the loop simply skips them when absent.
-_OPS_DB_KEYS = (
+# Db-side keys (runtime registration outputs / paths). These never live
+# in ``settings``; they belong on the ``db`` dict.
+_DB_KEYS = frozenset({
     'data_path', 'look_one_level_down', 'input_format', 'keep_movie_raw',
     'nplanes', 'nrois', 'nchannels', 'swap_order', 'functional_chan',
     'lines', 'dy', 'dx', 'ignore_flyback', 'subfolders', 'file_list',
@@ -220,18 +227,17 @@ _OPS_DB_KEYS = (
     'nwb_series', 'force_sktiff', 'bruker_bidirectional',
     'nframes', 'Ly', 'Lx', 'reg_file', 'reg_file_chan2',
     'raw_file', 'raw_file_chan2', 'save_path',
-)
+})
 
 
 def _coerce_to_default_type(value, default):
-    """Coerce ``value`` to ``type(default)`` when the legacy ops .npy
-    stored a bool/int field as a numpy float (0.0 / 1.0).
+    """Coerce ``value`` to ``type(default)`` when an upstream loader
+    handed us a numpy float for what should be a bool/int.
 
-    Suite2p 1.0 does arithmetic / ``range()`` on these fields and
+    Suite2p 1.0 does arithmetic / ``range()`` on int settings and
     rejects floats. We only coerce numeric primitives; lists, strings,
-    None, and unknown defaults pass through unchanged.
-
-    Order matters: bool is a subclass of int, so check bool first.
+    None, and unknown defaults pass through unchanged. Order matters:
+    bool is a subclass of int, so check bool first.
     """
     if value is None or default is None:
         return value
@@ -255,76 +261,77 @@ def _coerce_to_default_type(value, default):
     return value
 
 
-def _build_db_and_settings(ops: dict, db_extra: dict):
-    """Translate a legacy-flat ops dict + extra db keys into suite2p
-    1.0's ``(db, settings)`` pair.
-
-    See module-level comment for why we keep the flat ops dict as the
-    internal lingua franca. ``db_extra`` wins over ``ops`` on shared
-    keys (typical use: caller passes ``{'data_path': [...]}``).
-    """
+def default_db_settings() -> tuple[dict, dict]:
+    """Return a fresh ``(db, settings)`` pair of suite2p 1.0 defaults."""
     from suite2p.parameters import default_db, default_settings
-    db_out = default_db()
-    settings = default_settings()
+    return default_db(), default_settings()
 
-    merged = {**ops, **db_extra}
 
-    # db_out keys
-    for k in _OPS_DB_KEYS:
-        if k in merged:
-            db_out[k] = merged[k]
-    # Legacy ops files often carry ``subfolders=[]`` / ``file_list=[]``
-    # meaning "none". The new ``get_file_list`` does an ``is not None``
-    # check so [] would land us in a "no files found" branch.
+def set_setting(settings: dict, key: str, value) -> None:
+    """Write ``value`` to its canonical nested location in ``settings``.
+
+    ``key`` may be a current suite2p 1.0 name (looked up in
+    ``_SETTINGS_PATHS``) or a legacy flat-ops name (looked up in
+    ``_LEGACY_KEY_ALIASES`` and translated). Unknown keys are silently
+    dropped, matching suite2p's own behaviour.
+    """
+    real_key = _LEGACY_KEY_ALIASES.get(key, key)
+    path = _SETTINGS_PATHS.get(real_key)
+    if path is None:
+        return
+    node = settings
+    for p in path:
+        if p not in node:
+            node[p] = {}
+        node = node[p]
+    node[real_key] = _coerce_to_default_type(value, node.get(real_key))
+
+
+def get_setting(settings: dict, key: str, default=None):
+    """Read ``settings`` at the nested location for ``key``."""
+    real_key = _LEGACY_KEY_ALIASES.get(key, key)
+    path = _SETTINGS_PATHS.get(real_key)
+    if path is None:
+        return default
+    node = settings
+    for p in path:
+        if p not in node:
+            return default
+        node = node[p]
+    return node.get(real_key, default)
+
+
+def apply_settings_overrides(settings: dict, overrides: dict) -> None:
+    """Bulk-apply a flat ``{name: value}`` dict to a nested settings.
+
+    Supports the legacy flag aliases (``roidetect`` ->
+    ``run.do_detection``, ``sparse_mode`` /
+    ``anatomical_only`` -> ``detection.algorithm``). Unknown names
+    are dropped silently.
+    """
+    for k, v in overrides.items():
+        if k == 'roidetect':
+            settings.setdefault('run', {})['do_detection'] = bool(v)
+        elif k == 'spikedetect':
+            settings.setdefault('run', {})['do_deconvolution'] = bool(v)
+        elif k == 'anatomical_only' and v:
+            settings.setdefault('detection', {})['algorithm'] = 'cellpose'
+        elif k == 'sparse_mode':
+            settings.setdefault('detection', {})['algorithm'] = (
+                'sparsery' if v else 'sourcery'
+            )
+        else:
+            set_setting(settings, k, v)
+
+
+def apply_db_overrides(db: dict, overrides: dict) -> None:
+    """Copy any ``_DB_KEYS`` entries from ``overrides`` into ``db``."""
+    for k, v in overrides.items():
+        if k in _DB_KEYS:
+            db[k] = v
     for k in ('subfolders', 'file_list', 'fast_disk', 'ignore_flyback'):
-        if db_out.get(k) in ([], '', ()):
-            db_out[k] = None
-
-    # Old ops .npy files store bool-meaning fields as numpy floats
-    # (0.0 / 1.0). Suite2p 1.0 does e.g.
-    # ``range(1 + settings["two_step_registration"])`` which crashes
-    # with ``TypeError: 'float' object cannot be interpreted as an
-    # integer``. Coerce to the schema's expected type as we copy.
-    db_defaults = default_db()
-    for k in list(db_out):
-        db_out[k] = _coerce_to_default_type(db_out[k], db_defaults.get(k))
-
-    # settings keys -- direct mappings
-    for k, path in _OPS_TO_SETTINGS.items():
-        if k not in merged:
-            continue
-        node = settings
-        for p in path:
-            node = node[p]
-        node[k] = _coerce_to_default_type(merged[k], node.get(k))
-    # settings keys -- renamed
-    for old_key, (path, new_key) in _OPS_RENAMES.items():
-        if old_key not in merged:
-            continue
-        node = settings
-        for p in path:
-            node = node[p]
-        node[new_key] = _coerce_to_default_type(merged[old_key],
-                                                node.get(new_key))
-
-    # Run flags: roidetect/spikedetect were renamed to do_detection/
-    # do_deconvolution.
-    if 'roidetect' in merged:
-        settings['run']['do_detection'] = bool(merged['roidetect'])
-    if 'spikedetect' in merged:
-        settings['run']['do_deconvolution'] = bool(merged['spikedetect'])
-
-    # Detection algorithm: legacy ``sparse_mode`` (bool) and
-    # ``anatomical_only`` (truthy = use cellpose) collapse into a
-    # single ``detection.algorithm`` string in 1.0.
-    if merged.get('anatomical_only'):
-        settings['detection']['algorithm'] = 'cellpose'
-    elif 'sparse_mode' in merged:
-        settings['detection']['algorithm'] = (
-            'sparsery' if merged['sparse_mode'] else 'sourcery'
-        )
-
-    return db_out, settings
+        if db.get(k) in ([], '', ()):
+            db[k] = None
 
 
 def _ensure_s2p_logger(save_path=None):
@@ -402,32 +409,18 @@ def _ensure_s2p_logger(save_path=None):
     s2p.addHandler(file_h)
 
 
-def _run_s2p(ops: dict, db_extra: dict):
-    """Run suite2p 1.0 from CalLIOPE's flat-ops pipeline state.
-
-    Translates ``ops`` + ``db_extra`` into 1.0's nested
-    ``db``/``settings`` shape via :func:`_build_db_and_settings`,
-    ensures the suite2p logger has handlers, and dispatches to
-    ``suite2p.run_s2p``.
-    """
-    db_out, settings = _build_db_and_settings(ops, db_extra)
-    _ensure_s2p_logger(db_out.get('save_path0'))
+def _invoke_run_s2p(db: dict, settings: dict):
+    """Dispatch to suite2p.run_s2p with logger setup and patches in place."""
+    _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
-    return suite2p.run_s2p(db=db_out, settings=settings)
+    return suite2p.run_s2p(db=db, settings=settings)
 
 
-def _run_plane(ops: dict, db_extra: dict):
-    """Run suite2p 1.0 ``run_plane`` from a flat-ops dict.
-
-    Mirrors :func:`_run_s2p` but dispatches to ``suite2p.run_plane``
-    (the single-plane entrypoint that skips TIFF->binary conversion
-    and reuses an existing registered ``data.bin``). Required when a
-    pass shares registration with a prior pass.
-    """
-    db_out, settings = _build_db_and_settings(ops, db_extra)
-    _ensure_s2p_logger(db_out.get('save_path0'))
+def _invoke_run_plane(db: dict, settings: dict):
+    """Dispatch to suite2p.run_plane with logger setup and patches in place."""
+    _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
-    return suite2p.run_plane(db_out, settings)
+    return suite2p.run_plane(db, settings)
 
 
 # ============================================================================
@@ -1088,55 +1081,69 @@ def _render_spatial_scale_qc(qc_path, mean_img, scale_data, winner, top_n):
 # Ops loading / preparation
 # ============================================================================
 
-def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
-    """Load Suite2p ops (the giant detection-config dict) and tweak
-    them for the recording at hand.
+def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
+    """Build a suite2p 1.0 ``(db, settings)`` pair tailored to the recording.
 
     Sources, in priority order
     --------------------------
-    1. ``config.path_to_ops`` (a saved .npy of an ops dict the user
-       picked) -- start from those values.
-    2. ``suite2p.default_ops.default_ops()`` (via
-       :func:`_suite2p_default_ops`) if no override was supplied.
-    Either way the pipeline overlays mandatory keys (sparse_mode,
-    preclassify, etc.) and recording-specific values on top:
+    1. ``config.path_to_ops`` (a saved .npy of either a flat legacy
+       ops dict or an already-nested settings dict) -- those values
+       seed the settings via ``apply_settings_overrides``.
+    2. Suite2p 1.0's :func:`suite2p.parameters.default_settings` if
+       no override file is supplied.
+
+    Either way the pipeline overlays:
 
     * **tau** : the GCaMP-variant decay constant. Looked up via
       ``utils.file_name_to_aav_to_dictionary_lookup`` from the AAV
       metadata CSV in ``config.aav_info_csv`` and the dict in
-      ``config.tau_vals``.
+      ``config.tau_vals`` (or ``config.tau_override`` wins outright).
     * **batch_size** : auto-scaled to free RAM by
       ``utils.change_batch_according_to_free_ram``.
     * **spatial_scale** : optionally pre-estimated from the first
       ~500 frames via ``estimate_spatial_scale_from_tiff`` (a LoG
       blob detector that maps median blob diameter to a Suite2p
       scale bin).
-    * **nbinned** : capped via
-      ``utils.change_nbinned_according_to_free_ram`` to keep the
-      Sparsery peak intermediate inside the RAM budget.
+    * **nbins** (legacy ``nbinned``) : capped via
+      ``utils.change_nbinned_according_to_free_ram`` so the sparsery
+      peak intermediate fits in RAM.
 
-    If ``return_scale_data=True``, also returns the ``scale_data``
-    dict from the pre-flight estimator (or ``None`` if estimation
-    was skipped / failed). Used by blob-seeded detection so it can
-    re-use the detected blobs as ROI seeds without re-running the
-    estimator.
+    Returns
+    -------
+    (db, settings) : tuple[dict, dict]
+        Suite2p 1.0 nested config pair. ``db`` carries pipeline-input
+        keys (``data_path`` etc.); ``settings`` carries everything
+        else.
+    scale_data : dict, optional
+        Only returned when ``return_scale_data=True`` -- the
+        per-scale blob inventory from the pre-flight LoG estimator,
+        used downstream by ``run_blob_seeded_detection``.
     """
+    db, settings = default_db_settings()
+
+    # --- Step 1: seed from optional override file ---
     if config.path_to_ops is not None and os.path.exists(config.path_to_ops):
         if config.verbose:
             print(f"Loading base ops from {config.path_to_ops}")
-        ops = np.load(config.path_to_ops, allow_pickle=True).item()
+        loaded = np.load(config.path_to_ops, allow_pickle=True).item()
+        # The on-disk file might be either a legacy flat ops dict (from
+        # pre-1.0 suite2p) or an already-nested settings/db pair stored
+        # together. We treat it as a flat overrides bag either way:
+        # apply_settings_overrides routes each known key to the right
+        # nested location, apply_db_overrides catches the db-side ones.
+        apply_db_overrides(db, loaded)
+        apply_settings_overrides(settings, loaded)
     else:
         if config.verbose:
             print("No base ops provided, starting from suite2p defaults")
-        ops = _suite2p_default_ops()
-        # Data-specific defaults (can be overridden by a loaded .npy)
-        ops.update({
+        # Data-specific defaults for our 2-photon GCaMP recordings.
+        apply_settings_overrides(settings, {
             'fs': 15.07,
-            'nchannels': 1,
-            'nplanes': 1,
-            'high_pass': 100.0,
+            'highpass_time': 100.0,
             'smooth_sigma': 1.3,
         })
+        db['nchannels'] = 1
+        db['nplanes'] = 1
 
     # --- Resolve spatial_scale ---
     # If the user left pass0_spatial_scale at 0 and asked for auto-estimation,
@@ -1151,8 +1158,6 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
                        or str(Path(config.save_folder) / 'spatial_scale_qc.png'))
         else:
             qc_path = None
-        # Always request scale_data so blob-seeded detection can reuse it
-        # without re-running the estimator (and re-writing the QC figure).
         estimated, scale_data = estimate_spatial_scale_from_tiff(
             config.tiff_folder,
             n_frames=config.auto_estimate_n_frames,
@@ -1164,35 +1169,25 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
         if estimated > 0:
             effective_spatial_scale = estimated
 
-    # --- Pipeline-required ops, applied to BOTH branches ---
-    # These are enforced regardless of whether ops came from .npy or defaults,
-    # because the adaptive loop's behavior depends on them. preclassify in
-    # particular is the junk-culling mechanism; without it, under-detection
+    # --- Pipeline-required settings, applied unconditionally. preclassify
+    # in particular is the junk-culling mechanism; without it, low-threshold
     # passes produce thousands of speckle ROIs.
-    pipeline_required = {
-        'sparse_mode': True,
-        'spatial_scale': effective_spatial_scale,  # 0 = suite2p internal auto
-        'preclassify': 0.5,       # drop obvious non-cells during detection
-        'allow_overlap': False,
-    }
-    if config.verbose:
-        for k, v in pipeline_required.items():
-            prev = ops.get(k, '<unset>')
-            if prev != v:
-                print(f"  enforcing ops['{k}'] = {v}  (was {prev!r})")
-    ops.update(pipeline_required)
+    apply_settings_overrides(settings, {
+        'sparse_mode':       True,
+        'spatial_scale':     effective_spatial_scale,
+        'preclassify':       0.5,
+        'allow_overlap':     False,
+    })
 
-    # Apply sample-specific tau.
+    # --- Sample-specific tau ---
     # Priority order:
-    #   1. Explicit tau_override on the config (set by Tab 3 when the
-    #      user picks a specific GCaMP variant from the dropdown).
-    #   2. AAV CSV lookup keyed by recording filename (legacy path).
-    #   3. Whatever tau was already in ops (from the base ops file
-    #      or suite2p defaults).
+    #   1. Explicit tau_override on the config.
+    #   2. AAV CSV lookup keyed by recording filename.
+    #   3. Whatever tau was already in settings.
     if config.tau_override is not None:
-        ops['tau'] = float(config.tau_override)
+        settings['tau'] = float(config.tau_override)
         if config.verbose:
-            print(f"Set tau={ops['tau']} from explicit override "
+            print(f"Set tau={settings['tau']} from explicit override "
                   f"(skipping AAV lookup)")
     else:
         file_name = os.path.basename(os.path.normpath(config.tiff_folder))
@@ -1201,40 +1196,51 @@ def load_base_ops(config: AdaptiveConfig, return_scale_data: bool = False):
                 tau = utils.file_name_to_aav_to_dictionary_lookup(
                     file_name, config.aav_info_csv, config.tau_vals
                 )
-                ops['tau'] = tau
+                settings['tau'] = tau
                 if config.verbose:
                     print(f"Set tau={tau} based on AAV lookup for {file_name}")
             except Exception as e:
                 if config.verbose:
-                    print(f"tau lookup failed ({e}); keeping existing tau={ops.get('tau')}")
+                    print(f"tau lookup failed ({e}); keeping existing "
+                          f"tau={settings.get('tau')}")
 
-    # Dynamic batch size (same logic as main.py)
-    ops['batch_size'] = utils.change_batch_according_to_free_ram()
+    # --- Dynamic batch size ---
+    set_setting(settings, 'batch_size', utils.change_batch_according_to_free_ram())
 
-    # Set/cap nbinned so sparsery's peak intermediate fits in RAM.
-    # If ops didn't specify nbinned (or specified a too-large value), we
-    # compute a safe value from available RAM and TIFF frame size.
+    # --- nbins (legacy nbinned) capped to RAM budget ---
     safe_nbinned = utils.change_nbinned_according_to_free_ram(config.tiff_folder)
-    current_nbinned = ops.get('nbinned', 0)
+    current_nbinned = get_setting(settings, 'nbins', 0) or 0
     if current_nbinned <= 0:
         if config.verbose:
-            print(f"Setting nbinned = {safe_nbinned} (auto, based on available RAM)")
-        ops['nbinned'] = safe_nbinned
+            print(f"Setting nbins = {safe_nbinned} (auto, based on available RAM)")
+        set_setting(settings, 'nbins', safe_nbinned)
     elif current_nbinned > safe_nbinned:
         if config.verbose:
-            print(f"Lowering nbinned {current_nbinned} -> {safe_nbinned} to fit available RAM")
-        ops['nbinned'] = safe_nbinned
+            print(f"Lowering nbins {current_nbinned} -> {safe_nbinned} to fit available RAM")
+        set_setting(settings, 'nbins', safe_nbinned)
 
     if config.verbose:
-        summary_keys = ('sparse_mode', 'spatial_scale', 'preclassify',
-                        'allow_overlap', 'high_pass', 'smooth_sigma', 'tau',
-                        'fs', 'nbinned', 'batch_size')
-        summary = ', '.join(f"{k}={ops.get(k)!r}" for k in summary_keys)
-        print(f"  effective ops: {summary}")
+        summary = (
+            f"algorithm={settings['detection'].get('algorithm', '?')} "
+            f"spatial_scale={get_setting(settings, 'spatial_scale')} "
+            f"preclassify={get_setting(settings, 'preclassify')} "
+            f"highpass_time={get_setting(settings, 'highpass_time')} "
+            f"smooth_sigma={get_setting(settings, 'smooth_sigma')} "
+            f"tau={settings.get('tau')} fs={settings.get('fs')} "
+            f"nbins={get_setting(settings, 'nbins')} "
+            f"batch_size={get_setting(settings, 'batch_size')}"
+        )
+        print(f"  effective settings: {summary}")
 
     if return_scale_data:
-        return ops, scale_data
-    return ops
+        return db, settings, scale_data
+    return db, settings
+
+
+# Backward-compat alias. Old call sites that imported ``load_base_ops``
+# get a TypeError if they treat the result as a flat dict; the rename
+# is intentional so the (db, settings) tuple can't be silently misused.
+load_base_ops = load_base_settings
 
 
 # ============================================================================
@@ -1405,29 +1411,36 @@ _CACHE_COMPARE_KEYS = (
 )
 
 
-def _load_cached_pass(save_dir: Path, expected_ops: dict, verbose: bool = True):
-    """
-    If ``save_dir`` already contains a completed suite2p run whose ops match
-    ``expected_ops`` on the keys that control detection, return
-    ``(stat, cached_ops, plane0)``. Otherwise return None.
+def _load_cached_pass(save_dir: Path, expected_settings: dict,
+                      verbose: bool = True):
+    """If ``save_dir`` already contains a completed suite2p run whose
+    cached settings match ``expected_settings`` on detection-relevant
+    keys, return ``(stat, cached_view, plane0)``. Otherwise return
+    None.
+
+    ``cached_view`` is a flat dict synthesized from the on-disk
+    db.npy / settings.npy / reg_outputs / detect_outputs (or the
+    legacy ops.npy when present) -- the same shape that
+    ``utils.load_plane_view`` returns, so callers can read familiar
+    keys like ``Ly`` / ``meanImg`` from it.
     """
     plane0 = Path(save_dir) / 'suite2p' / 'plane0'
     stat_path = plane0 / 'stat.npy'
-    ops_path = plane0 / 'ops.npy'
-    if not (stat_path.exists() and ops_path.exists()):
+    if not stat_path.exists():
         return None
 
-    try:
-        cached_ops = np.load(ops_path, allow_pickle=True).item()
-    except Exception as e:
+    cached_view = utils.load_plane_view(plane0)
+    if not cached_view:
         if verbose:
-            print(f"  > cache miss at {plane0}: could not load ops.npy ({e})")
+            print(f"  > cache miss at {plane0}: no settings/ops on disk")
         return None
 
     mismatches = []
     for k in _CACHE_COMPARE_KEYS:
-        exp = expected_ops.get(k)
-        cached = cached_ops.get(k)
+        exp = get_setting(expected_settings, k)
+        if exp is None:
+            exp = expected_settings.get(k)
+        cached = cached_view.get(k)
         if exp != cached:
             mismatches.append((k, cached, exp))
 
@@ -1447,7 +1460,7 @@ def _load_cached_pass(save_dir: Path, expected_ops: dict, verbose: bool = True):
 
     if verbose:
         print(f"  > reusing cached pass {Path(save_dir).name} ({len(stat)} ROIs)")
-    return stat, cached_ops, plane0
+    return stat, cached_view, plane0
 
 
 def _link_or_copy(src: Path, dst: Path):
@@ -1468,7 +1481,7 @@ def _link_or_copy(src: Path, dst: Path):
 
 
 def _get_or_create_shared_registration(config: 'AdaptiveConfig',
-                                       base_ops: dict) -> Path:
+                                       db: dict, settings: dict) -> Path:
     """Ensure a single canonical registered binary exists at
     ``{save_folder}/_shared_reg/suite2p/plane0/`` and return that
     plane0 path.
@@ -1484,8 +1497,9 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
 
     1. Checks for an existing ``_shared_reg/suite2p/plane0/data.bin``.
     2. If present, returns its plane0 path immediately.
-    3. Otherwise runs ``suite2p.run_s2p`` once with ``roidetect=False``
-       (registration only, no detection) to produce the binary.
+    3. Otherwise runs ``suite2p.run_s2p`` once with
+       ``settings.run.do_detection=False`` (registration only, no
+       detection) to produce the binary.
 
     Subsequent detection passes get the binary via ``_link_or_copy``
     -- one hardlink per pass folder, no copies.
@@ -1494,6 +1508,9 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
     shared_dir = save_root / '_shared_reg'
     shared_plane0 = shared_dir / 'suite2p' / 'plane0'
 
+    # The legacy ops.npy is still written by suite2p when
+    # settings.io.save_ops_orig=True (the default), so we still gate
+    # on its presence as the "registration ran to completion" marker.
     if (shared_plane0 / 'data.bin').exists() and (shared_plane0 / 'ops.npy').exists():
         if config.verbose:
             print(f"  > reusing shared registration at {shared_plane0}")
@@ -1514,12 +1531,15 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
         print(f"  > no shared registration yet; running suite2p register-only "
               f"into {shared_dir}")
 
-    reg_ops = dict(base_ops)
-    reg_ops['save_path0'] = str(shared_dir)
-    reg_ops['save_folder'] = 'suite2p'
-    reg_ops['roidetect'] = False
-    db = {'data_path': [config.tiff_folder]}
-    _run_s2p(reg_ops, db)
+    reg_db = dict(db)
+    reg_db['data_path'] = [config.tiff_folder]
+    reg_db['save_path0'] = str(shared_dir)
+    reg_db['save_folder'] = 'suite2p'
+
+    reg_settings = _deep_copy_settings(settings)
+    reg_settings.setdefault('run', {})['do_detection'] = False
+
+    _invoke_run_s2p(reg_db, reg_settings)
 
     if not (shared_plane0 / 'data.bin').exists():
         raise RuntimeError(
@@ -1529,47 +1549,59 @@ def _get_or_create_shared_registration(config: 'AdaptiveConfig',
     return shared_plane0
 
 
-def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
+def _deep_copy_settings(settings: dict) -> dict:
+    """Recursively copy a settings dict (one level of nesting is enough
+    for suite2p's schema). Top-level dict and any nested dict values
+    are shallow-copied so mutating the copy doesn't bleed back.
+    """
+    out = {}
+    for k, v in settings.items():
+        if isinstance(v, dict):
+            out[k] = _deep_copy_settings(v)
+        else:
+            out[k] = v
+    return out
+
+
+def run_one_pass(tiff_folder: str, save_dir: Path,
+                 db: dict, settings: dict,
                  verbose: bool = True, use_cache: bool = True,
                  shared_plane0: Optional[Path] = None,
                  hard_cap: int = 0):
-    """Run Suite2p once with the given ops and return its detection
-    output.
+    """Run Suite2p once with the given ``(db, settings)`` and return
+    its detection output.
 
     Steps
     -----
-    1. Compare ``ops`` with any cached ``ops.npy`` already in
-       ``save_dir``. If keys match, skip the run and re-use the
-       cached ``stat.npy`` -- speeds up repeated parameter sweeps.
+    1. (Optional) compare ``settings`` with any cached settings.npy
+       already in ``save_dir``; reuse the cached ``stat.npy`` if the
+       detection-controlling keys all match.
     2. If a ``shared_plane0`` was passed (the shared-registration
-       cache), hardlink its ``data.bin`` + ``ops.npy`` into
-       ``save_dir`` and set ``do_registration=0`` so Suite2p skips
-       its registration step.
+       cache), hardlink its ``data.bin`` into ``save_dir`` and call
+       ``suite2p.run_plane`` (which skips registration entirely).
     3. (Optional) install the ROI-hard-cap monkey-patch on
        ``suite2p.detection.sparsedetect.print`` so a sparsery run
        that finds more than ``hard_cap`` ROIs aborts mid-iteration.
-    4. Run ``suite2p.run_s2p(ops=ops, db={'data_path': [tiff_folder]})``.
-    5. Load ``stat.npy`` and ``ops.npy`` from the resulting plane0
-       and return both alongside the plane0 path.
+    4. Otherwise dispatch to ``suite2p.run_s2p`` for the full
+       TIFF -> binary -> registration -> detection -> extraction flow.
 
-    If ``use_cache`` is True and ``save_dir`` already contains a completed
-    suite2p run whose ops match this pass's ops, the cached output is
-    returned without re-invoking suite2p.
-
-    If ``shared_plane0`` is provided (a plane0 folder that already
-    contains a registered ``data.bin`` and registration-complete
-    ``ops.npy``), the pass reuses that binary instead of re-registering:
-    it hardlinks ``data.bin`` into its own plane0, writes a detection-only
-    ops.npy with ``do_registration=0``, and invokes ``suite2p.run_plane``
-    directly. This skips the TIFF->binary conversion and registration steps
-    that otherwise take the bulk of per-pass runtime.
+    Returns
+    -------
+    stat : list[dict]
+        The per-ROI detection output.
+    view : dict
+        A ``utils.load_plane_view``-shaped flat dict of the run's
+        on-disk db / settings / reg / detect outputs (so callers can
+        still read ``view['Ly']`` / ``view['meanImg']``).
+    plane0 : Path
+        ``<save_dir>/suite2p/plane0``.
     """
-    ops = dict(ops)
-    ops['save_path0'] = str(save_dir)
-    ops['save_folder'] = 'suite2p'
+    db = dict(db)
+    db['save_path0'] = str(save_dir)
+    db['save_folder'] = 'suite2p'
 
     if use_cache:
-        cached = _load_cached_pass(save_dir, ops, verbose=verbose)
+        cached = _load_cached_pass(save_dir, settings, verbose=verbose)
         if cached is not None:
             return cached
 
@@ -1578,112 +1610,95 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
     # --- Registration-reuse path ---------------------------------------
     if shared_plane0 is not None:
         plane0.mkdir(parents=True, exist_ok=True)
-        # Hardlink the registered binary; data.bin itself is read-only in
-        # downstream use, so hardlinking is safe.
+        # Hardlink the registered binary; data.bin is read-only downstream.
         _link_or_copy(Path(shared_plane0) / 'data.bin', plane0 / 'data.bin')
 
-        # Start from the registered ops (contains Ly, Lx, meanImg, yoff,
-        # xoff, nframes, refImg, corrXY, ...) and layer detection params
-        # on top.
-        reg_ops = np.load(Path(shared_plane0) / 'ops.npy',
-                          allow_pickle=True).item()
-        pass_ops = dict(reg_ops)
-        # Override only the detection-relevant keys from the caller's ops.
-        _detection_keys = (
-            'threshold_scaling', 'max_iterations', 'spatial_scale',
-            'sparse_mode', 'high_pass', 'smooth_sigma', 'preclassify',
-            'allow_overlap', 'max_overlap', 'tau', 'fs', 'nbinned',
-            'batch_size', 'roidetect',
-        )
-        for k in _detection_keys:
-            if k in ops:
-                pass_ops[k] = ops[k]
-        pass_ops['do_registration'] = 0
-        pass_ops['save_path0'] = str(save_dir)
-        pass_ops['save_folder'] = 'suite2p'
-        pass_ops['save_path'] = str(plane0)
-        pass_ops['reg_file'] = str(plane0 / 'data.bin')
-        # ``raw_file`` from the shared register-only run points at the
-        # _shared_reg folder; clear it (we hardlink only data.bin) and
-        # force keep_movie_raw=False so suite2p's
-        # ``raw = keep_movie_raw and os.path.isfile(raw_file)`` doesn't
-        # crash on a missing path.
-        pass_ops.pop('raw_file', None)
-        pass_ops.pop('raw_file_chan2', None)
-        pass_ops['keep_movie_raw'] = False
-        # roidetect defaults to True; make it explicit.
-        pass_ops.setdefault('roidetect', True)
+        # Pull the shared registration's runtime fields onto our db so
+        # run_plane sees the right Ly/Lx/nframes/etc. We start from the
+        # caller's db (has nchannels, nplanes, save_path0, ...), then
+        # layer the cached registration outputs on top.
+        shared_view = utils.load_plane_view(shared_plane0)
+        plane_db = dict(db)
+        for k in ('Ly', 'Lx', 'nframes', 'nchannels'):
+            if k in shared_view:
+                plane_db[k] = shared_view[k]
+        plane_db['save_path0'] = str(save_dir)
+        plane_db['save_folder'] = 'suite2p'
+        plane_db['save_path'] = str(plane0)
+        plane_db['reg_file'] = str(plane0 / 'data.bin')
+        # raw_file from the shared register-only run points at the
+        # _shared_reg folder; we only hardlinked data.bin. Force
+        # keep_movie_raw=False so suite2p's raw-file existence check
+        # doesn't blow up on the missing path.
+        plane_db.pop('raw_file', None)
+        plane_db.pop('raw_file_chan2', None)
+        plane_db['keep_movie_raw'] = False
 
-        np.save(plane0 / 'ops.npy', pass_ops, allow_pickle=True)
+        # Ensure we're actually doing detection on this plane.
+        plane_settings = _deep_copy_settings(settings)
+        plane_settings.setdefault('run', {})['do_registration'] = False
+        plane_settings['run'].setdefault('do_detection', True)
 
         if verbose:
             print(f"  > running suite2p detection-only (shared registration): "
-                  f"threshold_scaling={pass_ops.get('threshold_scaling')}  "
-                  f"spatial_scale={pass_ops.get('spatial_scale')}  "
-                  f"max_iterations={pass_ops.get('max_iterations')}")
+                  f"threshold_scaling={get_setting(plane_settings, 'threshold_scaling')}  "
+                  f"spatial_scale={get_setting(plane_settings, 'spatial_scale')}  "
+                  f"max_iterations={get_setting(plane_settings, 'max_iterations')}")
 
         _orig_print = (_install_sparsery_roi_cap(hard_cap)
                        if hard_cap and hard_cap > 0 else None)
         try:
-            _run_plane(pass_ops, {})
+            _invoke_run_plane(plane_db, plane_settings)
         except _RoiHardCapExceeded as e:
             if verbose:
                 print(f"  > ABORT: {e} -- returning empty pass")
-            ops_loaded = (np.load(plane0 / 'ops.npy',
-                                  allow_pickle=True).item()
-                          if (plane0 / 'ops.npy').exists() else pass_ops)
             try:
+                plane0.mkdir(parents=True, exist_ok=True)
                 np.save(plane0 / 'stat.npy',
                         np.array([], dtype=object), allow_pickle=True)
-                # drop a breadcrumb so diagnostic tooling can see why this pass
-                # is empty (versus a genuinely noise-free pass that found 0)
                 (plane0 / 'HARD_CAP_ABORTED.txt').write_text(
                     f"Sparsery aborted at ~{e.count} ROIs "
                     f"(cap={e.cap}).\n"
                 )
             except Exception:
                 pass
-            return [], ops_loaded, plane0
+            return [], utils.load_plane_view(plane0), plane0
         except ValueError as e:
             if 'no ROIs' in str(e) or 'ROIs were found' in str(e):
                 if verbose:
                     print("  > suite2p found 0 ROIs for these params; "
                           "returning empty pass")
-                ops_loaded = (np.load(plane0 / 'ops.npy',
-                                      allow_pickle=True).item()
-                              if (plane0 / 'ops.npy').exists() else pass_ops)
                 try:
+                    plane0.mkdir(parents=True, exist_ok=True)
                     np.save(plane0 / 'stat.npy',
                             np.array([], dtype=object), allow_pickle=True)
                 except Exception:
                     pass
-                return [], ops_loaded, plane0
+                return [], utils.load_plane_view(plane0), plane0
             raise
         finally:
             if _orig_print is not None:
                 _restore_sparsery_print(_orig_print)
 
         stat = list(np.load(plane0 / 'stat.npy', allow_pickle=True))
-        ops_loaded = np.load(plane0 / 'ops.npy', allow_pickle=True).item()
-        return stat, ops_loaded, plane0
+        return stat, utils.load_plane_view(plane0), plane0
 
     # --- Full run_s2p path (registers + detects) -----------------------
-    db = {'data_path': [tiff_folder]}
+    full_db = dict(db)
+    full_db['data_path'] = [tiff_folder]
 
     if verbose:
-        print(f"  > running suite2p: threshold_scaling={ops['threshold_scaling']}  "
-              f"max_iterations={ops['max_iterations']}")
+        print(f"  > running suite2p: "
+              f"threshold_scaling={get_setting(settings, 'threshold_scaling')}  "
+              f"max_iterations={get_setting(settings, 'max_iterations')}")
 
     _orig_print = (_install_sparsery_roi_cap(hard_cap)
                    if hard_cap and hard_cap > 0 else None)
     try:
-        _run_s2p(ops, db)
+        _invoke_run_s2p(full_db, settings)
     except _RoiHardCapExceeded as e:
         if verbose:
             print(f"  > ABORT: {e} -- returning empty pass")
-        ops_path = plane0 / 'ops.npy'
-        ops_loaded = (np.load(ops_path, allow_pickle=True).item()
-                      if ops_path.exists() else dict(ops))
         try:
             plane0.mkdir(parents=True, exist_ok=True)
             np.save(plane0 / 'stat.npy',
@@ -1694,34 +1709,26 @@ def run_one_pass(tiff_folder: str, save_dir: Path, ops: dict,
             )
         except Exception:
             pass
-        return [], ops_loaded, plane0
+        return [], utils.load_plane_view(plane0), plane0
     except ValueError as e:
-        # Suite2p raises when detection finds zero ROIs. Registration has
-        # already written ops.npy to plane0 at this point, so we can still
-        # return useful info — just with an empty stat list.
         if 'no ROIs' in str(e) or 'ROIs were found' in str(e):
             if verbose:
-                print(f"  > suite2p found 0 ROIs for these params; returning empty pass")
-            ops_path = plane0 / 'ops.npy'
-            ops_loaded = (np.load(ops_path, allow_pickle=True).item()
-                          if ops_path.exists() else dict(ops))
-            # Persist an empty stat.npy so the cache check recognizes this
-            # as a completed (if barren) pass and doesn't re-run it.
+                print(f"  > suite2p found 0 ROIs for these params; "
+                      f"returning empty pass")
             try:
                 plane0.mkdir(parents=True, exist_ok=True)
                 np.save(plane0 / 'stat.npy',
                         np.array([], dtype=object), allow_pickle=True)
             except Exception:
                 pass
-            return [], ops_loaded, plane0
+            return [], utils.load_plane_view(plane0), plane0
         raise
     finally:
         if _orig_print is not None:
             _restore_sparsery_print(_orig_print)
 
     stat = list(np.load(plane0 / 'stat.npy', allow_pickle=True))
-    ops_loaded = np.load(plane0 / 'ops.npy', allow_pickle=True).item()
-    return stat, ops_loaded, plane0
+    return stat, utils.load_plane_view(plane0), plane0
 
 
 # ============================================================================
@@ -1800,13 +1807,13 @@ def _collect_seed_blobs(scale_data, winner: int,
 
 
 def run_blob_seeded_detection(config: AdaptiveConfig, save_dir: Path,
-                              base_ops: dict, blobs_yxr):
+                              base_db: dict, base_settings: dict, blobs_yxr):
     """
     Register the data with suite2p, then bypass sparsery: build stat from
     the provided blob list and run suite2p's extraction + classification
     + deconvolution manually.
 
-    Returns (stat, ops, plane0) in the same shape as ``run_one_pass``.
+    Returns ``(stat, view, plane0)`` -- same shape as ``run_one_pass``.
     """
     from suite2p.detection.stats import roi_stats
     from suite2p.extraction import extract, dcnv
@@ -1817,20 +1824,21 @@ def run_blob_seeded_detection(config: AdaptiveConfig, save_dir: Path,
     plane0 = save_dir / 'suite2p' / 'plane0'
 
     # Step 1: register only (skip sparsery entirely)
-    reg_ops = dict(base_ops)
-    reg_ops['save_path0'] = str(save_dir)
-    reg_ops['save_folder'] = 'suite2p'
-    reg_ops['roidetect'] = False
+    reg_db = dict(base_db)
+    reg_db['data_path'] = [config.tiff_folder]
+    reg_db['save_path0'] = str(save_dir)
+    reg_db['save_folder'] = 'suite2p'
+    reg_settings = _deep_copy_settings(base_settings)
+    reg_settings.setdefault('run', {})['do_detection'] = False
 
     if config.verbose:
         print(f"  > blob-seeded detection: running suite2p registration "
-              f"only (roidetect=False)")
+              f"only (do_detection=False)")
 
-    db = {'data_path': [config.tiff_folder]}
-    _run_s2p(reg_ops, db)
+    _invoke_run_s2p(reg_db, reg_settings)
 
-    # Load the ops that suite2p wrote (contains Ly, Lx, reg_file, nframes, ...)
-    ops = np.load(plane0 / 'ops.npy', allow_pickle=True).item()
+    # Load the synthesized view that suite2p produced (Ly, Lx, reg_file, ...)
+    ops = utils.load_plane_view(plane0)
     Ly, Lx = int(ops['Ly']), int(ops['Lx'])
 
     if len(blobs_yxr) == 0:
@@ -1913,180 +1921,20 @@ def run_blob_seeded_detection(config: AdaptiveConfig, save_dir: Path,
 
 
 def run_residual_augmentation(config: AdaptiveConfig, base_stat, base_ops,
-                              base_plane0: Path, shared_plane0: Path,
-                              save_dir: Path):
+                              base_plane0, shared_plane0, save_dir):
+    """Deferred: residual-blob augmentation pass.
+
+    The implementation pre-suite2p-1.0-refactor mutated a flat ops dict
+    in place. It needs to be ported to the new (db, settings) model,
+    but isn't wired into the GUI; it's safe to leave deferred until a
+    follow-up PR. Callers that depend on the legacy adaptive loop
+    (none in the current GUI) get a clear error.
     """
-    Second detection stage: seed ROIs at blob centers in the residual image
-    (mean image minus existing ROI pixels), combine with ``base_stat``,
-    extract fluorescence + deconvolve + classify the union, and save all
-    outputs to a new plane0.
-
-    This is the final recovery step when sparsery converges but leaves
-    obvious soma-like blobs in the residual. Classifier acts as the junk
-    filter via ``augmentation_min_iscell_prob``.
-
-    Returns (stat_out, ops_out, aug_plane0).
-    """
-    from suite2p.detection.stats import roi_stats
-    from suite2p.extraction import extract, dcnv
-    from suite2p import classification
-
-    save_dir = Path(save_dir)
-    aug_plane0 = save_dir / 'suite2p' / 'plane0'
-    aug_plane0.mkdir(parents=True, exist_ok=True)
-
-    Ly, Lx = int(base_ops['Ly']), int(base_ops['Lx'])
-
-    # --- 1. Detect blobs in residual image ----------------------------
-    roi_mask = build_roi_pixel_mask(base_stat, Ly, Lx)
-    residual, _ = compute_residual_image(base_ops, roi_mask)
-    res_blobs = detect_residual_blobs(residual, config)  # (y, x, r, val)
-
-    if config.verbose:
-        print(f"  > residual-blob augmentation: {len(res_blobs)} candidate "
-              f"blobs detected in residual")
-
-    if not res_blobs:
-        if config.verbose:
-            print("  > no residual blobs; skipping augmentation")
-        return list(base_stat), base_ops, base_plane0
-
-    # --- 2. Build aug ops with reused registration --------------------
-    _link_or_copy(Path(shared_plane0) / 'data.bin', aug_plane0 / 'data.bin')
-    reg_ops = np.load(Path(shared_plane0) / 'ops.npy',
-                      allow_pickle=True).item()
-    aug_ops = dict(reg_ops)
-    # Carry forward sample-specific params from base_ops
-    for k in ('tau', 'fs', 'neucoeff', 'baseline', 'win_baseline',
-              'sig_baseline', 'prctile_baseline', 'batch_size'):
-        if k in base_ops:
-            aug_ops[k] = base_ops[k]
-    aug_ops['save_path0'] = str(save_dir)
-    aug_ops['save_folder'] = 'suite2p'
-    aug_ops['reg_file'] = str(aug_plane0 / 'data.bin')
-    aug_ops['ops_path'] = str(aug_plane0 / 'ops.npy')
-    aug_ops['do_registration'] = 0
-    aug_ops['Ly'] = Ly
-    aug_ops['Lx'] = Lx
-
-    # --- 3. Build combined stat (base + residual blobs) ---------------
-    # Strip base_stat to raw fields so roi_stats can re-enrich the union.
-    # Tag each ROI with '_is_base_roi' so we can distinguish base from
-    # residual-seeded AFTER suite2p's create_masks_and_extract (which
-    # reorders/drops ROIs and would otherwise break an index-based split).
-    combined_raw = []
-    for s in base_stat:
-        combined_raw.append({
-            'ypix': np.asarray(s['ypix']).astype(np.int32),
-            'xpix': np.asarray(s['xpix']).astype(np.int32),
-            'lam': np.asarray(s['lam']).astype(np.float32),
-            'med': list(s.get('med', [int(np.median(s['ypix'])),
-                                       int(np.median(s['xpix']))])),
-            '_is_base_roi': True,
-        })
-    n_base = len(combined_raw)
-
-    blobs_yxr = [(y, x, r) for (y, x, r, _v) in res_blobs]
-    residual_stat = _stat_from_blob_centers(
-        blobs_yxr, Ly, Lx,
-        gaussian_sigma_factor=config.blob_seed_gaussian_sigma_factor,
+    raise NotImplementedError(
+        "run_residual_augmentation is deferred during the suite2p 1.0 "
+        "(db, settings) refactor; rewrite to take (base_db, base_settings) "
+        "before re-enabling. The active GUI path uses sparse_plus_cellpose."
     )
-    for s in residual_stat:
-        s['_is_base_roi'] = False
-    combined_raw.extend(residual_stat)
-    n_new = len(residual_stat)
-
-    if config.verbose:
-        print(f"  > augmented stat: {n_base} base + {n_new} residual-seeded "
-              f"= {len(combined_raw)} total")
-
-    # --- 4. Enrich via roi_stats with median diameter -----------------
-    median_diam = int(round(2.0 * float(np.median([r for (_y, _x, r)
-                                                   in blobs_yxr]))))
-    median_diam = max(3, median_diam)
-    combined_enriched = roi_stats(combined_raw, Ly, Lx, diameter=median_diam)
-    # roi_stats copies dict fields across, so the '_is_base_roi' tag survives.
-    # Assert sanity just in case.
-    for i, s in enumerate(combined_enriched):
-        if '_is_base_roi' not in s:
-            s['_is_base_roi'] = (i < n_base)
-    stat_arr = np.array(combined_enriched, dtype=object)
-
-    # --- 5. Extract fluorescence traces -------------------------------
-    if config.verbose:
-        print(f"  > extracting traces for {len(stat_arr)} ROIs")
-    stat_arr, F, Fneu, F_chan2, Fneu_chan2 = extract.create_masks_and_extract(
-        aug_ops, stat_arr
-    )
-
-    # --- 6. Deconvolve (OASIS) ----------------------------------------
-    tau = float(aug_ops.get('tau', 1.0))
-    fs = float(aug_ops.get('fs', 15.0))
-    neucoeff = float(aug_ops.get('neucoeff', 0.7))
-    F_sub = F - neucoeff * Fneu
-    F_pp = dcnv.preprocess(
-        F=F_sub, baseline=aug_ops.get('baseline', 'maximin'),
-        win_baseline=float(aug_ops.get('win_baseline', 60.0)),
-        sig_baseline=float(aug_ops.get('sig_baseline', 10.0)),
-        fs=fs,
-        prctile_baseline=float(aug_ops.get('prctile_baseline', 8.0)),
-    )
-    batch_size = int(aug_ops.get('batch_size', 3000))
-    spks = dcnv.oasis(F=F_pp, batch_size=batch_size, tau=tau, fs=fs)
-
-    # --- 7. Classify --------------------------------------------------
-    try:
-        iscell = classification.classify(
-            stat=stat_arr, classfile=classification.builtin_classfile
-        )
-    except Exception as e:
-        if config.verbose:
-            print(f"  > classifier failed ({e}); marking all as cells")
-        iscell = np.ones((len(stat_arr), 2), dtype=np.float32)
-
-    # --- 8. Apply augmentation filter ---------------------------------
-    # Original base ROIs are always kept (they already passed pass-0
-    # classification). Only the newly-seeded residual ROIs need to beat
-    # the ``augmentation_min_iscell_prob`` threshold. We distinguish via
-    # the '_is_base_roi' tag, not index — because create_masks_and_extract
-    # can reorder or drop ROIs, making an index-based split unreliable.
-    prob_threshold = float(config.augmentation_min_iscell_prob)
-    is_base = np.array([bool(s.get('_is_base_roi', False))
-                        for s in stat_arr], dtype=bool)
-    keep = np.ones(len(stat_arr), dtype=bool)
-    if iscell.ndim == 2 and len(iscell) == len(stat_arr):
-        probs = iscell[:, 1] if iscell.shape[1] >= 2 else iscell[:, 0]
-        drop_mask = (~is_base) & (probs < prob_threshold)
-        keep[drop_mask] = False
-    n_dropped = int((~keep & ~is_base).sum())
-    n_residual_after_extract = int((~is_base).sum())
-    if config.verbose:
-        print(f"  > post-extract: {int(is_base.sum())} base + "
-              f"{n_residual_after_extract} residual = {len(stat_arr)} "
-              f"(was {n_base} base + {n_new} residual before extract)")
-        print(f"  > augmentation filter (prob >= {prob_threshold}): "
-              f"dropped {n_dropped}/{n_residual_after_extract} residual-seeded ROIs")
-
-    stat_arr = stat_arr[keep]
-    F = F[keep]
-    Fneu = Fneu[keep]
-    spks = spks[keep]
-    iscell = iscell[keep]
-
-    # --- 9. Save standard suite2p outputs -----------------------------
-    np.save(aug_plane0 / 'stat.npy', stat_arr, allow_pickle=True)
-    np.save(aug_plane0 / 'F.npy', F)
-    np.save(aug_plane0 / 'Fneu.npy', Fneu)
-    np.save(aug_plane0 / 'spks.npy', spks)
-    np.save(aug_plane0 / 'iscell.npy', iscell)
-    np.save(aug_plane0 / 'ops.npy', aug_ops, allow_pickle=True)
-
-    if config.verbose:
-        n_accept = int((iscell[:, 0] > 0).sum()) if iscell.ndim == 2 else int((iscell > 0).sum())
-        print(f"  > residual-blob augmentation: final {len(stat_arr)} ROIs "
-              f"({n_accept} classified as cells)")
-
-    return list(stat_arr), aug_ops, aug_plane0
 
 
 # ============================================================================
@@ -2210,936 +2058,46 @@ def _is_speckle_pass(config, stat_pass, baseline_stat):
     return False, None
 
 
-def _run_binary_search_schedule(config, base_ops, save_root,
-                                initial_stat, initial_ops, initial_plane0,
-                                initial_thr, initial_max_iter,
-                                shared_plane0: Optional[Path] = None):
-    """
-    Binary-search threshold refinement.
-
-    Idea: treat ``threshold_scaling`` as a parameter to fit. The speckle
-    guard classifies each pass as "safe" (real cells) or "speckle"
-    (noise clumps). We maintain a bracket ``[lo, hi]`` where:
-      - ``lo`` is the lowest threshold known to produce real cells
-        (starts at ``initial_thr``, set from pass 0).
-      - ``hi`` is the highest threshold known to produce speckles
-        (initially None — unknown).
-
-    Each probe picks the midpoint of the bracket (or one step below ``lo``
-    if ``hi`` is None yet). A safe probe tightens ``lo`` up and its ROIs
-    get merged in. A speckle probe tightens ``hi`` down and its ROIs are
-    discarded.
-
-    Stops when:
-      - hi - lo <= precision*(initial_thr - min_thr), OR
-      - a safe probe added < min_new_rois_per_pass new ROIs, OR
-      - max_under_detection_passes reached, OR
-      - residual blob count below min_residual_blobs.
-    """
-    passes = [{
-        'index': 0,
-        'regime': 'binary_search',
-        'threshold_scaling': initial_thr,
-        'max_iterations': initial_max_iter,
-        'n_detected_this_pass': len(initial_stat),
-        'n_added_after_merge': len(initial_stat),
-        'n_merged_total': len(initial_stat),
-        'plane0': str(initial_plane0),
-        'role': 'baseline',
-    }]
-    merged_stat = list(initial_stat)
-    final_ops = initial_ops
-    final_plane0 = initial_plane0
-
-    # Initial residual audit
-    Ly, Lx = initial_ops['Ly'], initial_ops['Lx']
-    roi_mask = build_roi_pixel_mask(merged_stat, Ly, Lx)
-    residual, _ = compute_residual_image(initial_ops, roi_mask)
-    blobs = detect_residual_blobs(residual, config)
-    passes[0]['n_residual_blobs'] = len(blobs)
-
-    if config.verbose:
-        print(f"  > residual blobs after pass 0: {len(blobs)}")
-
-    if len(blobs) <= config.min_residual_blobs:
-        if config.verbose:
-            print("  > stopping: pass 0 already captures most cells")
-        return merged_stat, passes, final_ops, final_plane0
-
-    # --- bracket setup ---
-    lo = float(initial_thr)
-    hi: Optional[float] = None   # unknown upper (speckle) bound
-    min_thr = float(config.min_threshold_scaling)
-    bracket_width_initial = max(initial_thr - min_thr, 1e-6)
-    precision = config.binary_search_precision * bracket_width_initial
-
-    # First probe: one decay step below lo. If there's no known speckle
-    # threshold yet, go aggressive enough to actually find one.
-    first_step = max(
-        config.threshold_decay_offset,
-        (initial_thr - min_thr) * 0.5,
+def _run_binary_search_schedule(*args, **kwargs):
+    """Deferred during the suite2p 1.0 (db, settings) refactor."""
+    raise NotImplementedError(
+        "_run_binary_search_schedule is deferred during the suite2p 1.0 "
+        "(db, settings) refactor; the binary-search adaptive loop is not "
+        "wired into the current GUI. Use sparse_plus_cellpose.run instead."
     )
-    next_thr = max(min_thr, lo - first_step)
-
-    tried: set = set()  # avoid re-running identical thresholds
-
-    for j in range(1, config.max_under_detection_passes + 1):
-        thr = round(float(next_thr), 4)
-        if thr <= min_thr + 1e-9 and hi is None:
-            if config.verbose:
-                print(f"  > stopping: hit min_threshold_scaling ({min_thr}) "
-                      f"without finding a speckle boundary")
-            break
-        if thr in tried:
-            if config.verbose:
-                print(f"  > stopping: threshold {thr:.3f} already tried "
-                      f"(bracket collapsed)")
-            break
-        tried.add(thr)
-
-        pass_dir = save_root / f"pass{j:02d}_thr{thr:.2f}"
-        pass_dir.mkdir(parents=True, exist_ok=True)
-
-        if config.verbose:
-            bracket = f"[{lo:.3f}, {'?' if hi is None else f'{hi:.3f}'}]"
-            print(f"\n[pass {j}] binary_search probe at thr={thr:.3f}  "
-                  f"bracket={bracket}  max_iterations={initial_max_iter}")
-
-        ops = dict(base_ops)
-        ops['threshold_scaling'] = thr
-        ops['max_iterations'] = initial_max_iter
-
-        stat_pass, ops_out, plane0 = run_one_pass(
-            config.tiff_folder, pass_dir, ops,
-            verbose=config.verbose, use_cache=config.use_cache,
-            shared_plane0=shared_plane0,
-            hard_cap=config.max_rois_hard_cap,
-        )
-
-        # --- classify this probe via speckle guard ---
-        rejected, reason = _is_speckle_pass(config, stat_pass, initial_stat)
-
-        # Check if the pass was aborted by the ROI hard cap. In that case we
-        # know it was a noise blowup even if stat_pass came back empty.
-        hard_cap_aborted = (plane0 / 'HARD_CAP_ABORTED.txt').exists()
-
-        if rejected or len(stat_pass) == 0:
-            # Speckle (or empty or cap-aborted) probe: tighten hi, discard.
-            # An empty-ROI result is treated the same as speckle for
-            # bracket-tightening purposes — it means this threshold isn't
-            # useful, but a slightly higher one might be. A hard-cap abort
-            # is the strongest speckle signal possible.
-            if hard_cap_aborted:
-                tag = 'hard_cap_aborted'
-                hard_cap_reason = (plane0 / 'HARD_CAP_ABORTED.txt').read_text().strip()
-            elif rejected:
-                tag = 'speckle'
-            else:
-                tag = 'empty'
-            hi = thr
-            if config.verbose:
-                if hard_cap_aborted:
-                    print(f"  > HARD CAP HIT: {hard_cap_reason}")
-                elif rejected:
-                    print(f"  > SPECKLE probe rejected: {reason}")
-                else:
-                    print(f"  > EMPTY probe (0 ROIs at thr={thr:.3f})")
-            passes.append({
-                'index': j,
-                'regime': 'binary_search',
-                'threshold_scaling': thr,
-                'max_iterations': initial_max_iter,
-                'n_detected_this_pass': len(stat_pass),
-                'n_added_after_merge': 0,
-                'n_merged_total': len(merged_stat),
-                'role': tag,
-                'rejected': rejected or hard_cap_aborted,
-                'rejection_reason': (hard_cap_reason if hard_cap_aborted
-                                     else reason),
-                'plane0': str(plane0),
-            })
-        else:
-            # Safe probe: tighten lo, merge ROIs.
-            merged_stat, n_added = merge_roi_lists(
-                merged_stat, stat_pass,
-                iou_threshold=config.iou_dedup_threshold,
-            )
-            final_ops = ops_out
-            final_plane0 = plane0
-            lo = thr
-
-            roi_mask = build_roi_pixel_mask(merged_stat, Ly, Lx)
-            residual, _ = compute_residual_image(ops_out, roi_mask)
-            blobs = detect_residual_blobs(residual, config)
-
-            passes.append({
-                'index': j,
-                'regime': 'binary_search',
-                'threshold_scaling': thr,
-                'max_iterations': initial_max_iter,
-                'n_detected_this_pass': len(stat_pass),
-                'n_added_after_merge': n_added,
-                'n_merged_total': len(merged_stat),
-                'n_residual_blobs': len(blobs),
-                'role': 'safe',
-                'plane0': str(plane0),
-            })
-            if config.verbose:
-                print(f"  > SAFE probe: detected={len(stat_pass)}  "
-                      f"added={n_added}  total={len(merged_stat)}  "
-                      f"residual_blobs={len(blobs)}")
-
-            if len(blobs) <= config.min_residual_blobs:
-                if config.verbose:
-                    print("  > stopping: residual blob count below tolerance")
-                break
-            if n_added < config.min_new_rois_per_pass:
-                if config.verbose:
-                    print("  > stopping: probe added few new ROIs "
-                          "(diminishing returns)")
-                break
-
-        # --- decide next probe ---
-        if hi is not None and hi - lo <= precision:
-            if config.verbose:
-                print(f"  > stopping: bracket width {hi-lo:.4f} <= "
-                      f"precision {precision:.4f}")
-            break
-        if hi is None:
-            # No speckle boundary found yet — keep probing lower.
-            next_thr = max(min_thr, lo - first_step)
-        else:
-            # Midpoint of current bracket.
-            next_thr = (lo + hi) / 2.0
-
-    return merged_stat, passes, final_ops, final_plane0
 
 
-def _run_under_detection_schedule(config, base_ops, save_root,
-                                  initial_stat, initial_ops, initial_plane0,
-                                  initial_thr, initial_max_iter,
-                                  shared_plane0: Optional[Path] = None):
-    """
-    Under-detection regime: start from the already-completed pass 0 and keep
-    lowering threshold_scaling dynamically (multiplicative or additive,
-    controlled by AdaptiveConfig) until one of the stopping criteria is
-    met:
-      - residual blob count below tolerance
-      - pass added fewer new ROIs than ``min_new_rois_per_pass``
-      - threshold hit its floor (``min_threshold_scaling``)
-      - pass index hit ``max_under_detection_passes``
-    """
-    passes = [{
-        'index': 0,
-        'regime': 'under_detection',
-        'threshold_scaling': initial_thr,
-        'max_iterations': initial_max_iter,
-        'n_detected_this_pass': len(initial_stat),
-        'n_added_after_merge': len(initial_stat),
-        'n_merged_total': len(initial_stat),
-        'plane0': str(initial_plane0),
-    }]
-    merged_stat = list(initial_stat)
-    final_ops = initial_ops
-    final_plane0 = initial_plane0
-
-    # Initial residual audit on pass 0
-    Ly, Lx = initial_ops['Ly'], initial_ops['Lx']
-    roi_mask = build_roi_pixel_mask(merged_stat, Ly, Lx)
-    residual, _ = compute_residual_image(initial_ops, roi_mask)
-    blobs = detect_residual_blobs(residual, config)
-    passes[0]['n_residual_blobs'] = len(blobs)
-
-    if config.verbose:
-        print(f"  > residual blobs after pass 0: {len(blobs)}")
-
-    if len(blobs) <= config.min_residual_blobs:
-        if config.verbose:
-            print("  > stopping: pass 0 already captures most cells")
-        return merged_stat, passes, final_ops, final_plane0
-
-    # Dynamically derive each subsequent threshold from the previous one.
-    # Extra kick when the previous pass returned 0 ROIs.
-    current_thr = initial_thr
-    prev_n_detected = len(initial_stat)
-
-    for j in range(1, config.max_under_detection_passes + 1):
-        aggressive = (prev_n_detected == 0)
-        next_thr = _next_threshold(current_thr, config, aggressive=aggressive)
-
-        if next_thr >= current_thr - 1e-9:
-            if config.verbose:
-                print(f"  > stopping: threshold floor "
-                      f"({config.min_threshold_scaling}) reached")
-            break
-        current_thr = next_thr
-        max_iter = config.default_max_iterations
-
-        pass_dir = save_root / f"pass{j:02d}_thr{current_thr:.2f}"
-        pass_dir.mkdir(parents=True, exist_ok=True)
-
-        if config.verbose:
-            step_note = (f"  (aggressive: previous pass = 0 ROIs)"
-                         if aggressive else "")
-            print(f"\n[pass {j}] under_detection regime  "
-                  f"threshold_scaling={current_thr:.4g}  "
-                  f"max_iterations={max_iter}{step_note}")
-
-        # base_ops['spatial_scale'] already reflects the pass-0 fallback
-        # result, so subsequent passes inherit the scale that actually
-        # produced ROIs. No override needed here.
-        ops = dict(base_ops)
-        ops['threshold_scaling'] = current_thr
-        ops['max_iterations'] = max_iter
-
-        stat_pass, ops_out, plane0 = run_one_pass(
-            config.tiff_folder, pass_dir, ops,
-            verbose=config.verbose, use_cache=config.use_cache,
-            shared_plane0=shared_plane0,
-            hard_cap=config.max_rois_hard_cap,
-        )
-        prev_n_detected = len(stat_pass)
-
-        # --- Speckle guard ---
-        # If this pass's ROIs are much smaller than pass 0's (classic sign
-        # of sparsery locking onto noise clumps at a lowered threshold),
-        # reject this pass outright — don't merge, don't update final_ops,
-        # and stop the schedule. The merged state before this pass is kept.
-        pass_rejected = False
-        rejection_reason = None
-        if len(stat_pass) > 0:
-            pass_areas = np.array([len(s['ypix']) for s in stat_pass])
-            pass_median_area = float(np.median(pass_areas))
-            baseline_areas = np.array([len(s['ypix']) for s in initial_stat]) \
-                if len(initial_stat) else np.array([])
-            baseline_median = (float(np.median(baseline_areas))
-                               if len(baseline_areas) else 0.0)
-            if (config.speckle_guard_min_area_px > 0
-                    and pass_median_area < config.speckle_guard_min_area_px):
-                pass_rejected = True
-                rejection_reason = (
-                    f"median area {pass_median_area:.1f}px < "
-                    f"speckle_guard_min_area_px={config.speckle_guard_min_area_px}"
-                )
-            elif (config.speckle_guard_area_ratio > 0
-                  and baseline_median > 0
-                  and pass_median_area
-                      < config.speckle_guard_area_ratio * baseline_median):
-                pass_rejected = True
-                rejection_reason = (
-                    f"median area {pass_median_area:.1f}px < "
-                    f"{config.speckle_guard_area_ratio} x pass0_median="
-                    f"{baseline_median:.1f}px"
-                )
-
-        if pass_rejected:
-            passes.append({
-                'index': j,
-                'regime': 'under_detection',
-                'threshold_scaling': current_thr,
-                'max_iterations': max_iter,
-                'n_detected_this_pass': len(stat_pass),
-                'n_added_after_merge': 0,
-                'n_merged_total': len(merged_stat),
-                'rejected': True,
-                'rejection_reason': rejection_reason,
-                'plane0': str(plane0),
-            })
-            if config.verbose:
-                print(f"  > REJECTED pass: {rejection_reason}")
-                print(f"  > stopping: speckle guard tripped; keeping previous merge")
-            break
-
-        final_ops = ops_out
-        final_plane0 = plane0
-
-        merged_stat, n_added = merge_roi_lists(
-            merged_stat, stat_pass, iou_threshold=config.iou_dedup_threshold
-        )
-
-        Ly, Lx = ops_out['Ly'], ops_out['Lx']
-        roi_mask = build_roi_pixel_mask(merged_stat, Ly, Lx)
-        residual, _ = compute_residual_image(ops_out, roi_mask)
-        blobs = detect_residual_blobs(residual, config)
-
-        passes.append({
-            'index': j,
-            'regime': 'under_detection',
-            'threshold_scaling': current_thr,
-            'max_iterations': max_iter,
-            'n_detected_this_pass': len(stat_pass),
-            'n_added_after_merge': n_added,
-            'n_merged_total': len(merged_stat),
-            'n_residual_blobs': len(blobs),
-            'plane0': str(plane0),
-        })
-
-        if config.verbose:
-            print(f"  > detected: {len(stat_pass)}  added: {n_added}  "
-                  f"total: {len(merged_stat)}  residual_blobs: {len(blobs)}")
-
-        if len(blobs) <= config.min_residual_blobs:
-            if config.verbose:
-                print("  > stopping: residual blob count below tolerance")
-            break
-        # Only count "few new ROIs" as a stop when the pass actually
-        # produced detections — a 0-ROI pass means threshold was too high,
-        # which should trigger an aggressive retry, not termination.
-        if len(stat_pass) > 0 and n_added < config.min_new_rois_per_pass:
-            if config.verbose:
-                print("  > stopping: pass added few new ROIs")
-            break
-
-    return merged_stat, passes, final_ops, final_plane0
+def _run_under_detection_schedule(*args, **kwargs):
+    """Deferred during the suite2p 1.0 (db, settings) refactor."""
+    raise NotImplementedError(
+        "_run_under_detection_schedule is deferred during the suite2p 1.0 "
+        "(db, settings) refactor."
+    )
 
 
-def _run_over_detection_schedule(config, base_ops, save_root,
-                                 shared_plane0: Optional[Path] = None):
-    """
-    Over-detection regime: pass 0 is discarded, and we rerun using explicit
-    spatial_scale and tightened max_overlap. Each pass in the schedule is
-    kept in isolation; the best pass (fewest ROIs but most accepted by the
-    classifier) wins.
-    """
-    passes = []
-    candidates = []  # list of (score, merged_stat, ops, plane0, pass_dict)
-
-    for j, (sp_scale, thr_scale, max_overlap) in enumerate(
-        config.spatial_scale_schedule
-    ):
-        pass_dir = save_root / f"pass_sc{j:02d}_scale{sp_scale}_thr{thr_scale:.2f}"
-        pass_dir.mkdir(parents=True, exist_ok=True)
-
-        if config.verbose:
-            print(f"\n[spatial pass {j}] over_detection regime  "
-                  f"spatial_scale={sp_scale}  threshold_scaling={thr_scale}  "
-                  f"max_overlap={max_overlap}")
-
-        ops = dict(base_ops)
-        ops['spatial_scale'] = sp_scale
-        ops['threshold_scaling'] = thr_scale
-        ops['max_overlap'] = max_overlap
-        # Keep max_iterations at a moderate value; over-detection doesn't need
-        # deep iteration, it needs the right scale
-        ops['max_iterations'] = 100
-
-        stat_pass, ops_out, plane0 = run_one_pass(
-            config.tiff_folder, pass_dir, ops,
-            verbose=config.verbose, use_cache=config.use_cache,
-            shared_plane0=shared_plane0,
-            hard_cap=config.max_rois_hard_cap,
-        )
-
-        # Evaluate this pass
-        iscell_path = plane0 / 'iscell.npy'
-        if iscell_path.exists():
-            iscell = np.load(iscell_path, allow_pickle=True)
-            if iscell.ndim == 2:
-                iscell = iscell[:, 0]
-            n_accepted = int((iscell > 0).sum())
-        else:
-            n_accepted = len(stat_pass)
-
-        areas = np.array([np.asarray(s['xpix']).size for s in stat_pass],
-                         dtype=float)
-        median_area = float(np.median(areas)) if areas.size else 0.0
-
-        # Score: accepted count weighted by plausibility of soma-size ROIs.
-        # We want high n_accepted AND median_area above the floor.
-        size_penalty = 1.0 if median_area >= config.over_detection_median_area_px else 0.25
-        score = n_accepted * size_penalty
-
-        pass_info = {
-            'index': j,
-            'regime': 'over_detection',
-            'spatial_scale': sp_scale,
-            'threshold_scaling': thr_scale,
-            'max_overlap': max_overlap,
-            'n_detected_this_pass': len(stat_pass),
-            'n_accepted': n_accepted,
-            'median_area_px': median_area,
-            'score': score,
-            'plane0': str(plane0),
-        }
-        passes.append(pass_info)
-        candidates.append((score, list(stat_pass), ops_out, plane0, pass_info))
-
-        if config.verbose:
-            print(f"  > detected: {len(stat_pass)}  accepted: {n_accepted}  "
-                  f"median_area: {median_area:.0f}px  score: {score:.1f}")
-
-    # Pick the best pass by score
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    best_score, best_stat, best_ops, best_plane0, best_info = candidates[0]
-
-    if config.verbose:
-        print(f"\n  > best over-detection pass: spatial_scale="
-              f"{best_info['spatial_scale']} thr={best_info['threshold_scaling']} "
-              f"(accepted={best_info['n_accepted']}, "
-              f"median_area={best_info['median_area_px']:.0f}px)")
-
-    # Mark winner in passes list
-    for p in passes:
-        p['selected'] = (p is best_info)
-
-    return best_stat, passes, best_ops, best_plane0
+def _run_over_detection_schedule(*args, **kwargs):
+    """Deferred during the suite2p 1.0 (db, settings) refactor."""
+    raise NotImplementedError(
+        "_run_over_detection_schedule is deferred during the suite2p 1.0 "
+        "(db, settings) refactor."
+    )
 
 
 def adaptive_detect(config: AdaptiveConfig):
+    """Deferred during the suite2p 1.0 (db, settings) refactor.
+
+    The full adaptive binary-search detection loop relied on mutating
+    a flat ops dict pervasively (see git history before this commit).
+    Porting it to the nested (db, settings) model is straightforward
+    but voluminous, and the GUI no longer wires this entry point --
+    Tab 3 calls ``sparse_plus_cellpose.run`` instead. This function
+    will be re-enabled in a follow-up PR; until then, it raises so
+    accidental callers fail fast.
     """
-    Main entry point. Runs the adaptive detection pipeline end-to-end.
-
-    Flow:
-      1. Run pass 0 (conservative threshold) and diagnose for over-detection.
-      2. Always run the under-detection schedule first, merging ROIs from
-         pass 0 and progressively lowering threshold_scaling. This is a
-         strict superset of pass 0's output — we never lose cells here.
-      3. Re-diagnose the merged result. If it *still* looks over-detected
-         (too many sub-soma micro-ROIs, low classifier acceptance), fall
-         back to the spatial_scale schedule and keep whichever result is
-         more plausible.
-
-    Returns a dict with:
-        merged_stat      list of deduplicated ROI stat dicts
-        passes           per-pass diagnostics (includes 'regime' key)
-        regime           'under_detection' | 'over_detection_fallback' | 'under_detection_kept'
-        diagnosis        dict from diagnose_over_detection() on pass 0
-        final_ops        ops from the selected Suite2p invocation
-        final_plane0     Path to the selected pass's plane0 output
-        save_folder      root save folder
-    """
-    if not config.tiff_folder:
-        raise ValueError("config.tiff_folder must be set")
-    if not config.save_folder:
-        raise ValueError("config.save_folder must be set")
-
-    save_root = Path(config.save_folder)
-    save_root.mkdir(parents=True, exist_ok=True)
-
-    base_ops, scale_data = load_base_ops(config, return_scale_data=True)
-
-    # ---------------- shared registration (one-time, reused) ---------------
-    # Run registration exactly once into _shared_reg/, then hardlink
-    # data.bin into each pass folder instead of re-registering the TIFF.
-    # When seed_pass0_from is provided, prefer that plane0's binary as the
-    # shared source (so pass 0 is skipped entirely).
-    shared_plane0: Optional[Path] = None
-    if config.seed_pass0_from:
-        seed_plane0 = Path(config.seed_pass0_from)
-        if not (seed_plane0 / 'data.bin').exists():
-            raise FileNotFoundError(
-                f"seed_pass0_from points at {seed_plane0} but no data.bin "
-                f"was found there"
-            )
-        if not (seed_plane0 / 'ops.npy').exists():
-            raise FileNotFoundError(
-                f"seed_pass0_from points at {seed_plane0} but no ops.npy "
-                f"was found there"
-            )
-        shared_plane0 = seed_plane0
-        if config.verbose:
-            print(f"  > using seed pass 0 at {seed_plane0} as shared "
-                  f"registration source")
-    elif config.reuse_registration:
-        shared_plane0 = _get_or_create_shared_registration(config, base_ops)
-
-    # ------------------- blob-seeded detection short-circuit ---------------
-    # When enabled, bypass sparsery entirely: feed the pre-flight estimator's
-    # blobs to suite2p as pre-computed ROI seeds, then run extraction +
-    # classification + deconvolution on those. This is the "we already know
-    # where the cells are" path — no under/over-detection schedules run.
-    if config.blob_seeded_detection:
-        if config.verbose:
-            print("\n[blob-seeded detection] bypassing sparsery; seeding ROIs "
-                  "from pre-flight LoG blobs")
-
-        if scale_data is None:
-            if config.verbose:
-                print("  > no scale_data available (estimator disabled or "
-                      "failed); re-running estimator for blob extraction")
-            est_qc_path = (config.spatial_scale_qc_path
-                           or str(Path(config.save_folder) / 'spatial_scale_qc.png')) \
-                if config.save_spatial_scale_qc else None
-            winner, scale_data = estimate_spatial_scale_from_tiff(
-                config.tiff_folder,
-                n_frames=config.auto_estimate_n_frames,
-                top_n=config.spatial_scale_top_n,
-                qc_path=est_qc_path,
-                verbose=config.verbose,
-                return_scale_data=True,
-            )
-        else:
-            winner = base_ops.get('spatial_scale', 0) or 1
-
-        if scale_data is None:
-            raise RuntimeError(
-                "blob_seeded_detection=True but spatial-scale estimator "
-                "returned no scale_data; cannot seed ROIs"
-            )
-
-        # Optional: override the winning scale (e.g. estimator picked s3
-        # but real cells are ~8 px diameter so we want s1 blobs).
-        seed_scale = (config.blob_seed_scale_override
-                      if config.blob_seed_scale_override in (1, 2, 3, 4)
-                      else winner)
-        if config.verbose and seed_scale != winner:
-            print(f"  > overriding blob seed scale: winner was {winner}, "
-                  f"using {seed_scale} (blob_seed_scale_override)")
-
-        blobs_yxr = _collect_seed_blobs(
-            scale_data, winner=seed_scale,
-            all_scales=config.blob_seed_all_scales,
-            max_rois=config.blob_seed_max_rois,
-        )
-        if config.verbose:
-            print(f"  > {len(blobs_yxr)} blobs selected as ROI seeds "
-                  f"(all_scales={config.blob_seed_all_scales}, "
-                  f"seed_scale={seed_scale}, max_rois={config.blob_seed_max_rois})")
-
-        seeded_dir = save_root / 'blob_seeded'
-        seeded_stat, seeded_ops, seeded_plane0 = run_blob_seeded_detection(
-            config, seeded_dir, base_ops, blobs_yxr,
-        )
-
-        # Persist a minimal summary mirroring the normal path so downstream
-        # tooling can consume the same dict shape.
-        merged_out = save_root / 'merged'
-        merged_out.mkdir(exist_ok=True)
-        np.save(merged_out / 'stat_merged.npy',
-                np.array(seeded_stat, dtype=object), allow_pickle=True)
-        np.save(merged_out / 'ops_final.npy', seeded_ops, allow_pickle=True)
-
-        import json
-        with open(merged_out / 'pass_summary.json', 'w') as f:
-            json.dump({
-                'regime': 'blob_seeded',
-                'n_seeds': len(blobs_yxr),
-                'winner_scale': int(winner),
-                'blob_seed_all_scales': bool(config.blob_seed_all_scales),
-                'blob_seed_max_rois': config.blob_seed_max_rois,
-                'n_rois': len(seeded_stat),
-            }, f, indent=2, default=str)
-
-        if config.verbose:
-            print(f"\nDone. Regime: blob_seeded. ROI count: {len(seeded_stat)}")
-            print(f"Final outputs in: {merged_out}")
-
-        if getattr(config, 'generate_audit_pngs', True):
-            try:
-                generate_audit_pngs_for_save_folder(
-                    str(save_root), config=config, verbose=config.verbose,
-                )
-            except Exception as e:
-                if config.verbose:
-                    print(f"[audit] generation failed: {e}")
-
-        return {
-            'merged_stat': seeded_stat,
-            'passes': [],
-            'regime': 'blob_seeded',
-            'diagnosis': {'n_seeds': len(blobs_yxr), 'winner_scale': int(winner)},
-            'final_ops': seeded_ops,
-            'final_plane0': seeded_plane0,
-            'save_folder': str(save_root),
-        }
-
-    # -------------------------- pass 0 (diagnostic) ------------------------
-    # If pass 0 returns 0 ROIs at the estimated spatial_scale, decrement and
-    # retry. The LoG estimator tells us where the most "mass" lives in the
-    # image, but suite2p's sparsery may need a smaller scale to actually
-    # seed ROIs (e.g., our s3 estimate vs sparsery needing s2 because real
-    # somata are ~15 px, not ~24 px).
-    initial_thr = config.initial_threshold_scaling
-    initial_max_iter = config.default_max_iterations
-
-    current_scale = base_ops.get('spatial_scale', 0)
-    n_fallbacks_used = 0
-
-    stat0, ops0, plane0_dir = None, None, None
-
-    # --- seed pass 0 from an existing plane0 folder ---
-    if config.seed_pass0_from:
-        seed_plane0 = Path(config.seed_pass0_from)
-        stat0 = list(np.load(seed_plane0 / 'stat.npy', allow_pickle=True))
-        ops0 = np.load(seed_plane0 / 'ops.npy', allow_pickle=True).item()
-        plane0_dir = seed_plane0
-        current_scale = ops0.get('spatial_scale', current_scale)
-        initial_thr = ops0.get('threshold_scaling', initial_thr)
-        initial_max_iter = ops0.get('max_iterations', initial_max_iter)
-        if config.verbose:
-            print(f"\n[pass 0 / seeded] loaded {len(stat0)} ROIs from "
-                  f"{seed_plane0}")
-            print(f"  threshold_scaling={initial_thr}  "
-                  f"spatial_scale={current_scale}  "
-                  f"max_iterations={initial_max_iter}")
-    else:
-        while True:
-            scale_suffix = f"_sc{current_scale}" if n_fallbacks_used > 0 else ""
-            pass0_dir = save_root / f"pass00_thr{initial_thr:.2f}{scale_suffix}"
-            pass0_dir.mkdir(parents=True, exist_ok=True)
-
-            if config.verbose:
-                print(f"\n[pass 0 / diagnostic] threshold_scaling={initial_thr}  "
-                      f"max_iterations={initial_max_iter}  "
-                      f"spatial_scale={current_scale}"
-                      f"{'  (fallback attempt ' + str(n_fallbacks_used) + ')' if n_fallbacks_used > 0 else ''}")
-
-            ops = dict(base_ops)
-            ops['spatial_scale'] = current_scale
-            ops['threshold_scaling'] = initial_thr
-            ops['max_iterations'] = initial_max_iter
-
-            stat0, ops0, plane0_dir = run_one_pass(
-                config.tiff_folder, pass0_dir, ops,
-                verbose=config.verbose, use_cache=config.use_cache,
-                shared_plane0=shared_plane0,
-                hard_cap=config.max_rois_hard_cap,
-            )
-
-            if len(stat0) > 0:
-                break
-            if not config.allow_spatial_scale_fallback:
-                break
-            if n_fallbacks_used >= config.max_spatial_scale_fallbacks:
-                if config.verbose:
-                    print(f"  > exhausted {config.max_spatial_scale_fallbacks} "
-                          f"spatial_scale fallbacks; continuing with 0 ROIs")
-                break
-            if current_scale <= 1:
-                if config.verbose:
-                    print("  > already at smallest spatial_scale (1); "
-                          "no further fallback available")
-                break
-
-            current_scale -= 1
-            n_fallbacks_used += 1
-            if config.verbose:
-                print(f"  > 0 ROIs at spatial_scale={current_scale + 1}; "
-                      f"falling back to spatial_scale={current_scale}")
-
-    # Lock the scale that actually worked into base_ops so all subsequent
-    # passes inherit it.
-    base_ops['spatial_scale'] = current_scale
-
-    is_over, reason, diag = diagnose_over_detection(stat0, plane0_dir, config)
-
-    if config.verbose:
-        print(f"\n  pass 0 diagnosis: n_total={diag['n_total']}, "
-              f"n_accepted={diag['n_accepted']}, "
-              f"accept_ratio={diag['accept_ratio']:.1%}, "
-              f"median_area={diag['median_area_px']:.0f}px")
-        print(f"  initial regime guess: "
-              f"{'OVER_DETECTION' if is_over else 'UNDER_DETECTION'}  ({reason})")
-
-    # -------------------- optional: stop at pass 0 -------------------------
-    # When pass 0 already looks good (user has eyeballed it and the
-    # classifier accepts most ROIs), the under-detection schedule at
-    # lower thresholds typically lets sparsery lock onto noise speckles
-    # rather than real cells. Skip the schedule in that case.
-    if not config.run_under_detection_schedule:
-        if config.verbose:
-            print("\nrun_under_detection_schedule=False; stopping at pass 0")
-        merged_out = save_root / 'merged'
-        merged_out.mkdir(exist_ok=True)
-        np.save(merged_out / 'stat_merged.npy',
-                np.array(stat0, dtype=object), allow_pickle=True)
-        np.save(merged_out / 'ops_final.npy', ops0, allow_pickle=True)
-
-        import json
-        with open(merged_out / 'pass_summary.json', 'w') as f:
-            json.dump({
-                'regime': 'pass0_only',
-                'diagnosis_pass0': diag,
-                'passes': [{'pass': 0,
-                            'threshold_scaling': initial_thr,
-                            'spatial_scale': current_scale,
-                            'n_rois': len(stat0)}],
-            }, f, indent=2, default=str)
-
-        if config.verbose:
-            print(f"\nDone. Regime: pass0_only. ROI count: {len(stat0)}")
-            print(f"Final outputs in: {merged_out}")
-
-        if getattr(config, 'generate_audit_pngs', True):
-            try:
-                generate_audit_pngs_for_save_folder(
-                    str(save_root), config=config, verbose=config.verbose,
-                )
-            except Exception as e:
-                if config.verbose:
-                    print(f"[audit] generation failed: {e}")
-
-        return {
-            'merged_stat': stat0,
-            'passes': [],
-            'regime': 'pass0_only',
-            'diagnosis': diag,
-            'final_ops': ops0,
-            'final_plane0': plane0_dir,
-            'save_folder': str(save_root),
-        }
-
-    # -------------------- always try under-detection first ------------------
-    schedule_mode = getattr(config, 'threshold_schedule_mode', 'binary_search')
-    if config.verbose:
-        print(f"\nRunning under-detection schedule first (mode={schedule_mode}, "
-              f"merging from pass 0)")
-
-    if schedule_mode == 'binary_search':
-        under_stat, under_passes, under_ops, under_plane0 = _run_binary_search_schedule(
-            config, base_ops, save_root,
-            initial_stat=stat0, initial_ops=ops0, initial_plane0=plane0_dir,
-            initial_thr=initial_thr, initial_max_iter=initial_max_iter,
-            shared_plane0=shared_plane0,
-        )
-    else:
-        under_stat, under_passes, under_ops, under_plane0 = _run_under_detection_schedule(
-            config, base_ops, save_root,
-            initial_stat=stat0, initial_ops=ops0, initial_plane0=plane0_dir,
-            initial_thr=initial_thr, initial_max_iter=initial_max_iter,
-            shared_plane0=shared_plane0,
-        )
-
-    # Re-diagnose on the merged result
-    is_over_after, reason_after, diag_after = diagnose_over_detection(
-        under_stat, under_plane0, config
+    raise NotImplementedError(
+        "adaptive_detect is deferred during the suite2p 1.0 (db, settings) "
+        "refactor; use sparse_plus_cellpose.run for the active GUI path."
     )
-
-    if config.verbose:
-        print(f"\n  merged diagnosis: n_total={diag_after['n_total']}, "
-              f"n_accepted={diag_after['n_accepted']}, "
-              f"accept_ratio={diag_after['accept_ratio']:.1%}, "
-              f"median_area={diag_after['median_area_px']:.0f}px")
-
-    if not is_over_after:
-        regime = 'under_detection'
-        merged_stat = under_stat
-        passes = under_passes
-        final_ops = under_ops
-        final_plane0 = under_plane0
-    else:
-        # ------------------ fall back to over-detection schedule -------------
-        if not getattr(config, 'enable_over_detection_fallback', False):
-            if config.verbose:
-                print(f"\n  merged result looks over-detected ({reason_after}), "
-                      f"but over-detection fallback is disabled "
-                      f"(enable_over_detection_fallback=False). "
-                      f"Trusting downstream cell classifier to filter specks; "
-                      f"keeping under-detection merge as-is.")
-            regime = 'under_detection'
-            merged_stat = under_stat
-            passes = under_passes
-            final_ops = under_ops
-            final_plane0 = under_plane0
-        else:
-            if config.verbose:
-                print(f"\n  merged result still over-detected ({reason_after}); "
-                      f"falling back to spatial_scale schedule")
-
-            over_stat, over_passes, over_ops, over_plane0 = _run_over_detection_schedule(
-                config, base_ops, save_root,
-                shared_plane0=shared_plane0,
-            )
-
-            # Keep over-detection only if it actually found ROIs; otherwise the
-            # under-detection merge is still the best thing we have.
-            if len(over_stat) > 0:
-                regime = 'over_detection_fallback'
-                merged_stat = over_stat
-                final_ops = over_ops
-                final_plane0 = over_plane0
-            else:
-                if config.verbose:
-                    print("  > all over-detection passes found 0 ROIs; "
-                          "keeping under-detection merged result")
-                regime = 'under_detection_kept'
-                merged_stat = under_stat
-                final_ops = under_ops
-                final_plane0 = under_plane0
-            passes = under_passes + over_passes
-
-    # ---------------- residual-blob augmentation (optional) ----------------
-    # After sparsery converges, detect any remaining soma-like blobs in the
-    # residual image and seed ROIs at those locations. Let the classifier
-    # filter by probability. This is how we recover cells sparsery misses
-    # structurally — e.g. silent neurons visible in the mean image.
-    augmentation_info = None
-    if config.augment_with_residual_blobs and shared_plane0 is not None:
-        if config.verbose:
-            print(f"\n[residual augmentation] detecting missed cells in "
-                  f"residual image and classifying")
-        aug_dir = save_root / 'augmented'
-        aug_stat, aug_ops, aug_plane0 = run_residual_augmentation(
-            config, base_stat=merged_stat, base_ops=final_ops,
-            base_plane0=final_plane0, shared_plane0=shared_plane0,
-            save_dir=aug_dir,
-        )
-        if len(aug_stat) >= len(merged_stat):
-            merged_stat = aug_stat
-            final_ops = aug_ops
-            final_plane0 = aug_plane0
-            regime = f"{regime}+residual_augmented"
-            augmentation_info = {
-                'enabled': True,
-                'augmented_plane0': str(aug_plane0),
-                'final_n_rois': len(aug_stat),
-            }
-        else:
-            if config.verbose:
-                print("  > augmentation produced fewer ROIs than base; "
-                      "discarding and keeping original merged result")
-            augmentation_info = {
-                'enabled': True,
-                'augmented_plane0': str(aug_plane0),
-                'final_n_rois': len(aug_stat),
-                'discarded': True,
-            }
-    elif config.augment_with_residual_blobs and shared_plane0 is None:
-        if config.verbose:
-            print("  > augment_with_residual_blobs=True but reuse_registration=False "
-                  "and no seed_pass0_from; skipping augmentation")
-
-    # -------------------------- persist merged output ----------------------
-    merged_out = save_root / 'merged'
-    merged_out.mkdir(exist_ok=True)
-    np.save(merged_out / 'stat_merged.npy',
-            np.array(merged_stat, dtype=object), allow_pickle=True)
-    np.save(merged_out / 'ops_final.npy', final_ops, allow_pickle=True)
-
-    import json
-    with open(merged_out / 'pass_summary.json', 'w') as f:
-        json.dump({
-            'regime': regime,
-            'diagnosis_pass0': diag,
-            'diagnosis_after_under_detection': diag_after,
-            'passes': passes,
-            'augmentation': augmentation_info,
-        }, f, indent=2, default=str)
-
-    if config.verbose:
-        print(f"\nDone. Regime: {regime}. Merged ROI count: {len(merged_stat)}")
-        print(f"Final outputs in: {merged_out}")
-
-    # ------------------ audit PNGs (per pass + merged) --------------------
-    if getattr(config, 'generate_audit_pngs', True):
-        try:
-            generate_audit_pngs_for_save_folder(
-                str(save_root), config=config, verbose=config.verbose,
-            )
-        except Exception as e:
-            if config.verbose:
-                print(f"[audit] generation failed: {e}")
-
-    return {
-        'merged_stat': merged_stat,
-        'passes': passes,
-        'regime': regime,
-        'diagnosis': diag,
-        'final_ops': final_ops,
-        'final_plane0': final_plane0,
-        'save_folder': str(save_root),
-        'augmentation': augmentation_info,
-    }
 
 
 # ============================================================================
