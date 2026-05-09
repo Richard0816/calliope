@@ -32,8 +32,10 @@ Tab 3 calls this module's ``run_full_pipeline`` (defined later in the
 file) when the user clicks "Run detection". Inputs:
 
 - The shifted TIFF stack from Tab 1.
-- A base settings dict (``updated_settings.npy``) with sensible 2-photon
-  defaults in suite2p 1.0's nested settings format.
+- Base settings (calliope's 2-photon defaults) come from
+  ``calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS`` in source.
+  Per-session edits flow in via Tab 3's "Edit suite2p settings..."
+  popout as a ``settings_override`` dict.
 - The recording's tau (GCaMP decay constant) looked up from the AAV
   metadata table.
 
@@ -105,7 +107,11 @@ from .brute_force_ops import run_cellpose_pass
 
 TIFF_FOLDER = r'D:\2024-11-20_00003'
 SAVE_FOLDER = r'D:\sparse_plus_cellpose\2024-11-20_00003'
-PATH_TO_OPS = r'updated_settings.npy'
+# PATH_TO_OPS is kept None: base settings come from
+# calliope.core.calliope_settings.build_base_settings (in-source).
+# Set to a .npy path here only if you want to override with a saved
+# settings/ops file from outside the repo.
+PATH_TO_OPS = None
 
 # Fixed sparsery ops — no binary search, just one pass with these values.
 SPARSERY_OPS = {
@@ -392,6 +398,7 @@ def run(
     aav_info_csv: str | None = None,
     tau_vals: dict | None = None,
     tau_override: float | None = None,
+    settings_override: dict | None = None,
     verbose: bool = True,
 ) -> Path:
     """Sparsery + cellpose detection. Returns the final ``suite2p/plane0`` path.
@@ -402,9 +409,10 @@ def run(
     1. Build an ``AdaptiveConfig`` (the legacy detection's config
        dataclass; we still piggy-back on it for the AAV / tau lookup
        and for the shared-registration cache).
-    2. ``load_base_settings`` reads the base 2-photon settings file
-       (``updated_settings.npy``, suite2p 1.0 nested format) and
-       overlays the recording's tau looked up from the AAV CSV.
+    2. ``load_base_settings`` builds the base 2-photon ``(db, settings)``
+       pair from :func:`calliope_settings.build_base_settings` (in source)
+       and overlays any per-session ``settings_override`` (from Tab 3's
+       popout) plus the recording's tau looked up from the AAV CSV.
     3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
        correction once and caches ``data.bin`` + ``ops.npy`` so both
        Sparsery and Cellpose can reuse it.
@@ -455,7 +463,10 @@ def run(
 
     sp_ops = dict(SPARSERY_OPS) if sparsery_ops is None else dict(sparsery_ops)
     cp_cfg = dict(CELLPOSE_CFG) if cellpose_cfg is None else dict(cellpose_cfg)
-    ops_path = str(path_to_ops) if path_to_ops else PATH_TO_OPS
+    # ``path_to_ops`` is the legacy back-compat path: when explicit, it
+    # wins. When None, the in-source defaults from
+    # ``calliope.core.calliope_settings.build_base_settings`` are used.
+    ops_path = str(path_to_ops) if path_to_ops else None
 
     cfg_kwargs = dict(
         tiff_folder=str(tiff_folder),
@@ -475,10 +486,19 @@ def run(
     # default) lets the legacy filename-based resolver run.
     if tau_override is not None:
         cfg_kwargs["tau_override"] = float(tau_override)
+    if settings_override:
+        cfg_kwargs["settings_override"] = dict(settings_override)
     cfg = AdaptiveConfig(**cfg_kwargs)
 
     if verbose:
-        print(f'[s+cp] loading base settings from {ops_path}')
+        if ops_path:
+            print(f'[s+cp] loading base settings from legacy file {ops_path}')
+        else:
+            from . import calliope_settings as _cs
+            n_overrides = len(_cs.CALLIOPE_BASE_SETTINGS)
+            tweak = " + popout edits" if settings_override else ""
+            print(f'[s+cp] base settings = suite2p defaults + '
+                  f'{n_overrides} calliope overrides{tweak}')
     base_db, base_settings = load_base_settings(cfg)
 
     if verbose:
