@@ -60,11 +60,12 @@ sys.path.insert(0, str(WORKTREE))
 
 from .adaptive_detection import (
     AdaptiveConfig,
-    load_base_ops,
+    load_base_settings,
     _get_or_create_shared_registration,
     run_one_pass,
     build_roi_pixel_mask,
     compute_residual_image,
+    apply_settings_overrides,
 )
 
 # Cellpose is optional. If it's not installed we mark cellpose configs as
@@ -443,9 +444,12 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
     plane0 = Path(save_dir) / 'suite2p' / 'plane0'
     plane0.mkdir(parents=True, exist_ok=True)
 
-    # Load the shared (post-registration) ops to get meanImg + Ly/Lx.
-    reg_ops = np.load(Path(shared_plane0) / 'ops.npy',
-                      allow_pickle=True).item()
+    # Load the shared (post-registration) view to get meanImg + Ly/Lx.
+    # In suite2p 1.0 these live in db.npy / settings.npy / reg_outputs.npy
+    # which load_plane_view stitches into a flat lookup (with a fallback
+    # to a legacy ops.npy on older runs).
+    from . import utils
+    reg_ops = utils.load_plane_view(shared_plane0)
     img_key = cfg.get('cellpose_channel_input', 'meanImg')
     if img_key not in reg_ops or reg_ops[img_key] is None:
         # Fallback: meanImg is always present after registration.
@@ -556,12 +560,14 @@ def main():
         max_rois_hard_cap=HARD_CAP,
     )
 
-    print(f'[brute] load base ops from {PATH_TO_OPS}')
-    base_ops = load_base_ops(adaptive_cfg)
+    print(f'[brute] load base settings from {PATH_TO_OPS}')
+    base_db, base_settings = load_base_settings(adaptive_cfg)
 
     print(f'[brute] acquire/verify shared registration (one-time)')
     t0 = time.time()
-    shared_plane0 = _get_or_create_shared_registration(adaptive_cfg, base_ops)
+    shared_plane0 = _get_or_create_shared_registration(
+        adaptive_cfg, base_db, base_settings,
+    )
     print(f'[brute] shared reg ready at {shared_plane0}  '
           f'({time.time() - t0:.1f}s)')
 
@@ -617,16 +623,21 @@ def main():
                     folder, shared_plane0, cfg, verbose=True,
                 )
             else:
-                ops = dict(base_ops)
-                for k, v in cfg.items():
-                    if k == 'detection_backend':
-                        continue
-                    ops[k] = v
-                ops['max_iterations'] = MAX_ITERATIONS
-                # Detection only; we want noise tripwires to fire fast.
-                ops['roidetect'] = True
+                # Build per-config (db, settings) by overlaying the cfg
+                # knobs (threshold_scaling, spatial_scale, ...) onto a
+                # copy of base_settings.
+                pass_settings = {
+                    k: (dict(v) if isinstance(v, dict) else v)
+                    for k, v in base_settings.items()
+                }
+                overrides = {k: v for k, v in cfg.items()
+                             if k != 'detection_backend'}
+                overrides['max_iterations'] = MAX_ITERATIONS
+                overrides['roidetect'] = True
+                apply_settings_overrides(pass_settings, overrides)
+                pass_db = dict(base_db)
                 stat, ops_out, plane0 = run_one_pass(
-                    TIFF_FOLDER, folder, ops,
+                    TIFF_FOLDER, folder, pass_db, pass_settings,
                     verbose=True, use_cache=False,
                     shared_plane0=shared_plane0,
                     hard_cap=HARD_CAP,
