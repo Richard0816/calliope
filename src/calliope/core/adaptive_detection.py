@@ -412,6 +412,7 @@ def _run_s2p(ops: dict, db_extra: dict):
     """
     db_out, settings = _build_db_and_settings(ops, db_extra)
     _ensure_s2p_logger(db_out.get('save_path0'))
+    _patch_suite2p_estimate_spatial_scale()
     return suite2p.run_s2p(db=db_out, settings=settings)
 
 
@@ -425,6 +426,7 @@ def _run_plane(ops: dict, db_extra: dict):
     """
     db_out, settings = _build_db_and_settings(ops, db_extra)
     _ensure_s2p_logger(db_out.get('save_path0'))
+    _patch_suite2p_estimate_spatial_scale()
     return suite2p.run_plane(db_out, settings)
 
 
@@ -493,6 +495,50 @@ def _restore_sparsery_print(original_print):
             del _sd.__dict__['print']
     else:
         _sd.print = original_print
+
+
+# ----------------------------------------------------------------------------
+# suite2p 1.0 estimate_spatial_scale shim
+# ----------------------------------------------------------------------------
+# In suite2p 1.0.0.1, ``sparsedetect.estimate_spatial_scale`` calls
+# ``scipy.stats.mode(..., keepdims=True)``, which returns a 1-element ndarray
+# instead of a scalar. That propagates into ``spatscale_pix = 3 * 2**scale``
+# (now also an ndarray) and finally ``int(spatscale_pix * 1.5 // 2 * 2)``,
+# which throws ``TypeError: only 0-dimensional arrays can be converted to
+# Python scalars``. Triggered whenever ``settings.detection.sparsery_settings.
+# spatial_scale == 0`` (auto-estimate).
+#
+# Wrap the upstream function so its return is coerced to a Python int. Idem-
+# potent (only patches once); preserves the original via ``_calliope_orig``
+# so we can restore for tests.
+
+def _patch_suite2p_estimate_spatial_scale() -> None:
+    """Coerce ``estimate_spatial_scale`` return to a Python int.
+
+    Necessary because suite2p 1.0.0.1 + scipy >= 1.11 returns a (1,)
+    ndarray from ``mode(..., keepdims=True)`` and downstream code does
+    ``int(spatscale_pix * 1.5 // 2 * 2)`` which fails on non-scalar arrays.
+    """
+    import suite2p.detection.sparsedetect as _sd
+    if getattr(_sd.estimate_spatial_scale, '_calliope_patched', False):
+        return
+    _orig = _sd.estimate_spatial_scale
+
+    def _wrapped(I):
+        result = _orig(I)
+        # Return shape may be a Python int, a 0-d ndarray, or a (1,) ndarray
+        # depending on suite2p version + scipy version. ``np.asarray(...).
+        # item()`` handles all three.
+        try:
+            return int(np.asarray(result).item())
+        except (TypeError, ValueError):
+            # Older suite2p that returned a tuple-of-(im, count) shouldn't
+            # land here, but if it does, pass through unchanged.
+            return result
+
+    _wrapped._calliope_patched = True
+    _wrapped._calliope_orig = _orig
+    _sd.estimate_spatial_scale = _wrapped
 
 
 # ============================================================================

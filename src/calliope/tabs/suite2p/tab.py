@@ -615,27 +615,26 @@ class Suite2pTab(ttk.Frame):
         Skipped silently if the user left both inputs at 0.
         """
         from ...core.scale import resolve_pix_to_um
+        from ...core import utils
         zoom = params.get("scope_zoom", 0.0) or None
         um_px = params.get("um_per_pixel", 0.0) or None
         if zoom is None and um_px is None:
             return
-        ops_path = plane0 / "ops.npy"
-        if not ops_path.exists():
-            print(f"[GUI] pix_to_um: ops.npy not found at {ops_path}; "
+        view = utils.load_plane_view(plane0)
+        if not view:
+            print(f"[GUI] pix_to_um: no plane outputs at {plane0}; "
                   "skipping calibration stamp")
             return
-        ops = np.load(ops_path, allow_pickle=True).item()
         try:
             resolved = resolve_pix_to_um(
-                ops, zoom=zoom, um_per_pixel=um_px,
+                view, zoom=zoom, um_per_pixel=um_px,
             )
         except (TypeError, ValueError) as e:
             print(f"[GUI] pix_to_um: invalid calibration ({e}); skipping")
             return
         if resolved is None:
             return
-        ops["pix_to_um"] = float(resolved)
-        np.save(ops_path, ops, allow_pickle=True)
+        utils.save_pix_to_um(plane0, float(resolved))
         source = "direct µm/px" if um_px is not None else f"zoom {zoom}"
         print(f"[GUI] pix_to_um = {resolved:.4f} µm/px (source: {source})")
 
@@ -933,19 +932,20 @@ class Suite2pTab(ttk.Frame):
 
     def _draw_panels(self, plane0: Path) -> None:
         # Load ops only to extract the handful of 2D background images we
-        # actually display. Suite2p's ops.npy carries dozens of fields plus
-        # several full-resolution preview images (mean, max_proj, refImg,
-        # Vcorr, ...) -- caching the whole dict was holding 30-200 MB per
-        # recording. Pull just the ndarrays in KNOWN_BG_IMAGES (cast to
-        # float32 once, since that's the dtype the renderer needs) and let
-        # the rest of ops fall out of scope at the end of this function.
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        # actually display. Suite2p 1.0's reg_outputs.npy / detect_outputs.npy
+        # carry the preview images we want (mean, max_proj, refImg, Vcorr,
+        # ...). load_plane_view merges them into a flat dict; pull just the
+        # ndarrays in KNOWN_BG_IMAGES (cast to float32 once, since that's
+        # the dtype the renderer needs) and let the rest fall out of scope
+        # at the end of this function.
+        from ...core import utils as core_utils
+        view = core_utils.load_plane_view(plane0)
         bg_images: dict[str, np.ndarray] = {}
         for key, _label in self.KNOWN_BG_IMAGES:
-            img = ops.get(key)
+            img = view.get(key)
             if isinstance(img, np.ndarray) and img.ndim == 2:
                 bg_images[key] = np.ascontiguousarray(img, dtype=np.float32)
-        del ops  # release every other field (mostly metadata + heavy intermediates)
+        del view  # release every other field
 
         stat = np.load(plane0 / "stat.npy", allow_pickle=True)
         n_total = len(stat)

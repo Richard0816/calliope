@@ -66,6 +66,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Circle
 
 from .logic import spatial as spatial_helpers
+from ...core import utils as core_utils
 
 from ...gui_common import AppState, attach_fig_toolbar
 
@@ -391,12 +392,12 @@ class SpatialPropagationTab(ttk.Frame):
         cached = self._plane0_cache.get(plane0)
         if cached is not None:
             return cached
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        view = core_utils.load_plane_view(plane0)
         stat_all = np.load(plane0 / "stat.npy", allow_pickle=True)
         meta = {
             "stat_all": stat_all,
-            "Ly": int(ops["Ly"]), "Lx": int(ops["Lx"]),
-            "pix_to_um": ops.get("pix_to_um", None),
+            "Ly": int(view["Ly"]), "Lx": int(view["Lx"]),
+            "pix_to_um": view.get("pix_to_um", None),
         }
         self._plane0_cache[plane0] = meta
         return meta
