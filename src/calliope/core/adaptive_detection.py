@@ -572,7 +572,14 @@ class AdaptiveConfig:
     # ---- Required paths ----
     tiff_folder: str = ""                         # folder containing TIFFs
     save_folder: str = ""                         # where per-pass output lives
-    path_to_ops: Optional[str] = None             # optional starting ops.npy
+    path_to_ops: Optional[str] = None             # optional legacy override .npy
+
+    # ---- Per-session settings overrides (from Tab 3 popout) ----
+    # Nested suite2p 1.0 settings dict. Deep-merged on top of the in-source
+    # defaults from ``calliope.core.calliope_settings.build_base_settings``
+    # by ``load_base_settings``. Tab 3's "Edit suite2p settings..." popout
+    # constructs this from the user's edits and stuffs it on the cfg.
+    settings_override: Optional[dict] = None
 
     # ---- Sample metadata (used for tau lookup) ----
     aav_info_csv: str = "human_SLE_2p_meta.csv"
@@ -1122,15 +1129,18 @@ def _deep_merge(dst: dict, src: dict) -> None:
 def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
     """Build a suite2p 1.0 ``(db, settings)`` pair tailored to the recording.
 
-    Sources, in priority order
-    --------------------------
-    1. ``config.path_to_ops`` (a saved .npy of either a flat legacy
-       ops dict or an already-nested settings dict) -- those values
-       seed the settings via ``apply_settings_overrides``.
-    2. Suite2p 1.0's :func:`suite2p.parameters.default_settings` if
-       no override file is supplied.
+    Base settings come from :mod:`calliope.core.calliope_settings` (the
+    in-source hardcoded dict that replaced the legacy
+    ``updated_settings.npy``). When the user has tweaked the popout
+    "Edit suite2p settings..." dialog in Tab 3, ``config.settings_override``
+    carries those tweaks and gets deep-merged on top.
 
-    Either way the pipeline overlays:
+    For backward-compat, ``config.path_to_ops`` still works: if set, it's
+    treated as a flat legacy ops dict (pre-1.0 suite2p) or an already-
+    nested settings dict, and its values overlay the hardcoded base. New
+    code should prefer the in-source dict + popout edits.
+
+    The pipeline then overlays per-recording dynamics:
 
     * **tau** : the GCaMP-variant decay constant. Looked up via
       ``utils.file_name_to_aav_to_dictionary_lookup`` from the AAV
@@ -1157,9 +1167,20 @@ def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
         per-scale blob inventory from the pre-flight LoG estimator,
         used downstream by ``run_blob_seeded_detection``.
     """
-    db, settings = default_db_settings()
+    from . import calliope_settings as _cs
 
-    # --- Step 1: seed from optional override file ---
+    # --- Step 0: seed from the in-source calliope base settings ---
+    db = _cs.build_base_db()
+    settings = _cs.build_base_settings()
+    db['nchannels'] = 1
+    db['nplanes'] = 1
+
+    # --- Step 1: optional Tab 3 popout overrides (per-session edits) ---
+    settings_override = getattr(config, 'settings_override', None)
+    if settings_override:
+        _deep_merge(settings, settings_override)
+
+    # --- Step 2: optional legacy override file (back-compat) ---
     if config.path_to_ops is not None and os.path.exists(config.path_to_ops):
         if config.verbose:
             print(f"Loading base ops from {config.path_to_ops}")
@@ -1168,24 +1189,13 @@ def load_base_settings(config: AdaptiveConfig, return_scale_data: bool = False):
         #   (a) a legacy flat ops dict (pre-1.0 suite2p, e.g.
         #       suite2p_2p_ops_240621.npy) -- treat as flat overrides
         #       and route each known key to its nested location;
-        #   (b) an already-nested suite2p 1.0 settings dict
-        #       (updated_settings.npy) -- deep-merge directly.
+        #   (b) an already-nested suite2p 1.0 settings dict (legacy
+        #       updated_settings.npy) -- deep-merge directly.
         if _looks_like_nested_settings(loaded):
             _deep_merge(settings, loaded)
         else:
             apply_db_overrides(db, loaded)
             apply_settings_overrides(settings, loaded)
-    else:
-        if config.verbose:
-            print("No base ops provided, starting from suite2p defaults")
-        # Data-specific defaults for our 2-photon GCaMP recordings.
-        apply_settings_overrides(settings, {
-            'fs': 15.07,
-            'highpass_time': 100.0,
-            'smooth_sigma': 1.3,
-        })
-        db['nchannels'] = 1
-        db['nplanes'] = 1
 
     # --- Resolve spatial_scale ---
     # If the user left pass0_spatial_scale at 0 and asked for auto-estimation,
@@ -2355,7 +2365,7 @@ if __name__ == '__main__':
     config = AdaptiveConfig(
         tiff_folder=r'D:\2024-11-20_00003',
         save_folder=r'D:\adaptive_runs\2024-11-20_00003',
-        path_to_ops=r"updated_settings.npy",  # set to None to use suite2p defaults
+        path_to_ops=None,  # use in-source defaults from calliope.core.calliope_settings
 
         # Seed from the already-known-good pass 0 (17 real cells at sc=1,
         # thr=1.0). Reuses its data.bin as the shared registration too, so

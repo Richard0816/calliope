@@ -86,7 +86,9 @@ except Exception as _e:                                              # pragma: n
 
 TIFF_FOLDER = r'D:\2024-11-20_00003'
 SAVE_FOLDER = r'D:\adaptive_runs_bruteforce\2024-11-20_00003'
-PATH_TO_OPS = r'updated_settings.npy'
+# PATH_TO_OPS is kept None: base settings come from
+# calliope.core.calliope_settings.build_base_settings (in-source).
+PATH_TO_OPS = None
 
 # Abort any sparsery pass once it produces this many ROIs. The cap fires
 # at the next 1000-ROI progress boundary (sparsery prints every 1000).
