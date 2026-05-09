@@ -1674,6 +1674,15 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
         for k in ('Ly', 'Lx', 'nframes', 'nchannels'):
             if k in shared_view:
                 plane_db[k] = shared_view[k]
+        # data_path needs to be a non-empty list -- run_plane indexes it
+        # at [0] for the bad_frames.npy lookup. Prefer the value the
+        # shared register-only run wrote to its db.npy; fall back to
+        # the caller-supplied tiff_folder.
+        shared_data_path = shared_view.get('data_path')
+        if isinstance(shared_data_path, (list, tuple)) and shared_data_path:
+            plane_db['data_path'] = list(shared_data_path)
+        else:
+            plane_db['data_path'] = [str(tiff_folder)]
         plane_db['save_path0'] = str(save_dir)
         plane_db['save_folder'] = 'suite2p'
         plane_db['save_path'] = str(plane0)
