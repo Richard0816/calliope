@@ -117,7 +117,7 @@ class Suite2pTab(ttk.Frame):
 
     POLL_MS = 80
 
-    DEFAULT_OPS_PATH = _DATA_DIR / "suite2p_2p_ops_240621.npy"
+    DEFAULT_OPS_PATH = _DATA_DIR / "updated_settings.npy"
     DEFAULT_CKPT_PATH = Path(r"F:\cellfilter_checkpoints\best.pt")
     DEFAULT_AAV_CSV = _DATA_DIR / "human_SLE_2p_meta.csv"
 
