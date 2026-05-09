@@ -1648,6 +1648,243 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     return dff, low, dt, num_frames, num_rois
 
 
+# ============================================================================
+# Suite2p 1.0 plane-folder view
+# ============================================================================
+# Suite2p 1.0 split the legacy monolithic ``ops.npy`` into four files:
+#
+#     db.npy             -- per-plane database (Ly, Lx, nframes, nchannels,
+#                           data_path, save_path[0], reg_file, ...)
+#     settings.npy       -- pipeline settings (tau, fs, all detection /
+#                           registration / extraction knobs, nested by
+#                           subsystem: settings['detection'][...], etc.)
+#     reg_outputs.npy    -- registration artefacts (meanImg, meanImgE,
+#                           refImg, yoff, xoff, corrXY, badframes,
+#                           yrange, xrange, bidiphase, ...)
+#     detect_outputs.npy -- detection artefacts (max_proj, Vcorr,
+#                           meanImg_crop, diameter, Vmax, Vmap, ...)
+#
+# Suite2p still writes a merged ``ops.npy`` when ``settings.io.save_ops_orig
+# = True`` (the default), so ``ops.npy`` reads keep working on fresh outputs
+# but are not the canonical 1.0 location.
+#
+# ``load_plane_view`` returns a single flat dict synthesised from the four
+# canonical files (with an ``ops.npy`` fallback for legacy plane folders),
+# so call-sites that historically did ``np.load("ops.npy").item()`` can
+# switch to ``load_plane_view(plane0)`` without changing key names.
+
+# Fields stored under nested settings paths in suite2p 1.0. Map flat key ->
+# (settings, sub-keys...). Used to flatten settings.npy into the view dict.
+_FLAT_FROM_SETTINGS: dict[str, tuple[str, ...]] = {
+    # top-level
+    "tau":                       ("tau",),
+    "fs":                        ("fs",),
+    "diameter":                  ("diameter",),
+    "torch_device":              ("torch_device",),
+    # run flags
+    "do_registration":           ("run", "do_registration"),
+    "do_detection":              ("run", "do_detection"),
+    "do_deconvolution":          ("run", "do_deconvolution"),
+    # io
+    "save_mat":                  ("io", "save_mat"),
+    "save_NWB":                  ("io", "save_NWB"),
+    "save_ops_orig":             ("io", "save_ops_orig"),
+    "delete_bin":                ("io", "delete_bin"),
+    "move_bin":                  ("io", "move_bin"),
+    "combined":                  ("io", "combined"),
+    # registration
+    "nimg_init":                 ("registration", "nimg_init"),
+    "maxregshift":               ("registration", "maxregshift"),
+    "nonrigid":                  ("registration", "nonrigid"),
+    "smooth_sigma":              ("registration", "smooth_sigma"),
+    "smooth_sigma_time":         ("registration", "smooth_sigma_time"),
+    "two_step_registration":     ("registration", "two_step_registration"),
+    # detection
+    "denoise":                   ("detection", "denoise"),
+    "threshold_scaling":         ("detection", "threshold_scaling"),
+    "max_overlap":               ("detection", "max_overlap"),
+    "spatial_scale":             ("detection", "sparsery_settings", "spatial_scale"),
+    "max_iterations":            ("detection", "sourcery_settings", "max_iterations"),
+    # classification
+    "preclassify":               ("classification", "preclassify"),
+    "classifier_path":           ("classification", "classifier_path"),
+    # extraction
+    "neuropil_extract":          ("extraction", "neuropil_extract"),
+    "inner_neuropil_radius":     ("extraction", "inner_neuropil_radius"),
+    "min_neuropil_pixels":       ("extraction", "min_neuropil_pixels"),
+    "lam_percentile":            ("extraction", "lam_percentile"),
+    "allow_overlap":             ("extraction", "allow_overlap"),
+    # extraction (renamed)
+    "neuropil_coefficient":      ("extraction", "neuropil_coefficient"),
+    # deconvolution preprocess
+    "baseline":                  ("dcnv_preprocess", "baseline"),
+    "win_baseline":              ("dcnv_preprocess", "win_baseline"),
+    "sig_baseline":              ("dcnv_preprocess", "sig_baseline"),
+    "prctile_baseline":          ("dcnv_preprocess", "prctile_baseline"),
+}
+
+
+def _flatten_settings(settings: dict) -> dict:
+    """Walk the nested ``settings`` dict and emit the flat keys readers
+    historically used. Keys whose nested path is missing are skipped
+    silently (older settings.npy files won't have every subsystem).
+    """
+    out: dict = {}
+    for flat_key, path in _FLAT_FROM_SETTINGS.items():
+        node = settings
+        ok = True
+        for p in path:
+            if not isinstance(node, dict) or p not in node:
+                ok = False
+                break
+            node = node[p]
+        if ok:
+            out[flat_key] = node
+    return out
+
+
+def load_plane_view(plane0: Union[str, Path]) -> dict:
+    """Load a flat ops-like view of a suite2p 1.0 plane folder.
+
+    Reads ``db.npy``, ``settings.npy``, ``reg_outputs.npy``, and
+    ``detect_outputs.npy`` if present and merges their keys into one
+    dict. Settings are flattened (e.g. ``settings['detection']
+    ['threshold_scaling']`` becomes ``view['threshold_scaling']``).
+    Falls back to a legacy ``ops.npy`` if the canonical files are
+    missing, so old plane folders keep working.
+
+    Calliope-side calibration (``pix_to_um``) is layered on top via
+    :func:`load_pix_to_um` so callers see one merged dict.
+
+    Returns an empty dict if nothing readable is found.
+    """
+    plane0 = Path(plane0)
+    view: dict = {}
+
+    # Load the four canonical files, ignoring missing ones.
+    db_path = plane0 / "db.npy"
+    settings_path = plane0 / "settings.npy"
+    reg_path = plane0 / "reg_outputs.npy"
+    det_path = plane0 / "detect_outputs.npy"
+
+    have_canonical = False
+    if db_path.exists():
+        try:
+            db = np.load(db_path, allow_pickle=True).item()
+            if isinstance(db, dict):
+                view.update(db)
+                have_canonical = True
+        except Exception:
+            pass
+    if settings_path.exists():
+        try:
+            settings = np.load(settings_path, allow_pickle=True).item()
+            if isinstance(settings, dict):
+                view.update(_flatten_settings(settings))
+                have_canonical = True
+        except Exception:
+            pass
+    if reg_path.exists():
+        try:
+            reg = np.load(reg_path, allow_pickle=True).item()
+            if isinstance(reg, dict):
+                view.update(reg)
+                have_canonical = True
+        except Exception:
+            pass
+    if det_path.exists():
+        try:
+            det = np.load(det_path, allow_pickle=True).item()
+            if isinstance(det, dict):
+                view.update(det)
+                have_canonical = True
+        except Exception:
+            pass
+
+    # Fallback: legacy ops.npy. Suite2p still writes this by default
+    # (save_ops_orig=True), so fresh outputs have it too -- but the
+    # canonical-file reads above take precedence on a per-key basis.
+    if not have_canonical:
+        ops_path = plane0 / "ops.npy"
+        if ops_path.exists():
+            try:
+                ops = np.load(ops_path, allow_pickle=True).item()
+                if isinstance(ops, dict):
+                    view.update(ops)
+            except Exception:
+                pass
+
+    # Layer calliope-side calibration on top.
+    pix = load_pix_to_um(plane0)
+    if pix is not None:
+        view["pix_to_um"] = pix
+
+    return view
+
+
+# ============================================================================
+# Calliope-side per-plane calibration
+# ============================================================================
+# The micrometre-per-pixel calibration is a calliope-only field (suite2p
+# does not produce or read it). It used to be stamped onto ``ops.npy``,
+# which couples calliope state to suite2p's output schema. The calibration
+# now lives in its own ``calliope_calibration.npy`` next to the plane so
+# we can stop touching ops.npy and so suite2p re-runs do not blow it away.
+
+_CALLIOPE_CAL_NAME = "calliope_calibration.npy"
+
+
+def _calibration_path(plane0: Union[str, Path]) -> Path:
+    return Path(plane0) / _CALLIOPE_CAL_NAME
+
+
+def load_pix_to_um(plane0: Union[str, Path]) -> Optional[float]:
+    """Return the calliope-stamped µm-per-pixel calibration, or None.
+
+    Looks first at ``<plane0>/calliope_calibration.npy``. Falls back to
+    a legacy ``ops['pix_to_um']`` read if the new file is missing, so
+    older plane folders keep working until they're re-stamped.
+    """
+    plane0 = Path(plane0)
+    cal_path = _calibration_path(plane0)
+    if cal_path.exists():
+        try:
+            cal = np.load(cal_path, allow_pickle=True).item()
+            if isinstance(cal, dict) and "pix_to_um" in cal:
+                v = cal["pix_to_um"]
+                return float(v) if v is not None else None
+        except Exception:
+            pass
+    # Legacy fallback.
+    ops_path = plane0 / "ops.npy"
+    if ops_path.exists():
+        try:
+            ops = np.load(ops_path, allow_pickle=True).item()
+            if isinstance(ops, dict) and "pix_to_um" in ops:
+                v = ops["pix_to_um"]
+                return float(v) if v is not None else None
+        except Exception:
+            pass
+    return None
+
+
+def save_pix_to_um(plane0: Union[str, Path], value: float) -> None:
+    """Stamp the calibration into ``<plane0>/calliope_calibration.npy``."""
+    plane0 = Path(plane0)
+    plane0.mkdir(parents=True, exist_ok=True)
+    cal_path = _calibration_path(plane0)
+    payload: dict = {}
+    if cal_path.exists():
+        try:
+            existing = np.load(cal_path, allow_pickle=True).item()
+            if isinstance(existing, dict):
+                payload = existing
+        except Exception:
+            payload = {}
+    payload["pix_to_um"] = float(value)
+    np.save(cal_path, payload, allow_pickle=True)
+
+
 def robust_df_over_f_1d(F, win_sec=45, perc=10, fps=30.0):
     """Rolling-percentile baseline dF/F for one trace.
 

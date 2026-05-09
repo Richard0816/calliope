@@ -783,8 +783,8 @@ class ClusteringTab(ttk.Frame):
         dff = dff_mm
         Z = _correlation_linkage(dff)
         stat, _ = _stat_for_prefix(plane0, prefix)
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-        Lx, Ly = int(ops["Lx"]), int(ops["Ly"])
+        view = utils.load_plane_view(plane0)
+        Lx, Ly = int(view["Lx"]), int(view["Ly"])
         auto_frac = cmap_mod.auto_choose_threshold(Z, target_counts=(4, 5))
         return {
             "Z": Z, "dff": dff, "dff_shape": dff.shape, "stat": stat,
@@ -849,8 +849,8 @@ class ClusteringTab(ttk.Frame):
                 f"dF/F memmap has {N} columns. Re-run analysis instead "
                 f"of reloading.")
         stat, _ = _stat_for_prefix(plane0, prefix)
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-        Lx, Ly = int(ops["Lx"]), int(ops["Ly"])
+        view = utils.load_plane_view(plane0)
+        Lx, Ly = int(view["Lx"]), int(view["Ly"])
         zmax = float(np.max(Z[:, 2]))
         return {
             "Z": Z, "dff": dff_mm, "dff_shape": dff_mm.shape, "stat": stat,

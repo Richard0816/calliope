@@ -41,27 +41,28 @@ from . import sparse_plus_cellpose as spc
 
 
 def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
-    """Resolve and store the µm/pixel calibration on ``ops.npy``.
-    Returns the resolved scalar (or None when both inputs were 0).
+    """Resolve the µm/pixel calibration and write it to
+    ``calliope_calibration.npy`` next to the plane.
+
+    Returns the resolved scalar (or None when both inputs were 0 or
+    the resolver could not produce a value).
     """
     zoom = params.get("scope_zoom", 0.0) or None
     um_px = params.get("um_per_pixel", 0.0) or None
     if zoom is None and um_px is None:
         return None
-    ops_path = plane0 / "ops.npy"
-    if not ops_path.exists():
+    view = utils.load_plane_view(plane0)
+    if not view:
         return None
-    ops = np.load(ops_path, allow_pickle=True).item()
     try:
         resolved = scale_mod.resolve_pix_to_um(
-            ops, zoom=zoom, um_per_pixel=um_px,
+            view, zoom=zoom, um_per_pixel=um_px,
         )
     except (TypeError, ValueError):
         return None
     if resolved is None:
         return None
-    ops["pix_to_um"] = float(resolved)
-    np.save(ops_path, ops, allow_pickle=True)
+    utils.save_pix_to_um(plane0, float(resolved))
     return float(resolved)
 
 
@@ -287,14 +288,14 @@ def _render_detection_panels(plane0: Path, figures_dir: Path) -> list[str]:
     figures_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
 
-    ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+    view = utils.load_plane_view(plane0)
     stat = np.load(plane0 / "stat.npy", allow_pickle=True)
     n_total = len(stat)
     keep = _load_keep_mask(plane0, n_total)
 
     bg = None
     for key in ("meanImg", "meanImgE", "max_proj", "Vcorr"):
-        img = ops.get(key)
+        img = view.get(key)
         if isinstance(img, np.ndarray) and img.ndim == 2:
             bg = np.asarray(img, dtype=np.float32)
             break

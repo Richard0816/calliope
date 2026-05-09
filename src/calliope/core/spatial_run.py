@@ -27,6 +27,7 @@ import numpy as np
 
 from . import scale as scale_mod
 from . import spatial as spatial_helpers
+from . import utils
 
 
 def render_spatial_event_figures(
@@ -55,9 +56,9 @@ def render_spatial_event_figures(
     kept_idx = np.asarray(event_data["kept_idx"])
     fps: Optional[float] = event_data.get("fps")
 
-    ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-    Ly, Lx = int(ops["Ly"]), int(ops["Lx"])
-    pix_to_um = scale_mod.resolve_pix_to_um(ops)
+    view = utils.load_plane_view(plane0)
+    Ly, Lx = int(view["Ly"]), int(view["Lx"])
+    pix_to_um = scale_mod.resolve_pix_to_um(view)
     stat_all = np.load(plane0 / "stat.npy", allow_pickle=True)
     stat_filtered = [stat_all[i] for i in kept_idx.tolist()]
 
