@@ -91,7 +91,6 @@ from .adaptive_detection import (
     _link_or_copy,
     run_one_pass,
     build_roi_pixel_mask,
-    visualize_audit,
     apply_settings_overrides,
 )
 from . import utils
@@ -423,8 +422,6 @@ def run(
     6. ``merge_and_extract`` -- drop overlapping Cellpose ROIs,
        concatenate, run Suite2p extract / dcnv / classify, save into
        ``<save_folder>/final/suite2p/plane0``.
-    7. ``visualize_audit`` -- optional ``audit.png`` overlay of all
-       final ROIs on the mean image.
 
     Parameters
     ----------
@@ -472,9 +469,6 @@ def run(
         tiff_folder=str(tiff_folder),
         save_folder=str(save_root),
         path_to_ops=ops_path,
-        auto_estimate_spatial_scale=False,
-        generate_audit_pngs=False,
-        augment_with_residual_blobs=False,
         use_cache=False,
         verbose=verbose,
     )
@@ -556,17 +550,6 @@ def run(
         sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
         max_overlap=max_overlap, verbose=verbose,
     )
-
-    # ---- audit.png ----
-    try:
-        if verbose:
-            print(f'[s+cp] writing audit.png')
-        visualize_audit(str(final_plane0), config=cfg,
-                        outpath=str(final_plane0 / 'audit.png'),
-                        title_prefix='sparse+cellpose')
-    except Exception as e:
-        if verbose:
-            print(f'[s+cp] audit failed: {e}')
 
     if verbose:
         print(f'\n[s+cp] DONE.')
