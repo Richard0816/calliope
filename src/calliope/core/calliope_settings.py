@@ -76,6 +76,15 @@ CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
         "highpass_time":     50.0,
         "threshold_scaling": 0.8,
         "chan2_threshold":   0.65,
+        "sparsery_settings": {
+            # Raise from suite2p's default 5000. Dense slice
+            # recordings routinely hit the cap before sparsery has
+            # stopped finding above-threshold ROIs, which truncates
+            # the detection. 10000 is generous enough to let it run
+            # to natural completion on our typical FOVs without
+            # consuming unreasonable memory.
+            "max_ROIs":      10000,
+        },
         "cellpose_settings": {
             "cellpose_model":  "cyto",
             "flow_threshold":  1.5,
