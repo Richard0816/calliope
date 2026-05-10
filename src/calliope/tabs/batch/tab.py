@@ -727,6 +727,15 @@ class BatchTab(ttk.Frame):
                 "Empty TIFFs",
                 f"Row '{bad[0].identifier}' has no TIFF files.")
             return
+        # Single overwrite confirmation up front. Tab 1's _on_force_rerun
+        # would otherwise pop a "this will overwrite existing outputs"
+        # dialog per row, which is annoying when the user has 30 of them.
+        if not messagebox.askyesno(
+                "Run all",
+                f"Force-rerun preprocessing on {len(self._rows)} "
+                f"recordings, overwriting any existing outputs in:\n"
+                f"  {out}\n\nContinue?"):
+            return
         self._save_queue()
 
         # Resolve the PipelineApp instance so the orchestrator can
@@ -901,8 +910,10 @@ class BatchTab(ttk.Frame):
             path_extractor=lambda r: getattr(r, "out_dir", None),
         )
         # Force-rerun bypasses the "load existing outputs" cache so the
-        # batch always re-runs the recording from scratch.
-        self.after(50, prep._on_force_rerun)
+        # batch always re-runs the recording from scratch. Skip Tab 1's
+        # _on_force_rerun wrapper -- it pops a confirmation dialog per
+        # row that the user already answered once in _on_run_all.
+        self.after(50, lambda: prep._start_run(force=True))
 
     def _stage_detection(self) -> None:
         det = self._app.detection_tab
