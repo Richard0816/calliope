@@ -256,6 +256,15 @@ class EventDetectionTab(ttk.Frame):
         self._render_worker: Optional[threading.Thread] = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
+        # Snapshot of the most recent unfiltered event publish + the
+        # per-event prominence array. Used by the "Filter weak events..."
+        # popout to re-publish a strength-masked subset without
+        # re-detecting. Populated by _on_render_done.
+        self._base_event_payload: Optional[dict] = None
+        self._base_prominences: Optional[np.ndarray] = None
+        # Most recent strength threshold the popout applied (0 = keep
+        # all). Stored so the popout reopens with the same setting.
+        self._strength_threshold: float = 0.0
         # Onset source: 'derivative' (default, MAD-z + hysteresis on
         # the SG derivative of the lowpass dF/F) or 'spks' (MAD-z +
         # hysteresis on Suite2p's deconvolved spike trace from
@@ -298,6 +307,14 @@ class EventDetectionTab(ttk.Frame):
             row, text="Save summary",
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="right", padx=(0, 6))
+        # Opens a temporary Toplevel showing the per-event peak-prominence
+        # histogram + a strength-rank slider so the user can drop weak
+        # (likely noise) events without re-detecting. Disabled until the
+        # first render produces a prominence array.
+        self.filter_btn = ttk.Button(
+            row, text="Filter weak events...",
+            command=self._on_open_filter_popout, state="disabled")
+        self.filter_btn.pack(side="right", padx=(0, 6))
         ttk.Button(row, text="Reload from folder...",
                    command=self._reload_from_folder).pack(side="right")
 
@@ -595,8 +612,13 @@ class EventDetectionTab(ttk.Frame):
 
         # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
         # propagation) can render the same events without re-detecting.
+        # We snapshot the unfiltered payload + per-event prominence on
+        # ``self`` so the Filter popout can re-publish a strength-masked
+        # subset later without re-running detection.
+        diagnostics = data.get("diagnostics") or {}
+        prominences = diagnostics.get("prominence")
         try:
-            self.state.set_event_results({
+            self._base_event_payload = {
                 "plane0": self._plane0,
                 "event_windows": data.get("event_windows"),
                 "A": data.get("A"),
@@ -605,9 +627,173 @@ class EventDetectionTab(ttk.Frame):
                 "fps": data.get("fps"),
                 "T": data.get("T"),
                 "onsets_by_roi": data.get("onsets_by_roi"),
-            })
+            }
+            self._base_prominences = (
+                np.asarray(prominences, dtype=float)
+                if prominences is not None else None)
+            self.state.set_event_results(dict(self._base_event_payload))
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
+        # Re-arm the Filter popout button: enabled iff we have at least
+        # 2 events with prominence values (otherwise the histogram is
+        # degenerate and the slider has nothing to do).
+        try:
+            n_evs = (len(self._base_event_payload.get("event_windows") or [])
+                     if self._base_prominences is not None else 0)
+            self.filter_btn.config(
+                state="normal" if n_evs >= 2 else "disabled")
+        except Exception:
+            pass
+
+    # -- Filter-weak-events popout ----------------------------------------
+
+    def _on_open_filter_popout(self) -> None:
+        """Open a temporary Toplevel showing the per-event peak-prominence
+        histogram + a strength-rank slider.
+
+        Strength is the percentile rank of each event's
+        ``find_peaks`` prominence (1.0 = strongest, 0.0 = weakest).
+        Setting the slider to 0.4 keeps the strongest 60% of events.
+        On Apply we filter ``event_windows`` / ``A`` / ``first_time``
+        by the boolean mask and re-publish via
+        ``state.set_event_results``; downstream tabs (7, 8) update on
+        receive without re-detecting.
+
+        The popout is single-use: closing or applying destroys it.
+        Re-opening starts fresh with the current
+        ``self._strength_threshold``.
+        """
+        if (self._base_event_payload is None
+                or self._base_prominences is None
+                or len(self._base_prominences) < 2):
+            messagebox.showinfo(
+                "Nothing to filter",
+                "Render events first; need at least 2 events.")
+            return
+
+        proms = np.asarray(self._base_prominences, dtype=float)
+        n = int(proms.size)
+        # Per-event strength = ascending percentile rank in [1/n, 1].
+        # Argsort gives the sort order; ranks invert that mapping.
+        order = np.argsort(proms, kind="stable")
+        ranks = np.empty(n, dtype=float)
+        ranks[order] = (np.arange(1, n + 1, dtype=float)) / float(n)
+
+        win = tk.Toplevel(self)
+        win.title("Filter weak events by peak prominence")
+        win.transient(self.winfo_toplevel())
+        win.geometry("620x460")
+
+        # ---- Histogram of prominence + threshold marker -------------
+        fig = plt.Figure(figsize=(6, 3.2), tight_layout=True)
+        ax = fig.add_subplot(111)
+        nbins = max(10, min(40, n // 2))
+        ax.hist(proms, bins=nbins, color="#4682b4",
+                edgecolor="white", linewidth=0.5)
+        ax.set_xlabel("Peak prominence", fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.tick_params(labelsize=8)
+        thr_line = ax.axvline(proms.min(), color="tab:red", lw=1.4,
+                              linestyle="--")
+        # Translucent shading for the *kept* prominence range.
+        kept_shade = ax.axvspan(proms.min(), proms.max(),
+                                color="tab:green", alpha=0.10)
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True,
+                                    padx=6, pady=(6, 0))
+
+        # ---- Slider + count label + buttons -------------------------
+        ctrl = ttk.Frame(win, padding=(6, 4))
+        ctrl.pack(fill="x")
+        ttk.Label(ctrl, text="Min strength rank:").pack(side="left")
+        thr_var = tk.DoubleVar(value=float(self._strength_threshold))
+        scale = ttk.Scale(ctrl, from_=0.0, to=1.0, length=260,
+                          variable=thr_var, orient="horizontal")
+        scale.pack(side="left", padx=(6, 6))
+        thr_readout = ttk.Label(ctrl, text="0.00", width=5)
+        thr_readout.pack(side="left")
+
+        count_var = tk.StringVar(value="")
+        ttk.Label(ctrl, textvariable=count_var,
+                  font=("", 9, "italic")).pack(side="right")
+
+        def _redraw(*_):
+            t = float(thr_var.get())
+            kept_mask = ranks >= t
+            n_kept = int(kept_mask.sum())
+            # Threshold prominence = the smallest kept value (or
+            # the max + epsilon if everything is dropped, just so
+            # the line stays inside the axis).
+            kept_proms = proms[kept_mask] if n_kept > 0 else np.array(
+                [proms.max() + 1e-12])
+            min_kept = float(kept_proms.min())
+            thr_line.set_xdata([min_kept, min_kept])
+            # Update the green-shaded "kept" band.
+            xmin, xmax = ax.get_xlim()
+            xy = np.array([
+                [min_kept, 0], [min_kept, 1],
+                [xmax, 1], [xmax, 0], [min_kept, 0]])
+            kept_shade.set_xy(xy)
+            thr_readout.config(text=f"{t:.2f}")
+            count_var.set(f"keeping {n_kept} / {n} events")
+            canvas.draw_idle()
+
+        thr_var.trace_add("write", _redraw)
+        _redraw()
+
+        # ---- Apply / Reset / Cancel ---------------------------------
+        btn_row = ttk.Frame(win, padding=(6, 4))
+        btn_row.pack(fill="x")
+
+        def _do_apply():
+            t = float(thr_var.get())
+            mask = ranks >= t
+            self._strength_threshold = t
+            self._publish_filtered_events(mask)
+            n_kept = int(mask.sum())
+            self.status_var.set(
+                f"Filtered to {n_kept} / {n} events "
+                f"(rank >= {t:.2f}).")
+            win.destroy()
+
+        def _do_reset():
+            thr_var.set(0.0)
+
+        ttk.Button(btn_row, text="Reset (keep all)",
+                   command=_do_reset).pack(side="left")
+        ttk.Button(btn_row, text="Cancel",
+                   command=win.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Apply",
+                   command=_do_apply).pack(side="right", padx=(0, 6))
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def _publish_filtered_events(self, mask: np.ndarray) -> None:
+        """Re-publish ``event_results`` with only the events ``mask``
+        keeps. Downstream tabs (7 + 8) react on the AppState publish.
+        """
+        if self._base_event_payload is None:
+            return
+        base = self._base_event_payload
+        ev = base.get("event_windows")
+        A = base.get("A")
+        ft = base.get("first_time")
+        kept_ev = (np.asarray(ev)[mask]
+                   if ev is not None and len(ev) > 0 else ev)
+        kept_A = (np.asarray(A)[:, mask]
+                  if A is not None else A)
+        kept_ft = (np.asarray(ft)[:, mask]
+                   if ft is not None else ft)
+        try:
+            self.state.set_event_results({
+                **base,
+                "event_windows": kept_ev,
+                "A": kept_A,
+                "first_time": kept_ft,
+            })
+        except Exception as e:
+            print(f"[GUI] filtered publish failed: {e}")
 
     # -- Summary export -----------------------------------------------------
 
