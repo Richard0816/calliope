@@ -87,6 +87,12 @@ class AppState:
         self.plane0: Optional[Path] = None
         self.lowpass_plane0: Optional[Path] = None
         self.event_results: Optional[dict] = None
+        # Tab 6 + Tab 7 broadcast a "stage finished" signal that the
+        # batch runner subscribes to so it can advance to the next
+        # stage. Payloads carry the plane0 / output path the producer
+        # tab just wrote.
+        self.clusters_ready: Optional[Path] = None
+        self.xcorr_ready: Optional[Path] = None
         # Subscriber lists. Underscore prefix is convention for
         # "internal -- don't poke this from outside the class". Python
         # does not actually enforce privacy.
@@ -94,6 +100,8 @@ class AppState:
         self._plane0_listeners: list = []
         self._lowpass_listeners: list = []
         self._event_listeners: list = []
+        self._clusters_listeners: list = []
+        self._xcorr_listeners: list = []
 
     # ---- preprocess result channel ----
 
@@ -159,6 +167,41 @@ class AppState:
                 fn(results)
             except Exception as e:
                 print(f"event_results listener error: {e}")
+
+    # ---- clustering-ready channel (Tab 6 -> batch runner) ----
+
+    def subscribe_clusters_ready(self, fn) -> None:
+        """Subscribe to Tab 6's "clustering analysis finished" signal.
+
+        Listener receives the plane0 path the clustering ran on so
+        callers (batch runner) can move on to the next stage.
+        """
+        self._clusters_listeners.append(fn)
+
+    def set_clusters_ready(self, plane0: Path) -> None:
+        self.clusters_ready = Path(plane0)
+        for fn in self._clusters_listeners:
+            try:
+                fn(self.clusters_ready)
+            except Exception as e:
+                print(f"clusters_ready listener error: {e}")
+
+    # ---- crosscorrelation-ready channel (Tab 7 -> batch runner) ----
+
+    def subscribe_xcorr_ready(self, fn) -> None:
+        """Subscribe to Tab 7's "xcorr finished" signal.
+
+        Listener receives the output directory Tab 7 wrote into.
+        """
+        self._xcorr_listeners.append(fn)
+
+    def set_xcorr_ready(self, out_path: Path) -> None:
+        self.xcorr_ready = Path(out_path)
+        for fn in self._xcorr_listeners:
+            try:
+                fn(self.xcorr_ready)
+            except Exception as e:
+                print(f"xcorr_ready listener error: {e}")
 
 
 # ---------------------------------------------------------------------------

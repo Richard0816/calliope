@@ -27,6 +27,7 @@ import numpy as np
 
 from . import scale as scale_mod
 from . import spatial as spatial_helpers
+from . import utils
 
 
 def render_spatial_event_figures(
@@ -55,19 +56,24 @@ def render_spatial_event_figures(
     kept_idx = np.asarray(event_data["kept_idx"])
     fps: Optional[float] = event_data.get("fps")
 
-    ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-    Ly, Lx = int(ops["Ly"]), int(ops["Lx"])
-    pix_to_um = scale_mod.resolve_pix_to_um(ops)
+    view = utils.load_plane_view(plane0)
+    Ly, Lx = int(view["Ly"]), int(view["Lx"])
+    pix_to_um = scale_mod.resolve_pix_to_um(view)
     stat_all = np.load(plane0 / "stat.npy", allow_pickle=True)
     stat_filtered = [stat_all[i] for i in kept_idx.tolist()]
 
+    # Suite2p stores ROI pixels with y=0 at the TOP of the FOV (image
+    # convention). Render with origin="upper" + a flipped y-extent so the
+    # rendered figure's orientation matches suite2p's GUI -- y-axis ticks
+    # go 0 at top -> Ly at bottom, centroids land at the suite2p (cx, cy)
+    # without needing a Ly - cy flip.
     if pix_to_um is not None:
         scale = float(pix_to_um)
-        extent = [0, Lx * scale, 0, Ly * scale]
+        extent = [0, Lx * scale, Ly * scale, 0]
         xlabel, ylabel = "X (µm)", "Y (µm)"
     else:
         scale = 1.0
-        extent = None
+        extent = [0, Lx, Ly, 0]
         xlabel, ylabel = "X (px)", "Y (px)"
 
     written: list[str] = []
@@ -94,7 +100,7 @@ def render_spatial_event_figures(
         fig = plt.Figure(figsize=(7, 6), tight_layout=True)
         ax = fig.add_subplot(111)
         im = ax.imshow(
-            img, origin="lower",
+            img, origin="upper",
             cmap=spatial_helpers.CYAN_TO_RED,
             aspect="equal", vmin=0.0, vmax=1.0, extent=extent,
         )

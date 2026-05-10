@@ -30,9 +30,16 @@ Module index
 - ``spatial``             - cyan->blue->red colormap, per-event
                              activation-rank painting, frame-grouped
                              centroids (used by tab 8).
-- ``adaptive_detection``  - legacy residual-blob detector kept for
-                             backwards compat.
-- ``brute_force_ops``     - alternative Suite2p ``ops`` profile.
+- ``suite2p_pipeline``    - all suite2p contact: ``run_one_pass``,
+                             ``run_cellpose_pass``,
+                             ``_get_or_create_shared_registration``,
+                             ``load_base_settings``, plus the
+                             monkey-patches that work around suite2p
+                             1.0 quirks. Imported only by
+                             ``sparse_plus_cellpose``.
+- ``calliope_settings``   - in-source nested defaults for the lab's
+                             2-photon rig + popout flatten/nest
+                             helpers.
 - ``summary_writer``      - writes ``calliope_summary.xlsx``
                              (Recording / EventOnsets / EventWindows
                              sheets) used by tabs 5+.

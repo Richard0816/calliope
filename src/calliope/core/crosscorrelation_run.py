@@ -88,7 +88,9 @@ def run_crosscorrelation(
         Suite2p plane folder.
     params : dict
         ``prefix`` (default ``"r0p7_filtered_"``),
-        ``cluster_folder`` (default ``"gui_recluster"``),
+        ``cluster_folder`` (default ``""`` -- ROI files live directly
+        under ``<prefix>cluster_results/``; pass a name to use an
+        extra subfolder under there),
         ``fps`` (must be supplied; usually carried over from
         upstream stages),
         ``max_lag_seconds`` (default 2.0),
@@ -106,7 +108,7 @@ def run_crosscorrelation(
     """
     plane0 = Path(plane0)
     prefix = str(params.get("prefix", "r0p7_filtered_"))
-    cluster_folder = str(params.get("cluster_folder", "gui_recluster"))
+    cluster_folder = str(params.get("cluster_folder", ""))
     fps = float(params.get("fps", 0.0) or 0.0)
     if fps <= 0:
         raise ValueError("run_crosscorrelation requires positive fps in params")

@@ -32,14 +32,16 @@ Tab 3 calls this module's ``run_full_pipeline`` (defined later in the
 file) when the user clicks "Run detection". Inputs:
 
 - The shifted TIFF stack from Tab 1.
-- A base ops dict (``suite2p_2p_ops_240621.npy``) with sensible 2-photon
-  defaults.
+- Base settings (calliope's 2-photon defaults) come from
+  ``calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS`` in source.
+  Per-session edits flow in via Tab 3's "Edit suite2p settings..."
+  popout as a ``settings_override`` dict.
 - The recording's tau (GCaMP decay constant) looked up from the AAV
   metadata table.
 
-Compared to ``final_adaptive_detection.py``, this script skips the
-spatial-scale estimation and threshold binary search. Ops are whatever
-you set at the top of this file.
+All suite2p contact happens via :mod:`calliope.core.suite2p_pipeline`;
+this file is the orchestrator that wires sparsery + cellpose together
+and runs extract/dcnv/classify on the merged ROI list.
 
 Usage:
     python sparse_plus_cellpose.py
@@ -78,23 +80,24 @@ from suite2p.extraction import extract, dcnv
 # ``classification``: Suite2p's built-in cell/not-cell classifier
 # that writes iscell.npy.
 from suite2p import classification
+# ``default_settings`` is the source of truth for the nested 1.0
+# extraction defaults; we deep-merge calliope's overrides on top.
+from suite2p.parameters import default_settings
 
 # Helpers re-used from the older adaptive-detection pipeline. Even
 # though we skip the binary-search loop here, we still need ops
 # loading, the registration cache, and the ROI-mask builder.
-from .adaptive_detection import (
-    AdaptiveConfig,
-    load_base_ops,
+from .suite2p_pipeline import (
+    Suite2pPipelineConfig,
+    load_base_settings,
     _get_or_create_shared_registration,
     _link_or_copy,
     run_one_pass,
+    run_cellpose_pass,
     build_roi_pixel_mask,
-    visualize_audit,
+    apply_settings_overrides,
 )
-
-# The Cellpose pass itself lives in the adjacent ``brute_force_ops``
-# module so it can be tested / re-run independently.
-from .brute_force_ops import run_cellpose_pass
+from . import utils
 
 
 # ============================================================================
@@ -103,7 +106,11 @@ from .brute_force_ops import run_cellpose_pass
 
 TIFF_FOLDER = r'D:\2024-11-20_00003'
 SAVE_FOLDER = r'D:\sparse_plus_cellpose\2024-11-20_00003'
-PATH_TO_OPS = r'suite2p_2p_ops_240621.npy'
+# PATH_TO_OPS is kept None: base settings come from
+# calliope.core.calliope_settings.build_base_settings (in-source).
+# Set to a .npy path here only if you want to override with a saved
+# settings/ops file from outside the repo.
+PATH_TO_OPS = None
 
 # Fixed sparsery ops — no binary search, just one pass with these values.
 SPARSERY_OPS = {
@@ -132,7 +139,7 @@ HARD_CAP = 60000
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
-# Tau lookup table by GCaMP variant. Forwarded into AdaptiveConfig so
+# Tau lookup table by GCaMP variant. Forwarded into Suite2pPipelineConfig so
 # load_base_ops can match a recording's tau via aav_info_csv. The GUI passes
 # this through `tau_vals=spc.DEFAULT_TAU_VALS`.
 DEFAULT_TAU_VALS: dict = {"6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137}
@@ -206,7 +213,7 @@ def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
 
 
 def merge_and_extract(sparsery_stat, cellpose_stat,
-                      shared_plane0: Path, base_ops: dict,
+                      shared_plane0: Path, base_settings: dict,
                       final_dir: Path, max_overlap: float,
                       verbose: bool = True):
     """Combine sparsery + non-overlapping cellpose ROIs, then extract
@@ -243,9 +250,11 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
 
     _link_or_copy(Path(shared_plane0) / 'data.bin',
                   final_plane0 / 'data.bin')
-    reg_ops = np.load(Path(shared_plane0) / 'ops.npy',
-                      allow_pickle=True).item()
-    Ly, Lx = int(reg_ops['Ly']), int(reg_ops['Lx'])
+    # Load the shared registration's runtime view (Ly, Lx, meanImg, ...)
+    # via load_plane_view so we work off the new db.npy / settings.npy /
+    # reg_outputs.npy on disk (with a fallback to legacy ops.npy).
+    reg_view = utils.load_plane_view(shared_plane0)
+    Ly, Lx = int(reg_view['Ly']), int(reg_view['Lx'])
 
     cellpose_kept = filter_non_overlapping_cellpose(
         sparsery_stat, cellpose_stat, Ly, Lx,
@@ -281,11 +290,25 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     if not combined_raw:
         raise RuntimeError('merge produced 0 ROIs — nothing to extract')
 
-    final_ops = dict(reg_ops)
-    for k in ('tau', 'fs', 'neucoeff', 'baseline', 'win_baseline',
-              'sig_baseline', 'prctile_baseline', 'batch_size'):
-        if k in base_ops:
-            final_ops[k] = base_ops[k]
+    # Build the flat ops dict that suite2p's extract.create_masks_and_extract
+    # still consumes. Start from the shared-registration's view and overlay
+    # the trace-extraction knobs we care about, pulled from base_settings.
+    from .suite2p_pipeline import get_setting
+    final_ops = dict(reg_view)
+    final_ops['tau'] = float(base_settings.get('tau', final_ops.get('tau', 1.0)))
+    final_ops['fs'] = float(base_settings.get('fs', final_ops.get('fs', 15.0)))
+    final_ops['neucoeff'] = float(
+        get_setting(base_settings, 'neuropil_coefficient',
+                    final_ops.get('neucoeff', 0.7))
+    )
+    for k in ('baseline', 'win_baseline', 'sig_baseline',
+              'prctile_baseline'):
+        v = get_setting(base_settings, k)
+        if v is not None:
+            final_ops[k] = v
+    bs = get_setting(base_settings, 'batch_size')
+    if bs is not None:
+        final_ops['batch_size'] = bs
     final_ops['save_path0'] = str(final_dir)
     final_ops['save_folder'] = 'suite2p'
     final_ops['reg_file']    = str(final_plane0 / 'data.bin')
@@ -299,7 +322,16 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
             [len(s['ypix']) for s in combined_raw]
         ) / np.pi)),
     )))
-    enriched = roi_stats(combined_raw, Ly, Lx, diameter=median_diam)
+    # suite2p 1.0's roi_stats unpacks ``dy, dx = diameter[0], diameter[1]``
+    # so a scalar int trips a ``'int' object is not subscriptable``. Pass a
+    # 2-element list (square pixels on the lab's 2-photon rig).
+    # It also fancy-indexes ``stats[keep_rois]`` with a numpy bool mask, so
+    # the input list has to be wrapped as an object ndarray; a bare Python
+    # list raises ``TypeError: only integer scalar arrays can be converted
+    # to a scalar index``.
+    combined_arr = np.array(combined_raw, dtype=object)
+    enriched = roi_stats(combined_arr, Ly, Lx,
+                         diameter=[median_diam, median_diam])
     for i, s in enumerate(enriched):
         if '_source' not in s:
             s['_source'] = combined_raw[i].get('_source', 'sparsery')
@@ -307,13 +339,35 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
 
     if verbose:
         print(f"    extracting traces for {len(stat_arr)} ROIs")
-    stat_arr, F, Fneu, F_chan2, Fneu_chan2 = extract.create_masks_and_extract(
-        final_ops, stat_arr,
-    )
+    # suite2p 1.0 dropped ``extract.create_masks_and_extract`` and now exposes
+    # ``extract.extraction_wrapper(stat, f_reg, settings=...)``. We open the
+    # registered binary as a BinaryFile (memmap-backed; exposes the .shape
+    # extraction_wrapper expects) and pass settings.extraction through.
+    from suite2p.io import BinaryFile
+    import torch
+    nframes = int(reg_view.get('nframes') or 0)
+    if nframes <= 0:
+        # Fallback when load_plane_view didn't surface nframes (e.g. older
+        # plane folder without db.npy): infer from file size at int16.
+        nframes = (final_plane0 / 'data.bin').stat().st_size // (Ly * Lx * 2)
+    extraction_settings = {
+        **default_settings()['extraction'],
+        **base_settings.get('extraction', {}),
+    }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with BinaryFile(Ly=Ly, Lx=Lx,
+                    filename=str(final_plane0 / 'data.bin'),
+                    n_frames=nframes, write=False) as f_reg:
+        F, Fneu, F_chan2, Fneu_chan2 = extract.extraction_wrapper(
+            stat_arr, f_reg,
+            settings=extraction_settings,
+            device=device,
+        )
 
     tau = float(final_ops.get('tau', 1.0))
     fs = float(final_ops.get('fs', 15.0))
-    neucoeff = float(final_ops.get('neucoeff', 0.7))
+    neucoeff = float(extraction_settings.get('neuropil_coefficient',
+                                             final_ops.get('neucoeff', 0.7)))
     F_sub = F - neucoeff * Fneu
     F_pp = dcnv.preprocess(
         F=F_sub,
@@ -342,6 +396,12 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     np.save(final_plane0 / 'Fneu.npy',   Fneu)
     np.save(final_plane0 / 'spks.npy',   spks)
     np.save(final_plane0 / 'iscell.npy', iscell)
+    # Persist the merged-output ops snapshot. Suite2p 1.0's full pipeline
+    # would write its own ops.npy (when settings.io.save_ops_orig=True),
+    # but here we ran extract/dcnv/classify by hand on the shared
+    # registration, so we drop the merged ops ourselves so downstream
+    # readers (utils.load_plane_view, Tab 6/7 spatial overlays, the
+    # cellfilter dataset loader) see a complete view.
     np.save(final_plane0 / 'ops.npy',    final_ops, allow_pickle=True)
 
     if verbose:
@@ -368,6 +428,7 @@ def run(
     aav_info_csv: str | None = None,
     tau_vals: dict | None = None,
     tau_override: float | None = None,
+    settings_override: dict | None = None,
     verbose: bool = True,
 ) -> Path:
     """Sparsery + cellpose detection. Returns the final ``suite2p/plane0`` path.
@@ -375,12 +436,14 @@ def run(
     This is the single-call public API Tab 3's worker uses. The full
     flow:
 
-    1. Build an ``AdaptiveConfig`` (the legacy detection's config
-       dataclass; we still piggy-back on it for the AAV / tau lookup
-       and for the shared-registration cache).
-    2. ``load_base_ops`` reads the base 2-photon ops file
-       (``suite2p_2p_ops_240621.npy``) and overlays the recording's
-       tau looked up from the AAV CSV.
+    1. Build a ``Suite2pPipelineConfig`` (input bundle for the
+       suite2p invocation helpers in
+       :mod:`calliope.core.suite2p_pipeline` -- AAV/tau lookup,
+       optional popout settings override, shared-registration cache).
+    2. ``load_base_settings`` builds the base 2-photon ``(db, settings)``
+       pair from :func:`calliope_settings.build_base_settings` (in source)
+       and overlays any per-session ``settings_override`` (from Tab 3's
+       popout) plus the recording's tau looked up from the AAV CSV.
     3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
        correction once and caches ``data.bin`` + ``ops.npy`` so both
        Sparsery and Cellpose can reuse it.
@@ -391,8 +454,6 @@ def run(
     6. ``merge_and_extract`` -- drop overlapping Cellpose ROIs,
        concatenate, run Suite2p extract / dcnv / classify, save into
        ``<save_folder>/final/suite2p/plane0``.
-    7. ``visualize_audit`` -- optional ``audit.png`` overlay of all
-       final ROIs on the mean image.
 
     Parameters
     ----------
@@ -414,8 +475,8 @@ def run(
         Cellpose ROIs whose pixels are >= this fraction inside an
         existing Sparsery ROI are dropped during merge.
     aav_info_csv, tau_vals : optional
-        Forwarded to ``AdaptiveConfig`` for the GCaMP-variant tau
-        lookup.
+        Forwarded to ``Suite2pPipelineConfig`` for the GCaMP-variant
+        tau lookup.
     verbose : bool
         Print step-by-step progress.
 
@@ -431,15 +492,15 @@ def run(
 
     sp_ops = dict(SPARSERY_OPS) if sparsery_ops is None else dict(sparsery_ops)
     cp_cfg = dict(CELLPOSE_CFG) if cellpose_cfg is None else dict(cellpose_cfg)
-    ops_path = str(path_to_ops) if path_to_ops else PATH_TO_OPS
+    # ``path_to_ops`` is the legacy back-compat path: when explicit, it
+    # wins. When None, the in-source defaults from
+    # ``calliope.core.calliope_settings.build_base_settings`` are used.
+    ops_path = str(path_to_ops) if path_to_ops else None
 
     cfg_kwargs = dict(
         tiff_folder=str(tiff_folder),
         save_folder=str(save_root),
         path_to_ops=ops_path,
-        auto_estimate_spatial_scale=False,
-        generate_audit_pngs=False,
-        augment_with_residual_blobs=False,
         use_cache=False,
         verbose=verbose,
     )
@@ -451,31 +512,48 @@ def run(
     # default) lets the legacy filename-based resolver run.
     if tau_override is not None:
         cfg_kwargs["tau_override"] = float(tau_override)
-    cfg = AdaptiveConfig(**cfg_kwargs)
+    if settings_override:
+        cfg_kwargs["settings_override"] = dict(settings_override)
+    cfg = Suite2pPipelineConfig(**cfg_kwargs)
 
     if verbose:
-        print(f'[s+cp] loading base ops from {ops_path}')
-    base_ops = load_base_ops(cfg)
+        if ops_path:
+            print(f'[s+cp] loading base settings from legacy file {ops_path}')
+        else:
+            from . import calliope_settings as _cs
+            n_overrides = len(_cs.CALLIOPE_BASE_SETTINGS)
+            tweak = " + popout edits" if settings_override else ""
+            print(f'[s+cp] base settings = suite2p defaults + '
+                  f'{n_overrides} calliope overrides{tweak}')
+    base_db, base_settings = load_base_settings(cfg)
 
     if verbose:
         print(f'[s+cp] shared registration')
     t0 = time.time()
-    shared_plane0 = _get_or_create_shared_registration(cfg, base_ops)
+    shared_plane0 = _get_or_create_shared_registration(
+        cfg, base_db, base_settings,
+    )
     if verbose:
         print(f'[s+cp] shared reg ready at {shared_plane0}  '
               f'({time.time() - t0:.1f}s)')
 
-    # ---- sparsery (one shot, fixed ops) ----
+    # ---- sparsery (one shot, fixed settings) ----
     if verbose:
         print(f'[s+cp] sparsery pass '
               f'(threshold_scaling={sp_ops["threshold_scaling"]})')
     sparsery_dir = save_root / 'sparsery_pass'
-    ops = dict(base_ops)
-    ops.update(sp_ops)
-    ops['roidetect'] = True
+    sp_settings = {
+        # _deep_copy via dict comprehension over top-level keys; nested
+        # dicts get cloned by apply_settings_overrides as needed.
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in base_settings.items()
+    }
+    apply_settings_overrides(sp_settings, sp_ops)
+    apply_settings_overrides(sp_settings, {'roidetect': True})
+    sp_db = dict(base_db)
     t_sp = time.time()
-    sp_stat, _sp_ops_out, _sp_plane0 = run_one_pass(
-        str(tiff_folder), sparsery_dir, ops,
+    sp_stat, _sp_view, _sp_plane0 = run_one_pass(
+        str(tiff_folder), sparsery_dir, sp_db, sp_settings,
         verbose=verbose, use_cache=False,
         shared_plane0=shared_plane0,
         hard_cap=(hard_cap or 0),
@@ -501,20 +579,9 @@ def run(
         print(f'[s+cp] merging + extracting')
     final_dir = save_root / 'final'
     stat_arr, _final_ops, final_plane0 = merge_and_extract(
-        sp_stat, cp_stat, shared_plane0, base_ops, final_dir,
+        sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
         max_overlap=max_overlap, verbose=verbose,
     )
-
-    # ---- audit.png ----
-    try:
-        if verbose:
-            print(f'[s+cp] writing audit.png')
-        visualize_audit(str(final_plane0), config=cfg,
-                        outpath=str(final_plane0 / 'audit.png'),
-                        title_prefix='sparse+cellpose')
-    except Exception as e:
-        if verbose:
-            print(f'[s+cp] audit failed: {e}')
 
     if verbose:
         print(f'\n[s+cp] DONE.')

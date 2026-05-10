@@ -114,7 +114,11 @@ from ...gui_common import format_roi_indices
 DEFAULT_PREFIX = "r0p7_filtered_"
 DEFAULT_PALETTE = "tab10"
 ABOVE_CUT_COLOR = "gray"
-EXPORT_SUBDIR = "gui_recluster"
+# Cluster ROI .npy files are written directly into
+# ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster"
+# subfolder. Tab 7 + the headless ``crosscorrelation_run`` already
+# accept an empty ``cluster_folder`` and skip the join in that case.
+EXPORT_SUBDIR = ""
 POLL_MS = 80
 
 
@@ -735,7 +739,8 @@ class ClusteringTab(ttk.Frame):
         return True
 
     def _existing_cluster_dir(self, plane0: Path, prefix: str) -> Path:
-        return plane0 / f"{prefix}cluster_results" / EXPORT_SUBDIR
+        base = plane0 / f"{prefix}cluster_results"
+        return base / EXPORT_SUBDIR if EXPORT_SUBDIR else base
 
     def _has_existing_clusters(self, plane0: Path, prefix: str) -> bool:
         d = self._existing_cluster_dir(plane0, prefix)
@@ -783,8 +788,8 @@ class ClusteringTab(ttk.Frame):
         dff = dff_mm
         Z = _correlation_linkage(dff)
         stat, _ = _stat_for_prefix(plane0, prefix)
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-        Lx, Ly = int(ops["Lx"]), int(ops["Ly"])
+        view = utils.load_plane_view(plane0)
+        Lx, Ly = int(view["Lx"]), int(view["Ly"])
         auto_frac = cmap_mod.auto_choose_threshold(Z, target_counts=(4, 5))
         return {
             "Z": Z, "dff": dff, "dff_shape": dff.shape, "stat": stat,
@@ -849,8 +854,8 @@ class ClusteringTab(ttk.Frame):
                 f"dF/F memmap has {N} columns. Re-run analysis instead "
                 f"of reloading.")
         stat, _ = _stat_for_prefix(plane0, prefix)
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
-        Lx, Ly = int(ops["Lx"]), int(ops["Ly"])
+        view = utils.load_plane_view(plane0)
+        Lx, Ly = int(view["Lx"]), int(view["Ly"])
         zmax = float(np.max(Z[:, 2]))
         return {
             "Z": Z, "dff": dff_mm, "dff_shape": dff_mm.shape, "stat": stat,
@@ -921,6 +926,15 @@ class ClusteringTab(ttk.Frame):
             f"auto cut={auto_frac:.2f}xmax  -> {n_clusters} clusters. "
             f"Toggle 'Manual threshold' + slider to tune.")
         self._refresh_reload_btn()
+
+        # Tab 0's batch runner subscribes to this signal to advance to
+        # Tab 7. Publishing here (rather than after every recluster) keeps
+        # the batch advancing exactly once per row.
+        try:
+            plane0 = Path(self.path_var.get())
+            self.state.set_clusters_ready(plane0)
+        except Exception as e:
+            print(f"[GUI] clusters_ready publish failed: {e}")
 
     def _on_reloaded(self, data: dict) -> None:
         self.progress.stop()
@@ -1456,8 +1470,7 @@ class ClusteringTab(ttk.Frame):
                 filtered_to_suite2p = np.where(
                     np.asarray(mask, dtype=bool))[0].astype(int)
 
-        out_dir = (self._plane0 / f"{self._prefix}cluster_results"
-                   / EXPORT_SUBDIR)
+        out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Clear stale C*_rois.npy first so old runs don't poison crosscorr.
         for stale in out_dir.glob("C*_rois.npy"):

@@ -379,8 +379,8 @@ def plot_spatial(
     via the cell mask so `order` aligns with clustering indices.
     """
     root = Path(root)
-    ops = np.load(root / "ops.npy", allow_pickle=True).item()
-    Ly, Lx = ops["Ly"], ops["Lx"]
+    view = utils.load_plane_view(root)
+    Ly, Lx = view["Ly"], view["Lx"]
 
     if used_indices is not None:
         full_stat = list(np.load(root / "stat.npy", allow_pickle=True))
@@ -401,7 +401,7 @@ def plot_spatial(
     coverage = utils.paint_spatial(np.ones(len(stat)), stat, Ly, Lx)
     img[coverage == 0] = np.nan
 
-    pix_to_um = _resolve_pix_to_um(root, ops)
+    pix_to_um = _resolve_pix_to_um(root, view)
     if pix_to_um is not None:
         extent = [0, Lx * pix_to_um, 0, Ly * pix_to_um]
         xlabel, ylabel = "X (µm)", "Y (µm)"

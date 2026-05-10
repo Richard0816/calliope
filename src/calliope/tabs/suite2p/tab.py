@@ -88,6 +88,20 @@ from ...gui_common import (
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 
+def _count_leaves(d: dict) -> int:
+    """Recursively count non-dict leaves in a nested dict.
+
+    Used to summarise the popout's overrides count in the run log.
+    """
+    n = 0
+    for v in d.values():
+        if isinstance(v, dict):
+            n += _count_leaves(v)
+        else:
+            n += 1
+    return n
+
+
 class Suite2pTab(ttk.Frame):
     """Runs sparse_plus_cellpose -> dF/F -> cell filter on the preprocessed
     shifted TIFF and renders three panels: live console, raw detected ROIs,
@@ -117,7 +131,8 @@ class Suite2pTab(ttk.Frame):
 
     POLL_MS = 80
 
-    DEFAULT_OPS_PATH = _DATA_DIR / "suite2p_2p_ops_240621.npy"
+    # Base settings now come from calliope.core.calliope_settings (in source)
+    # rather than a .npy file; the corresponding "Base ops" picker is gone.
     DEFAULT_CKPT_PATH = Path(r"F:\cellfilter_checkpoints\best.pt")
     DEFAULT_AAV_CSV = _DATA_DIR / "human_SLE_2p_meta.csv"
 
@@ -224,6 +239,11 @@ class Suite2pTab(ttk.Frame):
         self._worker: Optional[threading.Thread] = None
         self._final_plane0: Optional[Path] = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
+        # Per-session suite2p settings override produced by the
+        # "Edit suite2p settings..." popout. Empty dict means "use the
+        # in-source defaults from calliope.core.calliope_settings". Gets
+        # passed to spc.run via the settings_override kwarg.
+        self._settings_override: dict = {}
         self._bg_var = tk.StringVar(value=self.DEFAULT_BG_KEY)
         self._panel_cache: Optional[dict] = None
 
@@ -239,13 +259,11 @@ class Suite2pTab(ttk.Frame):
                        "-> dF/F -> cell filter", padding=8)
         header.pack(fill="x", pady=(0, 6))
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Base ops:", width=12).pack(side="left")
-        self.ops_var = tk.StringVar(value=str(self.DEFAULT_OPS_PATH))
-        ttk.Entry(row, textvariable=self.ops_var).pack(
-            side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", command=self._browse_ops).pack(
-            side="left")
+        # The "Base ops" / "Base settings" file picker that used to live
+        # here is gone in the native (db, settings) refactor. Base settings
+        # come from calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS
+        # (in-source) and per-session edits go through the
+        # "Edit suite2p settings..." popout next to the Run button.
 
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         ttk.Label(row, text="Cell filter:", width=12).pack(side="left")
@@ -257,19 +275,24 @@ class Suite2pTab(ttk.Frame):
 
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         ttk.Label(row, text="dF/F baseline:", width=12).pack(side="left")
-        self.baseline_var = tk.StringVar(value="rolling")
-        ttk.Radiobutton(
-            row, text="Rolling (45 s window, 10th pct)",
-            value="rolling", variable=self.baseline_var,
-        ).pack(side="left", padx=(0, 12))
+        # Default = first-N-minutes mode at 2 minutes. The lab's
+        # standard recordings have a clean baseline at the start, and
+        # rolling has both higher CPU cost and worse behaviour on long
+        # epileptiform sweeps where the rolling window can sit inside
+        # an event.
+        self.baseline_var = tk.StringVar(value="first_n")
         ttk.Radiobutton(
             row, text="First N minutes:",
             value="first_n", variable=self.baseline_var,
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 4))
         self.baseline_min_var = tk.StringVar(value="2")
         ttk.Entry(row, textvariable=self.baseline_min_var,
-                  width=6).pack(side="left", padx=(4, 2))
-        ttk.Label(row, text="min").pack(side="left")
+                  width=6).pack(side="left", padx=(0, 2))
+        ttk.Label(row, text="min").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            row, text="Rolling (45 s window, 10th pct)",
+            value="rolling", variable=self.baseline_var,
+        ).pack(side="left")
 
         # ---- GCaMP variant picker (drives Suite2p's tau) ----
         # Default keeps the legacy AAV-CSV-driven lookup for users
@@ -316,6 +339,9 @@ class Suite2pTab(ttk.Frame):
         self.summary_btn.pack(side="left", padx=(6, 0))
         ttk.Button(row, text="Advanced...",
                    command=self._on_advanced).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="Edit suite2p settings...",
+                   command=self._on_edit_suite2p_settings).pack(
+                       side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(row, mode="indeterminate", length=200)
         self.progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(value="Run preprocessing first.")
@@ -374,13 +400,6 @@ class Suite2pTab(ttk.Frame):
         self.fil_canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # -- Handlers -----------------------------------------------------------
-
-    def _browse_ops(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select base Suite2p ops file",
-            filetypes=[("NumPy", "*.npy"), ("All files", "*.*")])
-        if path:
-            self.ops_var.set(path)
 
     def _browse_ckpt(self) -> None:
         path = filedialog.askopenfilename(
@@ -451,6 +470,39 @@ class Suite2pTab(ttk.Frame):
                 "[GUI] Advanced parameters updated. Re-run detection "
                 "to apply.")
 
+    def _on_edit_suite2p_settings(self) -> None:
+        """Open the popout that edits the underlying suite2p 1.0 settings.
+
+        Unlike the Advanced... dialog (which exposes the curated
+        ``PARAM_SPEC`` subset Calliope cares about), this popout shows
+        every leaf in the nested suite2p settings tree. Edits are
+        merged on top of :func:`calliope_settings.build_base_settings`
+        and persist for the session via ``self._settings_override``.
+        """
+        from ...core import calliope_settings as _cs
+        base = _cs.build_base_settings()
+        specs, flat = _cs.flatten_settings_to_specs(
+            base, current=self._settings_override or None,
+        )
+        if not open_advanced(
+                self, "Edit suite2p settings (deep merge on top of defaults)",
+                specs, flat):
+            return
+        new_overrides = _cs.nest_flat_values(flat, base)
+        if new_overrides == self._settings_override:
+            self._append_log(
+                "[GUI] suite2p settings: no changes from current overrides.")
+            return
+        self._settings_override = new_overrides
+        if not new_overrides:
+            self._append_log(
+                "[GUI] suite2p settings reset to in-source defaults.")
+        else:
+            self._append_log(
+                f"[GUI] suite2p settings updated "
+                f"({_count_leaves(new_overrides)} overrides). "
+                "Re-run detection to apply.")
+
     def _on_run(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             messagebox.showinfo("Busy", "Detection is already running.")
@@ -458,12 +510,6 @@ class Suite2pTab(ttk.Frame):
         result = self.state.result
         if result is None:
             messagebox.showerror("Missing input", "Run preprocessing first.")
-            return
-
-        ops_path = self.ops_var.get().strip()
-        if not ops_path or not Path(ops_path).exists():
-            messagebox.showerror(
-                "Missing ops", f"Base ops file not found:\n{ops_path}")
             return
 
         ckpt_path = self.ckpt_var.get().strip()
@@ -517,7 +563,6 @@ class Suite2pTab(ttk.Frame):
                 self._run_pipeline(
                     tiff_folder=tiff_folder,
                     save_folder=save_folder,
-                    ops_path=ops_path,
                     ckpt_path=(ckpt_path if ckpt_present else None),
                     rec_id=rec_id,
                     baseline_mode=baseline_mode,
@@ -538,7 +583,6 @@ class Suite2pTab(ttk.Frame):
         self,
         tiff_folder: Path,
         save_folder: Path,
-        ops_path: str,
         ckpt_path: Optional[str],
         rec_id: str,
         baseline_mode: str,
@@ -579,7 +623,9 @@ class Suite2pTab(ttk.Frame):
             final_plane0 = spc.run(
                 tiff_folder=str(tiff_folder),
                 save_folder=str(save_folder),
-                path_to_ops=ops_path,
+                # path_to_ops omitted: in-source defaults from
+                # calliope.core.calliope_settings are used. The popout's
+                # settings_override layers on top.
                 sparsery_ops=sparsery_ops,
                 cellpose_cfg=cellpose_cfg,
                 hard_cap=hard_cap,
@@ -587,6 +633,10 @@ class Suite2pTab(ttk.Frame):
                 aav_info_csv=aav_csv,
                 tau_vals=spc.DEFAULT_TAU_VALS,
                 tau_override=tau_override,
+                # Per-session overrides from the "Edit suite2p settings..."
+                # popout. Empty dict means no overrides.
+                settings_override=(self._settings_override
+                                   or None),
                 verbose=True,
             )
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
@@ -615,27 +665,26 @@ class Suite2pTab(ttk.Frame):
         Skipped silently if the user left both inputs at 0.
         """
         from ...core.scale import resolve_pix_to_um
+        from ...core import utils
         zoom = params.get("scope_zoom", 0.0) or None
         um_px = params.get("um_per_pixel", 0.0) or None
         if zoom is None and um_px is None:
             return
-        ops_path = plane0 / "ops.npy"
-        if not ops_path.exists():
-            print(f"[GUI] pix_to_um: ops.npy not found at {ops_path}; "
+        view = utils.load_plane_view(plane0)
+        if not view:
+            print(f"[GUI] pix_to_um: no plane outputs at {plane0}; "
                   "skipping calibration stamp")
             return
-        ops = np.load(ops_path, allow_pickle=True).item()
         try:
             resolved = resolve_pix_to_um(
-                ops, zoom=zoom, um_per_pixel=um_px,
+                view, zoom=zoom, um_per_pixel=um_px,
             )
         except (TypeError, ValueError) as e:
             print(f"[GUI] pix_to_um: invalid calibration ({e}); skipping")
             return
         if resolved is None:
             return
-        ops["pix_to_um"] = float(resolved)
-        np.save(ops_path, ops, allow_pickle=True)
+        utils.save_pix_to_um(plane0, float(resolved))
         source = "direct µm/px" if um_px is not None else f"zoom {zoom}"
         print(f"[GUI] pix_to_um = {resolved:.4f} µm/px (source: {source})")
 
@@ -933,19 +982,20 @@ class Suite2pTab(ttk.Frame):
 
     def _draw_panels(self, plane0: Path) -> None:
         # Load ops only to extract the handful of 2D background images we
-        # actually display. Suite2p's ops.npy carries dozens of fields plus
-        # several full-resolution preview images (mean, max_proj, refImg,
-        # Vcorr, ...) -- caching the whole dict was holding 30-200 MB per
-        # recording. Pull just the ndarrays in KNOWN_BG_IMAGES (cast to
-        # float32 once, since that's the dtype the renderer needs) and let
-        # the rest of ops fall out of scope at the end of this function.
-        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        # actually display. Suite2p 1.0's reg_outputs.npy / detect_outputs.npy
+        # carry the preview images we want (mean, max_proj, refImg, Vcorr,
+        # ...). load_plane_view merges them into a flat dict; pull just the
+        # ndarrays in KNOWN_BG_IMAGES (cast to float32 once, since that's
+        # the dtype the renderer needs) and let the rest fall out of scope
+        # at the end of this function.
+        from ...core import utils as core_utils
+        view = core_utils.load_plane_view(plane0)
         bg_images: dict[str, np.ndarray] = {}
         for key, _label in self.KNOWN_BG_IMAGES:
-            img = ops.get(key)
+            img = view.get(key)
             if isinstance(img, np.ndarray) and img.ndim == 2:
                 bg_images[key] = np.ascontiguousarray(img, dtype=np.float32)
-        del ops  # release every other field (mostly metadata + heavy intermediates)
+        del view  # release every other field
 
         stat = np.load(plane0 / "stat.npy", allow_pickle=True)
         n_total = len(stat)
