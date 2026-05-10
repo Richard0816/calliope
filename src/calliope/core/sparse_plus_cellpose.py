@@ -322,7 +322,12 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     # suite2p 1.0's roi_stats unpacks ``dy, dx = diameter[0], diameter[1]``
     # so a scalar int trips a ``'int' object is not subscriptable``. Pass a
     # 2-element list (square pixels on the lab's 2-photon rig).
-    enriched = roi_stats(combined_raw, Ly, Lx,
+    # It also fancy-indexes ``stats[keep_rois]`` with a numpy bool mask, so
+    # the input list has to be wrapped as an object ndarray; a bare Python
+    # list raises ``TypeError: only integer scalar arrays can be converted
+    # to a scalar index``.
+    combined_arr = np.array(combined_raw, dtype=object)
+    enriched = roi_stats(combined_arr, Ly, Lx,
                          diameter=[median_diam, median_diam])
     for i, s in enumerate(enriched):
         if '_source' not in s:
