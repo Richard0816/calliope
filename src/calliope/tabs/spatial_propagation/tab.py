@@ -677,11 +677,15 @@ class SpatialPropagationTab(ttk.Frame):
                      title_top_right, with_arrows=True)
 
         # ---- Bottom panel: vectors-only with std circles ----
+        # Suite2p y=0 is the TOP of the FOV (image convention). Set
+        # the y-limit reversed so the on-screen orientation matches
+        # the order-map panels above + suite2p's own GUI (top of FOV
+        # rendered at the top of the plot, ticks read 0->Ly downward).
         self.fig_vec.clear()
         self.ax_vec = self.fig_vec.add_subplot(111)
         self.ax_vec.set_aspect("equal", adjustable="box")
         self.ax_vec.set_xlim(0, fov_w)
-        self.ax_vec.set_ylim(0, fov_h)
+        self.ax_vec.set_ylim(fov_h, 0)
         self.ax_vec.set_xlabel(xlabel)
         self.ax_vec.set_ylabel(ylabel)
         self.ax_vec.set_title(

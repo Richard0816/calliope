@@ -743,21 +743,37 @@ def detect_event_windows(
 
     # 4b) Drop events whose population is below ``min_active_rois``.
     # Computed from the activation matrix (sum across ROIs per event
-    # gives the number of cells that fired inside that window). The
-    # diagnostics dict below still carries the unfiltered prominence /
-    # peak / boundary arrays so the on-screen "smoothed density"
-    # diagnostic plot keeps its full context; only the published
-    # event_windows / A / first_time are sliced.
+    # gives the number of cells that fired inside that window). Both
+    # the published event_windows / A / first_time AND the per-peak
+    # diagnostic arrays (peak_s / peak_height / prominence / mu_s /
+    # sigma_s / boundary_source_* / duration_s) are sliced so the
+    # diagnostic plot's red C3 peak markers only mark surviving
+    # events. Continuous-time diagnostic arrays (smoothed_density,
+    # baseline_trace, etc.) stay full-length so the density plot
+    # keeps its context.
     if event_windows.shape[0] > 0 and params.min_active_rois > 0:
         n_active_per_event = A.sum(axis=0).astype(int)
         keep_mask = n_active_per_event >= int(params.min_active_rois)
-        if not keep_mask.all():
-            event_windows = event_windows[keep_mask]
-            A = A[:, keep_mask]
-            first_time = first_time[:, keep_mask]
+    else:
+        keep_mask = np.ones(event_windows.shape[0], dtype=bool)
+    if not keep_mask.all():
+        event_windows = event_windows[keep_mask]
+        A = A[:, keep_mask]
+        first_time = first_time[:, keep_mask]
 
     if not return_diagnostics:
         return event_windows, A, first_time
+
+    # Per-peak fields slice with keep_mask; continuous-time fields stay
+    # at full resolution so the smoothed-density curve still shows
+    # context around the dropped events.
+    def _slice_per_peak(arr):
+        if arr is None:
+            return arr
+        a = np.asarray(arr)
+        if a.size != keep_mask.size:
+            return a
+        return a[keep_mask]
 
     diagnostics = {
         "time_centers_s": centers,
@@ -766,14 +782,16 @@ def detect_event_windows(
         "baseline_trace": boundaries["baseline_trace"],
         "end_threshold_trace": boundaries["end_threshold_trace"],
         "baseline_noise": boundaries["baseline_noise"],
-        "peak_s": boundaries["peak_s"],
-        "peak_height": boundaries["peak_height"],
-        "mu_s": boundaries["mu_s"],
-        "sigma_s": boundaries["sigma_s"],
-        "boundary_source_left": boundaries["boundary_source_left"],
-        "boundary_source_right": boundaries["boundary_source_right"],
-        "prominence": boundaries["prominence"],
-        "duration_s": boundaries["duration_s"],
+        "peak_s": _slice_per_peak(boundaries["peak_s"]),
+        "peak_height": _slice_per_peak(boundaries["peak_height"]),
+        "mu_s": _slice_per_peak(boundaries["mu_s"]),
+        "sigma_s": _slice_per_peak(boundaries["sigma_s"]),
+        "boundary_source_left": _slice_per_peak(
+            boundaries["boundary_source_left"]),
+        "boundary_source_right": _slice_per_peak(
+            boundaries["boundary_source_right"]),
+        "prominence": _slice_per_peak(boundaries["prominence"]),
+        "duration_s": _slice_per_peak(boundaries["duration_s"]),
     }
     return event_windows, A, first_time, diagnostics
 
