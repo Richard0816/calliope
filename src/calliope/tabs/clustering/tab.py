@@ -922,6 +922,15 @@ class ClusteringTab(ttk.Frame):
             f"Toggle 'Manual threshold' + slider to tune.")
         self._refresh_reload_btn()
 
+        # Tab 0's batch runner subscribes to this signal to advance to
+        # Tab 7. Publishing here (rather than after every recluster) keeps
+        # the batch advancing exactly once per row.
+        try:
+            plane0 = Path(self.path_var.get())
+            self.state.set_clusters_ready(plane0)
+        except Exception as e:
+            print(f"[GUI] clusters_ready publish failed: {e}")
+
     def _on_reloaded(self, data: dict) -> None:
         self.progress.stop()
         self.run_btn.config(state="normal")
