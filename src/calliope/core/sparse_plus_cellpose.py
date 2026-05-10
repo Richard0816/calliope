@@ -80,6 +80,9 @@ from suite2p.extraction import extract, dcnv
 # ``classification``: Suite2p's built-in cell/not-cell classifier
 # that writes iscell.npy.
 from suite2p import classification
+# ``default_settings`` is the source of truth for the nested 1.0
+# extraction defaults; we deep-merge calliope's overrides on top.
+from suite2p.parameters import default_settings
 
 # Helpers re-used from the older adaptive-detection pipeline. Even
 # though we skip the binary-search loop here, we still need ops
@@ -336,13 +339,35 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
 
     if verbose:
         print(f"    extracting traces for {len(stat_arr)} ROIs")
-    stat_arr, F, Fneu, F_chan2, Fneu_chan2 = extract.create_masks_and_extract(
-        final_ops, stat_arr,
-    )
+    # suite2p 1.0 dropped ``extract.create_masks_and_extract`` and now exposes
+    # ``extract.extraction_wrapper(stat, f_reg, settings=...)``. We open the
+    # registered binary as a BinaryFile (memmap-backed; exposes the .shape
+    # extraction_wrapper expects) and pass settings.extraction through.
+    from suite2p.io import BinaryFile
+    import torch
+    nframes = int(reg_view.get('nframes') or 0)
+    if nframes <= 0:
+        # Fallback when load_plane_view didn't surface nframes (e.g. older
+        # plane folder without db.npy): infer from file size at int16.
+        nframes = (final_plane0 / 'data.bin').stat().st_size // (Ly * Lx * 2)
+    extraction_settings = {
+        **default_settings()['extraction'],
+        **base_settings.get('extraction', {}),
+    }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with BinaryFile(Ly=Ly, Lx=Lx,
+                    filename=str(final_plane0 / 'data.bin'),
+                    n_frames=nframes, write=False) as f_reg:
+        F, Fneu, F_chan2, Fneu_chan2 = extract.extraction_wrapper(
+            stat_arr, f_reg,
+            settings=extraction_settings,
+            device=device,
+        )
 
     tau = float(final_ops.get('tau', 1.0))
     fs = float(final_ops.get('fs', 15.0))
-    neucoeff = float(final_ops.get('neucoeff', 0.7))
+    neucoeff = float(extraction_settings.get('neuropil_coefficient',
+                                             final_ops.get('neucoeff', 0.7)))
     F_sub = F - neucoeff * Fneu
     F_pp = dcnv.preprocess(
         F=F_sub,
