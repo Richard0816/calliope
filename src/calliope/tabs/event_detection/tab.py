@@ -309,11 +309,13 @@ class EventDetectionTab(ttk.Frame):
         self.summary_btn.pack(side="right", padx=(0, 6))
         # Opens a temporary Toplevel showing the per-event peak-prominence
         # histogram + a strength-rank slider so the user can drop weak
-        # (likely noise) events without re-detecting. Disabled until the
-        # first render produces a prominence array.
+        # (likely noise) events without re-detecting. Always clickable;
+        # the handler explains why it can't run if there's no fresh
+        # prominence array (e.g. nothing rendered yet, or the recording
+        # was Reload-from-folder'd without a Render click).
         self.filter_btn = ttk.Button(
             row, text="Filter weak events...",
-            command=self._on_open_filter_popout, state="disabled")
+            command=self._on_open_filter_popout)
         self.filter_btn.pack(side="right", padx=(0, 6))
         ttk.Button(row, text="Reload from folder...",
                    command=self._reload_from_folder).pack(side="right")
@@ -634,16 +636,9 @@ class EventDetectionTab(ttk.Frame):
             self.state.set_event_results(dict(self._base_event_payload))
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
-        # Re-arm the Filter popout button: enabled iff we have at least
-        # 2 events with prominence values (otherwise the histogram is
-        # degenerate and the slider has nothing to do).
-        try:
-            n_evs = (len(self._base_event_payload.get("event_windows") or [])
-                     if self._base_prominences is not None else 0)
-            self.filter_btn.config(
-                state="normal" if n_evs >= 2 else "disabled")
-        except Exception:
-            pass
+        # Filter button stays always-enabled (see _build_ui); the
+        # popout itself validates _base_prominences and explains the
+        # problem if it's missing.
 
     # -- Filter-weak-events popout ----------------------------------------
 
@@ -663,12 +658,29 @@ class EventDetectionTab(ttk.Frame):
         Re-opening starts fresh with the current
         ``self._strength_threshold``.
         """
-        if (self._base_event_payload is None
-                or self._base_prominences is None
-                or len(self._base_prominences) < 2):
+        # Three preflight conditions, each with a distinct message so
+        # the user knows which one to fix:
+        if self._base_event_payload is None:
             messagebox.showinfo(
                 "Nothing to filter",
-                "Render events first; need at least 2 events.")
+                "Click Render first so events get computed and a "
+                "per-event prominence array becomes available.")
+            return
+        if self._base_prominences is None:
+            messagebox.showinfo(
+                "Prominence missing",
+                "The current event payload has no prominence array. "
+                "This can happen if events were loaded from a saved "
+                "summary without re-running detection. Click Render "
+                "again to recompute.")
+            return
+        if len(self._base_prominences) < 2:
+            n = int(len(self._base_prominences))
+            messagebox.showinfo(
+                "Not enough events",
+                f"Found only {n} event(s); need at least 2 to rank "
+                f"by relative strength. Lower the detection "
+                f"thresholds in Advanced and re-render.")
             return
 
         proms = np.asarray(self._base_prominences, dtype=float)
