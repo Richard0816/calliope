@@ -944,11 +944,36 @@ class BatchTab(ttk.Frame):
         self.after(50, ev._on_render)
 
     def _stage_clustering(self) -> None:
+        """Cluster, then export *_rois.npy.
+
+        Tab 7 needs the per-cluster ROI lists Tab 6 writes via the
+        Export button -- without them, _on_run_full bails because the
+        cluster folder doesn't exist. Tab 6's _on_export is synchronous
+        (no worker), so we just run it inline after the analysis
+        publishes set_clusters_ready and before advancing to xcorr.
+        """
         cl = self._app.clustering_tab
-        self._arm_completion(
-            self.state.subscribe_clusters_ready, "clustering",
-            path_extractor=lambda p: p,
-        )
+        fired = [False]
+
+        def cb(plane0):
+            if fired[0] or self._current_stage != "clustering":
+                return
+            fired[0] = True
+            try:
+                cl._on_export()
+            except Exception as e:
+                self._append_log(
+                    f"  [clustering] export FAILED: {e}\n"
+                    f"{traceback.format_exc()}")
+                self.after(0, lambda: self._fail_stage(
+                    "clustering", e))
+                return
+            self._append_log(
+                "  [clustering] cluster ROI lists exported")
+            self.after(0, lambda: self._on_stage_done(
+                "clustering", plane0))
+
+        self.state.subscribe_clusters_ready(cb)
         self.after(50, cl._on_run)
 
     def _stage_crosscorrelation(self) -> None:
