@@ -39,9 +39,9 @@ file) when the user clicks "Run detection". Inputs:
 - The recording's tau (GCaMP decay constant) looked up from the AAV
   metadata table.
 
-Compared to ``final_adaptive_detection.py``, this script skips the
-spatial-scale estimation and threshold binary search. Ops are whatever
-you set at the top of this file.
+All suite2p contact happens via :mod:`calliope.core.suite2p_pipeline`;
+this file is the orchestrator that wires sparsery + cellpose together
+and runs extract/dcnv/classify on the merged ROI list.
 
 Usage:
     python sparse_plus_cellpose.py
@@ -84,20 +84,17 @@ from suite2p import classification
 # Helpers re-used from the older adaptive-detection pipeline. Even
 # though we skip the binary-search loop here, we still need ops
 # loading, the registration cache, and the ROI-mask builder.
-from .adaptive_detection import (
-    AdaptiveConfig,
+from .suite2p_pipeline import (
+    Suite2pPipelineConfig,
     load_base_settings,
     _get_or_create_shared_registration,
     _link_or_copy,
     run_one_pass,
+    run_cellpose_pass,
     build_roi_pixel_mask,
     apply_settings_overrides,
 )
 from . import utils
-
-# The Cellpose pass itself lives in the adjacent ``brute_force_ops``
-# module so it can be tested / re-run independently.
-from .brute_force_ops import run_cellpose_pass
 
 
 # ============================================================================
@@ -139,7 +136,7 @@ HARD_CAP = 60000
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
-# Tau lookup table by GCaMP variant. Forwarded into AdaptiveConfig so
+# Tau lookup table by GCaMP variant. Forwarded into Suite2pPipelineConfig so
 # load_base_ops can match a recording's tau via aav_info_csv. The GUI passes
 # this through `tau_vals=spc.DEFAULT_TAU_VALS`.
 DEFAULT_TAU_VALS: dict = {"6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137}
@@ -293,7 +290,7 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     # Build the flat ops dict that suite2p's extract.create_masks_and_extract
     # still consumes. Start from the shared-registration's view and overlay
     # the trace-extraction knobs we care about, pulled from base_settings.
-    from .adaptive_detection import get_setting
+    from .suite2p_pipeline import get_setting
     final_ops = dict(reg_view)
     final_ops['tau'] = float(base_settings.get('tau', final_ops.get('tau', 1.0)))
     final_ops['fs'] = float(base_settings.get('fs', final_ops.get('fs', 15.0)))
@@ -405,9 +402,10 @@ def run(
     This is the single-call public API Tab 3's worker uses. The full
     flow:
 
-    1. Build an ``AdaptiveConfig`` (the legacy detection's config
-       dataclass; we still piggy-back on it for the AAV / tau lookup
-       and for the shared-registration cache).
+    1. Build a ``Suite2pPipelineConfig`` (input bundle for the
+       suite2p invocation helpers in
+       :mod:`calliope.core.suite2p_pipeline` -- AAV/tau lookup,
+       optional popout settings override, shared-registration cache).
     2. ``load_base_settings`` builds the base 2-photon ``(db, settings)``
        pair from :func:`calliope_settings.build_base_settings` (in source)
        and overlays any per-session ``settings_override`` (from Tab 3's
@@ -443,8 +441,8 @@ def run(
         Cellpose ROIs whose pixels are >= this fraction inside an
         existing Sparsery ROI are dropped during merge.
     aav_info_csv, tau_vals : optional
-        Forwarded to ``AdaptiveConfig`` for the GCaMP-variant tau
-        lookup.
+        Forwarded to ``Suite2pPipelineConfig`` for the GCaMP-variant
+        tau lookup.
     verbose : bool
         Print step-by-step progress.
 
@@ -482,7 +480,7 @@ def run(
         cfg_kwargs["tau_override"] = float(tau_override)
     if settings_override:
         cfg_kwargs["settings_override"] = dict(settings_override)
-    cfg = AdaptiveConfig(**cfg_kwargs)
+    cfg = Suite2pPipelineConfig(**cfg_kwargs)
 
     if verbose:
         if ops_path:

@@ -448,7 +448,7 @@ def find_recording_root(path) -> Path:
         "plane0", "suite2p",                # Suite2p output structure
         "final", "detection",               # sparse_plus_cellpose layout
         "_shared_reg", "sparsery_pass",
-        "cellpose_pass", "merged",          # adaptive_detection layout
+        "cellpose_pass", "merged",          # legacy multi-pass layout
     }
     for ancestor in p.parents:
         if ancestor.name not in INTERMEDIATE_NAMES:
@@ -1412,7 +1412,7 @@ def _activation_matrix_from_windows(
 
 # ---------------------------------------------------------------------------
 # Suite2p detection / dF/F helpers (used by the Suite2p tab and the
-# adaptive_detection / cellfilter modules under calliope.core).
+# suite2p_pipeline / cellfilter modules under calliope.core).
 # ---------------------------------------------------------------------------
 
 
@@ -1972,7 +1972,7 @@ def first_n_min_df_over_f_1d(F, baseline_min=2.0, perc=10, fps=30.0):
 
 
 # ---------------------------------------------------------------------------
-# AAV / notes-CSV lookups (used by adaptive_detection)
+# AAV / notes-CSV lookups (used by suite2p_pipeline.load_base_settings)
 # ---------------------------------------------------------------------------
 #
 # Why these helpers exist:
@@ -2048,8 +2048,9 @@ def file_name_to_aav_to_dictionary_lookup(file_name, aav_info_csv, dic):
     its row in the AAV CSV, read the ``AAV`` column, and resolve the
     matching dictionary value (e.g. tau).
 
-    Used by ``adaptive_detection.load_base_ops`` to set the recording
-    -specific tau in the Suite2p ops dict before detection.
+    Used by ``suite2p_pipeline.load_base_settings`` to set the
+    recording-specific tau in the suite2p settings dict before
+    detection.
     """
     row_num = get_row_number_csv_module(aav_info_csv, 'video', file_name)
     col = pd.read_csv(aav_info_csv, usecols=["AAV"])

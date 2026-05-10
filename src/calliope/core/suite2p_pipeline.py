@@ -1,47 +1,44 @@
 """Suite2p 1.0 invocation helpers for CalLIOPE.
 
-This module used to host an "adaptive" binary-search detection loop
-that dialled ``threshold_scaling`` up or down across many sparsery
-passes. That loop is gone -- Tab 3 calls ``sparse_plus_cellpose.run``
-once with one fixed set of detection settings, and the lab does not
-plan to revisit the iterative variant. The file kept its old name
-because external imports still reference it.
+This is the single home for everything that talks to suite2p directly.
+``sparse_plus_cellpose.py`` (Tab 3's worker) imports from here; nothing
+else in the package should import suite2p outside of this module.
 
-What's left here
-----------------
-Just the helpers ``sparse_plus_cellpose`` and ``brute_force_ops`` need:
+The pipeline has three layers:
 
-* ``AdaptiveConfig`` -- input bundle (tiff/save folders, AAV CSV +
-  tau lookup, optional Tab-3-popout settings override, optional
-  legacy ``path_to_ops`` override file).
-* ``load_base_settings(cfg)`` -- builds the suite2p 1.0
-  ``(db, settings)`` pair starting from
-  :func:`calliope_settings.build_base_settings`, then layering on the
-  popout override, optional ``path_to_ops`` file, AAV-derived ``tau``,
-  and RAM-tuned ``batch_size`` / ``nbins``.
-* ``_get_or_create_shared_registration(cfg, base_db, base_settings)``
-  -- runs suite2p register-only once into ``_shared_reg/``, returns
-  the resulting plane0 so detection passes can hardlink ``data.bin``.
-* ``run_one_pass(tiff_folder, save_dir, db, settings, ...)`` -- one
-  detection pass on the registered binary via ``run_plane``, with a
-  full-pipeline ``run_s2p`` fallback when ``shared_plane0`` is None.
-* ``build_roi_pixel_mask(stat, Ly, Lx)`` -- boolean ``(Ly, Lx)`` mask
-  union of every ROI's pixels (used by sparse_plus_cellpose to drop
-  Cellpose ROIs already covered by sparsery).
-* ``compute_residual_image(ops, roi_mask)`` -- mean image with
-  detected pixels masked to background median (used by
-  ``brute_force_ops.residual_metrics``).
-* Settings-routing helpers (``set_setting`` / ``get_setting`` /
-  ``apply_settings_overrides`` / ``apply_db_overrides`` /
-  ``default_db_settings``) for translating flat legacy keys to the
-  nested 1.0 schema.
-* Two suite2p 1.0 monkey-patches: the sparsery ROI hard cap and the
-  ``estimate_spatial_scale`` ndarray-return fix (see the bodies for
-  why each one is necessary).
+1. **Settings construction** -- :func:`load_base_settings` builds a
+   suite2p 1.0 ``(db, settings)`` pair from
+   :func:`calliope.core.calliope_settings.build_base_settings` (the
+   in-source defaults), then deep-merges any per-session
+   ``settings_override`` from Tab 3's "Edit suite2p settings..."
+   popout. Per-recording dynamics (``tau`` from the AAV CSV,
+   RAM-tuned ``batch_size`` / ``nbins``) are layered on top.
 
-Suite2p 1.0 is invoked via :func:`_invoke_run_s2p` and
-:func:`_invoke_run_plane`; both install the spatial-scale patch and
-the ``logging.getLogger('suite2p')`` stream handler before dispatch.
+2. **Suite2p invocation** -- :func:`_invoke_run_s2p` and
+   :func:`_invoke_run_plane` are the only call sites for
+   ``suite2p.run_s2p`` and ``suite2p.run_plane``. Both install the
+   ``logging.getLogger('suite2p')`` stream handler and the
+   ``estimate_spatial_scale`` ndarray-return monkey-patch before
+   dispatching.
+
+3. **Pipeline orchestration** --
+   :func:`_get_or_create_shared_registration` runs suite2p
+   register-only once into ``_shared_reg/`` so subsequent detection
+   passes can hardlink the registered ``data.bin``;
+   :func:`run_one_pass` is the single-pass detector. The cellpose
+   side is :func:`run_cellpose_pass`, which segments the mean image
+   so we can union its ROIs with sparsery's set.
+
+Settings routing helpers (``set_setting`` / ``get_setting`` /
+``apply_settings_overrides`` / ``apply_db_overrides`` /
+``default_db_settings``) translate flat legacy ops keys (the format
+suite2p 0.x used and the GUI tabs still produce in PARAM_SPEC) to
+the nested 1.0 schema.
+
+Two monkey-patches are installed: :func:`_install_sparsery_roi_cap`
+(abort sparsery mid-pass once ROI count crosses a cap) and
+:func:`_patch_suite2p_estimate_spatial_scale` (coerce suite2p's broken
+``mode(..., keepdims=True)`` ndarray return back to a Python int).
 """
 
 from __future__ import annotations
@@ -49,30 +46,15 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import suite2p
+
 from . import utils
-
-
-def _suite2p_default_ops() -> dict:
-    """Return suite2p's legacy flat default-ops dict.
-
-    Suite2p 1.0 dropped the package-level ``suite2p.default_ops()``
-    shortcut but kept the function inside the ``suite2p.default_ops``
-    submodule. We still build flat ops dicts internally and translate
-    at the ``run_s2p`` boundary (see :func:`_build_db_and_settings`),
-    so we just need a working default-ops factory regardless of
-    suite2p version.
-    """
-    try:
-        from suite2p.default_ops import default_ops
-        return default_ops()
-    except (ImportError, AttributeError):
-        # Pre-1.0 suite2p exposed it as a top-level attribute.
-        return suite2p.default_ops()  # type: ignore[attr-defined]
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
 
 
 # ============================================================================
@@ -516,23 +498,16 @@ def _patch_suite2p_estimate_spatial_scale() -> None:
 # ============================================================================
 
 @dataclass
-class AdaptiveConfig:
+class Suite2pPipelineConfig:
     """Inputs for the suite2p invocation helpers in this module.
 
-    Historically this dataclass held ~50 fields driving the adaptive
-    binary-search detection loop (``adaptive_detect``). That loop and
-    its supporting code are gone (Tab 3 calls
-    ``sparse_plus_cellpose.run`` instead, which does a single pass).
-    Only the fields the surviving helpers actually consume remain:
+    Consumers:
 
     * ``load_base_settings`` reads paths, AAV/tau settings, the popout
       override dict, and the legacy ``path_to_ops`` back-compat file.
     * ``_get_or_create_shared_registration`` reads ``tiff_folder`` and
       ``save_folder``.
     * ``run_one_pass`` reads ``use_cache`` and ``verbose``.
-
-    The name "AdaptiveConfig" is kept so existing imports
-    (``from .adaptive_detection import AdaptiveConfig``) still work.
     """
 
     # ---- Required paths ----
@@ -614,7 +589,7 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
-def load_base_settings(config: AdaptiveConfig):
+def load_base_settings(config: Suite2pPipelineConfig):
     """Build a suite2p 1.0 ``(db, settings)`` pair tailored to the recording.
 
     Base settings come from :mod:`calliope.core.calliope_settings` (the
@@ -748,9 +723,12 @@ def load_base_settings(config: AdaptiveConfig):
     return db, settings
 
 
-# Backward-compat alias. Old call sites that imported ``load_base_ops``
-# get a TypeError if they treat the result as a flat dict; the rename
-# is intentional so the (db, settings) tuple can't be silently misused.
+# Backward-compat aliases. ``AdaptiveConfig`` was the dataclass name
+# back when this module hosted the adaptive binary-search loop;
+# ``load_base_ops`` was the pre-1.0 entry point that returned a flat
+# ops dict. The new names are ``Suite2pPipelineConfig`` and
+# ``load_base_settings``. Aliases let old scripts keep importing.
+AdaptiveConfig = Suite2pPipelineConfig
 load_base_ops = load_base_settings
 
 
@@ -892,7 +870,7 @@ def _link_or_copy(src: Path, dst: Path):
         shutil.copy2(str(src), str(dst))
 
 
-def _get_or_create_shared_registration(config: 'AdaptiveConfig',
+def _get_or_create_shared_registration(config: 'Suite2pPipelineConfig',
                                        db: dict, settings: dict) -> Path:
     """Ensure a single canonical registered binary exists at
     ``{save_folder}/_shared_reg/suite2p/plane0/`` and return that
@@ -1151,3 +1129,188 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
     stat = list(np.load(plane0 / 'stat.npy', allow_pickle=True))
     return stat, utils.load_plane_view(plane0), plane0
 
+
+# ============================================================================
+# Cellpose pass (segments the mean image; output unioned with sparsery)
+# ============================================================================
+# Cellpose is optional. If it's not installed, ``run_cellpose_pass`` raises
+# at call time with a clear message. The sentinels are checked at import
+# time so we can fail fast on a misconfigured environment.
+
+try:
+    from cellpose import models as _cp_models  # type: ignore
+    _CELLPOSE_AVAILABLE = True
+    _CELLPOSE_IMPORT_ERROR = None
+except Exception as _e:                                              # pragma: no cover
+    _cp_models = None
+    _CELLPOSE_AVAILABLE = False
+    _CELLPOSE_IMPORT_ERROR = repr(_e)
+
+
+def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
+    """Convert a cellpose integer label mask into suite2p-style stat dicts.
+
+    Cellpose returns masks as shape (Ly, Lx) with 0=background and 1..N
+    as per-cell labels. We emit one dict per label containing the keys
+    ``build_roi_pixel_mask`` / extract / classify expect: ``ypix``,
+    ``xpix``, ``lam``, ``med``, ``npix``, ``radius``.
+    """
+    stat: list[dict] = []
+    if masks is None:
+        return stat
+    labels = np.unique(masks)
+    labels = labels[labels > 0]
+    for lbl in labels:
+        ys, xs = np.where(masks == lbl)
+        if ys.size == 0:
+            continue
+        npix = int(ys.size)
+        stat.append({
+            'ypix': ys.astype(np.int32),
+            'xpix': xs.astype(np.int32),
+            'lam':  np.ones(npix, dtype=np.float32) / float(npix),
+            'med':  [float(np.median(ys)), float(np.median(xs))],
+            'npix': npix,
+            'radius': float(np.sqrt(npix / np.pi)),
+        })
+    return stat
+
+
+def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
+                      verbose: bool = True):
+    """Run Cellpose on the mean image from the shared registration.
+
+    Why we do this on the mean image, not the movie
+    -----------------------------------------------
+    Cellpose is a 2-D segmentation model -- it doesn't know about
+    time. We feed it the recording's mean image (a steady spatial
+    snapshot of the cells) and treat the resulting masks as
+    candidate ROIs. This catches cells that Suite2p's Sparsery
+    detector misses because they're real but didn't fire enough
+    during the recording.
+
+    Steps
+    -----
+    1. Load the shared registration's ``meanImg`` (or whichever
+       ``cellpose_channel_input`` key the user picked -- e.g.
+       ``meanImgE`` for the enhanced version).
+    2. Rescale to ``[0, 1]`` based on the 1st / 99.9th percentiles
+       so Cellpose's internal normalisation gets reasonable input
+       regardless of the raw mean image's brightness scale.
+    3. Run ``CellposeModel.eval``. Feature-detects the Cellpose
+       major version and adjusts the call accordingly.
+    4. Convert each integer mask label into a Suite2p-style
+       ``stat`` dict (ypix / xpix / lam / med / npix) so downstream
+       merging code can treat Cellpose ROIs identically to Sparsery
+       ones.
+    5. Save ``stat.npy`` + ``cellpose_masks.npy`` for audit.
+
+    Returns ``(stat, ops_out, plane0)`` with the same shape/semantics
+    as ``run_one_pass`` so downstream merge code works unchanged.
+
+    The plane0 directory contains:
+      - ops.npy             (copy of the shared registered ops)
+      - stat.npy            (cellpose-derived suite2p-style stat list)
+      - cellpose_masks.npy  (raw integer-label mask, for audit)
+    """
+    if not _CELLPOSE_AVAILABLE:
+        raise RuntimeError(
+            f"cellpose not importable: {_CELLPOSE_IMPORT_ERROR}")
+
+    plane0 = Path(save_dir) / "suite2p" / "plane0"
+    plane0.mkdir(parents=True, exist_ok=True)
+
+    # Load the shared (post-registration) view to get meanImg + Ly/Lx.
+    # In suite2p 1.0 these live in db.npy / settings.npy / reg_outputs.npy
+    # which load_plane_view stitches into a flat lookup (with a fallback
+    # to a legacy ops.npy on older runs).
+    reg_ops = utils.load_plane_view(shared_plane0)
+    img_key = cfg.get("cellpose_channel_input", "meanImg")
+    if img_key not in reg_ops or reg_ops[img_key] is None:
+        # Fallback: meanImg is always present after registration.
+        img_key = "meanImg"
+    img = np.asarray(reg_ops[img_key]).astype(np.float32)
+
+    # Robust rescale to [0, 1] so Cellpose's internal normalization has
+    # reasonable input regardless of raw mean-image dynamic range.
+    lo = float(np.quantile(img, 0.01))
+    hi = float(np.quantile(img, 0.999))
+    if hi <= lo:
+        hi = float(img.max()); lo = float(img.min())
+    if hi > lo:
+        img_norm = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        img_norm = np.zeros_like(img)
+
+    model_type = cfg.get("cellpose_model_type", "cyto")
+    diameter = cfg.get("cellpose_diameter", 0) or None   # 0 -> auto
+    flow_threshold = float(cfg.get("cellpose_flow_threshold", 0.4))
+    cellprob_threshold = float(cfg.get("cellpose_cellprob_threshold", 0.0))
+
+    # Feature-detect cellpose API version.
+    #   Cellpose <=3.x: ``models.Cellpose`` wrapper + ``CellposeModel``;
+    #       eval accepts ``channels`` and returns
+    #       (masks, flows, styles, diams).
+    #   Cellpose 4.x : ``Cellpose`` wrapper removed; only ``CellposeModel``;
+    #       eval no longer takes ``channels`` and returns
+    #       (masks, flows, styles). Also ``model_type`` is gone -- one
+    #       unified model.
+    has_wrapper = hasattr(_cp_models, "Cellpose")
+    api_version = "3x" if has_wrapper else "4x"
+
+    if verbose:
+        print(f"  > running cellpose ({api_version}): model={model_type}  "
+              f"diameter={diameter}  flow={flow_threshold}  "
+              f"cellprob={cellprob_threshold}  img={img_key} "
+              f"{img.shape}")
+
+    t0 = time.time()
+    if has_wrapper:
+        model = _cp_models.Cellpose(model_type=model_type, gpu=True)
+        eval_kwargs = dict(
+            diameter=diameter,
+            channels=[0, 0],
+            flow_threshold=flow_threshold,
+            cellprob_threshold=cellprob_threshold,
+        )
+    else:
+        # Cellpose 4.x: the ``model_type`` axis no longer discriminates
+        # between cyto/cyto2/nuclei -- there's only the unified cpsam
+        # model. We still record the requested type in ops for audit.
+        model = _cp_models.CellposeModel(gpu=True)
+        eval_kwargs = dict(
+            diameter=diameter,
+            flow_threshold=flow_threshold,
+            cellprob_threshold=cellprob_threshold,
+        )
+
+    eval_out = model.eval(img_norm, **eval_kwargs)
+    # 3.x -> (masks, flows, styles, diams); 4.x -> (masks, flows, styles).
+    masks = eval_out[0]
+    diams = eval_out[3] if len(eval_out) >= 4 else None
+    if verbose:
+        print(f"  > cellpose done in {time.time() - t0:.1f}s  "
+              f"(est. diameter={diams})")
+
+    stat = _cellpose_masks_to_stat(np.asarray(masks))
+
+    # Persist outputs in a suite2p-like layout so the rest of the
+    # pipeline + any downstream audit tools can find them.
+    ops_out = dict(reg_ops)
+    ops_out["Ly"] = int(img.shape[0])
+    ops_out["Lx"] = int(img.shape[1])
+    ops_out["cellpose_config"] = {
+        "api_version": api_version,
+        "model_type": model_type,
+        "diameter_requested": cfg.get("cellpose_diameter", 0),
+        "diameter_estimated": float(diams) if diams is not None else None,
+        "flow_threshold": flow_threshold,
+        "cellprob_threshold": cellprob_threshold,
+        "channel_input": img_key,
+    }
+    np.save(plane0 / "ops.npy", ops_out, allow_pickle=True)
+    np.save(plane0 / "stat.npy", np.array(stat, dtype=object),
+            allow_pickle=True)
+    np.save(plane0 / "cellpose_masks.npy", np.asarray(masks))
+
+    return stat, ops_out, plane0
