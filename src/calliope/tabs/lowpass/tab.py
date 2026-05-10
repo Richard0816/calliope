@@ -234,6 +234,20 @@ class LowpassTab(ttk.Frame):
 
         f1 = ttk.LabelFrame(body, text="1. FFT power spectrum", padding=4)
         f1.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        # Y-axis scale toggle. Log is the default (better for visualising
+        # power-law roll-off at higher frequencies); linear is useful for
+        # sanity-checking a single dominant peak at e.g. line frequency.
+        fft_top = ttk.Frame(f1); fft_top.pack(fill="x")
+        ttk.Label(fft_top, text="y-axis:").pack(side="left", padx=(0, 4))
+        self.fft_yscale_var = tk.StringVar(value="log")
+        ttk.Radiobutton(
+            fft_top, text="log", value="log",
+            variable=self.fft_yscale_var,
+            command=self._draw_fft).pack(side="left")
+        ttk.Radiobutton(
+            fft_top, text="linear", value="linear",
+            variable=self.fft_yscale_var,
+            command=self._draw_fft).pack(side="left", padx=(4, 0))
         self.fft_fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
         self.fft_ax = self.fft_fig.add_subplot(111)
         self.fft_ax.set_axis_off()
@@ -446,10 +460,19 @@ class LowpassTab(ttk.Frame):
         ax = self.fft_ax
         ax.clear(); ax.set_axis_on()
         xf = self._fft_xf[1:]; power = self._fft_power[1:]
-        ax.semilogy(xf, np.maximum(power, 1e-12), lw=0.8, color="black")
+        # Y-axis scale comes from the radio button next to the plot.
+        # Log clips the floor so log10 doesn't underflow; linear shows
+        # raw values so dominant peaks (e.g. line frequency) are obvious.
+        yscale = self.fft_yscale_var.get()
+        if yscale == "linear":
+            ax.plot(xf, power, lw=0.8, color="black")
+            ax.set_yscale("linear")
+            ax.set_ylabel("Power", fontsize=8)
+        else:
+            ax.semilogy(xf, np.maximum(power, 1e-12), lw=0.8, color="black")
+            ax.set_ylabel("Power (log)", fontsize=8)
         ax.set_xlim(0, min(self._fps / 2.0, 15.0))
         ax.set_xlabel("Frequency (Hz)", fontsize=8)
-        ax.set_ylabel("Power (log)", fontsize=8)
         ax.set_title(f"FFT - {self._trace_label}", fontsize=9)
         ax.tick_params(labelsize=7)
         self._cutoff_line = ax.axvline(

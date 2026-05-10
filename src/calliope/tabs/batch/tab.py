@@ -2,11 +2,20 @@
 
 What this tab does
 ------------------
-Drives the full Tabs 3-8 pipeline (detection -> lowpass -> events
--> clustering -> xcorr -> spatial figures) over a list of
-recordings. One row per recording: identifier, TIFFs, per-row
-"Edit parameters" button. A top-level "Apply to all rows" button
-sets defaults across every row.
+Drives the full Tabs 1 + 3-8 pipeline (preprocess -> detection ->
+lowpass -> events -> clustering -> xcorr -> spatial figures) over a
+list of recordings by **driving the GUI tabs themselves** rather than
+calling headless backends. For each row it:
+
+  1. Sets the relevant tab's input fields the same way a user would.
+  2. Switches the notebook to that tab so live progress is visible.
+  3. Calls the tab's ``_on_run`` (or equivalent).
+  4. Subscribes one-shot to the AppState publish channel that signals
+     the stage's completion (``set_result``, ``set_plane0``,
+     ``set_lowpass_ready``, ``set_event_results``,
+     ``set_clusters_ready``, ``set_xcorr_ready``).
+  5. On receive, advances to the next stage. The user can switch into
+     any tab mid-run to see the live state (panels, progress, log).
 
 What the user sees
 ------------------
@@ -15,7 +24,10 @@ What the user sees
 - Middle: scrollable list of recording rows. Each row has an
   identifier entry, a list of TIFFs (with Browse), an "Edit
   parameters..." button, and a per-row status / progress label.
-- Bottom: live console (stdout/stderr captured via QueueWriter).
+- Bottom: orchestration log -- per-stage start/done/timing for the
+  active row. The detailed suite2p / preprocess output now lives in
+  each individual tab's own console (which the user can view by
+  clicking that tab during the run).
 
 State persistence
 -----------------
@@ -30,9 +42,9 @@ After every Run All, ``<output>/batch_report.csv`` is written with
 
 from __future__ import annotations
 
-import contextlib
 import csv
 import json
+import os
 import queue
 import threading
 import time
@@ -43,7 +55,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from ...gui_common import (
-    AppState, QueueWriter, open_advanced, spec_defaults,
+    AppState, open_advanced, spec_defaults,
 )
 
 
@@ -329,24 +341,30 @@ class BatchRow:
             value="; ".join(tiffs or []))
         self.params: dict = dict(params) if params is not None else {}
         self.status_var = tk.StringVar(value="ready")
+        # Per-row selection checkbox -- read by BatchTab._on_merge_selected
+        # to combine multiple recordings into a single grouped row that
+        # mirrors Tab 1's "select multiple TIFFs as one recording" path.
+        self.selected_var = tk.BooleanVar(value=False)
 
+        ttk.Checkbutton(self.frame, variable=self.selected_var) \
+            .grid(row=0, column=0, padx=(0, 4))
         ttk.Entry(self.frame, textvariable=self.id_var, width=22) \
-            .grid(row=0, column=0, padx=(0, 6))
+            .grid(row=0, column=1, padx=(0, 6))
         ttk.Entry(self.frame, textvariable=self.tiff_var, width=46) \
-            .grid(row=0, column=1, padx=(0, 4), sticky="ew")
+            .grid(row=0, column=2, padx=(0, 4), sticky="ew")
         ttk.Button(self.frame, text="Browse...", width=10,
                    command=self._on_browse) \
-            .grid(row=0, column=2, padx=(0, 4))
+            .grid(row=0, column=3, padx=(0, 4))
         ttk.Button(self.frame, text="Edit params", width=12,
                    command=self._on_edit_params) \
-            .grid(row=0, column=3, padx=(0, 4))
+            .grid(row=0, column=4, padx=(0, 4))
         ttk.Label(self.frame, textvariable=self.status_var,
                   width=18, anchor="w") \
-            .grid(row=0, column=4, padx=(0, 4))
+            .grid(row=0, column=5, padx=(0, 4))
         ttk.Button(self.frame, text="x", width=2,
                    command=self._on_remove) \
-            .grid(row=0, column=5)
-        self.frame.columnconfigure(1, weight=1)
+            .grid(row=0, column=6)
+        self.frame.columnconfigure(2, weight=1)
 
     @property
     def identifier(self) -> str:
@@ -459,6 +477,14 @@ class BatchTab(ttk.Frame):
         ttk.Button(row, text="+ Add row", width=12,
                    command=self.add_row) \
             .pack(side="left", padx=(8, 0))
+        # Merge selected (checked) rows into one grouped recording, the
+        # same shape Tab 1 produces when the user selects multiple
+        # TIFFs in its listbox: identifier = +-joined stems, TIFFs
+        # concatenated in trailing-index order, params from the first
+        # checked row.
+        ttk.Button(row, text="Merge selected", width=14,
+                   command=self._on_merge_selected) \
+            .pack(side="left", padx=(8, 0))
         self.run_btn = ttk.Button(
             row, text="Run all", width=12,
             command=self._on_run_all)
@@ -469,9 +495,13 @@ class BatchTab(ttk.Frame):
         self.abort_btn.pack(side="right", padx=(0, 6))
 
         # Headers + scrollable rows -----------------------------------------
+        # First column = the per-row selection checkbox (no header text);
+        # the rest match BatchRow's grid order.
         headers = ttk.Frame(self, padding=(4, 0))
         headers.pack(fill="x")
-        for txt, w in (("Identifier", 22), ("TIFF file(s) (semicolon-sep)", 50),
+        for txt, w in (("", 3),
+                       ("Identifier", 22),
+                       ("TIFF file(s) (semicolon-sep)", 50),
                        ("", 11), ("", 13), ("Status", 18), ("", 3)):
             ttk.Label(headers, text=txt, width=w, anchor="w") \
                 .pack(side="left", padx=(0, 4))
@@ -528,6 +558,83 @@ class BatchTab(ttk.Frame):
         for row in list(self._rows):
             row.destroy()
         self._rows.clear()
+
+    @staticmethod
+    def _trailing_index(name: str) -> int:
+        """Last run of digits in a path's stem; -1 if there isn't one.
+
+        Used to order TIFFs that came in via different rows but together
+        form a continuous recording (e.g. ``rec_000.tif``,
+        ``rec_001.tif``, ...). Mirrors ``PreprocessTab._trailing_index``
+        so merged rows feed the preprocess tab in the same order the
+        user would have got selecting them in Tab 1's listbox.
+        """
+        import re
+        stem = Path(name).stem
+        m = re.search(r"(\d+)(?!.*\d)", stem)
+        return int(m.group(1)) if m else -1
+
+    def _on_merge_selected(self) -> None:
+        """Combine all checked rows into one grouped recording row.
+
+        Mirrors what Tab 1 does when the user selects multiple TIFFs in
+        its listbox:
+          - Concatenate every checked row's TIFFs in trailing-index order.
+          - Auto-derive the new identifier as ``+``-joined TIFF stems
+            (matches PreprocessTab._resolved_identifier).
+          - Inherit per-row params from the first checked row.
+          - Replace the checked rows in place at the position of the
+            first checked row, then remove the rest.
+        """
+        if getattr(self, "_batch_active", False):
+            messagebox.showinfo("Busy", "Stop the batch run before merging.")
+            return
+        checked = [r for r in self._rows if r.selected_var.get()]
+        if len(checked) < 2:
+            messagebox.showinfo(
+                "Pick at least 2 rows",
+                "Tick the box on each row you want to merge into one "
+                "grouped recording, then click Merge selected.")
+            return
+
+        # Pool the TIFFs and order by trailing index so the merged
+        # recording reads in numeric sequence (rec_000 -> rec_001 -> ...).
+        # Dedupe by absolute path so the same TIFF can't appear twice.
+        seen: set[str] = set()
+        merged_tiffs: list[str] = []
+        for r in checked:
+            for t in r.tiff_list():
+                key = str(Path(t).resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_tiffs.append(t)
+        merged_tiffs.sort(key=self._trailing_index)
+
+        merged_id = "+".join(Path(t).stem for t in merged_tiffs)
+        merged_params = dict(checked[0].params or {})
+
+        # Splice: insert at the first checked row's position, drop the
+        # checked set, then bring the new row visually to that slot.
+        first = checked[0]
+        insert_at = self._rows.index(first)
+        for r in checked:
+            self.remove_row(r)
+        new_row = self.add_row(
+            identifier=merged_id, tiffs=merged_tiffs, params=merged_params)
+        # Move the new row to where the first checked row used to be.
+        if new_row is not self._rows[insert_at]:
+            self._rows.remove(new_row)
+            self._rows.insert(insert_at, new_row)
+            # Re-pack so the on-screen order matches the list order.
+            for r in self._rows:
+                r.frame.pack_forget()
+            for r in self._rows:
+                r.frame.pack(fill="x", padx=4)
+
+        self._append_log(
+            f"Merged {len(checked)} rows into '{merged_id}' "
+            f"({len(merged_tiffs)} TIFFs).")
 
     # -- Top-bar actions ---------------------------------------------------
 
@@ -655,9 +762,51 @@ class BatchTab(ttk.Frame):
 
     # -- Run all ----------------------------------------------------------
 
+    # ---------------------------------------------------------------------
+    # Batch orchestration
+    # ---------------------------------------------------------------------
+    # The batch runner now drives the GUI tabs in sequence rather than
+    # calling headless ``*_run.py`` modules. For each row it walks
+    # STAGES, sets the relevant tab's input fields the same way a user
+    # would, then calls that tab's ``_on_run`` (or equivalent) and
+    # subscribes one-shot to the AppState publish channel that signals
+    # the stage's completion (``set_result``, ``set_plane0``,
+    # ``set_lowpass_ready``, ``set_event_results``,
+    # ``set_clusters_ready``, ``set_xcorr_ready``). When the publish
+    # fires, it advances to the next stage. Spatial propagation (Tab 8)
+    # has no Run button -- it renders reactively from
+    # ``set_event_results`` so the orchestrator just waits a beat for
+    # it to draw and advances.
+    #
+    # Why drive the GUI rather than call headless modules: lets the
+    # user click into any tab mid-run and see the live state (panels,
+    # progress, log) as the pipeline progresses through that recording.
+
+    STAGES = (
+        "preprocess",
+        "detection",
+        "lowpass",
+        "event_detection",
+        "clustering",
+        "crosscorrelation",
+        "spatial_propagation",
+    )
+
+    # Notebook indices matching pipeline_gui's add() order. Tab 0 is
+    # this batch tab; the orchestrator never selects it during a run.
+    _STAGE_TAB_INDEX = {
+        "preprocess":         1,
+        "detection":          3,
+        "lowpass":            4,
+        "event_detection":    5,
+        "clustering":         6,
+        "crosscorrelation":   7,
+        "spatial_propagation": 8,
+    }
+
     def _on_run_all(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            messagebox.showinfo("Busy", "A run is already in progress.")
+        if getattr(self, "_batch_active", False):
+            messagebox.showinfo("Busy", "A batch run is already in progress.")
             return
         if not self._rows:
             messagebox.showinfo("Empty queue",
@@ -668,127 +817,403 @@ class BatchTab(ttk.Frame):
             messagebox.showinfo("Pick output folder",
                                 "Set the output folder first.")
             return
-        # Validate TIFFs.
         bad = [r for r in self._rows if not r.tiff_list()]
         if bad:
             messagebox.showerror(
                 "Empty TIFFs",
                 f"Row '{bad[0].identifier}' has no TIFF files.")
             return
+        # Single overwrite confirmation up front. Tab 1's _on_force_rerun
+        # would otherwise pop a "this will overwrite existing outputs"
+        # dialog per row, which is annoying when the user has 30 of them.
+        if not messagebox.askyesno(
+                "Run all",
+                f"Force-rerun preprocessing on {len(self._rows)} "
+                f"recordings, overwriting any existing outputs in:\n"
+                f"  {out}\n\nContinue?"):
+            return
         self._save_queue()
+
+        # Resolve the PipelineApp instance so the orchestrator can
+        # reach sibling tabs by attribute. The toplevel widget is
+        # PipelineApp itself (it inherits from tk.Tk).
+        self._app = self.winfo_toplevel()
+
+        self._batch_active = True
+        self._batch_queue = list(self._rows)
+        self._batch_results: list[dict] = []
+        self._batch_out_root = Path(out)
+        self._abort_flag.clear()
+
+        # Pause Tab 2's QC GIF animation for the duration of the batch.
+        # The user can flip back to Tab 2 mid-batch but we don't want
+        # to spin the animation loop on every recording when nobody's
+        # asking for it. Snapshot the previous setting so we can restore.
+        self._qc_animate_was = None
+        try:
+            qc_tab = self._app.qc_tab
+            self._qc_animate_was = bool(qc_tab._gif_animate_var.get())
+            if self._qc_animate_was:
+                qc_tab._gif_animate_var.set(False)
+                qc_tab._on_animate_toggle()
+        except Exception:
+            pass
 
         self.run_btn.config(state="disabled")
         self.abort_btn.config(state="normal")
-        self._abort_flag.clear()
         for row in self._rows:
             row.set_status("queued")
 
-        rows_snapshot = list(self._rows)
-        out_root = Path(out)
-
-        def worker():
-            try:
-                self._run_pipeline_loop(rows_snapshot, out_root)
-            except Exception as e:
-                self._log_queue.put(
-                    ("log",
-                     f"[batch] worker crashed: {e}\n"
-                     f"{traceback.format_exc()}"))
-            finally:
-                self._log_queue.put(("done", None))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        self._append_log("=== Batch run starting ===")
+        self.after(0, self._batch_next_row)
 
     def _on_abort(self) -> None:
         self._abort_flag.set()
-        self._log("[batch] abort requested; will stop after current row.")
+        self._append_log(
+            "[batch] abort requested; finishing current stage then stopping.")
 
-    def _run_pipeline_loop(self, rows: list[BatchRow],
-                           out_root: Path) -> None:
-        """Worker thread body. Iterate rows, run the full pipeline,
-        write batch_report.csv at the end.
+    # ---- Row + stage state machine -------------------------------------
+
+    def _batch_next_row(self) -> None:
+        """Pop the next row off the queue and start it at preprocess.
+
+        Runs on the Tk main thread (scheduled via ``after``).
         """
-        from ...core import batch_pipeline
+        if self._abort_flag.is_set() or not self._batch_queue:
+            self._batch_finish()
+            return
 
-        writer = QueueWriter(self._log_queue)
-        results: list[dict] = []
+        self._current_row = self._batch_queue.pop(0)
+        ident = self._current_row.identifier
+        rec_save = self._batch_out_root / ident
+        try:
+            rec_save.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._append_log(
+                f"[{ident}] FAILED to create output folder: {e}")
+            self._current_row.set_status("failed")
+            self._batch_results.append({
+                "recording_id": ident, "status": "failed",
+                "plane0": "", "total_s": 0.0,
+                "error": f"mkdir failed: {e}",
+            })
+            self.after(0, self._batch_next_row)
+            return
 
-        with contextlib.redirect_stdout(writer), \
-                contextlib.redirect_stderr(writer):
-            for row in rows:
-                if self._abort_flag.is_set():
-                    self._log_queue.put(("status", (row, "aborted")))
-                    break
-                ident = row.identifier
-                self._log_queue.put(("status", (row, "running")))
-                rec_save = out_root / ident
-                rec_save.mkdir(parents=True, exist_ok=True)
-                tiffs = row.tiff_list()
-                if not tiffs:
-                    self._log_queue.put(
-                        ("log",
-                         f"[{ident}] FAILED: no TIFFs specified."))
-                    self._log_queue.put(("status", (row, "failed")))
-                    results.append({
-                        "recording_id": ident, "status": "failed",
-                        "plane0": "", "total_s": 0.0,
-                        "error": "no_tiffs_specified",
-                    })
-                    continue
-                self._log_queue.put(("log", ""))
-                if len(tiffs) == 1:
-                    self._log_queue.put(
-                        ("log",
-                         f"--- Recording '{ident}' "
-                         f"({Path(tiffs[0]).name}) ---"))
-                else:
-                    self._log_queue.put(
-                        ("log",
-                         f"--- Recording '{ident}' "
-                         f"({len(tiffs)} TIFFs, in trailing-index "
-                         f"order):"))
-                    for s in tiffs:
-                        self._log_queue.put(
-                            ("log", f"      {Path(s).name}"))
-                    self._log_queue.put(("log", "---"))
-                self._log_queue.put(
-                    ("log", f"  output -> {rec_save}"))
-                params = dict(self.default_params)
-                params.update(row.params)
-                params.setdefault("cutoff_hz",
-                                  params.get("default_lowpass_hz", 1.0))
-                t0 = time.time()
-                try:
-                    result = batch_pipeline.run_recording(
-                        src_tiffs=tiffs,
-                        save_folder=str(rec_save),
-                        params=params,
-                        baseline_mode=str(
-                            params.get("baseline_mode", "first_n")),
-                        baseline_min=float(
-                            params.get("baseline_min", 2.0)),
-                        recording_id=ident,
-                        progress_cb=lambda msg: self._log_queue.put(
-                            ("log", msg)),
-                    )
-                    result["total_s"] = time.time() - t0
-                    results.append(result)
-                    self._log_queue.put(
-                        ("status", (row, result.get("status", "ok"))))
-                except Exception as e:
-                    self._log_queue.put(
-                        ("log",
-                         f"[{ident}] worker exception: {e}\n"
-                         f"{traceback.format_exc()}"))
-                    self._log_queue.put(("status", (row, "failed")))
-                    results.append({
-                        "recording_id": ident, "status": "failed",
-                        "plane0": "", "total_s": time.time() - t0,
-                        "error": str(e),
-                    })
+        self._current_row_save = rec_save
+        self._row_t0 = time.time()
+        self._row_results = {
+            "recording_id": ident,
+            "status": "running",
+            "plane0": "",
+            "stages": {},
+        }
 
-        self._write_report(out_root, results)
+        self._append_log("")
+        tiffs = self._current_row.tiff_list()
+        if len(tiffs) == 1:
+            self._append_log(
+                f"--- Recording '{ident}' ({Path(tiffs[0]).name}) ---")
+        else:
+            self._append_log(
+                f"--- Recording '{ident}' "
+                f"({len(tiffs)} TIFFs, trailing-index order):")
+            for t in tiffs:
+                self._append_log(f"      {Path(t).name}")
+            self._append_log("---")
+        self._append_log(f"  output -> {rec_save}")
+
+        self._begin_stage("preprocess")
+
+    def _begin_stage(self, stage: str) -> None:
+        """Trigger ``stage`` for the current row + arm the one-shot
+        completion listener.
+        """
+        if self._abort_flag.is_set():
+            self._row_results["status"] = "aborted"
+            self._on_row_done()
+            return
+
+        self._current_stage = stage
+        self._stage_t0 = time.time()
+        self._current_row.set_status(f"running {stage}")
+        self._append_log(f"  [{stage}] starting")
+
+        # Switch the notebook to the active tab so the user sees panels
+        # update live. Failure to switch is non-fatal.
+        try:
+            tab_idx = self._STAGE_TAB_INDEX.get(stage)
+            if tab_idx is not None:
+                self._app._nb.select(tab_idx)
+        except Exception:
+            pass
+
+        method = getattr(self, f"_stage_{stage}", None)
+        if method is None:
+            self._fail_stage(stage, RuntimeError(f"no handler for {stage}"))
+            return
+        try:
+            method()
+        except Exception as e:
+            self._fail_stage(stage, e)
+
+    def _arm_completion(self, subscribe_fn, expected_stage: str,
+                        path_extractor=lambda payload: None) -> None:
+        """Attach a one-shot AppState listener that fires ``_on_stage_done``
+        the first time it's called for the current stage.
+
+        AppState's subscribe API has no unsubscribe; we use an internal
+        flag to short-circuit subsequent calls. The listener also bails
+        if the orchestrator has already moved on to a different stage.
+        """
+        fired = [False]
+        def cb(payload):
+            if fired[0] or self._current_stage != expected_stage:
+                return
+            fired[0] = True
+            try:
+                hint = path_extractor(payload)
+            except Exception:
+                hint = None
+            self.after(0, lambda: self._on_stage_done(expected_stage, hint))
+        subscribe_fn(cb)
+
+    # ---- Per-stage triggers --------------------------------------------
+
+    def _stage_preprocess(self) -> None:
+        prep = self._app.preprocess_tab
+        row = self._current_row
+        tiffs = [Path(t).resolve() for t in row.tiff_list()]
+
+        # Pick a working dir + depth that's guaranteed to surface all
+        # of the row's TIFFs in Tab 1's listbox:
+        #   - dir = deepest common parent of every row TIFF (so all of
+        #     them are reachable from one tree),
+        #   - depth = max number of directory hops between dir and any
+        #     TIFF (so _refresh_tiffs's recursive walk reaches them).
+        # Falls back gracefully when ``commonpath`` raises (e.g. mixed
+        # drive letters on Windows): in that case we use the parent of
+        # the first TIFF and depth 0, which still matches single-folder
+        # rows correctly.
+        try:
+            common = Path(os.path.commonpath([str(t) for t in tiffs]))
+        except ValueError:
+            common = tiffs[0].parent
+        # ``commonpath`` on a single path returns that path verbatim
+        # (e.g. a .tif file), and on real directories ``is_file`` may
+        # not be a reliable check (file may not exist yet). Cover both
+        # by treating any path that looks like a TIFF as a file.
+        if common.suffix.lower() in (".tif", ".tiff") or common.is_file():
+            common = common.parent
+        max_depth = 0
+        for t in tiffs:
+            try:
+                rel_parts = t.relative_to(common).parts
+            except ValueError:
+                rel_parts = (t.name,)
+            # rel_parts includes the filename; depth counts the
+            # subdirectory hops between ``common`` and the file's parent.
+            max_depth = max(max_depth, len(rel_parts) - 1)
+
+        # Mimic the user filling in Tab 1.
+        prep.dir_var.set(str(common))
+        prep.depth_var.set(max_depth)
+        prep.data_root_var.set(str(self._batch_out_root))
+        prep.identifier_var.set(row.identifier)
+
+        # Populate the listbox via Tab 1's own refresher, then select
+        # the row's TIFFs by RESOLVED PATH (listbox items are relative
+        # to dir_var, so we reconstruct absolute paths and compare).
+        prep._refresh_tiffs()
+        listbox = prep.tiff_listbox
+        listbox.selection_clear(0, "end")
+        targets = {str(t.resolve()) for t in tiffs}
+        for i in range(listbox.size()):
+            abs_path = (common / listbox.get(i)).resolve()
+            if str(abs_path) in targets:
+                listbox.selection_set(i)
+
+        self._arm_completion(
+            self.state.subscribe, "preprocess",
+            path_extractor=lambda r: getattr(r, "out_dir", None),
+        )
+        # Force-rerun bypasses the "load existing outputs" cache so the
+        # batch always re-runs the recording from scratch. Skip Tab 1's
+        # _on_force_rerun wrapper -- it pops a confirmation dialog per
+        # row that the user already answered once in _on_run_all.
+        self.after(50, lambda: prep._start_run(force=True))
+
+    def _stage_detection(self) -> None:
+        det = self._app.detection_tab
+        # Tab 3 already auto-populates inputs from the AppState.result
+        # publish that just fired; nothing to set on our side.
+        self._arm_completion(
+            self.state.subscribe_plane0, "detection",
+            path_extractor=lambda p: p,
+        )
+        self.after(50, det._on_run)
+
+    def _stage_lowpass(self) -> None:
+        lp = self._app.lowpass_tab
+        self._arm_completion(
+            self.state.subscribe_lowpass_ready, "lowpass",
+            path_extractor=lambda p: p,
+        )
+        self.after(50, lp._on_compute)
+
+    def _stage_event_detection(self) -> None:
+        ev = self._app.event_tab
+        self._arm_completion(
+            self.state.subscribe_event_results, "event_detection",
+            path_extractor=lambda r: r.get("plane0") if isinstance(r, dict) else None,
+        )
+        # Tab 5's Render button -- it builds the per-ROI onset matrix,
+        # detects population events, and publishes set_event_results.
+        self.after(50, ev._on_render)
+
+    def _stage_clustering(self) -> None:
+        """Cluster, then export *_rois.npy.
+
+        Tab 7 needs the per-cluster ROI lists Tab 6 writes via the
+        Export button -- without them, _on_run_full bails because the
+        cluster folder doesn't exist. Tab 6's _on_export is synchronous
+        (no worker), so we just run it inline after the analysis
+        publishes set_clusters_ready and before advancing to xcorr.
+        """
+        cl = self._app.clustering_tab
+        fired = [False]
+
+        def cb(plane0):
+            if fired[0] or self._current_stage != "clustering":
+                return
+            fired[0] = True
+            try:
+                cl._on_export()
+            except Exception as e:
+                self._append_log(
+                    f"  [clustering] export FAILED: {e}\n"
+                    f"{traceback.format_exc()}")
+                self.after(0, lambda: self._fail_stage(
+                    "clustering", e))
+                return
+            self._append_log(
+                "  [clustering] cluster ROI lists exported")
+            self.after(0, lambda: self._on_stage_done(
+                "clustering", plane0))
+
+        self.state.subscribe_clusters_ready(cb)
+        self.after(50, cl._on_run)
+
+    def _stage_crosscorrelation(self) -> None:
+        """Run the full-recording xcorr first, then the per-event xcorr.
+
+        Both Tab 7 entry points push to the same set_xcorr_ready
+        channel, so we use a two-step internal counter: first publish
+        triggers _on_run_per_event; second publish advances the batch.
+        """
+        xc = self._app.xcorr_tab
+        self._xcorr_step = "full"
+        fired = [False, False]   # one slot per step, shared via closure
+
+        def cb(payload):
+            # First publish: full done -> kick off per-event.
+            if not fired[0] and self._current_stage == "crosscorrelation":
+                fired[0] = True
+                self._append_log("  [crosscorrelation] full done; "
+                                 "starting per-event")
+                self._xcorr_step = "per_event"
+                self.after(200, xc._on_run_per_event)
+                return
+            # Second publish: per-event done -> advance to spatial.
+            if not fired[1] and self._current_stage == "crosscorrelation":
+                fired[1] = True
+                hint = payload
+                self.after(0, lambda: self._on_stage_done(
+                    "crosscorrelation", hint))
+
+        self.state.subscribe_xcorr_ready(cb)
+        self.after(50, xc._on_run_full)
+
+    def _stage_spatial_propagation(self) -> None:
+        """Tab 8 has no Run button -- it renders reactively from the
+        ``set_event_results`` publish that already fired during the
+        event-detection stage. Switching the notebook gives the user
+        the live render; we wait a beat then advance.
+        """
+        # Advance after a short delay to let the renderer paint.
+        self.after(750,
+                   lambda: self._on_stage_done("spatial_propagation", None))
+
+    # ---- Stage / row completion ---------------------------------------
+
+    def _on_stage_done(self, stage: str, path_hint) -> None:
+        if self._current_stage != stage:
+            return
+        elapsed = time.time() - self._stage_t0
+        self._row_results["stages"][stage] = {
+            "status": "ok",
+            "duration_s": elapsed,
+            "error": None,
+        }
+        if stage == "detection" and path_hint is not None:
+            self._row_results["plane0"] = str(path_hint)
+        self._append_log(f"  [{stage}] done ({elapsed:.1f}s)")
+
+        idx = self.STAGES.index(stage) + 1
+        if idx >= len(self.STAGES):
+            self._on_row_done()
+        else:
+            self._begin_stage(self.STAGES[idx])
+
+    def _fail_stage(self, stage: str, exc: BaseException) -> None:
+        elapsed = time.time() - self._stage_t0
+        self._row_results["stages"][stage] = {
+            "status": "failed",
+            "duration_s": elapsed,
+            "error": str(exc),
+        }
+        self._row_results["status"] = "failed"
+        self._append_log(
+            f"  [{stage}] FAILED: {exc}\n{traceback.format_exc()}")
+        self._on_row_done()
+
+    def _on_row_done(self) -> None:
+        elapsed = time.time() - self._row_t0
+        self._row_results["total_s"] = elapsed
+        if self._row_results["status"] == "running":
+            self._row_results["status"] = "ok"
+        self._batch_results.append(self._row_results)
+        self._current_row.set_status(self._row_results["status"])
+        self._append_log(
+            f"--- '{self._current_row.identifier}' "
+            f"{self._row_results['status']} in {elapsed:.1f}s ---")
+        self.after(0, self._batch_next_row)
+
+    def _batch_finish(self) -> None:
+        self._batch_active = False
+        self.run_btn.config(state="normal")
+        self.abort_btn.config(state="disabled")
+        if self._abort_flag.is_set():
+            self._append_log("=== Batch run aborted ===")
+        else:
+            self._append_log("=== Batch run done ===")
+        try:
+            self._write_report(self._batch_out_root, self._batch_results)
+        except Exception as e:
+            self._append_log(f"[batch] report write failed: {e}")
+        # Restore the user's Tab 2 animation preference.
+        if self._qc_animate_was:
+            try:
+                qc_tab = self._app.qc_tab
+                qc_tab._gif_animate_var.set(True)
+                qc_tab._on_animate_toggle()
+            except Exception:
+                pass
+        # Return the user to the batch tab so they see the summary.
+        try:
+            self._app._nb.select(0)
+        except Exception:
+            pass
 
     @staticmethod
     def _write_report(out_root: Path, results: list[dict]) -> None:

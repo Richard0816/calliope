@@ -95,8 +95,9 @@ For the selected event index `k`:
   Frames with no activations are skipped, so the returned list is
   contiguous in *active* frames, not absolute frame index.
 - Top-left and top-right: identical `imshow` (with
-  `cmap=CYAN_TO_RED`, `vmin=0`, `vmax=1`, `origin="lower"`, axes in µm
-  if `ops["pix_to_um"]` is present, else pixels) — built by a single
+  `cmap=CYAN_TO_RED`, `vmin=0`, `vmax=1`, `origin="upper"` plus a
+  flipped y-extent so the FOV matches suite2p's GUI orientation, axes
+  in µm if `ops["pix_to_um"]` is present, else pixels) — built by a single
   inner helper that takes a `with_arrows` flag. The right-hand variant
   adds white-with-black-edge centroid dots and white `arrowstyle="->"`
   arrows connecting successive frame groups.

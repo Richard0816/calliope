@@ -169,16 +169,16 @@ class _RecordingCache:
             self.plane0 = self.root / "suite2p" / "plane0"
 
         stat = np.load(self.plane0 / "stat.npy", allow_pickle=True)
-        ops = np.load(self.plane0 / "ops.npy", allow_pickle=True).item()
+        view = utils.load_plane_view(self.plane0)
 
-        mean_img = ops.get("meanImgE", None)
+        mean_img = view.get("meanImgE", None)
         if mean_img is None:
-            mean_img = ops.get("meanImg")
+            mean_img = view.get("meanImg")
         mean_img = np.asarray(mean_img, dtype=np.float32)
 
-        max_img = ops.get("max_proj", None)
+        max_img = view.get("max_proj", None)
         if max_img is None:
-            max_img = ops.get("maxImg", None)
+            max_img = view.get("maxImg", None)
         if max_img is None:
             max_img = mean_img
         max_img = np.asarray(max_img, dtype=np.float32)
@@ -186,8 +186,8 @@ class _RecordingCache:
         # If max_proj is cropped (common with suite2p), pad it back to full FOV
         if max_img.shape != mean_img.shape:
             H, W = mean_img.shape
-            y0 = int(ops.get("yrange", [0, H])[0])
-            x0 = int(ops.get("xrange", [0, W])[0])
+            y0 = int(view.get("yrange", [0, H])[0])
+            x0 = int(view.get("xrange", [0, W])[0])
             padded = np.zeros_like(mean_img)
             mh, mw = max_img.shape
             padded[y0:y0 + mh, x0:x0 + mw] = max_img

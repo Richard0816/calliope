@@ -87,7 +87,11 @@ from .logic import utils
 
 
 DEFAULT_PREFIX = "r0p7_filtered_"
-DEFAULT_CLUSTER_FOLDER = "gui_recluster"
+# Cluster ROI .npy files now live directly in
+# ``<plane0>/<prefix>cluster_results/`` (no ``gui_recluster`` subdir).
+# Empty cluster_folder is interpreted by xc.run_cluster_xcorr_*_fast
+# as "no extra subdir" -- the path join is conditional on truthiness.
+DEFAULT_CLUSTER_FOLDER = ""
 DEFAULT_MAX_LAG_S = 2.0
 DEFAULT_FULL_OUTPUT_SUBDIR = "cross_correlation_full"
 POLL_MS = 100
@@ -1214,12 +1218,21 @@ class CrossCorrelationTab(ttk.Frame):
                     self.status_var.set(f"Done. Output: {payload}")
                     self._log(f"[full] done -> {payload}")
                     self._enable_run()
+                    # Tab 0's batch runner subscribes to advance to spatial.
+                    try:
+                        self.state.set_xcorr_ready(Path(payload))
+                    except Exception as e:
+                        print(f"[GUI] xcorr_ready publish failed: {e}")
                 elif kind == "done_per_event":
                     n = int(self.progress.cget("maximum"))
                     self._set_progress(n, n)
                     self.status_var.set(f"Done. Output: {payload}")
                     self._log(f"[per-event] done -> {payload}")
                     self._enable_run()
+                    try:
+                        self.state.set_xcorr_ready(Path(payload))
+                    except Exception as e:
+                        print(f"[GUI] xcorr_ready publish failed: {e}")
                 elif kind == "aborted":
                     self.status_var.set("Aborted by user.")
                     self._log(f"[abort] {payload} run aborted by user")
