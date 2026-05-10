@@ -53,7 +53,14 @@ CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
     # Top-level
     "tau":     0.137,
     "fs":      15.07,
-    "diameter": 0,
+    # NB: ``diameter`` is intentionally NOT overridden. Suite2p 1.0's
+    # default of [12.0, 12.0] is used; the legacy ``diameter=0`` we
+    # inherited from suite2p 0.x means "auto-pick", but in 1.0
+    # ``pipeline_s2p`` normalises that to ``np.array([0, 0])`` and
+    # ``roi_stats`` then divides by ``d0[0] == 0`` -> NaN/inf -> the
+    # ``np.linalg.eig`` call inside ``fitMVGaus`` crashes with
+    # ``LinAlgError: Array must not contain infs or NaNs``. Letting
+    # suite2p's default through avoids the trap.
 
     # Registration overrides
     "registration": {
