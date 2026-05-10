@@ -707,9 +707,14 @@ class EventDetectionTab(ttk.Frame):
         ax.tick_params(labelsize=8)
         thr_line = ax.axvline(proms.min(), color="tab:red", lw=1.4,
                               linestyle="--")
-        # Translucent shading for the *kept* prominence range.
-        kept_shade = ax.axvspan(proms.min(), proms.max(),
-                                color="tab:green", alpha=0.10)
+        # Translucent shading for the *kept* prominence range. Stored
+        # in a single-element list so the redraw closure can swap it
+        # out without mutating the patch's vertices (matplotlib's
+        # Rectangle.set_xy only takes (x0, y0), not a polygon array).
+        kept_shade_holder = [
+            ax.axvspan(proms.min(), proms.max(),
+                       color="tab:green", alpha=0.10)
+        ]
 
         canvas = FigureCanvasTkAgg(fig, master=win)
         canvas.get_tk_widget().pack(fill="both", expand=True,
@@ -741,12 +746,17 @@ class EventDetectionTab(ttk.Frame):
                 [proms.max() + 1e-12])
             min_kept = float(kept_proms.min())
             thr_line.set_xdata([min_kept, min_kept])
-            # Update the green-shaded "kept" band.
+            # Update the green-shaded "kept" band. Replace the patch
+            # rather than mutate it -- matplotlib's Rectangle (returned
+            # by axvspan) has set_xy that only accepts (x0, y0), not a
+            # full polygon array.
+            try:
+                kept_shade_holder[0].remove()
+            except Exception:
+                pass
             xmin, xmax = ax.get_xlim()
-            xy = np.array([
-                [min_kept, 0], [min_kept, 1],
-                [xmax, 1], [xmax, 0], [min_kept, 0]])
-            kept_shade.set_xy(xy)
+            kept_shade_holder[0] = ax.axvspan(
+                min_kept, xmax, color="tab:green", alpha=0.10)
             thr_readout.config(text=f"{t:.2f}")
             count_var.set(f"keeping {n_kept} / {n} events")
             canvas.draw_idle()
