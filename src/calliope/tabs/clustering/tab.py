@@ -114,7 +114,11 @@ from ...gui_common import format_roi_indices
 DEFAULT_PREFIX = "r0p7_filtered_"
 DEFAULT_PALETTE = "tab10"
 ABOVE_CUT_COLOR = "gray"
-EXPORT_SUBDIR = "gui_recluster"
+# Cluster ROI .npy files are written directly into
+# ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster"
+# subfolder. Tab 7 + the headless ``crosscorrelation_run`` already
+# accept an empty ``cluster_folder`` and skip the join in that case.
+EXPORT_SUBDIR = ""
 POLL_MS = 80
 
 
@@ -735,7 +739,8 @@ class ClusteringTab(ttk.Frame):
         return True
 
     def _existing_cluster_dir(self, plane0: Path, prefix: str) -> Path:
-        return plane0 / f"{prefix}cluster_results" / EXPORT_SUBDIR
+        base = plane0 / f"{prefix}cluster_results"
+        return base / EXPORT_SUBDIR if EXPORT_SUBDIR else base
 
     def _has_existing_clusters(self, plane0: Path, prefix: str) -> bool:
         d = self._existing_cluster_dir(plane0, prefix)
@@ -1465,8 +1470,7 @@ class ClusteringTab(ttk.Frame):
                 filtered_to_suite2p = np.where(
                     np.asarray(mask, dtype=bool))[0].astype(int)
 
-        out_dir = (self._plane0 / f"{self._prefix}cluster_results"
-                   / EXPORT_SUBDIR)
+        out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Clear stale C*_rois.npy first so old runs don't poison crosscorr.
         for stale in out_dir.glob("C*_rois.npy"):

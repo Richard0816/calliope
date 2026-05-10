@@ -15,11 +15,11 @@ Public surface
                  write_summary=True)``
     Compute the linkage, pick a threshold (auto or user-specified),
     cut to flat clusters, write ``<plane0>/<prefix>cluster_results/
-    gui_recluster/C{i}_rois.npy`` files (Suite2p ROI ids), the
-    accompanying ``linkage.npy`` / ``threshold_used.npy`` /
+    C{i}_rois.npy`` files (Suite2p ROI ids), the accompanying
+    ``linkage.npy`` / ``threshold_used.npy`` /
     ``_indices_are_suite2p`` markers, the Clusters sheet in
-    ``calliope_summary.xlsx``, and (optionally) dendrogram +
-    spatial cluster map PNGs.
+    ``calliope_summary.xlsx``, and (optionally) dendrogram + spatial
+    cluster map PNGs.
 """
 
 from __future__ import annotations
@@ -33,9 +33,11 @@ from scipy.cluster.hierarchy import dendrogram, fcluster
 from . import clustering_cmap as cmap_mod
 
 
-# Subfolder name kept consistent with Tab 6's ``EXPORT_SUBDIR`` so
-# downstream tabs (cross-correlation) can find the exports.
-EXPORT_SUBDIR = "gui_recluster"
+# Cluster .npy files are written directly into
+# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder. Tab 7
+# + crosscorrelation_run accept ``cluster_folder=""`` and skip the
+# join, so reads stay symmetric with this writer.
+EXPORT_SUBDIR = ""
 
 
 def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
@@ -169,7 +171,9 @@ def run_clustering(
     visual_to_label = _visual_cluster_map(Z, threshold)
     n_clusters = len(visual_to_label)
 
-    export_dir = plane0 / f"{prefix}cluster_results" / EXPORT_SUBDIR
+    export_dir = plane0 / f"{prefix}cluster_results"
+    if EXPORT_SUBDIR:
+        export_dir = export_dir / EXPORT_SUBDIR
     export_dir.mkdir(parents=True, exist_ok=True)
 
     filtered_to_suite2p: Optional[np.ndarray] = None
