@@ -939,7 +939,9 @@ class BatchTab(ttk.Frame):
             self.state.subscribe_event_results, "event_detection",
             path_extractor=lambda r: r.get("plane0") if isinstance(r, dict) else None,
         )
-        self.after(50, ev._on_run)
+        # Tab 5's Render button -- it builds the per-ROI onset matrix,
+        # detects population events, and publishes set_event_results.
+        self.after(50, ev._on_render)
 
     def _stage_clustering(self) -> None:
         cl = self._app.clustering_tab
