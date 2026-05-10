@@ -872,9 +872,9 @@ class BatchTab(ttk.Frame):
         prep.data_root_var.set(str(self._batch_out_root))
         prep.identifier_var.set(row.identifier)
 
-        # Populate the listbox via Tab 1's own scan, then select the
-        # row's TIFFs.
-        prep._on_scan()
+        # Populate the listbox via Tab 1's own refresher, then select
+        # the row's TIFFs.
+        prep._refresh_tiffs()
         listbox = prep.tiff_listbox
         listbox.selection_clear(0, "end")
         targets = {Path(p).name for p in tiffs}
