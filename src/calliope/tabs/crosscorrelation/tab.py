@@ -87,7 +87,11 @@ from .logic import utils
 
 
 DEFAULT_PREFIX = "r0p7_filtered_"
-DEFAULT_CLUSTER_FOLDER = "gui_recluster"
+# Cluster ROI .npy files now live directly in
+# ``<plane0>/<prefix>cluster_results/`` (no ``gui_recluster`` subdir).
+# Empty cluster_folder is interpreted by xc.run_cluster_xcorr_*_fast
+# as "no extra subdir" -- the path join is conditional on truthiness.
+DEFAULT_CLUSTER_FOLDER = ""
 DEFAULT_MAX_LAG_S = 2.0
 DEFAULT_FULL_OUTPUT_SUBDIR = "cross_correlation_full"
 POLL_MS = 100
