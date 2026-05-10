@@ -275,19 +275,24 @@ class Suite2pTab(ttk.Frame):
 
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         ttk.Label(row, text="dF/F baseline:", width=12).pack(side="left")
-        self.baseline_var = tk.StringVar(value="rolling")
-        ttk.Radiobutton(
-            row, text="Rolling (45 s window, 10th pct)",
-            value="rolling", variable=self.baseline_var,
-        ).pack(side="left", padx=(0, 12))
+        # Default = first-N-minutes mode at 2 minutes. The lab's
+        # standard recordings have a clean baseline at the start, and
+        # rolling has both higher CPU cost and worse behaviour on long
+        # epileptiform sweeps where the rolling window can sit inside
+        # an event.
+        self.baseline_var = tk.StringVar(value="first_n")
         ttk.Radiobutton(
             row, text="First N minutes:",
             value="first_n", variable=self.baseline_var,
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 4))
         self.baseline_min_var = tk.StringVar(value="2")
         ttk.Entry(row, textvariable=self.baseline_min_var,
-                  width=6).pack(side="left", padx=(4, 2))
-        ttk.Label(row, text="min").pack(side="left")
+                  width=6).pack(side="left", padx=(0, 2))
+        ttk.Label(row, text="min").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            row, text="Rolling (45 s window, 10th pct)",
+            value="rolling", variable=self.baseline_var,
+        ).pack(side="left")
 
         # ---- GCaMP variant picker (drives Suite2p's tau) ----
         # Default keeps the legacy AAV-CSV-driven lookup for users

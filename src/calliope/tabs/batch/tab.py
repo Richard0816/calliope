@@ -740,6 +740,20 @@ class BatchTab(ttk.Frame):
         self._batch_out_root = Path(out)
         self._abort_flag.clear()
 
+        # Pause Tab 2's QC GIF animation for the duration of the batch.
+        # The user can flip back to Tab 2 mid-batch but we don't want
+        # to spin the animation loop on every recording when nobody's
+        # asking for it. Snapshot the previous setting so we can restore.
+        self._qc_animate_was = None
+        try:
+            qc_tab = self._app.qc_tab
+            self._qc_animate_was = bool(qc_tab._gif_animate_var.get())
+            if self._qc_animate_was:
+                qc_tab._gif_animate_var.set(False)
+                qc_tab._on_animate_toggle()
+        except Exception:
+            pass
+
         self.run_btn.config(state="disabled")
         self.abort_btn.config(state="normal")
         for row in self._rows:
@@ -925,11 +939,33 @@ class BatchTab(ttk.Frame):
         self.after(50, cl._on_run)
 
     def _stage_crosscorrelation(self) -> None:
+        """Run the full-recording xcorr first, then the per-event xcorr.
+
+        Both Tab 7 entry points push to the same set_xcorr_ready
+        channel, so we use a two-step internal counter: first publish
+        triggers _on_run_per_event; second publish advances the batch.
+        """
         xc = self._app.xcorr_tab
-        self._arm_completion(
-            self.state.subscribe_xcorr_ready, "crosscorrelation",
-            path_extractor=lambda p: p,
-        )
+        self._xcorr_step = "full"
+        fired = [False, False]   # one slot per step, shared via closure
+
+        def cb(payload):
+            # First publish: full done -> kick off per-event.
+            if not fired[0] and self._current_stage == "crosscorrelation":
+                fired[0] = True
+                self._append_log("  [crosscorrelation] full done; "
+                                 "starting per-event")
+                self._xcorr_step = "per_event"
+                self.after(200, xc._on_run_per_event)
+                return
+            # Second publish: per-event done -> advance to spatial.
+            if not fired[1] and self._current_stage == "crosscorrelation":
+                fired[1] = True
+                hint = payload
+                self.after(0, lambda: self._on_stage_done(
+                    "crosscorrelation", hint))
+
+        self.state.subscribe_xcorr_ready(cb)
         self.after(50, xc._on_run_full)
 
     def _stage_spatial_propagation(self) -> None:
@@ -999,6 +1035,14 @@ class BatchTab(ttk.Frame):
             self._write_report(self._batch_out_root, self._batch_results)
         except Exception as e:
             self._append_log(f"[batch] report write failed: {e}")
+        # Restore the user's Tab 2 animation preference.
+        if self._qc_animate_was:
+            try:
+                qc_tab = self._app.qc_tab
+                qc_tab._gif_animate_var.set(True)
+                qc_tab._on_animate_toggle()
+            except Exception:
+                pass
         # Return the user to the batch tab so they see the summary.
         try:
             self._app._nb.select(0)
