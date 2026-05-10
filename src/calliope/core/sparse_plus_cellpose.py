@@ -319,7 +319,11 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
             [len(s['ypix']) for s in combined_raw]
         ) / np.pi)),
     )))
-    enriched = roi_stats(combined_raw, Ly, Lx, diameter=median_diam)
+    # suite2p 1.0's roi_stats unpacks ``dy, dx = diameter[0], diameter[1]``
+    # so a scalar int trips a ``'int' object is not subscriptable``. Pass a
+    # 2-element list (square pixels on the lab's 2-photon rig).
+    enriched = roi_stats(combined_raw, Ly, Lx,
+                         diameter=[median_diam, median_diam])
     for i, s in enumerate(enriched):
         if '_source' not in s:
             s['_source'] = combined_raw[i].get('_source', 'sparsery')
