@@ -341,24 +341,30 @@ class BatchRow:
             value="; ".join(tiffs or []))
         self.params: dict = dict(params) if params is not None else {}
         self.status_var = tk.StringVar(value="ready")
+        # Per-row selection checkbox -- read by BatchTab._on_merge_selected
+        # to combine multiple recordings into a single grouped row that
+        # mirrors Tab 1's "select multiple TIFFs as one recording" path.
+        self.selected_var = tk.BooleanVar(value=False)
 
+        ttk.Checkbutton(self.frame, variable=self.selected_var) \
+            .grid(row=0, column=0, padx=(0, 4))
         ttk.Entry(self.frame, textvariable=self.id_var, width=22) \
-            .grid(row=0, column=0, padx=(0, 6))
+            .grid(row=0, column=1, padx=(0, 6))
         ttk.Entry(self.frame, textvariable=self.tiff_var, width=46) \
-            .grid(row=0, column=1, padx=(0, 4), sticky="ew")
+            .grid(row=0, column=2, padx=(0, 4), sticky="ew")
         ttk.Button(self.frame, text="Browse...", width=10,
                    command=self._on_browse) \
-            .grid(row=0, column=2, padx=(0, 4))
+            .grid(row=0, column=3, padx=(0, 4))
         ttk.Button(self.frame, text="Edit params", width=12,
                    command=self._on_edit_params) \
-            .grid(row=0, column=3, padx=(0, 4))
+            .grid(row=0, column=4, padx=(0, 4))
         ttk.Label(self.frame, textvariable=self.status_var,
                   width=18, anchor="w") \
-            .grid(row=0, column=4, padx=(0, 4))
+            .grid(row=0, column=5, padx=(0, 4))
         ttk.Button(self.frame, text="x", width=2,
                    command=self._on_remove) \
-            .grid(row=0, column=5)
-        self.frame.columnconfigure(1, weight=1)
+            .grid(row=0, column=6)
+        self.frame.columnconfigure(2, weight=1)
 
     @property
     def identifier(self) -> str:
@@ -471,6 +477,14 @@ class BatchTab(ttk.Frame):
         ttk.Button(row, text="+ Add row", width=12,
                    command=self.add_row) \
             .pack(side="left", padx=(8, 0))
+        # Merge selected (checked) rows into one grouped recording, the
+        # same shape Tab 1 produces when the user selects multiple
+        # TIFFs in its listbox: identifier = +-joined stems, TIFFs
+        # concatenated in trailing-index order, params from the first
+        # checked row.
+        ttk.Button(row, text="Merge selected", width=14,
+                   command=self._on_merge_selected) \
+            .pack(side="left", padx=(8, 0))
         self.run_btn = ttk.Button(
             row, text="Run all", width=12,
             command=self._on_run_all)
@@ -481,9 +495,13 @@ class BatchTab(ttk.Frame):
         self.abort_btn.pack(side="right", padx=(0, 6))
 
         # Headers + scrollable rows -----------------------------------------
+        # First column = the per-row selection checkbox (no header text);
+        # the rest match BatchRow's grid order.
         headers = ttk.Frame(self, padding=(4, 0))
         headers.pack(fill="x")
-        for txt, w in (("Identifier", 22), ("TIFF file(s) (semicolon-sep)", 50),
+        for txt, w in (("", 3),
+                       ("Identifier", 22),
+                       ("TIFF file(s) (semicolon-sep)", 50),
                        ("", 11), ("", 13), ("Status", 18), ("", 3)):
             ttk.Label(headers, text=txt, width=w, anchor="w") \
                 .pack(side="left", padx=(0, 4))
@@ -540,6 +558,83 @@ class BatchTab(ttk.Frame):
         for row in list(self._rows):
             row.destroy()
         self._rows.clear()
+
+    @staticmethod
+    def _trailing_index(name: str) -> int:
+        """Last run of digits in a path's stem; -1 if there isn't one.
+
+        Used to order TIFFs that came in via different rows but together
+        form a continuous recording (e.g. ``rec_000.tif``,
+        ``rec_001.tif``, ...). Mirrors ``PreprocessTab._trailing_index``
+        so merged rows feed the preprocess tab in the same order the
+        user would have got selecting them in Tab 1's listbox.
+        """
+        import re
+        stem = Path(name).stem
+        m = re.search(r"(\d+)(?!.*\d)", stem)
+        return int(m.group(1)) if m else -1
+
+    def _on_merge_selected(self) -> None:
+        """Combine all checked rows into one grouped recording row.
+
+        Mirrors what Tab 1 does when the user selects multiple TIFFs in
+        its listbox:
+          - Concatenate every checked row's TIFFs in trailing-index order.
+          - Auto-derive the new identifier as ``+``-joined TIFF stems
+            (matches PreprocessTab._resolved_identifier).
+          - Inherit per-row params from the first checked row.
+          - Replace the checked rows in place at the position of the
+            first checked row, then remove the rest.
+        """
+        if getattr(self, "_batch_active", False):
+            messagebox.showinfo("Busy", "Stop the batch run before merging.")
+            return
+        checked = [r for r in self._rows if r.selected_var.get()]
+        if len(checked) < 2:
+            messagebox.showinfo(
+                "Pick at least 2 rows",
+                "Tick the box on each row you want to merge into one "
+                "grouped recording, then click Merge selected.")
+            return
+
+        # Pool the TIFFs and order by trailing index so the merged
+        # recording reads in numeric sequence (rec_000 -> rec_001 -> ...).
+        # Dedupe by absolute path so the same TIFF can't appear twice.
+        seen: set[str] = set()
+        merged_tiffs: list[str] = []
+        for r in checked:
+            for t in r.tiff_list():
+                key = str(Path(t).resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_tiffs.append(t)
+        merged_tiffs.sort(key=self._trailing_index)
+
+        merged_id = "+".join(Path(t).stem for t in merged_tiffs)
+        merged_params = dict(checked[0].params or {})
+
+        # Splice: insert at the first checked row's position, drop the
+        # checked set, then bring the new row visually to that slot.
+        first = checked[0]
+        insert_at = self._rows.index(first)
+        for r in checked:
+            self.remove_row(r)
+        new_row = self.add_row(
+            identifier=merged_id, tiffs=merged_tiffs, params=merged_params)
+        # Move the new row to where the first checked row used to be.
+        if new_row is not self._rows[insert_at]:
+            self._rows.remove(new_row)
+            self._rows.insert(insert_at, new_row)
+            # Re-pack so the on-screen order matches the list order.
+            for r in self._rows:
+                r.frame.pack_forget()
+            for r in self._rows:
+                r.frame.pack(fill="x", padx=4)
+
+        self._append_log(
+            f"Merged {len(checked)} rows into '{merged_id}' "
+            f"({len(merged_tiffs)} TIFFs).")
 
     # -- Top-bar actions ---------------------------------------------------
 
