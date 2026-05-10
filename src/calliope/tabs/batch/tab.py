@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import queue
 import threading
 import time
@@ -887,22 +888,54 @@ class BatchTab(ttk.Frame):
     def _stage_preprocess(self) -> None:
         prep = self._app.preprocess_tab
         row = self._current_row
-        tiffs = row.tiff_list()
-        first = Path(tiffs[0])
+        tiffs = [Path(t).resolve() for t in row.tiff_list()]
+
+        # Pick a working dir + depth that's guaranteed to surface all
+        # of the row's TIFFs in Tab 1's listbox:
+        #   - dir = deepest common parent of every row TIFF (so all of
+        #     them are reachable from one tree),
+        #   - depth = max number of directory hops between dir and any
+        #     TIFF (so _refresh_tiffs's recursive walk reaches them).
+        # Falls back gracefully when ``commonpath`` raises (e.g. mixed
+        # drive letters on Windows): in that case we use the parent of
+        # the first TIFF and depth 0, which still matches single-folder
+        # rows correctly.
+        try:
+            common = Path(os.path.commonpath([str(t) for t in tiffs]))
+        except ValueError:
+            common = tiffs[0].parent
+        # ``commonpath`` on a single path returns that path verbatim
+        # (e.g. a .tif file), and on real directories ``is_file`` may
+        # not be a reliable check (file may not exist yet). Cover both
+        # by treating any path that looks like a TIFF as a file.
+        if common.suffix.lower() in (".tif", ".tiff") or common.is_file():
+            common = common.parent
+        max_depth = 0
+        for t in tiffs:
+            try:
+                rel_parts = t.relative_to(common).parts
+            except ValueError:
+                rel_parts = (t.name,)
+            # rel_parts includes the filename; depth counts the
+            # subdirectory hops between ``common`` and the file's parent.
+            max_depth = max(max_depth, len(rel_parts) - 1)
 
         # Mimic the user filling in Tab 1.
-        prep.dir_var.set(str(first.parent))
+        prep.dir_var.set(str(common))
+        prep.depth_var.set(max_depth)
         prep.data_root_var.set(str(self._batch_out_root))
         prep.identifier_var.set(row.identifier)
 
         # Populate the listbox via Tab 1's own refresher, then select
-        # the row's TIFFs.
+        # the row's TIFFs by RESOLVED PATH (listbox items are relative
+        # to dir_var, so we reconstruct absolute paths and compare).
         prep._refresh_tiffs()
         listbox = prep.tiff_listbox
         listbox.selection_clear(0, "end")
-        targets = {Path(p).name for p in tiffs}
+        targets = {str(t.resolve()) for t in tiffs}
         for i in range(listbox.size()):
-            if listbox.get(i) in targets:
+            abs_path = (common / listbox.get(i)).resolve()
+            if str(abs_path) in targets:
                 listbox.selection_set(i)
 
         self._arm_completion(
