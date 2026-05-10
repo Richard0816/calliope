@@ -604,11 +604,16 @@ class SpatialPropagationTab(ttk.Frame):
         pix_to_um = data.get("pix_to_um", None)
         fps = data.get("fps", None)
         scale = float(pix_to_um) if pix_to_um is not None else 1.0
+        # Suite2p stores ROI pixels with y=0 at the TOP of the FOV (image
+        # convention). Render with origin="upper" + a flipped y-extent so
+        # the on-screen orientation matches suite2p's GUI: y axis ticks go
+        # 0 at the top -> Ly at the bottom, and centroid (cx, cy) lands at
+        # the suite2p coordinate without needing to subtract from Ly.
         if pix_to_um is not None:
-            extent = [0, Lx * scale, 0, Ly * scale]
+            extent = [0, Lx * scale, Ly * scale, 0]
             xlabel, ylabel = "X (µm)", "Y (µm)"
         else:
-            extent = None
+            extent = [0, Lx, Ly, 0]
             xlabel, ylabel = "X (px)", "Y (px)"
         fov_w = Lx * scale; fov_h = Ly * scale
 
@@ -637,7 +642,7 @@ class SpatialPropagationTab(ttk.Frame):
             fig.clear()
             ax = fig.add_subplot(111)
             im = ax.imshow(
-                img, origin="lower",
+                img, origin="upper",
                 cmap=spatial_helpers.CYAN_TO_RED,
                 aspect="equal", vmin=0.0, vmax=1.0, extent=extent)
             ax.set_title(title, fontsize=10)
