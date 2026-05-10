@@ -98,7 +98,7 @@ def build_base_settings() -> dict:
     :data:`CALLIOPE_BASE_SETTINGS`). The caller is responsible for any
     additional per-run overlays (recording-specific ``tau``, dynamic
     ``batch_size`` from free RAM, etc.) that
-    :func:`adaptive_detection.load_base_settings` performs.
+    :func:`suite2p_pipeline.load_base_settings` performs.
     """
     from suite2p.parameters import default_settings
     settings = default_settings()
