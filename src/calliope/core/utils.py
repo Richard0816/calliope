@@ -602,6 +602,16 @@ class EventDetectionParams:
     # Overlap merging  (DISABLED in favour of watershed split below)
     merge_gap_s: float = 0.0  # OLD path: merge events closer than this
 
+    # Drop events whose population is below this many active ROIs.
+    # Default 3 = excludes 2-ROI "events" which are almost always noise
+    # on epileptiform recordings where real events recruit dozens to
+    # hundreds of cells. Raise to 4-5 to also exclude 3-4-ROI events.
+    # Applied AFTER boundary walking + watershed split, so the
+    # diagnostic arrays still describe the unfiltered detection (the
+    # returned event_windows / A / first_time are sliced by the
+    # population mask but ``diagnostics["prominence"]`` etc. are not).
+    min_active_rois: int = 3
+
     # NEW: watershed split + hard duration cap  ----------------------------
     enable_watershed_split: bool = True
         # If consecutive baseline-walk windows overlap, split them at the
@@ -730,6 +740,21 @@ def detect_event_windows(
     # Used downstream by Tab 5 (heatmap sort), Tab 7 (per-event
     # cross-correlation cropping) and Tab 8 (activation-order maps).
     A, first_time = _activation_matrix_from_windows(onsets_by_roi, event_windows)
+
+    # 4b) Drop events whose population is below ``min_active_rois``.
+    # Computed from the activation matrix (sum across ROIs per event
+    # gives the number of cells that fired inside that window). The
+    # diagnostics dict below still carries the unfiltered prominence /
+    # peak / boundary arrays so the on-screen "smoothed density"
+    # diagnostic plot keeps its full context; only the published
+    # event_windows / A / first_time are sliced.
+    if event_windows.shape[0] > 0 and params.min_active_rois > 0:
+        n_active_per_event = A.sum(axis=0).astype(int)
+        keep_mask = n_active_per_event >= int(params.min_active_rois)
+        if not keep_mask.all():
+            event_windows = event_windows[keep_mask]
+            A = A[:, keep_mask]
+            first_time = first_time[:, keep_mask]
 
     if not return_diagnostics:
         return event_windows, A, first_time
