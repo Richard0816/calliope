@@ -1214,12 +1214,21 @@ class CrossCorrelationTab(ttk.Frame):
                     self.status_var.set(f"Done. Output: {payload}")
                     self._log(f"[full] done -> {payload}")
                     self._enable_run()
+                    # Tab 0's batch runner subscribes to advance to spatial.
+                    try:
+                        self.state.set_xcorr_ready(Path(payload))
+                    except Exception as e:
+                        print(f"[GUI] xcorr_ready publish failed: {e}")
                 elif kind == "done_per_event":
                     n = int(self.progress.cget("maximum"))
                     self._set_progress(n, n)
                     self.status_var.set(f"Done. Output: {payload}")
                     self._log(f"[per-event] done -> {payload}")
                     self._enable_run()
+                    try:
+                        self.state.set_xcorr_ready(Path(payload))
+                    except Exception as e:
+                        print(f"[GUI] xcorr_ready publish failed: {e}")
                 elif kind == "aborted":
                     self.status_var.set("Aborted by user.")
                     self._log(f"[abort] {payload} run aborted by user")
