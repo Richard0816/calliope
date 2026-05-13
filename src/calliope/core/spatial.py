@@ -35,8 +35,16 @@ from __future__ import annotations
 import matplotlib as mpl
 import numpy as np
 
+# Path / Optional needed by the headless event-figure renderer
+# (``render_spatial_event_figures``) at the bottom of this file.
+from pathlib import Path
+from typing import Optional
+
 # ``paint_spatial`` does the heavy lifting: it knows how to splat a
 # per-ROI scalar onto a (Ly, Lx) image given Suite2p stat entries.
+# ``load_plane_view`` is used by the headless renderer below.
+from . import scale as scale_mod
+from . import utils
 from .utils import paint_spatial
 
 
@@ -251,3 +259,271 @@ def event_frame_centroids(first_time_col: np.ndarray,
             "n": int(gx.size),
         })
     return out
+
+
+# ============================================================================
+# Directional monotonicity (Spearman vs projection angle)
+# ============================================================================
+
+def directional_monotonicity_spearman(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    ts: np.ndarray,
+    *,
+    n_angles: int = 360,
+    n_shuffles: int = 10000,
+    seed: int = 0,
+) -> dict:
+    """Find the propagation axis that maximises Spearman ρ between an
+    event's activation times and a planar projection of ROI positions.
+
+    Model
+    -----
+    Treat each active ROI as a point ``(x_i, y_i, t_i)`` where ``t_i``
+    is its activation frame within this event. For a unit direction
+    ``u(θ) = (cos θ, sin θ)`` define the projection
+    ``s_i(θ) = x_i cos θ + y_i sin θ``. If propagation has a coherent
+    direction θ*, the ordering of ``s_i(θ*)`` should match the
+    ordering of ``t_i``, which is exactly what Spearman's rank
+    correlation
+    ``ρ(θ) = SpearmanCorr(s_i(θ), t_i)``
+    measures (rank-only, so monotone-but-nonlinear relationships still
+    score high; sign-only, so flipped direction reads as negative
+    ρ instead of being missed).
+
+    Sweep θ across ``[0, 2π)`` at ``n_angles`` evenly-spaced steps,
+    pick ``θ*`` as the angle maximising ρ(θ), report:
+
+    * ``rho_obs`` -- ρ(θ*), in [-1, 1]; magnitude is the monotonicity
+      strength, 0 ≈ no directional structure, 1 = perfectly monotone
+      along θ*.
+    * Significance via a permutation test on activation times: at θ*,
+      shuffle ``t_i`` across cells ``n_shuffles`` times and compute
+      ρ for each shuffle. Spearman is rank-based so we precompute
+      the rank of ``s_i(θ*)`` once and permute the rank of ``t``
+      (numerically equivalent and ~30x faster than re-ranking each
+      shuffle).
+
+    Parameters
+    ----------
+    xs, ys : (n,) ndarray of float
+        ROI centroids, any units (the test is rotation-invariant up
+        to θ, so px or µm both work).
+    ts : (n,) ndarray of float or int
+        Activation times (frame index or seconds; only the *ordering*
+        matters for Spearman).
+    n_angles : int
+        Number of θ samples across ``[0, 2π)``. 360 → 1° resolution.
+    n_shuffles : int
+        Permutation count for the null distribution. 10000 → p
+        resolution ~1e-4; memory cost ~n_shuffles × n_angles × 8 B
+        (≈29 MB at the default 10000 × 360 grid, still trivial).
+    seed : int
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        ``{
+          'n':         number of points used,
+          'thetas':    (n_angles,) θ values (rad),
+          'rho_curve': (n_angles,) ρ at each θ,
+          'theta_star':float, argmax θ (rad),
+          'rho_obs':   float, ρ(θ*),
+          'null_rho':  (n_shuffles,) permutation-test ρ values,
+          'p_value':   float, P(shuffled ρ >= ρ_obs),
+        }``
+        Returns ``{}`` (empty dict) when there's insufficient signal
+        (``n < 3`` or no spread in ``t``).
+    """
+    xs = np.asarray(xs, dtype=float).ravel()
+    ys = np.asarray(ys, dtype=float).ravel()
+    ts = np.asarray(ts, dtype=float).ravel()
+    n = int(xs.size)
+    if n < 3 or ys.size != n or ts.size != n:
+        return {}
+    # Spearman is undefined when one variable is constant; bail out
+    # cleanly so the renderer can show a "needs more frames" hint
+    # instead of a NaN-ridden plot.
+    if np.unique(ts).size < 2:
+        return {}
+    if np.unique(xs).size < 2 and np.unique(ys).size < 2:
+        return {}
+
+    # scipy.stats.rankdata is faster than np.argsort+argsort for the
+    # sizes we care about (n ~ 5-500) and handles ties cleanly.
+    from scipy.stats import rankdata
+    rank_t = rankdata(ts, method="average")
+    rank_t_c = rank_t - rank_t.mean()
+    denom_t = float(np.sqrt((rank_t_c * rank_t_c).sum()))
+    if denom_t == 0.0:
+        return {}
+
+    thetas = np.linspace(0.0, 2.0 * np.pi, int(n_angles), endpoint=False)
+    rho_curve = np.empty(thetas.size, dtype=float)
+    # Vectorise the projection over angles: build (n_angles, n)
+    # projection matrix in one shot, rank each row independently.
+    # For typical n ~ 30 and n_angles = 360 that's ~11k entries —
+    # tiny.
+    proj = (np.outer(np.cos(thetas), xs)
+            + np.outer(np.sin(thetas), ys))                  # (n_angles, n)
+    ranks_s = rankdata(proj, method="average", axis=1)       # (n_angles, n)
+    ranks_s_c = ranks_s - ranks_s.mean(axis=1, keepdims=True)
+    denom_s = np.sqrt((ranks_s_c * ranks_s_c).sum(axis=1))   # (n_angles,)
+    safe = denom_s > 0
+    rho_curve[~safe] = 0.0
+    rho_curve[safe] = (ranks_s_c[safe] @ rank_t_c) / (denom_s[safe] * denom_t)
+
+    best_i = int(np.argmax(rho_curve))
+    theta_star = float(thetas[best_i])
+    rho_obs = float(rho_curve[best_i])
+
+    # Permutation null. Each shuffle reassigns activation times across
+    # cells, then sweeps θ on the same projection grid and records the
+    # *max* ρ -- mirroring how ρ_obs itself was picked. Without the
+    # max-over-θ step the null would be at a fixed direction and the
+    # observed statistic (a max over 360 angles) would compare against
+    # an uncorrected baseline, inflating significance.
+    rng = np.random.default_rng(int(seed))
+    perms = rng.standard_normal((int(n_shuffles), n)).argsort(axis=1)
+    perm_ranks = rank_t[perms]                              # (n_shuffles, n)
+    perm_ranks_c = perm_ranks - perm_ranks.mean(axis=1, keepdims=True)
+    # Reuse the precomputed (n_angles, n) projection ranks; one big
+    # matmul gives ρ at every (shuffle, angle) pair. Memory cost at
+    # the default 10000 × 360 grid is ~29 MB — still fine; bump
+    # n_shuffles further only if you need sub-1e-4 p resolution.
+    denom_s_safe = np.where(denom_s > 0, denom_s, 1.0)
+    rho_matrix = (perm_ranks_c @ ranks_s_c.T) / (denom_s_safe * denom_t)
+    null_rho = rho_matrix.max(axis=1)                       # (n_shuffles,)
+    # One-sided p: how often does the null's max ρ match or exceed
+    # ρ_obs. ``>=`` so ties count (conservative).
+    p_value = float(np.mean(null_rho >= rho_obs))
+
+    return {
+        "n": n,
+        "thetas": thetas,
+        "rho_curve": rho_curve,
+        "theta_star": theta_star,
+        "rho_obs": rho_obs,
+        "null_rho": null_rho,
+        "p_value": p_value,
+    }
+
+
+# ============================================================================
+# Headless per-event activation-order figure renderer (Tab 0 batch)
+# ============================================================================
+# Tab 8 is purely visual -- no computation to run headlessly -- but the batch
+# runner still wants the per-event activation-order PNGs saved alongside
+# everything else under ``calliope_figures/``. ``render_spatial_event_figures``
+# renders one PNG per event using the same ``order_map_for_event`` +
+# ``paint_order_map`` pipeline the tab uses, without any Tk dependency. Was
+# split into ``core/spatial_run.py`` previously; consolidated back into
+# ``core/spatial.py`` on 2026-05-11 as part of the core-folder refactor since
+# both files belong to the same Tab 8 domain.
+
+def render_spatial_event_figures(
+    plane0: Path,
+    event_data: dict,
+    *,
+    figures_dir: Path,
+) -> list[str]:
+    """Render the order-map-with-arrows panel (Tab 8's most
+    informative single view) for every event window. Saved as
+    ``event_001.png``, ``event_002.png``, ... under ``figures_dir``.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    plane0 = Path(plane0)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    ev = np.asarray(event_data.get("event_windows"))
+    if ev is None or ev.size == 0:
+        return []
+    A = np.asarray(event_data["A"])
+    first_time = np.asarray(event_data["first_time"])
+    kept_idx = np.asarray(event_data["kept_idx"])
+    fps: Optional[float] = event_data.get("fps")
+
+    view = utils.load_plane_view(plane0)
+    Ly, Lx = int(view["Ly"]), int(view["Lx"])
+    pix_to_um = scale_mod.resolve_pix_to_um(view)
+    stat_all = np.load(plane0 / "stat.npy", allow_pickle=True)
+    stat_filtered = [stat_all[i] for i in kept_idx.tolist()]
+
+    # Suite2p stores ROI pixels with y=0 at the TOP of the FOV (image
+    # convention). Render with origin="upper" + a flipped y-extent so the
+    # rendered figure's orientation matches suite2p's GUI -- y-axis ticks
+    # go 0 at top -> Ly at bottom, centroids land at the suite2p (cx, cy)
+    # without needing a Ly - cy flip.
+    if pix_to_um is not None:
+        scale = float(pix_to_um)
+        extent = [0, Lx * scale, Ly * scale, 0]
+        xlabel, ylabel = "X (µm)", "Y (µm)"
+    else:
+        scale = 1.0
+        extent = [0, Lx, Ly, 0]
+        xlabel, ylabel = "X (px)", "Y (px)"
+
+    written: list[str] = []
+    n_events = ev.shape[0]
+    for ev_idx in range(n_events):
+        first_col = first_time[:, ev_idx]
+        active_col = A[:, ev_idx]
+        order_rank = order_map_for_event(first_col, active_col)
+        img = paint_order_map(order_rank, stat_filtered, Ly, Lx)
+        t0 = float(ev[ev_idx, 0]); t1 = float(ev[ev_idx, 1])
+        n_active = int(active_col.sum())
+        n_total = int(active_col.size)
+        frac = n_active / n_total if n_total else 0.0
+
+        frame_groups = []
+        if fps:
+            frame_groups = event_frame_centroids(
+                first_col, active_col, stat_filtered, float(fps))
+        cxs = np.array([g["cx"] * scale for g in frame_groups])
+        cys = np.array([g["cy"] * scale for g in frame_groups])
+
+        fig = plt.Figure(figsize=(7, 6), tight_layout=True)
+        ax = fig.add_subplot(111)
+        im = ax.imshow(
+            img, origin="upper",
+            cmap=CYAN_TO_RED,
+            aspect="equal", vmin=0.0, vmax=1.0, extent=extent,
+        )
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        ax.set_title(
+            f"Event {ev_idx + 1} / {n_events}  ({t0:.2f}-{t1:.2f} s)\n"
+            f"active = {n_active} / {n_total} ({100 * frac:.1f}%)",
+            fontsize=10,
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02,
+                            ticks=[0.0, 0.5, 1.0])
+        cbar.ax.set_yticklabels(["earliest", "", "latest"])
+
+        if frame_groups:
+            ax.scatter(cxs, cys, s=18, c="white",
+                       edgecolors="black", linewidths=0.6, zorder=4)
+            for i in range(len(frame_groups) - 1):
+                x0, y0 = cxs[i], cys[i]
+                x1, y1 = cxs[i + 1], cys[i + 1]
+                if abs(x1 - x0) + abs(y1 - y0) < 1e-9:
+                    continue
+                ax.annotate(
+                    "", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(
+                        arrowstyle="->", color="white",
+                        lw=1.6, shrinkA=2, shrinkB=2,
+                        mutation_scale=14),
+                    zorder=5,
+                )
+
+        out = figures_dir / f"event_{ev_idx + 1:03d}.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        written.append(str(out))
+
+    return written

@@ -81,7 +81,6 @@ The whole thing also runs as a standalone window via `python clustering_tab.py`.
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import tkinter as tk
 import traceback
@@ -104,9 +103,10 @@ from scipy.cluster.hierarchy import (
 )
 from scipy.spatial.distance import pdist
 
-from .logic import clustering_cmap as cmap_mod
+from .logic import clustering as cmap_mod
 from .logic import summary_writer
 from .logic import utils
+from .cluster_popout import ClusterPopout
 
 from ...gui_common import format_roi_indices
 
@@ -152,17 +152,40 @@ def _attach_fig_toolbar(canvas: FigureCanvasTkAgg,
     return tb
 
 
-def _correlation_linkage(dff: np.ndarray, method: str = "average") -> np.ndarray:
-    """Linkage on the (1 - Pearson r) distance between every pair of ROIs.
+def _ward_linkage(dff: np.ndarray, method: str = "ward") -> np.ndarray:
+    """Ward linkage on z-scored ROI traces with Euclidean distance.
 
-    `pdist(metric="correlation")` returns 1 - r for every column pair, so the
-    resulting linkage is exactly the cross-correlation hierarchical clustering
-    referenced in the GUI prompt. Default to `average` linkage because Ward's
-    method assumes a Euclidean distance.
+    Z-scoring each ROI to ``(mean=0, std=1)`` flattens amplitude so
+    two cells with very different baseline brightness or scale but
+    the same activity *shape* land close together. With z-scoring
+    applied, squared Euclidean distance and (1 - Pearson r) are
+    equivalent up to a constant (``||x - y||^2 = 2T * (1 - r)``)
+    so the *pair-ranking* is identical to correlation distance --
+    we just use Euclidean to keep scipy's Ward implementation
+    happy (Ward requires a Euclidean metric).
+
+    Why Ward and not average:
+    - Ward minimises within-cluster sum-of-squares (Lance-Williams).
+      Produces compact, roughly balanced clusters -- the typical
+      "4-5 modes" shape lab members find useful.
+    - Average linkage merges by mean pairwise distance. On
+      unbalanced data it can collapse to "1 huge cluster + a few
+      tiny outliers", which is what triggered the earlier
+      cluster-fragmentation guard on cross-correlation.
+
+    History: the pre-2026-05-11 GUI used average + correlation
+    here. The docstring claimed Ward was off the table because
+    "Ward needs Euclidean" -- technically true, but irrelevant
+    once we've z-scored. Switched to Ward after the user pointed
+    out that z-scoring already kills amplitude differences.
     """
     dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
-    dist = pdist(dff_z.T, metric="correlation")
+    dist = pdist(dff_z.T, metric="euclidean")
     return linkage(dist, method=method)
+
+
+# Backward-compat alias for any caller that still imports the old name.
+_correlation_linkage = _ward_linkage
 
 
 def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
@@ -235,6 +258,23 @@ def _stat_for_prefix(plane0: Path, prefix: str):
             return ([s for s, keep in zip(full_stat, mask) if keep],
                     np.where(mask)[0])
     return full_stat, None
+
+
+def _build_label_image(stat, Ly: int, Lx: int) -> np.ndarray:
+    """Return a ``(Ly, Lx)`` int32 array where each painted pixel
+    holds ``filtered_idx + 1`` (0 = background).
+
+    Used by the spatial-click handler to map a cursor position to
+    the position in Tab 6's filtered stat list. Mirrors
+    ``Suite2pTab._build_label_image`` so click semantics stay
+    consistent across the two tabs.
+    """
+    label = np.zeros((int(Ly), int(Lx)), dtype=np.int32)
+    for i, s in enumerate(stat, start=1):
+        yp = np.asarray(s["ypix"]); xp = np.asarray(s["xpix"])
+        ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
+        label[yp[ok], xp[ok]] = i
+    return label
 
 
 def _spatial_image(stat, Lx, Ly, roi_rgb: np.ndarray) -> np.ndarray:
@@ -660,6 +700,14 @@ class ClusteringTab(ttk.Frame):
         self.s_canvas = FigureCanvasTkAgg(self.s_fig, master=sp_frame)
         _attach_fig_toolbar(self.s_canvas, sp_frame)
         self.s_canvas.get_tk_widget().pack(fill="both", expand=True)
+        # Click an ROI on the spatial map to open a popout showing the
+        # heatmap + raster for that ROI's cluster. Resolved via a
+        # cached label image (built every render in _render_all) that
+        # encodes ``filtered_idx + 1`` per painted pixel.
+        self.s_canvas.mpl_connect("button_press_event",
+                                  self._on_spatial_click)
+        self._spatial_label_img: Optional[np.ndarray] = None
+        self._cluster_popout: Optional[ClusterPopout] = None
 
         # Bottom controls.
         ctl = ttk.Frame(self, padding=(0, 6, 0, 0))
@@ -1025,6 +1073,81 @@ class ClusteringTab(ttk.Frame):
             self._render_all()
             self._schedule_summary_write()
 
+    def _on_spatial_click(self, event) -> None:
+        """Resolve the clicked ROI on the spatial cluster map and open
+        / refocus the cluster popout.
+
+        Skips clicks while a navigation toolbar mode is active so a
+        zoom-rectangle drag doesn't open the popout. Background-pixel
+        clicks are reported in the status bar instead of opening an
+        empty window.
+        """
+        if event.inaxes is not self.s_ax:
+            return
+        if event.button != 1:
+            return
+        toolbar = getattr(self.s_canvas, "toolbar", None)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return
+        if (self._spatial_label_img is None or self._Z is None
+                or self._dff is None or self._stat is None):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        Ly, Lx = self._spatial_label_img.shape
+        x = int(round(event.xdata))
+        y = int(round(event.ydata))
+        if not (0 <= x < Lx and 0 <= y < Ly):
+            return
+        lbl = int(self._spatial_label_img[y, x])
+        if lbl <= 0:
+            self.status_var.set(
+                f"No ROI at pixel ({x}, {y}); click on a coloured ROI.")
+            return
+        clicked_idx = lbl - 1
+
+        # Recompute labels at the current threshold so the popout
+        # matches whatever the spatial map is showing right now.
+        T = self._current_threshold()
+        labels = fcluster(self._Z, t=T, criterion="distance")
+        if not (0 <= clicked_idx < len(labels)):
+            return
+        cluster_label = int(labels[clicked_idx])
+
+        cluster_color = self._leaf_colors.get(int(clicked_idx), "#cccccc")
+        # Look up Tab 5's event_results when the GUI is wired into the
+        # shared AppState; the popout falls back to a derivative-based
+        # raster otherwise.
+        event_results = None
+        if self.state is not None:
+            event_results = getattr(self.state, "event_results", None)
+
+        # Resolve fps via lowpass-tab-style notes lookup; harmless to
+        # default to 1.0 (popout shows frame indices instead of seconds).
+        fps = 1.0
+        try:
+            from ...core import utils as core_utils
+            fps = float(core_utils.get_fps_from_notes(str(self._plane0)))
+        except Exception:
+            pass
+
+        popout = self._cluster_popout
+        if (popout is None or not popout.winfo_exists()
+                or getattr(popout, "_plane0", None) != self._plane0):
+            try:
+                popout = ClusterPopout(self.winfo_toplevel(), self._plane0)
+            except Exception as e:
+                messagebox.showerror("Cluster popout failed", str(e))
+                return
+            self._cluster_popout = popout
+        popout.show_cluster(
+            clicked_idx=clicked_idx,
+            cluster_label=cluster_label,
+            dff=self._dff, labels=labels, stat=self._stat,
+            cluster_color=cluster_color, fps=fps,
+            event_results=event_results,
+        )
+
     def _on_custom_colors(self) -> None:
         if self._Z is None:
             messagebox.showinfo("Run first",
@@ -1347,15 +1470,6 @@ class ClusteringTab(ttk.Frame):
 
     # -- Render ------------------------------------------------------------
 
-    def _resolve_palette_colors(self, n_clusters: int) -> list[str]:
-        if self._custom_colors:
-            cols = list(self._custom_colors)
-            if len(cols) < n_clusters:
-                cols = cols + [cols[-1]] * (n_clusters - len(cols))
-            return cols[:n_clusters]
-        return cmap_mod.resolve_palette(self._palette_name,
-                                        n_colors=max(1, n_clusters))
-
     def _render_all(self) -> None:
         if self._Z is None:
             return
@@ -1422,10 +1536,16 @@ class ClusteringTab(ttk.Frame):
             return
 
         img = _spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
+        # Parallel int label image so the click handler can map a
+        # cursor pixel back to the filtered-list ROI index. Encoded
+        # as ``filtered_idx + 1`` (0 = background); rebuilt on every
+        # render so a re-cluster / palette change keeps it in sync.
+        self._spatial_label_img = _build_label_image(
+            self._stat, self._Ly, self._Lx)
         ax = self.s_ax
         ax.clear()
         ax.imshow(img, origin="upper", aspect="equal")
-        ax.set_title(f"{n_clusters} clusters")
+        ax.set_title(f"{n_clusters} clusters  -- click an ROI for cluster panel")
         ax.set_xlabel("x (px)")
         ax.set_ylabel("y (px)")
         self.s_canvas.draw_idle()

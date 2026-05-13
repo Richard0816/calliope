@@ -1,6 +1,6 @@
 # Tab 2 — QC Preview
 
-**Goal.** Display the GIF and blob preview produced by Tab 1 so the user can decide visually whether to proceed.
+**Goal.** Display the QC GIF and mean image produced by Tab 1 so the user can decide visually whether to proceed.
 
 This is the smallest tab: no new computation, just two paired views and some memory-management plumbing.
 
@@ -11,9 +11,10 @@ This is the smallest tab: no new computation, just two paired views and some mem
 A `PreprocessResult` published by Tab 1 (or loaded from a folder). Specifically:
 - `result.qc_gif` — path to `qc.gif`
 - `result.mean_image_path` — path to `mean.npy`
-- `result.blobs_path` — path to `blobs.npy` (shape `(N, 3)`, columns `[y, x, radius]`)
 
 A "Reload from folder…" button calls `load_existing_preprocess(path)` and re-publishes the result, letting you point Tab 2 at a previously processed recording without re-running Tab 1.
+
+History: the right-hand panel used to overlay LoG soma-candidate circles on the mean image, fed by a `detect_blobs_on_mean` pass that wrote `blobs.npy`. The overlay was a holdover from before Tab 3's Sparsery + Cellpose detection came online; nothing downstream ever consumed `blobs.npy`. Removed 2026-05-12.
 
 ---
 
@@ -40,16 +41,14 @@ A "Reload from folder…" button calls `load_existing_preprocess(path)` and re-p
 
 `_freeze_to_still()` keeps exactly one frame alive (the one currently visible), drops the rest, and calls `gc.collect()`.
 
-### Step 3 — Blob overlay on the mean image
+### Step 3 — Mean image
 
-`_draw_blob_preview(result)`:
+`_draw_mean_image(result)`:
 
 1. Load `mean = np.load(result.mean_image_path)`.
-2. Load `blobs = np.load(result.blobs_path)` (or zeros if missing).
-3. Display: `ax.imshow(mean, cmap='gray', vmax=quantile(mean, 0.995))`. The `vmax` percentile clamp prevents a few hot pixels from dominating the colour scale.
-4. For each `(y, x, r)` row, add a `plt.Circle((x, y), r, color='cyan', fill=False, linewidth=1.2)` to the axes.
+2. Display: `ax.imshow(mean, cmap='gray', vmax=quantile(mean, 0.995))`. The `vmax` percentile clamp prevents a few hot pixels from dominating the colour scale.
 
-Title: `"<N> preview blobs"`.
+Title: `"Mean image"`.
 
 ---
 
@@ -63,7 +62,7 @@ None — Tab 2 is read-only.
 
 Two side-by-side panels in a `ttk.Frame`:
 - **Left**: a `ttk.Label` whose `image` attribute is the current animated frame, plus a status string ("`<N> frames`" or "Animate off (single frame)").
-- **Right**: a `matplotlib.Figure` with the mean image + cyan circles, wrapped in a `FigureCanvasTkAgg` and the standard `attach_fig_toolbar` (pan/zoom + Save Figure).
+- **Right**: a `matplotlib.Figure` with the mean image, wrapped in a `FigureCanvasTkAgg` and the standard `attach_fig_toolbar` (pan/zoom + Save Figure).
 
 The header shows `"Recording: <name>   (<Y> x <X>)"` once a result is available.
 
@@ -73,7 +72,7 @@ The header shows `"Recording: <name>   (<Y> x <X>)"` once a result is available.
 
 1. A loop that decodes a multi-frame GIF into a list of `PhotoImage` objects and cycles them via `Tk.after`.
 2. A `BooleanVar`-driven freeze/thaw lifecycle so the frame buffer doesn't stick around when the tab is hidden.
-3. `matplotlib` + `FigureCanvasTkAgg` to draw the mean image with circle patches at each `(x, y, r)` from `blobs.npy`.
+3. `matplotlib` + `FigureCanvasTkAgg` to draw the mean image.
 4. The percentile-based `vmax` (default `0.995`) for the mean image display so that the few hottest pixels don't wash out the rest.
 5. Reload-from-folder support via `load_existing_preprocess` (re-publishes the same `PreprocessResult` shape).
 

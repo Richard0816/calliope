@@ -19,9 +19,9 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 
 ## 2. Pipeline steps
 
-> **Headless entry point.** `core/clustering_run.py:run_clustering(plane0,
+> **Headless entry point.** `core/clustering.py:run_clustering(plane0,
 > params, *, figures_dir=None, write_summary=True)` runs the linkage,
-> picks a threshold (auto via `clustering_cmap.auto_choose_threshold` when
+> picks a threshold (auto via `clustering.auto_choose_threshold` when
 > `params['threshold']` is `None` or 0), cuts to flat clusters, exports
 > `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `threshold_used.npy` +
 > `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
@@ -31,30 +31,32 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 
 ### Step 1 — Distance matrix
 
-`_correlation_linkage(dff, method='average')`:
+`_ward_linkage(dff, method='ward')`:
 
 ```python
 dff_z = (dff − mean(dff, axis=0)) / (std(dff, axis=0) + 1e-8)   # z-score each column
-dist  = pdist(dff_z.T, metric='correlation')                     # 1 − Pearson r per pair
-Z     = linkage(dist, method='average')                          # UPGMA
+dist  = pdist(dff_z.T, metric='euclidean')                       # Euclidean on z-scored data
+Z     = linkage(dist, method='ward')                             # Ward / min-variance
 ```
 
-The `metric='correlation'` in `scipy.spatial.distance.pdist` is *literally* `1 − Pearson r` between every pair of columns. The explicit z-scoring before is redundant for `correlation` (which is invariant to mean/scale) but is left in to match the original script and to gracefully handle constant columns (`+1e-8` avoids division by zero).
+Z-scoring kills amplitude differences between cells, so two ROIs with very different baseline brightness but the same activity *shape* land close together. On z-scored data, `||x − y||² = 2T · (1 − Pearson r(x, y))` — squared Euclidean and `1 − r` are equivalent up to a constant. **Pair-ranking is identical to correlation distance**; we use Euclidean because scipy's Ward implementation requires it.
 
 The output `dist` is a condensed `(N·(N−1)/2,)` array fed straight to `scipy.cluster.hierarchy.linkage`.
 
-#### Why average linkage?
+#### Why Ward linkage?
 
 - **Single linkage** chains cells through any tenuous correlation; produces giant straggly clusters.
 - **Complete linkage** is too strict; tends to break true ensembles into many tiny groups.
-- **Ward** assumes a Euclidean distance, which `1 − r` is not.
-- **Average (UPGMA)** is the workhorse: cluster distance = mean pairwise `1 − r`. Stable, balanced.
+- **Average (UPGMA)** merges by mean pairwise distance. On unbalanced data (one big mode + several small ones) it tends toward "1 huge cluster + a few tiny outliers". The earlier per-event xcorr fragmentation guard was a workaround for exactly this failure mode.
+- **Ward** minimises within-cluster sum-of-squares (Lance-Williams). Produces compact, balanced clusters — the "4–5 modes" shape lab members find useful. Z-scoring removes the only objection to Ward (its Euclidean requirement); previous reluctance was based on a misreading of the math.
+
+(Switched from average + correlation → Ward + Euclidean on 2026-05-11 after user pointed out that z-scoring already kills amplitude differences. Backward-compat alias `_correlation_linkage` still exists to avoid breaking importers.)
 
 ### Step 2 — Auto-pick a cut
 
-`clustering_cmap.auto_choose_threshold(Z, target_counts=(4, 5))` walks candidate thresholds top-down and returns the fraction of `max(Z[:, 2])` that yields a cluster count in `[4, 5]`. It's a cheap heuristic — always inspect the dendrogram and override with the slider if needed.
+`clustering.auto_choose_threshold(Z, target_counts=(4, 5))` walks candidate thresholds top-down and returns the fraction of `max(Z[:, 2])` that yields a cluster count in `[4, 5]`. It's a cheap heuristic — always inspect the dendrogram and override with the slider if needed.
 
-The slider operates in **absolute distance** (`1 − r` units). The auto fraction is converted at render time: `T_auto = auto_frac · zmax`.
+The slider operates in **absolute Ward distance** (sum-of-squares units). The auto fraction is converted at render time: `T_auto = auto_frac · zmax`. The auto-pick counts via `fcluster` directly (post-2026-05-11) so the displayed cluster count always matches the spatial map.
 
 ### Step 3 — Render
 
@@ -92,9 +94,11 @@ img[w>0] /= w[w>0]                      # normalize
 
 Done independently for R, G, B channels. Background (no ROI coverage) is `NaN` so matplotlib draws it transparent over the figure background.
 
+A parallel `(Ly, Lx)` int label image (`_build_label_image`) encoding `filtered_idx + 1` per painted pixel is also rebuilt every render so the spatial-click handler can resolve a cursor position back to an ROI without a per-pixel scan over `stat`. Click any coloured ROI to open the cluster popout (see §"Cluster popout").
+
 ### Step 4 — Per-cluster colours
 
-The dropdown lists `clustering_cmap.AVAILABLE_PALETTES` (categorical: `tab10`, `tab20`, `Set1`, `Set2`, `Set3`, `Paired`, `Accent`, …; continuous: `viridis`, `plasma`, `magma`, `inferno`, `cividis`, `Spectral`, …). `resolve_palette(name, n_colors)` returns `n_colors` hex strings.
+The dropdown lists `clustering.AVAILABLE_PALETTES` (categorical: `tab10`, `tab20`, `Set1`, `Set2`, `Set3`, `Paired`, `Accent`, …; continuous: `viridis`, `plasma`, `magma`, `inferno`, `cividis`, `Spectral`, …). `resolve_palette(name, n_colors)` returns `n_colors` hex strings.
 
 The per-cluster custom dialog (`CustomColorDialog`) overrides the dropdown. Custom hex strings persist until the user clicks "Reset palette."
 
@@ -219,6 +223,20 @@ Plus the summary workbook's `Clusters` sheet via `summary_writer.write_clusters_
 
 ---
 
+## 4b. Cluster popout (click an ROI on the spatial map)
+
+Module: `tabs/clustering/cluster_popout.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
+
+Stacked panels:
+1. **Heatmap** of filtered lowpass dF/F restricted to that ROI's cluster (`(n_in_cluster, T)`, per-row min-max normalised, `magma` colormap). The cluster's colour from the spatial map tints the title background so the popout reads at a glance.
+2. **Event raster** for the same rows. Prefers `AppState.event_results['raster']` (Tab 5's per-ROI hysteresis onsets) when its column count matches the dF/F memmap so the popout shows the user's *real* event detections; otherwise falls back to a simple `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout.
+
+Both panels share the time axis (seconds when `notes.txt` provides fps, frame indices otherwise) and draw a yellow row marker for the clicked ROI's position within the cluster. The status bar lists the cluster's filtered-position roster (capped at 30 + overflow count).
+
+The popout reuses Tab 6's already-loaded `_dff` and `_stat`, so no extra disk reads happen on click.
+
+---
+
 ## 5. Auto-threshold heuristic (`auto_choose_threshold`)
 
 ```python
@@ -232,7 +250,7 @@ for f in fractions:
 return best_frac
 ```
 
-(See `core/clustering_cmap.py` for the exact implementation.) Defaults aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
+(See `core/clustering.py` for the exact implementation.) Defaults aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
 
 ---
 
@@ -240,8 +258,8 @@ return best_frac
 
 1. **Distance + linkage:**
    - z-score each column of dF/F (defensive; `correlation` metric is mean/scale-invariant anyway).
-   - `dist = scipy.spatial.distance.pdist(X.T, metric='correlation')`.
-   - `Z = scipy.cluster.hierarchy.linkage(dist, method='average')`.
+   - `dist = scipy.spatial.distance.pdist(X.T, metric='euclidean')`.
+   - `Z = scipy.cluster.hierarchy.linkage(dist, method='ward')`.
 2. **Pick a threshold** (auto or slider). `labels = scipy.cluster.hierarchy.fcluster(Z, t=T, criterion='distance')`.
 3. **Stable cluster numbering:** walk dendrogram leaves left-to-right, map first-seen label → C1, etc. Don't trust scipy's label ordering for visual cluster ids.
 4. **Stable colours:** build a `{raw_label: hex_color}` dict from your palette in visual-id order, then pass a `link_color_func` to `dendrogram` that paints each link with its descendant's colour. Bypass scipy's palette cycling.
@@ -251,6 +269,6 @@ return best_frac
    - One `C{i}_rois.npy` per cluster, indices = Suite2p ROI indices.
    - `linkage.npy` (full `Z`), `threshold_used.npy` (single-element float).
    - Marker file `_indices_are_suite2p` to disambiguate from the legacy filtered-position layout.
-8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering_cmap.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
+8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
 9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate filtered-list positions to Suite2p ROI ids using the keep mask if the prefix is filtered, sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
 10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `_correlation_linkage` call entirely.

@@ -23,3 +23,10 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Cell-filter curation data (per-curator labels, not source code)
+src/calliope/data/cellfilter_labels.csv
+# Cell-filter checkpoints live under ~/.calliope/cellfilter_checkpoints/
+# by default (outside the repo), so no need to ignore them here -- but
+# if someone overrides CHECKPOINT_DIR into the repo this catches them.
+cellfilter_checkpoints/

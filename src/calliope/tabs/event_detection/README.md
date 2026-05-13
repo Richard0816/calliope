@@ -32,7 +32,12 @@ When `figures_dir` is set, `run_event_detection` saves
 plots the GUI shows live). When `write_summary` is True (default for
 batch; False inside the interactive tab, since the tab triggers its own
 `_write_summary` after rendering), it also appends the `EventWindows`,
-`EventOnsets`, and `RoiEventTimes` sheets to `<plane0>/calliope_summary.xlsx`.
+`EventOnsets`, `RoiEventTimes`, and `EventMonotonicity` sheets to
+`<plane0>/calliope_summary.xlsx`. `EventMonotonicity` carries one row
+per event (`event_id, n_active, theta_star_deg, rho_obs, p_value,
+n_shuffles, u_x, u_y`) computed by
+`core.spatial.directional_monotonicity_spearman` — the same Spearman-
+rank propagation-direction test Tab 8's bottom panel renders.
 
 ### Step 0 — (Optional) manual ROI subset
 

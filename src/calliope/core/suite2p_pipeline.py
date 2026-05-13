@@ -368,18 +368,142 @@ def _ensure_s2p_logger(save_path=None):
     s2p.addHandler(file_h)
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True if ``exc`` is a CUDA out-of-memory error.
+
+    torch raises this as ``torch.cuda.OutOfMemoryError`` (subclass of
+    ``RuntimeError``) but older torch versions raise bare
+    ``RuntimeError`` with ``"out of memory"`` in the message. Cover
+    both shapes.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    if isinstance(exc, RuntimeError) and \
+            "out of memory" in str(exc).lower():
+        return True
+    return False
+
+
+def _clear_cuda_arena() -> None:
+    """Best-effort empty the torch CUDA allocator's free-list so the
+    OOM retry sees a clean memory map.
+
+    Useful between attempts because the allocator holds onto freed
+    blocks for reuse -- without an explicit reset, a retry can hit
+    the same fragmentation that caused the first OOM even when the
+    smaller batch_size would have fit in a fresh allocator.
+    """
+    try:
+        import torch, gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _invoke_run_s2p(db: dict, settings: dict):
-    """Dispatch to suite2p.run_s2p with logger setup and patches in place."""
+    """Dispatch to suite2p.run_s2p with logger setup and patches in place.
+
+    Wraps the call in :class:`utils.PeakMemoryMonitor` and feeds the
+    observed peak back to :class:`utils.AdaptiveBatchSizer` so the next
+    recording's batch_size converges on the target RAM fraction.
+
+    CUDA OOM safety net: if registration blows the GPU, halve
+    ``settings['registration']['batch_size']``, clear the CUDA arena,
+    and retry once. The closed loop's recording-2 update then has
+    real feedback to converge from. Up to two retries (8x reduction
+    from the initial estimate) before giving up -- past that the
+    user has a deeper problem than batch_size tuning.
+    """
     _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
-    return suite2p.run_s2p(db=db, settings=settings)
+    sizer = utils.get_adaptive_sizer()
+    used_bs = get_setting(settings, 'batch_size')
+    max_oom_retries = 2
+
+    for attempt in range(max_oom_retries + 1):
+        mon = utils.PeakMemoryMonitor()
+        mon.__enter__()
+        try:
+            result = suite2p.run_s2p(db=db, settings=settings)
+        except BaseException as exc:
+            mon.__exit__(type(exc), exc, exc.__traceback__)
+            if _is_cuda_oom(exc) and attempt < max_oom_retries:
+                new_bs = max(64, used_bs // 2)
+                print(f"[adaptive] CUDA OOM at batch_size={used_bs} "
+                      f"(attempt {attempt + 1}/{max_oom_retries + 1}); "
+                      f"halving to {new_bs} and retrying")
+                set_setting(settings, 'batch_size', new_bs)
+                # Record the OOM as a "100% GPU peak" data point so
+                # the closed loop knows this batch_size was too big
+                # even though we recover via retry. Use the just-
+                # halved value as the batch_size we'll actually run
+                # at on the retry.
+                sizer.update_from_peak(
+                    cpu_peak=mon.cpu_peak_fraction,
+                    gpu_peak=1.0,
+                    batch_size=new_bs)
+                used_bs = new_bs
+                _clear_cuda_arena()
+                continue
+            # Non-OOM or out of retries: record what we saw and
+            # bubble up.
+            sizer.update_from_peak(
+                cpu_peak=mon.cpu_peak_fraction,
+                gpu_peak=mon.gpu_peak_fraction,
+                batch_size=used_bs)
+            print(f"[adaptive] suite2p run_s2p FAILED: "
+                  f"cpu peak={mon.cpu_peak_fraction:.1%} "
+                  f"gpu peak={mon.gpu_peak_fraction:.1%} "
+                  f"batch_size_used={used_bs}"
+                  + (f" (after {attempt} OOM retries)"
+                     if attempt > 0 else ""))
+            raise
+        # Success path.
+        mon.__exit__(None, None, None)
+        sizer.update_from_peak(
+            cpu_peak=mon.cpu_peak_fraction,
+            gpu_peak=mon.gpu_peak_fraction,
+            batch_size=used_bs)
+        print(f"[adaptive] suite2p run_s2p: "
+              f"cpu peak={mon.cpu_peak_fraction:.1%} "
+              f"gpu peak={mon.gpu_peak_fraction:.1%} "
+              f"batch_size_used={used_bs}"
+              + (f" (after {attempt} OOM retries)"
+                 if attempt > 0 else ""))
+        return result
 
 
 def _invoke_run_plane(db: dict, settings: dict):
-    """Dispatch to suite2p.run_plane with logger setup and patches in place."""
+    """Dispatch to suite2p.run_plane with logger setup and patches in place.
+
+    Same peak-RAM monitor + adaptive feedback wrapping as
+    :func:`_invoke_run_s2p`. ``run_plane`` skips registration so its
+    batch_size doesn't matter for memory, but the detection phase still
+    benefits from the closed loop on subsequent recordings.
+    """
     _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
-    return suite2p.run_plane(db, settings)
+    sizer = utils.get_adaptive_sizer()
+    used_bs = get_setting(settings, 'batch_size')
+    with utils.PeakMemoryMonitor() as mon:
+        try:
+            return suite2p.run_plane(db, settings)
+        finally:
+            sizer.update_from_peak(
+                cpu_peak=mon.cpu_peak_fraction,
+                gpu_peak=mon.gpu_peak_fraction,
+                batch_size=used_bs)
+            print(f"[adaptive] suite2p run_plane: "
+                  f"cpu peak={mon.cpu_peak_fraction:.1%} "
+                  f"gpu peak={mon.gpu_peak_fraction:.1%} "
+                  f"batch_size_used={used_bs}")
 
 
 # ============================================================================
@@ -609,8 +733,11 @@ def load_base_settings(config: Suite2pPipelineConfig):
       ``utils.file_name_to_aav_to_dictionary_lookup`` from the AAV
       metadata CSV in ``config.aav_info_csv`` and the dict in
       ``config.tau_vals`` (or ``config.tau_override`` wins outright).
-    * **batch_size** : auto-scaled to free RAM by
-      ``utils.change_batch_according_to_free_ram``.
+    * **batch_size** : picked by ``utils.get_adaptive_sizer().pick()``
+      -- frame-size aware initial estimate for the first recording in
+      a queue, closed-loop scaling against the previous run's observed
+      peak RAM thereafter. Target fraction defaults to
+      ``utils.RAM_TARGET_FRACTION`` (0.80).
     * **spatial_scale** : pinned to 0 (suite2p auto-pick); the broken
       ``estimate_spatial_scale`` ndarray bug is patched at
       ``_invoke_run_*`` dispatch time via
@@ -692,8 +819,14 @@ def load_base_settings(config: Suite2pPipelineConfig):
                     print(f"tau lookup failed ({e}); keeping existing "
                           f"tau={settings.get('tau')}")
 
-    # --- Dynamic batch size ---
-    set_setting(settings, 'batch_size', utils.change_batch_according_to_free_ram())
+    # --- Dynamic batch size (frame-size aware + closed-loop in batch mode) ---
+    # First recording in a queue: frame-size-aware initial estimate.
+    # Recordings 2..N: scaled by the previous run's observed peak RAM
+    # so we converge on ``utils.RAM_TARGET_FRACTION``. Single-shot Tab 3
+    # calls just get the initial estimate every time (no feedback loop
+    # because there's no recording 2 to apply it to).
+    set_setting(settings, 'batch_size',
+                utils.get_adaptive_sizer().pick(config.tiff_folder))
 
     # --- nbins (legacy nbinned) capped to RAM budget ---
     safe_nbinned = utils.change_nbinned_according_to_free_ram(config.tiff_folder)
@@ -758,34 +891,6 @@ def build_roi_pixel_mask(stat, Ly: int, Lx: int) -> np.ndarray:
     return mask
 
 
-def compute_residual_image(ops: dict, roi_mask: np.ndarray,
-                           dilate_px: int = 2, prefer: str = 'meanImg'):
-    """
-    Residual brightness after subtracting detected ROIs from the mean image.
-    Dilates the ROI mask slightly so neuropil rings around detected cells
-    don't register as missed somata.
-
-    prefer='meanImg' (default) uses the raw mean, which preserves dynamic
-    range. 'meanImgE' uses the enhanced mean but is often clipped at 1.0.
-    """
-    from scipy.ndimage import binary_dilation
-
-    if prefer == 'meanImgE' and ops.get('meanImgE') is not None:
-        img = ops['meanImgE'].astype(np.float32)
-    elif 'meanImg' in ops:
-        img = ops['meanImg'].astype(np.float32)
-    else:
-        img = ops['meanImgE'].astype(np.float32)
-
-    dilated = binary_dilation(roi_mask, iterations=dilate_px)
-    residual = img.copy()
-
-    if dilated.any() and (~dilated).any():
-        bg = float(np.median(img[~dilated]))
-    else:
-        bg = float(np.median(img))
-    residual[dilated] = bg
-    return residual, bg
 
 # ============================================================================
 # Single Suite2p pass wrapper

@@ -5,8 +5,8 @@ propagation vectors. For every population event detected by **Tab 5**,
 ROIs that fired earliest are coloured cyan and those that fired latest
 are red. Click through events with the spinner or Prev / Next buttons.
 
-Four figures, laid out as a top row of two side-by-side panels, a
-centred vectors panel below them, and a full-width violin at the bottom:
+Three figures, laid out as a top row of two side-by-side activation-order
+maps with a three-subplot directional-monotonicity analysis underneath:
 
 1. **Top-left — activation order (plain).** The cyan→red spatial map
    painted from per-ROI first-onset rank, with no overlays — useful as
@@ -14,34 +14,52 @@ centred vectors panel below them, and a full-width violin at the bottom:
 2. **Top-right — activation order + frame-to-frame arrows.** Same map,
    with white arrows overlaid that connect the centroid of the ROIs
    activating in each frame to the centroid for the next active frame.
-3. **Middle — vectors-only.** The same arrow chain, drawn on a blank
-   FOV centred under the top pair. Each frame group is rendered as a
-   circle whose radius is the 2D RMS standard deviation
-   (`sqrt(var_x + var_y)`) of the contributing ROI centroids around
-   the group centroid; the circle's colour follows the same cyan→red
-   cmap, ticked by absolute frame index on the right colorbar.
-4. **Bottom — pairwise distance vs Δframe (every ROI as seed).** For
-   every active ROI `s` whose frame `f_s` is *not* the last active
-   frame in the event (i.e. seeds sweep frames `f_min .. f_max - 1`),
-   and for every other active ROI `o` with `f_o >= f_s`, the panel
-   accumulates `dist(s, o)` into the bin `Δframe = f_o - f_s`. Each
-   `Δframe` then becomes one violin showing the union of those
-   distance distributions across all valid seeds — so a 5-ROI first
-   frame contributes its 4 within-frame distances per seed
-   (`Δframe=0`) plus everything later, a 10-ROI second frame
-   contributes its own 9 within-frame distances per seed (with frame 1
-   cropped out) plus everything later, etc. Individual pairs are
-   jittered on top as small dots while the pair count stays under
-   ~4000; above that, only the violins are shown. A secondary `Δt (s)`
-   axis along the top mirrors the integer Δframe ticks. Inspired by
-   `plot_event_distance_vs_delta_t.py` from the legacy
-   `Calcium_imaging_suite2p` worktree but generalised: the legacy
-   script picked a single earliest-firing seed; this generalisation
-   uses every ROI as a seed in turn.
+3. **Bottom — directional monotonicity (Spearman ρ vs projection angle).**
+   Tests whether the event's activation has a coherent direction of
+   propagation, and how strong / significant that direction is. Three
+   subplots:
+   - **(a)** Scatter of active ROI positions coloured by activation
+     frame; black arrow along `u(θ*) = (cos θ*, sin θ*)` with length
+     scaled by `ρ_obs` (no arrow when `ρ_obs ≤ 0`).
+   - **(b)** `ρ(θ)` curve across θ ∈ [0°, 360°) with the maximum
+     marked.
+   - **(c)** Permutation null histogram of `ρ_max` from shuffled
+     activation times, with `ρ_obs` overlaid as a vertical red line
+     and the empirical p-value in the subplot title.
 
-Roadmap for additional view modes (lag violin, scalar feature maps,
-per-event propagation-vector CSV) lives in the legacy
-`spatial_heatmap_updated.py` reference and will land here later.
+   The maths (helper `core.spatial.directional_monotonicity_spearman`):
+
+   ```
+   for θ in linspace(0, 2π, 360):
+       s_i(θ) = x_i cos θ + y_i sin θ           # 1-D projection
+       ρ(θ)   = SpearmanCorr(s_i(θ), t_i)        # rank-only correlation
+   θ* = argmax_θ ρ(θ);   ρ_obs = ρ(θ*)
+
+   # permutation null (corrects for the multiple-θ search):
+   for k in range(N_shuffles):
+       t_perm    = permute(t)
+       ρ_null[k] = max_θ SpearmanCorr(s_i(θ), t_perm)
+   p = mean(ρ_null >= ρ_obs)
+   ```
+
+   ρ_obs near 1 = perfectly monotone propagation along `θ*`; near 0
+   = no directional structure. The null is computed by sweeping θ
+   on every shuffle and recording its maximum, so the p-value
+   accounts for the same multiple-direction search as the observed
+   statistic (otherwise random data with `n` cells and 360 θ tests
+   would look spuriously significant).
+
+   Replaces the pre-2026-05-10 "pairwise distance vs Δframe" violin,
+   which described spread but never told you whether the event had
+   a *direction* at all.
+
+   The same scalars are stamped into the workbook's
+   `EventMonotonicity` sheet (one row per event:
+   `event_id, n_active, theta_star_deg, rho_obs, p_value,
+   n_shuffles, u_x, u_y`) by `core.event_detection_run` whenever
+   Tab 5 (or the headless runner / Tab 0 batch) finishes, so
+   cross-recording analyses can stack monotonicity stats next to
+   the existing `EventWindows` / `EventOnsets` tables.
 
 ## Where the data comes from
 
@@ -123,7 +141,7 @@ paint the same maps.
 ## Headless figure rendering
 
 Tab 8 has no analysis to run headlessly — every panel is a pure render
-of the data Tab 5 publishes. For batch mode, `core/spatial_run.py`
+of the data Tab 5 publishes. For batch mode, `core/spatial.py`
 exposes `render_spatial_event_figures(plane0, event_data, *,
 figures_dir)` which loops over every event in `event_data['event_windows']`
 and saves the order-map-with-arrows panel (the most informative single
@@ -132,8 +150,8 @@ view) as `event_001.png`, `event_002.png`, … in `figures_dir`. The
 returns (`event_windows`, `A`, `first_time`, `kept_idx`, `fps`), so the
 batch orchestrator hands one stage's output straight to the next.
 
-The interactive Tab 8 still owns the full four-panel view + dist-vs-Δframe
-violin and listens to `state.event_results` — those panels stay in
+The interactive Tab 8 still owns the full four-panel view + directional
+monotonicity analysis and listens to `state.event_results` — those panels stay in
 `tabs/spatial_propagation/tab.py`.
 
 ## UI

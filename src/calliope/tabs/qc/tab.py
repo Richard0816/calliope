@@ -3,11 +3,10 @@
 What the user sees
 ------------------
 Two side-by-side panels: an animated GIF of the shifted movie on the
-left, and the mean image with detected blob candidates circled on
-the right. There's a checkbox to pause the animation (which also
-frees the frame buffer for memory-strapped machines) and a "Reload
-from folder..." button to re-load an already-preprocessed recording
-from disk.
+left, and the per-pixel mean image on the right. There's a checkbox
+to pause the animation (which also frees the frame buffer for
+memory-strapped machines) and a "Reload from folder..." button to
+re-load an already-preprocessed recording from disk.
 
 How this tab is driven
 ----------------------
@@ -16,8 +15,7 @@ Tab 1 publishes a ``PreprocessResult`` on the shared
 to that channel in ``__init__`` -- ``state.subscribe(self._on_result)``
 registers ``_on_result`` as a callback that will be invoked from
 Tab 1's worker. ``_on_result`` then materialises the GIF frames into
-``ImageTk.PhotoImage`` objects, displays the mean image, and
-overlays the blob circles.
+``ImageTk.PhotoImage`` objects and displays the mean image.
 
 Memory note
 -----------
@@ -66,7 +64,7 @@ from ...gui_common import AppState, attach_fig_toolbar
 
 
 class QcTab(ttk.Frame):
-    """QC preview: GIF playback on the left, mean+blobs on the right."""
+    """QC preview: GIF playback on the left, mean image on the right."""
 
     # Inter-frame delay in milliseconds. 66 ms ≈ 15 fps.
     FRAME_MS = 66
@@ -140,17 +138,16 @@ class QcTab(ttk.Frame):
         ttk.Label(gif_frame, textvariable=self.gif_status).pack(anchor="w",
                                                                 pady=(4, 0))
 
-        blob_frame = ttk.LabelFrame(body, text="Mean image + blob detection",
-                                    padding=6)
-        blob_frame.grid(row=0, column=1, sticky="nsew")
+        mean_frame = ttk.LabelFrame(body, text="Mean image", padding=6)
+        mean_frame.grid(row=0, column=1, sticky="nsew")
 
         self.fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_axis_off()
         self.ax.text(0.5, 0.5, "No data", ha="center", va="center",
                      transform=self.ax.transAxes)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=blob_frame)
-        attach_fig_toolbar(self.canvas, blob_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=mean_frame)
+        attach_fig_toolbar(self.canvas, mean_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # -- Reload helper ------------------------------------------------------
@@ -176,7 +173,7 @@ class QcTab(ttk.Frame):
             f"Recording: {result.out_dir.name}   "
             f"({result.shape_yx[0]} x {result.shape_yx[1]})")
         self._load_gif(result.qc_gif)
-        self._draw_blob_preview(result)
+        self._draw_mean_image(result)
 
     # -- GIF playback -------------------------------------------------------
 
@@ -298,22 +295,14 @@ class QcTab(ttk.Frame):
         if len(self._gif_frames) > 1 and self._gif_job is None:
             self._advance_gif()
 
-    # -- Blob preview plot --------------------------------------------------
+    # -- Mean image plot ----------------------------------------------------
 
-    def _draw_blob_preview(self, result: PreprocessResult) -> None:
+    def _draw_mean_image(self, result: PreprocessResult) -> None:
         mean = np.load(str(result.mean_image_path))
-        blobs = (np.load(str(result.blobs_path))
-                 if result.blobs_path.exists() else np.zeros((0, 3)))
 
         self.ax.clear()
         self.ax.set_axis_off()
         vmax = float(np.quantile(mean, 0.995))
         self.ax.imshow(mean, cmap="gray", vmax=vmax)
-        for row in np.atleast_2d(blobs):
-            if row.size < 3:
-                continue
-            y, x, r = float(row[0]), float(row[1]), float(row[2])
-            self.ax.add_patch(
-                plt.Circle((x, y), r, color="cyan", fill=False, linewidth=1.2))
-        self.ax.set_title(f"{len(blobs)} preview blobs")
+        self.ax.set_title("Mean image")
         self.canvas.draw_idle()

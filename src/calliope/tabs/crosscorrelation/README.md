@@ -23,7 +23,7 @@ From `plane0/`:
 
 > **Headless entry point.** The xcorr math (`run_cluster_xcorr_full_fast`
 > and `run_cluster_xcorr_per_event_fast` in `core/crosscorrelation.py`)
-> was already callable without Tk. `core/crosscorrelation_run.py` adds a
+> was already callable without Tk. `core/crosscorrelation.py` adds a
 > thin batch-friendly wrapper (`run_crosscorrelation(plane0, params, *,
 > event_windows=None, figures_dir=None, progress_cb=None)`) that drives
 > both the full-recording and per-event runs and saves `full.png` /

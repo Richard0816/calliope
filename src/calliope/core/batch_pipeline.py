@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import (
-    preprocess_run, detection_run, lowpass_run, event_detection_run,
-    clustering_run, crosscorrelation_run, spatial_run,
+    preprocessing, detection_run, lowpass_run, event_detection_run,
+    clustering, crosscorrelation, spatial,
 )
 
 
@@ -117,7 +117,7 @@ def run_recording(
     t0 = time.time()
     try:
         _emit("preprocess: starting")
-        pre = preprocess_run.run_preprocess(
+        pre = preprocessing.run_preprocess(
             src_tiffs=tiff_input,
             data_root=str(save_folder.parent),
             params=params,
@@ -235,7 +235,7 @@ def run_recording(
     t0 = time.time()
     try:
         _emit("clustering: starting")
-        clustering_run.run_clustering(
+        clustering.run_clustering(
             plane0, params,
             figures_dir=_figures_dir_for(save_folder, "clustering"),
             write_summary=True,
@@ -260,7 +260,7 @@ def run_recording(
                                  if event_data is not None else None)
             event_windows = (event_data.get("event_windows")
                              if event_data is not None else None)
-            crosscorrelation_run.run_crosscorrelation(
+            crosscorrelation.run_crosscorrelation(
                 plane0, xc_params,
                 event_windows=event_windows,
                 figures_dir=_figures_dir_for(save_folder,
@@ -288,7 +288,7 @@ def run_recording(
     if event_data is not None:
         try:
             _emit("spatial_propagation: starting")
-            figs = spatial_run.render_spatial_event_figures(
+            figs = spatial.render_spatial_event_figures(
                 plane0, event_data,
                 figures_dir=_figures_dir_for(save_folder,
                                              "spatial_propagation"),

@@ -1,16 +1,30 @@
-"""Hierarchical clustering of ROI dF/F traces (Tab 6 backend).
+"""Hierarchical clustering of ROI dF/F traces (Tab 6 backend +
+headless batch entry point).
 
 What this file does, in one paragraph
 -------------------------------------
 Cells in a slice are not independent -- groups of them have tightly
 correlated firing patterns ("functional ensembles"). To find those
-groups we (1) compute the pairwise correlation matrix between every
-pair of ROIs, (2) treat ``1 - r`` as a distance, (3) run scipy's
-hierarchical agglomerative clustering with average linkage, and (4)
+groups we (1) z-score each ROI's trace, (2) compute the pairwise
+Euclidean distance matrix between every pair of ROIs (which on
+z-scored data is equivalent to correlation distance up to a
+constant: ``||x - y||^2 = 2T * (1 - r)``), (3) run scipy's
+hierarchical agglomerative clustering with Ward linkage, and (4)
 either auto-pick a flat-cluster count or let the user slide a
 threshold along the dendrogram. The output is per-cell cluster
 labels -- the same colours then drive both the dendrogram and a
 spatial map of the FOV.
+
+This module mixes two layers:
+
+* Palette + plotting + threshold helpers (``resolve_palette``,
+  ``count_clusters``, ``auto_choose_threshold``, ``plot_dendrogram``,
+  ``plot_spatial``) used by both the interactive Tab 6 and the
+  headless ``run_clustering`` below.
+* The headless orchestrator ``run_clustering(plane0, params, ...)``
+  that drives the linkage + threshold pick + label remap + cluster
+  export + summary writer end-to-end so Tab 0's batch runner can
+  reproduce Tab 6's output without opening a Tk window.
 
 Where to look in the source if you've never used SciPy clustering
 -----------------------------------------------------------------
@@ -51,9 +65,6 @@ from typing import Iterable, Optional, Sequence, Union
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-# seaborn provides categorical / continuous colour palettes that look
-# nicer than matplotlib's defaults for cluster colouring.
-import seaborn as sns
 # SciPy's hierarchical-clustering primitives. ``linkage`` builds the
 # tree; ``dendrogram`` plots it; ``fcluster`` cuts it at a height;
 # ``set_link_color_palette`` lets us colour branches consistently.
@@ -163,50 +174,6 @@ def _resolve_pix_to_um(root: Path, ops: dict) -> Optional[float]:
     return resolve_pix_to_um(ops)
 
 
-def load_dff(root: Path, prefix: str = "r0p7_filtered_") -> np.ndarray:
-    """Open the ``(T, N_kept)`` filtered dF/F memmap for a recording.
-
-    Convenience wrapper around ``utils.s2p_open_memmaps`` that picks
-    just the dF/F array (not the lowpass + derivative siblings).
-    """
-    dff, _, _ = utils.s2p_open_memmaps(root, prefix=prefix)[:3]
-    if dff.ndim != 2:
-        raise ValueError(f"Expected (T, N) ΔF/F array, got shape {dff.shape}")
-    return dff
-
-
-def run_clustering(
-    dff: np.ndarray,
-    method: str = "ward",
-    metric: str = "euclidean",
-) -> np.ndarray:
-    """Compute the linkage matrix used to draw a dendrogram.
-
-    Steps:
-        1. Z-score each ROI's trace independently so cells with
-           higher absolute brightness don't dominate the distance.
-        2. Compute the pairwise distance matrix between ROIs in
-           condensed form (``scipy.spatial.distance.pdist``).
-        3. Run hierarchical agglomerative clustering with the chosen
-           ``method`` (Ward by default; the GUI more typically
-           overrides this to "average" with the "correlation" metric
-           for the 1 - Pearson r distance described in the
-           module-level docstring).
-
-    Returns the linkage matrix Z -- shape ``(N-1, 4)`` -- where each
-    row records one merge: ``[cluster_a, cluster_b, distance,
-    cluster_size]``. R users will recognise this as the same data
-    structure ``stats::hclust`` returns under ``$merge`` + ``$height``.
-    """
-    # ``+ 1e-8`` is a tiny epsilon that avoids dividing by zero on a
-    # constant trace (which would otherwise become NaN and poison
-    # the distance matrix).
-    dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
-    # ``.T`` transposes (T, N) -> (N, T); ``pdist`` operates on rows.
-    dist_matrix = pdist(dff_z.T, metric=metric)
-    return linkage(dist_matrix, method=method)
-
-
 def count_leaf_color_groups(Z: np.ndarray, color_threshold: float) -> int:
     """Count how many distinct branch colours the dendrogram would
     use at the given cut height fraction.
@@ -251,7 +218,7 @@ def auto_choose_threshold(
     step: float = 0.01,
 ) -> float:
     """Heuristic: walk the cut fraction down from ``start`` until the
-    branch-colour count lands in ``target_counts``.
+    fcluster count lands in ``target_counts``.
 
     The default targets (4, 5) match what the lab finds visually
     useful for typical brain-slice recordings. Returns the fractional
@@ -260,6 +227,16 @@ def auto_choose_threshold(
 
     Tab 6 calls this on first Render so the user sees something
     reasonable without having to touch the slider.
+
+    Counts via ``count_clusters`` (i.e. ``fcluster``) not
+    ``count_leaf_color_groups``. Matplotlib's dendrogram renderer
+    bundles small clusters under a single ``above_threshold_color``
+    group, so the colour-group count under-reports the true
+    fcluster count on fragmented recordings -- the auto-pick would
+    land at 5 visible colours while the spatial map showed 30+
+    actual clusters. Fragmentation bug was caught 2026-05-11 by
+    a downstream user; switching to ``count_clusters`` makes the
+    auto-pick match what the user sees on the spatial map.
     """
     # ``set(...)`` for fast ``in`` lookup below.
     target_counts = set(target_counts)
@@ -267,7 +244,7 @@ def auto_choose_threshold(
     # ``stop - 1e-9`` is a hair below the lower bound so np.arange
     # actually visits ``stop``.
     for ct in np.arange(start, stop - 1e-9, -step):
-        if count_leaf_color_groups(Z, float(ct)) in target_counts:
+        if count_clusters(Z, float(ct)) in target_counts:
             return float(ct)
     return start
 
@@ -316,29 +293,6 @@ def plot_dendrogram(
     plt.savefig(save_path, dpi=200)
     plt.close()
     return colors
-
-
-def plot_heatmap(
-    dff: np.ndarray,
-    order: np.ndarray,
-    save_path: Path,
-    heatmap_cmap: str = "magma",
-) -> None:
-    dff_sorted = dff[:, order]
-    plt.figure(figsize=(12, 6))
-    sns.heatmap(
-        dff_sorted.T,
-        cmap=heatmap_cmap,
-        cbar_kws={"label": "ΔF/F"},
-        xticklabels=False,
-        yticklabels=False,
-    )
-    plt.title("Hierarchical Clustering of ROI ΔF/F Traces")
-    plt.xlabel("Time (s)")
-    plt.ylabel("ROIs (clustered order)")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
 
 
 def _stat_for_prefix(root: Path, prefix: str) -> tuple[list, Optional[np.ndarray]]:
@@ -420,102 +374,268 @@ def plot_spatial(
     print("Saved", save_path)
 
 
-def cluster_and_plot(
-    root: Path,
-    prefix: str = "r0p7_filtered_",
-    method: str = "ward",
-    metric: str = "euclidean",
-    palette: PaletteLike = "tab10",
-    heatmap_cmap: str = "magma",
-    above_threshold_color: str = "gray",
-    color_threshold: Optional[float] = None,
-    target_counts: Iterable[int] = (4, 5),
-    save_dir: Optional[Path] = None,
-    save_format: Union[str, Iterable[str]] = "png",
-    cluster_colors: Optional[Sequence[str]] = None,
-) -> dict:
+# ---------------------------------------------------------------------------
+# Headless orchestrator -- the entry point Tab 0's batch runner calls.
+# ---------------------------------------------------------------------------
+#
+# The interactive Tab 6 builds its linkage / threshold / cluster export
+# inline from the tab class because it also has to drive a bunch of Tk
+# widgets between steps. For the headless batch path we want a single
+# function with no Tk dependency. Everything below is a straight lift of
+# the orchestration logic the tab runs after the user clicks Render.
+
+
+# Cluster .npy files are written directly into
+# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder. Tab 7
+# accepts ``cluster_folder=""`` and skips the join, so reads stay
+# symmetric with this writer.
+EXPORT_SUBDIR = ""
+
+
+def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
+    pred_path = plane0 / "predicted_cell_mask.npy"
+    if pred_path.exists():
+        return np.load(pred_path).astype(bool)
+    iscell_path = plane0 / "iscell.npy"
+    if iscell_path.exists():
+        ic = np.load(iscell_path)
+        return ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
+    return None
+
+
+def _load_filtered_dff(plane0: Path, prefix: str):
+    """Open ``<prefix>dff.memmap.float32`` against the cell-filter
+    mask. Returns (dff_array, T, N_kept, keep_mask).
     """
-    End-to-end: load ΔF/F -> cluster -> write dendrogram, heatmap, spatial map.
+    plane0 = Path(plane0)
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+    is_filtered = "filtered" in prefix.split("_")
 
-    `save_format` controls the output extension(s). Pass "png" (default),
-    "svg", "pdf", or an iterable like ("png", "svg") to save in multiple
-    formats. matplotlib's savefig picks the renderer from the extension.
-
-    `cluster_colors`, when provided, is an explicit list of colors mapping
-    onto C1, C2, C3, ... (dendrogram order, left to right). It overrides
-    `palette`. If shorter than n_clusters, scipy cycles through it;
-    extras beyond n_clusters are ignored.
-
-    Returns a dict with the linkage matrix, leaf order, chosen threshold,
-    leaf colors, and the output directory — everything a GUI needs to
-    display results or re-render with a different palette.
-    """
-    save_dir = (
-        Path(save_dir)
-        if save_dir
-        else Path(root) / f"{prefix}cluster_results" / "colourblind_safe"
-    )
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    formats = (save_format,) if isinstance(save_format, str) else tuple(save_format)
-    formats = tuple(f.lstrip(".").lower() for f in formats)
-
-    dff = load_dff(Path(root), prefix=prefix)
-    Z = run_clustering(dff, method=method, metric=metric)
-
-    if color_threshold is None:
-        color_threshold = auto_choose_threshold(Z, target_counts=target_counts)
-
-    order = np.asarray(dendrogram(Z, no_plot=True)["leaves"], dtype=int)
-
-    # Sample the palette with exactly n_clusters entries so the first
-    # cluster lands on one end of the colormap, the last on the other,
-    # and everything else is evenly spread in between. Apply BEFORE both
-    # the plotted dendrogram and the no_plot extraction so leaves_color_list
-    # reflects the user's choice for the spatial map too.
-    n_clusters = max(1, count_clusters(Z, color_threshold))
-    if cluster_colors is not None:
-        palette_colors = [mpl.colors.to_hex(c) for c in cluster_colors]
+    if is_filtered:
+        mask = _load_filter_mask(plane0)
+        if mask is None:
+            raise FileNotFoundError(
+                f"{plane0}: prefix {prefix!r} requires a cell-filter mask "
+                "(predicted_cell_mask.npy or iscell.npy).")
+        if mask.size != N_total:
+            raise ValueError(
+                f"{plane0}: cell-filter mask length {mask.size} does not "
+                f"match F.npy ROI count {N_total}.")
+        N_kept = int(mask.sum())
     else:
-        palette_colors = resolve_palette(palette, n_colors=n_clusters)
-    set_link_color_palette(palette_colors)
+        mask = None
+        N_kept = N_total
 
-    T = color_threshold * np.max(Z[:, 2])
-    link_colors = dendrogram(Z, no_plot=True, color_threshold=T)["leaves_color_list"]
+    dff_path = plane0 / f"{prefix}dff.memmap.float32"
+    if not dff_path.exists():
+        raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
+    dff = np.memmap(dff_path, dtype="float32", mode="r",
+                    shape=(T, N_kept))
+    return dff, T, N_kept, mask
 
-    for ext in formats:
-        plot_heatmap(
-            dff, order, save_dir / f"cluster_heatmap.{ext}",
-            heatmap_cmap=heatmap_cmap,
-        )
+
+def _ward_linkage(dff: np.ndarray,
+                  method: str = "ward") -> np.ndarray:
+    """Ward linkage on z-scored ROI traces with Euclidean distance.
+
+    Z-scoring kills amplitude, so squared Euclidean and (1 - Pearson r)
+    rank pairs identically (``||x - y||^2 = 2T * (1 - r)``); we use
+    Euclidean because scipy's Ward implementation requires it. Ward
+    minimises within-cluster sum-of-squares and produces compact,
+    balanced clusters -- the shape lab members want.
+
+    Mirrors ``tabs.clustering.tab._ward_linkage`` but without the Tk
+    import chain. See that function's docstring for the full history.
+    """
+    dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
+    dist = pdist(dff_z.T, metric="euclidean")
+    return linkage(dist, method=method)
+
+
+# Backward-compat alias for any caller that still imports the old name.
+_correlation_linkage = _ward_linkage
+
+
+def _visual_cluster_map(Z: np.ndarray, T: float) -> dict[int, int]:
+    """Map visual cluster index (1..n, dendrogram left-to-right) to
+    the raw fcluster label. Matches Tab 6's
+    ``_compute_visual_cluster_map``.
+    """
+    info = dendrogram(Z, no_plot=True, color_threshold=T,
+                      above_threshold_color="gray")
+    leaves = list(info["leaves"])
+    labels = fcluster(Z, t=T, criterion="distance")
+    seen: list[int] = []
+    for leaf_idx in leaves:
+        lbl = int(labels[leaf_idx])
+        if lbl not in seen:
+            seen.append(lbl)
+    return {i + 1: lbl for i, lbl in enumerate(seen)}
+
+
+def run_clustering(
+    plane0: Path,
+    params: dict,
+    *,
+    figures_dir: Optional[Path] = None,
+    write_summary: bool = True,
+) -> dict:
+    """Compute a hierarchical clustering of ROI dF/F traces and
+    export the cluster ROI lists.
+
+    Parameters
+    ----------
+    plane0 : Path
+        Suite2p plane folder.
+    params : dict
+        ``prefix`` (default ``"r0p7_filtered_"``),
+        ``threshold`` (None = auto-pick via :func:`auto_choose_threshold`),
+        ``target_counts`` (default ``(4, 5)``),
+        ``palette`` (default ``"tab10"``),
+        ``method`` (default ``"ward"``),
+        ``metric`` (default ``"euclidean"``).
+    figures_dir : Path or None
+        If set, saves ``dendrogram.png`` and ``spatial_clusters.png``
+        under that directory.
+    write_summary : bool
+        If True (default), writes/updates the ``Clusters`` sheet in
+        ``<plane0>/calliope_summary.xlsx``.
+
+    Returns
+    -------
+    dict
+        ``{Z, threshold, n_clusters, labels, visual_to_label,
+        export_dir, prefix, palette, link_colors}``.
+    """
+    from . import summary_writer as cluster_summary
+
+    plane0 = Path(plane0)
+    prefix = str(params.get("prefix", "r0p7_filtered_"))
+    palette = params.get("palette", "tab10")
+    method = str(params.get("method", "ward"))
+    target_counts = tuple(params.get("target_counts", (4, 5)))
+
+    dff, T, N_kept, _mask = _load_filtered_dff(plane0, prefix)
+    dff_arr = np.asarray(dff)
+    Z = _ward_linkage(dff_arr, method=method)
+
+    threshold_param = params.get("threshold")
+    if threshold_param is None:
+        frac = auto_choose_threshold(Z, target_counts=target_counts)
+        threshold = float(frac) * float(np.max(Z[:, 2]))
+    else:
+        threshold = float(threshold_param)
+
+    labels = fcluster(Z, t=threshold, criterion="distance")
+    visual_to_label = _visual_cluster_map(Z, threshold)
+    n_clusters = len(visual_to_label)
+
+    export_dir = plane0 / f"{prefix}cluster_results"
+    if EXPORT_SUBDIR:
+        export_dir = export_dir / EXPORT_SUBDIR
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    filtered_to_suite2p: Optional[np.ndarray] = None
+    if "filtered" in prefix.split("_"):
+        mask = _load_filter_mask(plane0)
+        if mask is not None and int(mask.sum()) == len(labels):
+            filtered_to_suite2p = np.where(
+                np.asarray(mask, dtype=bool))[0].astype(int)
+
+    for stale in export_dir.glob("C*_rois.npy"):
+        stale.unlink()
+    for vid in range(1, n_clusters + 1):
+        lbl = int(visual_to_label[vid])
+        local_idx = np.where(labels == lbl)[0].astype(int)
+        if filtered_to_suite2p is not None:
+            roi_idx = filtered_to_suite2p[local_idx]
+        else:
+            roi_idx = local_idx
+        np.save(export_dir / f"C{vid}_rois.npy", roi_idx.astype(int))
+    np.save(export_dir / "linkage.npy", Z)
+    np.save(export_dir / "threshold_used.npy",
+            np.array([threshold], dtype=float))
+    (export_dir / "_indices_are_suite2p").write_text("1")
+
+    link_colors = resolve_palette(palette, n_colors=max(1, n_clusters))
+
+    if figures_dir is not None:
+        figures_dir = Path(figures_dir)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        dendro_path = figures_dir / "dendrogram.png"
+        # plot_dendrogram expects a fractional threshold (0..1).
+        zmax = float(np.max(Z[:, 2])) or 1.0
         plot_dendrogram(
-            Z,
-            save_dir / f"dendrogram.{ext}",
-            color_threshold=color_threshold,
-            palette=palette,
-            above_threshold_color=above_threshold_color,
-            n_palette_colors=n_clusters,
-            cluster_colors=cluster_colors,
-        )
-        plot_spatial(
-            Path(root),
-            order,
-            link_colors,
-            save_path=save_dir / f"spatial_dendrogram_colored_rois.{ext}",
-            prefix=prefix,
+            Z, dendro_path, color_threshold=threshold / zmax,
+            palette=palette, n_palette_colors=n_clusters,
         )
 
-    np.save(save_dir / "cluster_order.npy", order)
-    np.save(save_dir / "linkage.npy", Z)
+        spatial_path = figures_dir / "spatial_clusters.png"
+        # plot_spatial expects ``order`` = a leaf list and
+        # ``link_colors`` = per-leaf colours. Build them from the
+        # dendrogram traversal so colours line up with the
+        # dendrogram PNG.
+        info = dendrogram(Z, no_plot=True, color_threshold=threshold,
+                          above_threshold_color="gray")
+        order = list(info["leaves"])
+        leaf_colors = list(info["leaves_color_list"]) \
+            if "leaves_color_list" in info else None
+        if leaf_colors is None:
+            # Older scipy: derive from labels + palette.
+            label_to_color = {
+                int(visual_to_label[vid]): link_colors[vid - 1]
+                for vid in range(1, n_clusters + 1)
+            }
+            leaf_colors = [label_to_color[int(labels[i])] for i in order]
+        used = filtered_to_suite2p
+        try:
+            plot_spatial(
+                plane0, order=order, link_colors=leaf_colors,
+                save_path=spatial_path, used_indices=used,
+                prefix=prefix,
+                title=f"Cluster spatial map ({n_clusters} clusters)",
+            )
+        except Exception as e:
+            # Don't let figure rendering kill the whole batch step.
+            print(f"[clustering] plot_spatial failed: {e}")
+
+    if write_summary:
+        # Remap raw fcluster labels to visual ids so the Clusters
+        # sheet's cluster_id column matches the dendrogram numbering
+        # (1..n in left-to-right leaf order).
+        label_to_visual = {int(lbl): vid
+                           for vid, lbl in visual_to_label.items()}
+        visual_labels = np.array(
+            [label_to_visual.get(int(l), 0) for l in labels],
+            dtype=int,
+        )
+        cluster_colors = {vid: link_colors[vid - 1]
+                          for vid in range(1, n_clusters + 1)}
+        roi_indices = (filtered_to_suite2p.tolist()
+                       if filtered_to_suite2p is not None
+                       else None)
+        try:
+            cluster_summary.write_clusters_sheet(
+                plane0,
+                cluster_labels=visual_labels,
+                cluster_colors=cluster_colors,
+                threshold=threshold,
+                method=method,
+                metric=str(params.get("metric", "euclidean")),
+                roi_indices=roi_indices,
+            )
+        except Exception as e:
+            print(f"[clustering] write_clusters_sheet failed: {e}")
 
     return {
-        "linkage": Z,
-        "order": order,
-        "color_threshold": color_threshold,
+        "Z": Z,
+        "threshold": threshold,
         "n_clusters": n_clusters,
+        "labels": labels,
+        "visual_to_label": visual_to_label,
+        "export_dir": str(export_dir),
+        "prefix": prefix,
+        "palette": palette,
         "link_colors": link_colors,
-        "palette_colors": palette_colors,
-        "save_dir": save_dir,
     }
-
-

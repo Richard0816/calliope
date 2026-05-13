@@ -29,6 +29,9 @@ Public surface
 
 from __future__ import annotations
 
+import gc
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -38,6 +41,118 @@ import numpy as np
 from . import utils
 from . import scale as scale_mod
 from . import sparse_plus_cellpose as spc
+
+
+# Intermediate-binary cleanup. ``sparse_plus_cellpose.run`` leaves two
+# ~13 GB ``data.bin`` files behind per recording (one under
+# ``_shared_reg/`` from the register-only pass, one under
+# ``sparsery_pass/`` from the detection-only pass). ``merge_and_extract``
+# has already folded everything into ``final/`` by the time the
+# pipeline returns -- the intermediate binaries are pure dead weight.
+# Without an explicit prune, an agent that drives detection over many
+# recordings (whether through this module or Tab 3's GUI) accumulates
+# ~26 GB/recording until the save drive fills (observed at recording
+# 13 in the 2026-05-12 batch).
+#
+# This mirrors ``BatchTab._prune_scratch_tree`` but runs unconditionally
+# at the tail of every detection -- including direct-run agents and
+# headless drivers that don't route through BatchTab's row state machine.
+_PRUNE_FILE_PATTERNS: tuple[str, ...] = (
+    "**/data_raw.bin",
+    "**/data_raw_chan2.bin",
+    "**/*.tmp",
+    "**/*.lock",
+)
+_PRUNE_INTERMEDIATE_DIRS: tuple[str, ...] = (
+    "sparsery_pass",
+    "cellpose_pass",
+)
+
+
+def _dir_size(p: Path) -> int:
+    total = 0
+    try:
+        for dp, _dn, fn in os.walk(str(p)):
+            for f in fn:
+                try:
+                    total += (Path(dp) / f).stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def prune_detection_intermediates(
+    save_folder,
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[int, int]:
+    """Delete the redundant detection binaries left under
+    ``<save_folder>/detection/`` after the final extraction has been
+    folded into ``final/``.
+
+    Drops ``sparsery_pass/`` + ``cellpose_pass/`` whole, drops
+    ``_shared_reg/suite2p/plane0/data.bin`` (~13 GB; regeneratable
+    from the shifted TIFF in ~5 min for a manual re-detect), and
+    drops stray ``data_raw*.bin`` / ``*.tmp`` / ``*.lock`` artefacts.
+    Keeps ``_shared_reg/ops.npy`` + the rest of the registration
+    metadata for audit, and keeps everything under ``final/``.
+
+    Returns ``(n_paths, bytes_freed)`` for logging. Errors on
+    individual paths are caught + reported via ``progress_cb`` so a
+    single file lock doesn't abort the whole cleanup.
+    """
+    det = Path(save_folder) / "detection"
+    if not det.is_dir():
+        return 0, 0
+    # Release any open suite2p memmap handles so Windows lets unlink
+    # / rmtree succeed on the first pass.
+    gc.collect()
+
+    n_paths = 0
+    bytes_freed = 0
+
+    for pattern in _PRUNE_FILE_PATTERNS:
+        for f in det.glob(pattern):
+            try:
+                if f.is_file() or f.is_symlink():
+                    sz = f.stat().st_size if f.is_file() else 0
+                    f.unlink()
+                    n_paths += 1
+                    bytes_freed += sz
+            except OSError:
+                continue
+
+    for sub in _PRUNE_INTERMEDIATE_DIRS:
+        p = det / sub
+        if not p.is_dir():
+            continue
+        sz = _dir_size(p)
+        shutil.rmtree(p, ignore_errors=True)
+        if not p.exists():
+            n_paths += 1
+            bytes_freed += sz
+
+    shared_bin = det / "_shared_reg" / "suite2p" / "plane0" / "data.bin"
+    if shared_bin.is_file():
+        try:
+            sz = shared_bin.stat().st_size
+            shared_bin.unlink()
+            n_paths += 1
+            bytes_freed += sz
+        except OSError as e:
+            if progress_cb is not None:
+                progress_cb(
+                    f"[detection] cleanup: could not remove "
+                    f"{shared_bin}: {e}")
+
+    if progress_cb is not None and n_paths > 0:
+        progress_cb(
+            f"[detection] pruned {n_paths} intermediate path"
+            f"{'' if n_paths == 1 else 's'} "
+            f"({bytes_freed / 1e9:.2f} GB freed)")
+    return n_paths, bytes_freed
 
 
 def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
@@ -397,6 +512,8 @@ def run_detection(
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")
     compute_filtered_dff(plane0)
+
+    prune_detection_intermediates(save_folder, progress_cb=progress_cb)
 
     figs: list[str] = []
     if figures_dir is not None:

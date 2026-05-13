@@ -3,10 +3,11 @@
 **Goal.** Convert one or more raw multi-page TIFFs into:
 - a uint16, non-negative TIFF (Suite2p's expected format),
 - a `mean.npy` time-average,
-- a `qc.gif` downsampled animated preview,
-- a `blobs.npy` list of candidate cell-body locations on the mean image.
+- a `qc.gif` downsampled animated preview.
 
 All outputs land under `<data_root>/<recording_name>/`.
+
+History: an earlier `detect_blobs_on_mean` step wrote `blobs.npy` (LoG soma candidates) for Tab 2 to overlay on the mean image. Removed 2026-05-12 — nothing downstream consumed `blobs.npy`, and skipping the LoG pass saves a `skimage`/`scipy.ndimage` import cost on every preprocess.
 
 ---
 
@@ -23,9 +24,9 @@ If multiple TIFFs are selected, they are treated as **one continuous recording**
 
 ## 2. Pipeline steps
 
-The driver function for a single TIFF is `preprocess_tiff` in `core/preprocessing.py`. For groups it's `preprocess_tiff_group`. Both run the same four logical steps; the group version replaces step 1 with a two-pass scan-then-write, and step 3 sums frame-counts across files for the mean.
+The driver function for a single TIFF is `preprocess_tiff` in `core/preprocessing.py`. For groups it's `preprocess_tiff_group`. Both run the same three logical steps; the group version replaces step 1 with a two-pass scan-then-write, and step 2 sums frame-counts across files for the mean.
 
-> **Headless entry point.** `core/preprocess_run.py:run_preprocess(src_tiffs, data_root, params, *, recording_name=None, figures_dir=None, progress_cb=None)` picks single vs grouped automatically and copies the QC GIF into `figures_dir` if provided. Tab 0's batch pipeline calls this; the interactive Tab 1 still calls `preprocess_tiff{,_group}` directly.
+> **Headless entry point.** `core/preprocessing.py:run_preprocess(src_tiffs, data_root, params, *, recording_name=None, figures_dir=None, progress_cb=None)` picks single vs grouped automatically and copies the QC GIF into `figures_dir` if provided. Tab 0's batch pipeline calls this; the interactive Tab 1 still calls `preprocess_tiff{,_group}` directly.
 
 ### Step 1 — Shift to non-negative uint16
 
@@ -61,30 +62,7 @@ Group: stream-sum each file's `m.sum(axis=0, dtype=np.float64)` into a running 2
 
 ---
 
-### Step 3 — Preview blob detection
-
-`detect_blobs_on_mean(mean_img, soma_diameter_px=12, scale_tol=0.5, min_contrast=0.10, min_area_px=25, max_area_px=400)`:
-
-1. **Background subtract.** Apply a 2D **median filter** with radius `bg_radius = max(3, round(soma_diameter_px))` to estimate the slowly-varying background, then subtract: `hp = clip(img − bg_local, 0, ∞)`. This removes large-scale brightness gradients (uneven illumination, vignetting) so the LoG is sensitive only to local bumps.
-2. **Robust normalize.** `norm = clip(hp / quantile(hp, 0.995), 0, 1)`. The 99.5th percentile is more robust than `max` to a few hot pixels.
-3. **Laplacian-of-Gaussian blob detection** (`skimage.feature.blob_log`) with sigma range:
-   - `r = soma_diameter_px / 2`
-   - `min_sigma = r·(1 − scale_tol) / √2`
-   - `max_sigma = r·(1 + scale_tol) / √2`
-   - `num_sigma = 6` evenly-spaced sigmas
-   - `threshold = min_contrast` after normalisation
-   - `overlap = 0.5` (drop blobs that overlap >50% with another)
-4. **Area filter.** For each `(y, x, σ)`, `radius = σ·√2`, `area = π·radius²`. Keep only blobs with `min_area_px ≤ area ≤ max_area_px` (default 25–400 px² ≈ soma-sized).
-
-Save as `blobs.npy` with shape `(N, 3)` columns `[y, x, radius]`.
-
-The `√2` factor in the sigma↔radius conversion comes from the LoG's mathematical definition: a blob of radius `r` is detected most strongly at a Gaussian `σ = r/√2`.
-
-**This is not the final ROI list.** It's a sanity check shown in Tab 2.
-
----
-
-### Step 4 — QC GIF
+### Step 3 — QC GIF
 
 `make_qc_gif(movie, gif_path, downsample_t=4, max_size_px=512, playback_fps=15, clip_low=1, clip_high=99.5)`:
 
@@ -104,22 +82,20 @@ For groups, the per-file downsampled frames are concatenated before encoding, wi
 ├── shifted_<orig>.tif        ← single-file path
 │   or 000_shifted_<orig>.tif, 001_shifted_<orig>.tif, ...   ← group path
 ├── mean.npy                  ← float32, shape (Y, X)
-├── blobs.npy                 ← float32, shape (N_blobs, 3); columns y, x, radius
 └── qc.gif
 ```
 
 The `PreprocessResult` dataclass that gets passed to other tabs records:
-- `out_dir`, `shifted_tiff`, `qc_gif`, `mean_image_path`, `blobs_path`
+- `out_dir`, `shifted_tiff`, `qc_gif`, `mean_image_path`
 - `n_frames` (group total; `-1` when loaded from disk)
 - `shape_yx`
-- `n_blobs`
 
 ---
 
 ## 4. Discovery helpers
 
 - `list_tiffs(folder, max_depth=0)` — BFS over the working directory, returns sorted `Path`s of `.tif/.tiff`. Default `max_depth=0` only scans the top level; the GUI's spinbox lets the user dig N levels deep.
-- `load_existing_preprocess(out_dir)` — reads `shifted_*.tif`, `mean.npy`, `blobs.npy`, `qc.gif` from disk; returns a `PreprocessResult` with `n_frames=-1` (unknown without reopening). Used by the "load existing" code paths in Tabs 1 and 2.
+- `load_existing_preprocess(out_dir)` — reads `shifted_*.tif`, `mean.npy`, `qc.gif` from disk; returns a `PreprocessResult` with `n_frames=-1` (unknown without reopening). Used by the "load existing" code paths in Tabs 1 and 2.
 
 ---
 
@@ -127,11 +103,6 @@ The `PreprocessResult` dataclass that gets passed to other tabs records:
 
 | Param | Default | Effect |
 |---|---|---|
-| `soma_diameter_px` | 12.0 | Expected soma diameter in pixels; sets LoG sigma range. |
-| `scale_tol` | 0.5 | Sigma range = `r·(1 ± scale_tol)/√2`. |
-| `min_contrast` | 0.10 | LoG threshold after percentile normalisation. |
-| `min_area_px` | 25 | Reject blobs smaller than this. |
-| `max_area_px` | 400 | Reject blobs larger than this. |
 | `downsample_t` | 4 | Keep every Nth frame for the QC GIF. |
 | `max_size_px` | 512 | Long-edge cap for GIF spatial size. |
 | `playback_fps` | 15 | GIF playback speed. |
@@ -146,7 +117,6 @@ To reproduce Tab 1 from scratch you need:
 1. `tifffile` to read multi-page TIFFs page-by-page (`TiffFile.pages`, `TiffWriter`, `bigtiff=True`).
 2. `numpy` for the shift arithmetic and mean accumulation.
 3. `Pillow` (`PIL.Image`) for GIF encoding.
-4. `scipy.ndimage.median_filter` and `skimage.feature.blob_log` for the blob preview.
-5. The decision tree: try in-RAM shift, on `MemoryError` fall back to two-pass streaming.
-6. The group invariant: one shared shift constant across all files, computed before any writes begin.
-7. The output filename conventions (`shifted_<orig>.tif` or `NNN_shifted_<orig>.tif`) — Suite2p's `natsort` depends on the leading numeric prefix to read multi-file groups in order.
+4. The decision tree: try in-RAM shift, on `MemoryError` fall back to two-pass streaming.
+5. The group invariant: one shared shift constant across all files, computed before any writes begin.
+6. The output filename conventions (`shifted_<orig>.tif` or `NNN_shifted_<orig>.tif`) — Suite2p's `natsort` depends on the leading numeric prefix to read multi-file groups in order.

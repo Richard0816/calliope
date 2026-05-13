@@ -19,12 +19,10 @@ GPU box.
 
 Usage
 -----
-    python -m cellfilter.predict
-        --- predicts for every recording folder found under
-            DATA_ROOT\\{Cx,Hip}\\
-
-    python -m cellfilter.predict --rec 2024-07-01_00018
-        --- predicts for a specific recording
+    python -m calliope.core.cellfilter.predict --plane0 PATH [PATH ...]
+        --- predicts for the listed plane0 directories. Multiple
+            paths are batched in one Python process so the model
+            checkpoint is loaded only once.
 
 Accepts full traces at inference (no random crop).
 """
@@ -42,7 +40,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 # ``argparse`` is the stdlib command-line parser. Roughly the
 # equivalent of R's ``optparse::OptionParser``.
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +48,7 @@ import torch
 from .. import utils
 
 from . import config as C
-from .dataset import _RecordingCache, find_recording_root
+from .dataset import _RecordingCache
 from .model import CellFilter
 
 
@@ -59,6 +56,19 @@ from .model import CellFilter
 def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
                       plane0: Path | None = None) -> Path:
     """Score every ROI in one recording and write the keep-mask.
+
+    Parameters
+    ----------
+    rec_id
+        Human-readable recording id (used only for the kept-count
+        log line at the end). Pass an empty string if you don't
+        have one; ``infer_recording_id(plane0)`` can supply it.
+    model, device
+        Loaded ``CellFilter`` and target torch device.
+    plane0
+        Suite2p plane0 folder for the recording. Required as of
+        2026-05-12; the old ``DATA_ROOT`` resolution path was
+        removed when curation labels moved in-project.
 
     Steps:
         1. Open a ``_RecordingCache`` (lazy-loads mean image, max
@@ -77,7 +87,11 @@ def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
     autograd for the whole call -- saves memory and time at
     inference.
     """
-    rec = _RecordingCache(rec_id, plane0=plane0)
+    if plane0 is None:
+        raise ValueError(
+            "predict_recording: plane0 is required (DATA_ROOT-based "
+            "recording id resolution was removed 2026-05-12).")
+    rec = _RecordingCache(Path(plane0))
     N = rec.N
 
     probs = np.zeros(N, dtype=np.float32)
@@ -108,35 +122,30 @@ def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
     return out_prob
 
 
-def list_all_recordings(data_root: Path = C.DATA_ROOT) -> list[str]:
-    """Walk DATA_ROOT/{Cx, Hip}/ and return every recording id whose
-    Suite2p output is on disk.
-
-    "Recording id" = the folder name; we treat anything containing
-    ``suite2p/plane0/stat.npy`` as a candidate. Sorted alphabetically
-    so the batch order is reproducible.
+def load_model_from_checkpoint(ckpt_path: Path,
+                               device: torch.device) -> CellFilter:
+    """Build a fresh ``CellFilter``, restore the saved weights, and
+    switch to eval mode. Shared between the CLI here and the
+    standalone curation app which also needs to score every ROI.
     """
-    rec_ids = []
-    for region in ("Cx", "Hip"):
-        region_dir = data_root / region
-        if not region_dir.exists():
-            continue
-        for p in region_dir.iterdir():
-            if p.is_dir() and (p / "suite2p" / "plane0" / "stat.npy").exists():
-                rec_ids.append(p.name)
-    return sorted(rec_ids)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoint at {ckpt_path}. Train first.")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model = CellFilter().to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model
 
 
 def main():
-    """CLI entry: predict cell-mask for one recording or every recording.
+    """CLI entry: predict cell-mask for one recording (or many).
 
     Argument structure (parsed via ``argparse``)
     -------------------------------------------
-    --rec ID
-        Run on a single recording id. Mutually informative with --plane0.
-    --plane0 PATH
-        Direct path to a ``suite2p/plane0`` folder; bypasses the
-        ``DATA_ROOT/{Cx,Hip}/<rec_id>`` resolution above.
+    --plane0 PATH [PATH ...]
+        One or more ``suite2p/plane0`` directories to score.
+        Required.
     --ckpt PATH
         Override checkpoint path (defaults to
         ``CHECKPOINT_DIR/best.pt``).
@@ -145,75 +154,44 @@ def main():
     -----
     1. Resolve the checkpoint path.
     2. Pick the device (CUDA when available, else CPU).
-    3. ``torch.load`` the checkpoint, build a fresh ``CellFilter``,
-       restore weights via ``load_state_dict``, switch to eval mode.
-    4. Either run on the explicit ``--plane0`` path, the single
-       ``--rec`` id, or every recording under DATA_ROOT.
-    5. Per-recording errors are caught individually so a single
-       missing memmap doesn't kill a batch run.
+    3. Build the model + load weights via ``load_model_from_checkpoint``.
+    4. For each ``--plane0`` argument, call ``predict_recording``.
+       Per-recording errors are caught individually so a single
+       missing memmap doesn't kill the batch.
+
+    History: pre-2026-05-12 this CLI also accepted ``--rec ID`` and
+    a no-arg "predict everything under DATA_ROOT" mode. Both were
+    removed when ``DATA_ROOT`` came out of the cellfilter config --
+    the canonical input is now an explicit plane0 path.
     """
-    # ``argparse`` is the standard CLI parser. ``add_argument`` is
-    # the equivalent of declaring an option in R's ``optparse``.
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rec", type=str, default=None,
-                    help="Single recording ID (e.g. 2024-07-01_00018). "
-                         "If omitted, predicts every recording under DATA_ROOT.")
-    ap.add_argument("--plane0", type=str, default=None,
-                    help="Direct path to a suite2p/plane0 directory. Bypasses "
-                         "DATA_ROOT/{Cx,Hip}/<rec_id> resolution.")
-    ap.add_argument("--ckpt", type=str, default=None,
-                    help="Path to checkpoint. Defaults to CHECKPOINT_DIR/best.pt")
+    ap.add_argument(
+        "--plane0", type=str, nargs="+", required=True,
+        help="One or more suite2p/plane0 directories to score.")
+    ap.add_argument(
+        "--ckpt", type=str, default=None,
+        help="Path to checkpoint. Defaults to CHECKPOINT_DIR/best.pt")
     args = ap.parse_args()
 
     ckpt_path = Path(args.ckpt) if args.ckpt else (C.CHECKPOINT_DIR / "best.pt")
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"No checkpoint at {ckpt_path}. Train first.")
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}   ckpt: {ckpt_path}")
+    model = load_model_from_checkpoint(ckpt_path, device)
 
-    # ``torch.load`` reads the checkpoint dict (model state +
-    # metadata) we wrote in train.py. ``map_location`` rehomes
-    # tensors saved on a different device.
-    # ``weights_only=False`` -> allow non-tensor entries (epoch
-    # number, val AUROC, etc.) in the checkpoint dict.
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = CellFilter().to(device)
-    # ``load_state_dict`` overwrites the model's parameters with the
-    # saved values.
-    model.load_state_dict(ckpt["model"])
-    # ``eval()`` flips the model into inference mode (disables
-    # dropout, freezes BatchNorm running stats).
-    model.eval()
-
-    # Branch 1: caller pointed us at an explicit plane0 path.
-    if args.plane0:
-        plane0 = Path(args.plane0)
+    from .. import utils as _u
+    for plane0_str in args.plane0:
+        plane0 = Path(plane0_str)
         if not (plane0 / "stat.npy").exists():
-            raise FileNotFoundError(f"No stat.npy in {plane0}")
-        # Resolve the recording id robustly: the new
-        # sparse_plus_cellpose layout puts plane0 deeper than
-        # ``<rec>/suite2p/plane0`` so the legacy two-parents-up
-        # walk lands on ``final`` instead of the recording id.
-        from .. import utils as _u
-        rec_id = args.rec or _u.infer_recording_id(plane0)
-        predict_recording(rec_id, model, device, plane0=plane0)
-        return
-
-    # Branch 2: --rec for one recording, otherwise scan DATA_ROOT.
-    if args.rec:
-        rec_ids = [args.rec]
-    else:
-        rec_ids = list_all_recordings()
-        print(f"Found {len(rec_ids)} recordings.")
-
-    for rid in rec_ids:
+            print(f"[skip] {plane0}: no stat.npy")
+            continue
         try:
-            predict_recording(rid, model, device)
+            rec_id = _u.infer_recording_id(plane0)
+        except Exception:
+            rec_id = plane0.parent.name
+        try:
+            predict_recording(rec_id, model, device, plane0=plane0)
         except Exception as ex:
-            # Per-recording try/except: don't abort the whole batch
-            # because one recording is missing a memmap.
-            print(f"[skip] {rid}: {ex}")
+            print(f"[skip] {plane0}: {ex}")
 
 
 if __name__ == "__main__":

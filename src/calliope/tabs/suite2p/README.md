@@ -211,6 +211,20 @@ Also writes `r0p7_cell_mask_bool.npy` (a copy of the keep mask under the legacy 
 
 If the **Also write filtered dF/F as CSV** checkbox is on, `_write_filtered_dff_csv` mirrors the memmap into `r0p7_filtered_dff.csv` with one column per kept ROI, headed `roi_<i>` (the Suite2p index), in 4096-frame chunks. The frame index is preserved as the CSV index.
 
+### Step 5 — Intermediate-binary cleanup
+
+The shared helper `core.detection_run.prune_detection_intermediates(save_folder, *, progress_cb=None)` runs immediately after `_run_filtered_dff` and reclaims the ~26 GB/recording of intermediate suite2p binaries that the detection passes leave behind:
+
+- drops `<save>/detection/sparsery_pass/` (detection-only pass binary + per-pass `F/Fneu/spks/stat` already folded into `final/`),
+- drops `<save>/detection/cellpose_pass/` (defensive — same policy as the sparsery pass),
+- drops `<save>/detection/_shared_reg/suite2p/plane0/data.bin` (registered-movie binary; regeneratable from the shifted TIFF in ~5 min for a manual re-detect),
+- drops `data_raw*.bin` / `*.tmp` / `*.lock` anywhere under `detection/`,
+- **keeps** `_shared_reg/ops.npy` + the rest of the registration metadata for audit, and **keeps** everything under `final/`.
+
+The same helper is called from `core.detection_run.run_detection` so headless drivers (`batch_pipeline.run_recording`, any external agent that calls `run_detection` in a loop) get the cleanup unconditionally — not just GUI runs. This mirrors `BatchTab._prune_scratch_tree`'s policy but runs at the tail of every detection. Without it, an agent that runs detection over many recordings will fill the save drive (12 recordings ≈ 312 GB; observed disk-full at recording 13 in the 2026-05-12 batch).
+
+`gc.collect()` runs before the prune so any lingering suite2p `np.memmap` references are released and Windows lets `unlink`/`rmtree` succeed on the first pass. Errors on individual paths are caught and reported via `progress_cb` so a single file lock doesn't abort the whole cleanup.
+
 ---
 
 ## 3. Outputs (in `plane0/`)
@@ -238,8 +252,27 @@ A summary workbook (`<rec>_summary.xlsx`) with an ROIs sheet is also written via
 ## 4. UI panels
 
 1. **Suite2p console** — captures stdout/stderr from the worker (`QueueWriter` + `contextlib.redirect_stdout`).
-2. **Detected ROIs (raw Suite2p output)** — overlays a `nipy_spectral` label image on a chosen background (`meanImgE` by default; user can switch to `meanImg`, `max_proj`, `Vcorr`, `refImg`, `meanImg_chan2`).
+2. **Detected ROIs (raw Suite2p output)** — overlays a `nipy_spectral` label image on a chosen background (`meanImgE` by default; user can switch to `meanImg`, `max_proj`, `Vcorr`, `refImg`, `meanImg_chan2`). **Click any ROI** to open the curation popout (see §6).
 3. **After cell-filter** — same background; if `predicted_cell_prob.npy` is present, overlays a `viridis` heatmap of `prob ∈ [0.5, 1.0]` so you can see *how confident* the classifier is per ROI. Otherwise overlays the keep set in `nipy_spectral`.
+
+---
+
+## 6. Curation popout (click an ROI on panel 2)
+
+Module: `tabs/suite2p/curation_popout.py`. Mirrors the standalone reference UI in `Calcium_imaging_suite2p/roi_curation_app.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
+
+Panels:
+1. Mean image with a yellow locator box around the clicked ROI's bbox.
+2. Max projection with the same locator box (max projection is reconstructed from `ops['max_proj']` padded back to full frame using `ops['yrange']` / `ops['xrange']`).
+3. Max projection + ROI footprint scatter overlay (red).
+4. ROI footprint alone (axis-equal scatter for shape inspection).
+5. ΔF/F trace from `r0p7_dff.memmap.float32` (full all-ROI memmap, not the filtered one — figure 2 panel cell rejects are still inspectable).
+
+Controls:
+- **Cell (1)** / **Not a cell (0)** flip iscell.npy in place and append to `cellfilter.config.LABELS_CSV` (default `F:\roi_curation.csv`) with columns `recording_ID, ROI_number, user_defined_cell` so the next training run picks up the new labels. Tab 3's panels 2 + 3 repaint immediately to reflect the new keep set.
+- **Retrain cell filter** stays disabled until the user has flipped at least one ROI's classification this session. On click it spawns a worker thread that runs `cellfilter.train.main()` (synchronous, ~40 epochs); the GUI stays responsive but the popout's flip buttons stay enabled (the trainer reads the CSV at start, so further mid-training flips land in the *next* round).
+
+Keybinds: `1` = cell, `0` = not a cell, `Esc` = close.
 
 ---
 

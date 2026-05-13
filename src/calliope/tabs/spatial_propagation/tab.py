@@ -63,7 +63,6 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Circle
 
 from .logic import spatial as spatial_helpers
 from ...core import utils as core_utils
@@ -131,6 +130,15 @@ class SpatialPropagationTab(ttk.Frame):
             self, text="Spatial propagation (events from tab 5)",
             padding=8)
         header.pack(fill="x", pady=(0, 6))
+
+        # Persistent recording header so the user always knows which
+        # plane0 the activation-order maps + monotonicity panels
+        # come from. Updated by ``_ingest_results`` when Tab 5
+        # publishes a new event_results dict.
+        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(0, 4))
+        self.recording_var = tk.StringVar(value="No recording loaded.")
+        ttk.Label(rec_row, textvariable=self.recording_var,
+                  font=("", 10, "italic")).pack(side="left")
 
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         self.status_var = tk.StringVar(
@@ -233,46 +241,33 @@ class SpatialPropagationTab(ttk.Frame):
         self.canvas_map_arrows.get_tk_widget().pack(
             fill="both", expand=True)
 
-        # Middle row: vectors-only panel, centred in a 1:2:1 inner-grid
-        # so it sits horizontally aligned with the top pair instead of
-        # stretching to the full window width.
-        body.rowconfigure(2, weight=1)
-        middle = ttk.Frame(body)
-        middle.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        middle.rowconfigure(0, weight=1)
-        middle.columnconfigure(0, weight=1)
-        middle.columnconfigure(1, weight=2)
-        middle.columnconfigure(2, weight=1)
-
-        f_vec = ttk.LabelFrame(
-            middle, text="Frame-to-frame propagation vectors  "
-                         "(circle radius = 2D std of contributing ROIs)",
-            padding=4)
-        f_vec.grid(row=0, column=1, sticky="nsew")
-        self.fig_vec = plt.Figure(figsize=(5, 5), tight_layout=True)
-        self.ax_vec = self.fig_vec.add_subplot(111)
-        self.ax_vec.set_axis_off()
-        self.canvas_vec = FigureCanvasTkAgg(self.fig_vec, master=f_vec)
-        self.toolbar_vec = attach_fig_toolbar(
-            self.canvas_vec, f_vec, data_basename="coact_vectors")
-        self.canvas_vec.get_tk_widget().pack(fill="both", expand=True)
-
-        # Bottom row: per-frame violin of pairwise distance, every
-        # active ROI used as a seed (except those in the last active
-        # frame).
+        # Bottom row: directional monotonicity test. Replaces the
+        # previous per-Δframe pairwise-distance violin (which described
+        # spread but not direction). The new panel asks "is there a
+        # monotone propagation axis at all, and how strong is it?" via
+        # Spearman ρ on a planar projection of ROI positions vs
+        # activation times, with a shuffle null for significance.
+        #
+        # The middle "vectors-only" panel (frame-centroid circles with
+        # 2D-std radii + arrows on a blank FOV) was dropped on
+        # 2026-05-10: its information is already conveyed by the
+        # white-arrow overlay on the top-right activation-order map,
+        # and the new monotonicity test below is the more useful
+        # quantitative companion than another spatial layout.
+        body.rowconfigure(1, weight=1)
         f_dist = ttk.LabelFrame(
-            body, text="Pairwise distance vs Δframe  "
-                       "(every active ROI as seed; last-frame ROIs "
-                       "excluded)",
+            body, text="Directional monotonicity  "
+                       "(Spearman ρ on projected position vs activation time, "
+                       "shuffle null for p-value)",
             padding=4)
-        f_dist.grid(row=2, column=0, columnspan=2, sticky="nsew",
+        f_dist.grid(row=1, column=0, columnspan=2, sticky="nsew",
                     pady=(4, 0))
-        self.fig_dist = plt.Figure(figsize=(8, 4), tight_layout=True)
+        self.fig_dist = plt.Figure(figsize=(8, 4.2), tight_layout=True)
         self.ax_dist = self.fig_dist.add_subplot(111)
         self.ax_dist.set_axis_off()
         self.canvas_dist = FigureCanvasTkAgg(self.fig_dist, master=f_dist)
         self.toolbar_dist = attach_fig_toolbar(
-            self.canvas_dist, f_dist, data_basename="dist_vs_delta_t")
+            self.canvas_dist, f_dist, data_basename="monotonicity")
         self.canvas_dist.get_tk_widget().pack(fill="both", expand=True)
 
     # -- Tab 5 ingestion ----------------------------------------------------
@@ -299,6 +294,15 @@ class SpatialPropagationTab(ttk.Frame):
         first_time = results.get("first_time")
         kept_idx = results.get("kept_idx")
         fps = results.get("fps")
+
+        if plane0 is not None:
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(plane0)
+            except Exception:
+                rec_id = Path(plane0).parent.name
+            self.recording_var.set(
+                f"Recording: {rec_id}    plane0: {plane0}")
 
         if (plane0 is None or ev_windows is None
                 or A is None or first_time is None
@@ -361,7 +365,6 @@ class SpatialPropagationTab(ttk.Frame):
             for fig, canvas in (
                     (self.fig_map_plain, self.canvas_map_plain),
                     (self.fig_map_arrows, self.canvas_map_arrows),
-                    (self.fig_vec, self.canvas_vec),
                     (self.fig_dist, self.canvas_dist)):
                 fig.clear()
                 ax = fig.add_subplot(111)
@@ -676,90 +679,13 @@ class SpatialPropagationTab(ttk.Frame):
         _paint_order(self.fig_map_arrows, "ax_map_arrows",
                      title_top_right, with_arrows=True)
 
-        # ---- Bottom panel: vectors-only with std circles ----
-        # Suite2p y=0 is the TOP of the FOV (image convention). Set
-        # the y-limit reversed so the on-screen orientation matches
-        # the order-map panels above + suite2p's own GUI (top of FOV
-        # rendered at the top of the plot, ticks read 0->Ly downward).
-        self.fig_vec.clear()
-        self.ax_vec = self.fig_vec.add_subplot(111)
-        self.ax_vec.set_aspect("equal", adjustable="box")
-        self.ax_vec.set_xlim(0, fov_w)
-        self.ax_vec.set_ylim(fov_h, 0)
-        self.ax_vec.set_xlabel(xlabel)
-        self.ax_vec.set_ylabel(ylabel)
-        self.ax_vec.set_title(
-            f"Frame-to-frame propagation  -  "
-            f"{len(frame_groups)} active frame"
-            f"{'' if len(frame_groups) == 1 else 's'}",
-            fontsize=10)
-        self.ax_vec.grid(True, color="0.92", linewidth=0.5)
-        self.ax_vec.set_axisbelow(True)
-
-        if frame_groups:
-            n_groups = len(frame_groups)
-            cmap = spatial_helpers.CYAN_TO_RED
-            # The data ``sigma_xy = sqrt(var_x + var_y)`` is roughly
-            # 1.41 standard deviations; we render only a fraction of
-            # that as the circle radius and cap it so a single diffuse
-            # frame can't blot out the FOV.
-            sigma_radius_frac = 0.20
-            min_r = 0.004 * max(fov_w, fov_h)
-            max_r = 0.040 * max(fov_w, fov_h)
-            # Colour-map by absolute frame index so the colorbar ticks
-            # are meaningful even when active frames are non-contiguous.
-            f_min = frame_groups[0]["frame"]
-            f_max = frame_groups[-1]["frame"]
-            f_span = max(f_max - f_min, 1)
-            for g in frame_groups:
-                cx = g["cx"] * scale
-                cy = g["cy"] * scale
-                r = g["sigma_xy"] * scale * sigma_radius_frac
-                r = max(min_r, min(r, max_r))
-                t = (g["frame"] - f_min) / f_span
-                color = cmap(t)
-                self.ax_vec.add_patch(Circle(
-                    (cx, cy), r, facecolor=color, edgecolor="black",
-                    alpha=0.65, linewidth=0.7, zorder=3))
-            for i in range(n_groups - 1):
-                x0, y0 = cxs[i], cys[i]
-                x1, y1 = cxs[i + 1], cys[i + 1]
-                if abs(x1 - x0) + abs(y1 - y0) < 1e-9:
-                    continue
-                self.ax_vec.annotate(
-                    "", xy=(x1, y1), xytext=(x0, y0),
-                    arrowprops=dict(
-                        arrowstyle="->", color="black",
-                        lw=1.4, shrinkA=4, shrinkB=4,
-                        mutation_scale=12),
-                    zorder=4)
-            # Scale bar: same colormap as the circles, ticked with the
-            # actual frame indices spanned by this event.
-            from matplotlib import cm as _cm
-            from matplotlib.colors import Normalize as _Normalize
-            sm = _cm.ScalarMappable(
-                norm=_Normalize(vmin=f_min, vmax=max(f_max, f_min + 1)),
-                cmap=cmap)
-            sm.set_array([])
-            cbar = self.fig_vec.colorbar(
-                sm, ax=self.ax_vec, fraction=0.04, pad=0.02)
-            if f_max > f_min:
-                ticks = sorted({f_min,
-                                int(round((f_min + f_max) / 2)),
-                                f_max})
-            else:
-                ticks = [f_min]
-            cbar.set_ticks(ticks)
-            cbar.ax.set_yticklabels([str(t) for t in ticks])
-            cbar.set_label("frame")
-        else:
-            self.ax_vec.text(
-                0.5, 0.5, "no per-frame activations",
-                ha="center", va="center",
-                transform=self.ax_vec.transAxes)
-
-        # ---- Bottom-most panel: every-ROI-as-seed violin per Δframe ----
-        self._render_dist_panel(
+        # ---- Bottom panel: directional monotonicity test ----
+        # The pre-2026-05-10 layout had a middle "vectors-only" panel
+        # here (frame-centroid circles with 2D-std radii + arrows on a
+        # blank FOV). It was dropped because the top-right map already
+        # carries the same arrow trace overlaid on the actual cell
+        # layout — having a blank-canvas version below it was redundant.
+        self._render_monotonicity_panel(
             first_col, active_col, data, ev_idx, fps, scale,
             xlabel_unit=("µm" if pix_to_um is not None else "px"))
 
@@ -768,147 +694,181 @@ class SpatialPropagationTab(ttk.Frame):
             f"({t0:.2f}-{t1:.2f} s, {n_active}/{n_total} ROIs)")
         self.canvas_map_plain.draw_idle()
         self.canvas_map_arrows.draw_idle()
-        self.canvas_vec.draw_idle()
         self.canvas_dist.draw_idle()
 
-    def _render_dist_panel(self, first_col, active_col, data, ev_idx,
-                           fps, scale, xlabel_unit) -> None:
-        """One violin per Δframe, aggregated over every active ROI used
-        as a seed.
+    def _render_monotonicity_panel(self, first_col, active_col, data,
+                                   ev_idx, fps, scale, xlabel_unit) -> None:
+        """Directional-monotonicity panel.
 
-        Seed sweep covers every active frame *up to the second-last*
-        (ROIs in the last active frame are excluded as seeds, since
-        they would only contribute same-frame, Δframe=0 distances).
-        For each seed s with frame ``f_s`` and every *other* active ROI
-        ``o`` whose frame satisfies ``f_o >= f_s``, we bin
-        ``dist(s, o)`` at ``Δframe = f_o - f_s``. So a 5-ROI first
-        frame contributes its 4 within-frame distances per seed
-        (Δframe=0) plus all later frames at Δframe>0, a 10-ROI second
-        frame likewise contributes its 9 within-frame distances per
-        seed (with frame 1 cropped out) plus everything after, etc. --
-        the violin at each Δframe is the union of those distance
-        distributions across every valid seed.
+        Tests whether the active ROIs' activation times propagate in a
+        coherent direction:
 
-        Inspired by ``plot_event_distance_vs_delta_t.py`` from the
-        legacy Calcium_imaging_suite2p worktree, but generalised to use
-        every ROI as a seed instead of just the earliest-firing one.
+        1. Sweep θ ∈ [0, 2π). Project each ROI's (x, y) onto
+           ``u(θ) = (cos θ, sin θ)`` to get a 1-D coordinate
+           ``s_i(θ)``.
+        2. Compute Spearman's rank correlation
+           ``ρ(θ) = SpearmanCorr(s_i(θ), t_i)`` per θ. Spearman is
+           rank-only, so any monotone propagation along ``u(θ)`` reads
+           as |ρ| → 1; the sign tells us which way along that axis.
+        3. ``ρ_obs = ρ(θ*)`` where θ* maximises ρ. Magnitude is the
+           monotonicity strength; near 0 means no direction, near 1
+           means perfectly monotone.
+        4. Permutation test for significance: at θ*, shuffle the
+           activation times across cells ``N`` times and recompute
+           ρ_k. The fraction of shuffles with ``ρ_k >= ρ_obs`` is the
+           empirical p-value.
+
+        The panel is three subplots:
+
+        * **(a)** Scatter of ROI positions coloured by activation
+          time; arrow along ``u(θ*)`` scaled by ``ρ_obs`` shows the
+          dominant axis (no arrow when ρ_obs ≤ 0).
+        * **(b)** ``ρ(θ)`` curve with the maximum marked.
+        * **(c)** Permutation null histogram with ``ρ_obs`` overlaid
+          as a vertical line and the p-value in the title.
+
+        Heavy lifting (Spearman sweep + shuffle null) lives in
+        :func:`spatial_helpers.directional_monotonicity_spearman` so
+        a headless caller could reuse it without dragging in the GUI.
         """
         self.fig_dist.clear()
-        self.ax_dist = self.fig_dist.add_subplot(111)
 
         sel = active_col & ~np.isnan(first_col)
-        if not np.any(sel) or not fps:
+        if not np.any(sel):
+            self.ax_dist = self.fig_dist.add_subplot(111)
             self.ax_dist.set_axis_off()
             self.ax_dist.text(
-                0.5, 0.5,
-                "no participating ROIs" if not np.any(sel)
-                else "fps unknown; cannot bin onsets into frames",
+                0.5, 0.5, "no participating ROIs",
                 ha="center", va="center",
                 transform=self.ax_dist.transAxes)
             return
 
         roi_local = np.where(sel)[0]
         n = int(roi_local.size)
-        if n < 2:
+        if n < 3:
+            self.ax_dist = self.fig_dist.add_subplot(111)
             self.ax_dist.set_axis_off()
             self.ax_dist.text(
                 0.5, 0.5,
-                "need at least 2 active ROIs to form pairs",
+                "need >= 3 active ROIs for monotonicity test",
                 ha="center", va="center",
                 transform=self.ax_dist.transAxes)
             return
 
-        fps_f = float(fps)
-        times = first_col[roi_local].astype(float)
-        frames = np.rint(times * fps_f).astype(int)
-
+        # Pixel positions; the test is rotation-invariant so the px↔µm
+        # conversion only matters for the scatter axis labels.
         stat_filtered = data["stat_filtered"]
         xs = np.array([float(np.median(stat_filtered[i]["xpix"]))
                        for i in roi_local], dtype=float)
         ys = np.array([float(np.median(stat_filtered[i]["ypix"]))
                        for i in roi_local], dtype=float)
+        ts_seconds = first_col[roi_local].astype(float)
+        # Spearman only cares about ordering, so either frame index or
+        # seconds works as t. Use frames when fps is known (matches the
+        # frame-binning used elsewhere in this tab) so colorbar ticks
+        # read as integers; fall back to seconds otherwise.
+        if fps:
+            ts = np.rint(ts_seconds * float(fps)).astype(int)
+            t_label = "activation frame"
+        else:
+            ts = ts_seconds
+            t_label = "activation time (s)"
 
-        # Pairwise Δframe and distance matrices. Rows are seeds, cols
-        # are "other" ROIs; keep entries where Δframe >= 0, seed !=
-        # other, and the seed's frame is strictly before the last
-        # active frame (so the last-frame ROIs never get seeded).
-        df_mat = frames[None, :] - frames[:, None]
-        dx = xs[None, :] - xs[:, None]
-        dy = ys[None, :] - ys[:, None]
-        dist_mat = np.hypot(dx, dy) * float(scale)
-        f_max_event = int(frames.max())
-        seed_valid = frames < f_max_event           # (n,) bool
-        keep = ((df_mat >= 0)
-                & ~np.eye(n, dtype=bool)
-                & seed_valid[:, None])
-        df_flat = df_mat[keep]
-        dist_flat = dist_mat[keep]
-
-        if df_flat.size == 0:
+        result = spatial_helpers.directional_monotonicity_spearman(
+            xs, ys, ts, n_angles=360, n_shuffles=10000, seed=0)
+        if not result:
+            self.ax_dist = self.fig_dist.add_subplot(111)
             self.ax_dist.set_axis_off()
             self.ax_dist.text(
                 0.5, 0.5,
-                "all active ROIs share a single frame; "
-                "no Δframe pairs to plot",
+                "monotonicity test undefined "
+                "(no spread in t or in x/y)",
                 ha="center", va="center",
                 transform=self.ax_dist.transAxes)
             return
 
-        unique_frames = sorted(set(int(f) for f in df_flat.tolist()))
-        distributions = [dist_flat[df_flat == f] for f in unique_frames]
-        f_min = unique_frames[0]
-        f_max = unique_frames[-1]
-        n_pairs = int(df_flat.size)
+        thetas = result["thetas"]
+        rho_curve = result["rho_curve"]
+        theta_star = float(result["theta_star"])
+        rho_obs = float(result["rho_obs"])
+        null_rho = result["null_rho"]
+        p_value = float(result["p_value"])
 
-        parts = self.ax_dist.violinplot(
-            distributions, positions=unique_frames, widths=0.8,
-            showmeans=False, showmedians=True, showextrema=False,
-        )
-        for body in parts.get("bodies", []):
-            body.set_facecolor("#4C72B0")
-            body.set_edgecolor("#1f3b66")
-            body.set_alpha(0.55)
-        if "cmedians" in parts:
-            parts["cmedians"].set_color("k")
-            parts["cmedians"].set_linewidth(1.0)
+        gs = self.fig_dist.add_gridspec(1, 3, width_ratios=[1.0, 1.1, 1.0])
+        ax_xy = self.fig_dist.add_subplot(gs[0, 0])
+        ax_curve = self.fig_dist.add_subplot(gs[0, 1])
+        ax_null = self.fig_dist.add_subplot(gs[0, 2])
+        # Keep self.ax_dist pointing at *something* — downstream code
+        # (status updates, fig save) references it; pick the curve
+        # since that's the panel's signature image.
+        self.ax_dist = ax_curve
 
-        rng = np.random.default_rng(0)
-        # Skip the per-pair dot scatter on huge events to keep the
-        # rendering responsive; the violins are still informative.
-        if n_pairs <= 4000:
-            for f, dist_arr in zip(unique_frames, distributions):
-                if dist_arr.size > 1:
-                    jitter = rng.uniform(-0.18, 0.18, size=dist_arr.size)
-                else:
-                    jitter = np.zeros(1)
-                self.ax_dist.scatter(
-                    np.full_like(dist_arr, f, dtype=float) + jitter,
-                    dist_arr,
-                    s=6, color="black", alpha=0.25, edgecolor="none",
-                    zorder=3)
+        # (a) Scatter coloured by activation time, with a θ* arrow.
+        # Units on this subplot follow the rest of Tab 8 (µm when
+        # available); the arrow's length encodes ρ_obs so a weak
+        # direction looks short and a strong one stretches across.
+        xs_disp = xs * float(scale)
+        ys_disp = ys * float(scale)
+        sc = ax_xy.scatter(
+            xs_disp, ys_disp, c=ts, s=30,
+            cmap=spatial_helpers.CYAN_TO_RED,
+            edgecolors="black", linewidths=0.4)
+        if rho_obs > 0:
+            cx = float(np.mean(xs_disp))
+            cy = float(np.mean(ys_disp))
+            span = max(
+                float(np.ptp(xs_disp)), float(np.ptp(ys_disp)), 1.0)
+            half = 0.45 * span * rho_obs
+            ax_xy.annotate(
+                "",
+                xy=(cx + half * np.cos(theta_star),
+                    cy + half * np.sin(theta_star)),
+                xytext=(cx - half * np.cos(theta_star),
+                        cy - half * np.sin(theta_star)),
+                arrowprops=dict(arrowstyle="->", color="black",
+                                lw=1.6, mutation_scale=16))
+        ax_xy.set_aspect("equal")
+        ax_xy.set_xlabel(f"X ({xlabel_unit})")
+        ax_xy.set_ylabel(f"Y ({xlabel_unit})")
+        ax_xy.set_title(
+            f"ROI positions  ({n} active)\ncolor = {t_label}",
+            fontsize=9)
+        ax_xy.invert_yaxis()                              # match Tab 8 orientation
+        cb = self.fig_dist.colorbar(sc, ax=ax_xy, fraction=0.045,
+                                    pad=0.02)
+        cb.ax.tick_params(labelsize=8)
 
-        self.ax_dist.set_xlabel(
-            f"Δ frame between seed and other ROI (fps={fps_f:.3f})")
-        self.ax_dist.set_ylabel(f"pairwise distance ({xlabel_unit})")
-        n_seeds = int(seed_valid.sum())
-        self.ax_dist.set_title(
-            f"Event {ev_idx + 1}  -  pairwise distance vs Δframe  "
-            f"(every ROI in the first {n_seeds} of {n} as seed, "
-            f"last-frame ROIs excluded; "
-            f"{n_pairs} ordered pairs, "
-            f"{len(unique_frames)} Δframe bin"
-            f"{'' if len(unique_frames) == 1 else 's'})",
+        # (b) ρ(θ) curve.
+        theta_deg = np.degrees(thetas)
+        ax_curve.plot(theta_deg, rho_curve, color="#1f3b66", lw=1.2)
+        ax_curve.axhline(0.0, color="gray", lw=0.6, alpha=0.6)
+        ax_curve.axvline(np.degrees(theta_star), color="red",
+                         lw=1.0, ls="--", alpha=0.8)
+        ax_curve.scatter([np.degrees(theta_star)], [rho_obs],
+                         color="red", s=30, zorder=4)
+        ax_curve.set_xlim(0, 360)
+        ax_curve.set_ylim(min(-1.0, float(rho_curve.min()) - 0.05),
+                          max(1.0, float(rho_curve.max()) + 0.05))
+        ax_curve.set_xticks([0, 90, 180, 270, 360])
+        ax_curve.set_xlabel("Projection direction θ (deg)")
+        ax_curve.set_ylabel("Spearman ρ(θ)")
+        ax_curve.set_title(
+            f"Event {ev_idx + 1}: ρ* = {rho_obs:+.2f}  "
+            f"@ θ* = {np.degrees(theta_star):.0f}°",
             fontsize=10)
-        try:
-            secax = self.ax_dist.secondary_xaxis(
-                "top",
-                functions=(lambda f, _fps=fps_f: f / _fps,
-                           lambda s, _fps=fps_f: s * _fps),
-            )
-            secax.set_xlabel("Δt (s)")
-        except Exception:
-            pass
-        self.ax_dist.grid(True, axis="y", alpha=0.25)
-        if (f_max - f_min) <= 25:
-            self.ax_dist.set_xticks(np.arange(f_min, f_max + 1))
+        ax_curve.grid(True, alpha=0.25)
+
+        # (c) Permutation null histogram.
+        ax_null.hist(null_rho, bins=40, color="#999999",
+                     edgecolor="#555555", alpha=0.85)
+        ax_null.axvline(rho_obs, color="red", lw=1.6,
+                        label=f"ρ_obs = {rho_obs:+.2f}")
+        ax_null.set_xlim(-1.0, 1.0)
+        ax_null.set_xlabel("Spearman ρ (shuffled t)")
+        ax_null.set_ylabel("count")
+        ax_null.set_title(
+            f"Permutation null (N = {null_rho.size})\n"
+            f"p = {p_value:.3f}", fontsize=9)
+        ax_null.legend(loc="upper left", fontsize=8, frameon=False)
+        ax_null.grid(True, alpha=0.25)
 

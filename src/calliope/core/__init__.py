@@ -14,7 +14,9 @@ re-used outside the GUI.
 Module index
 ------------
 - ``preprocessing``       - intensity-shift TIFF stacks, mean image,
-                             LoG blob detection, QC GIF.
+                             QC GIF, plus the headless
+                             ``run_preprocess`` entry point Tab 0's
+                             batch runner calls.
 - ``sparse_plus_cellpose`` - merge Suite2p (``Sparsery``) ROIs with a
                              Cellpose pass on the mean image.
 - ``utils``               - dF/F + neuropil correction, lowpass +
@@ -24,12 +26,20 @@ Module index
                              ``paint_spatial`` ROI->image painter,
                              ``EventDetectionParams`` dataclass.
 - ``crosscorrelation``    - batched (one matmul per lag) cluster x
-                             cluster cross-correlation.
-- ``clustering_cmap``     - palettes + auto-threshold helpers for
-                             hierarchical clustering.
+                             cluster cross-correlation + the
+                             headless ``run_crosscorrelation``
+                             wrapper that drives the full + per-event
+                             runs and renders the violin plots.
+- ``clustering``          - palettes, auto-threshold helpers,
+                             dendrogram + spatial plotters, and the
+                             headless ``run_clustering`` orchestrator
+                             that exports cluster ROI lists and the
+                             Clusters summary sheet.
 - ``spatial``             - cyan->blue->red colormap, per-event
                              activation-rank painting, frame-grouped
-                             centroids (used by tab 8).
+                             centroids (Tab 8) plus the headless
+                             ``render_spatial_event_figures`` entry
+                             point Tab 0's batch runner calls.
 - ``suite2p_pipeline``    - all suite2p contact: ``run_one_pass``,
                              ``run_cellpose_pass``,
                              ``_get_or_create_shared_registration``,
@@ -42,8 +52,14 @@ Module index
                              helpers.
 - ``summary_writer``      - writes ``calliope_summary.xlsx``
                              (Recording / EventOnsets / EventWindows
-                             sheets) used by tabs 5+.
+                             / Clusters / EventMonotonicity sheets)
+                             used by tabs 5+.
 - ``cellfilter``          - PyTorch CNN that scores each ROI as
                              cell / not-cell on a mix of a 32x32
                              spatial crop and the trace timeseries.
+- ``detection_run`` / ``lowpass_run`` / ``event_detection_run``
+                            -- per-stage headless entry points for
+                             Tab 0's batch pipeline (Tabs 3 / 4 / 5).
+- ``batch_pipeline``      - end-to-end orchestrator that strings the
+                             headless entry points together (Tab 0).
 """

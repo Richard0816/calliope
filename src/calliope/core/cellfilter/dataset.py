@@ -18,12 +18,13 @@ needs:
 How a sample is built
 ---------------------
 1. The dataset reads the curation CSV (one row per labelled ROI)
-   and stores ``(rec_id, roi_id, label)`` tuples internally.
-2. On ``dataset[i]``, we look up the recording on disk, slice out
-   the 32x32 patch around the ROI's median centroid, build the 3-
-   channel image, z-score the dF/F trace, and return the tensors.
+   and stores ``(plane0_path, roi_id, label)`` tuples internally.
+2. On ``dataset[i]``, we open the ROI's recording from its CSV-
+   stored ``plane0_path``, slice out the 32x32 patch around the
+   ROI's median centroid, build the 3-channel image, z-score the
+   dF/F trace, and return the tensors.
 3. Per-recording tensors (mean image, max projection, dF/F memmap,
-   stat) are cached in ``_REC_TENSOR_CACHE`` so repeated ROIs from
+   stat) are cached keyed by ``plane0_path`` so repeated ROIs from
    the same recording don't reload from disk.
 
 R analogy: think of this as a custom data-frame iterator that
@@ -33,14 +34,17 @@ PyTorch ``DataLoader`` plays the role of ``data.table::split`` +
 ``parallel::mclapply`` -- it batches and parallelises ``__getitem__``
 calls under the hood.
 
-Recordings are resolved by searching ``{DATA_ROOT}\\Cx\\<rec_id>``
-and ``{DATA_ROOT}\\Hip\\<rec_id>``. Per-recording tensors (mean,
-max, normalized traces, stat) are cached so repeated ROIs from the
-same recording don't reload from disk.
+History
+-------
+Pre-2026-05-12 the dataset resolved each ROI's recording by walking
+``C.DATA_ROOT/Cx/<rec_id>``, ``C.DATA_ROOT/Hip/<rec_id>``, and
+``C.EXTRA_DATA_ROOTS/<rec_id>``. Fragile on multi-machine setups and
+broke when recordings moved drives. The 2026-05-12 refactor switched
+the CSV schema to carry ``plane0_path`` per row, so this module no
+longer searches for recordings by name -- the CSV is self-locating.
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -55,48 +59,6 @@ from . import config as C
 
 
 # ---------------- helpers ----------------
-
-_REC_ROOT_CACHE: dict[str, Path] = {}
-
-
-def _scan_extra_root(extra_root: Path, rec_id: str) -> Optional[Path]:
-    """Recursively walk `extra_root` for a directory named `rec_id` that has
-    suite2p/plane0. Returns the first match, or None."""
-    if not extra_root.exists():
-        return None
-    for path in extra_root.rglob(rec_id):
-        if path.is_dir() and (path / "suite2p" / "plane0").is_dir():
-            return path
-    return None
-
-
-def find_recording_root(rec_id: str, data_root: Path = C.DATA_ROOT) -> Path:
-    """Resolve a recording id to its root folder.
-
-    Search order:
-      1. C.EXTRA_DATA_ROOTS (recursive walk)
-      2. data_root\\Cx\\<rec_id>, data_root\\Hip\\<rec_id>
-    """
-    if rec_id in _REC_ROOT_CACHE:
-        return _REC_ROOT_CACHE[rec_id]
-
-    for extra in getattr(C, "EXTRA_DATA_ROOTS", ()):
-        hit = _scan_extra_root(Path(extra), rec_id)
-        if hit is not None:
-            _REC_ROOT_CACHE[rec_id] = hit
-            return hit
-
-    for region in ("Cx", "Hip"):
-        cand = data_root / region / rec_id
-        if cand.exists():
-            _REC_ROOT_CACHE[rec_id] = cand
-            return cand
-
-    extras = ", ".join(str(p) for p in getattr(C, "EXTRA_DATA_ROOTS", ()))
-    raise FileNotFoundError(
-        f"Recording not found in extra roots [{extras}] or in {data_root}/Cx,Hip: {rec_id}"
-    )
-
 
 def _znorm(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
@@ -153,20 +115,12 @@ class _RecordingCache:
     T, N       : trace length and ROI count.
     H, W       : FOV dimensions (pixels).
     """
-    def __init__(self, rec_id: str, plane0: Optional[Path] = None):
-        self.rec_id = rec_id
-        # Two ways to specify a recording: an explicit ``plane0``
-        # path (used by ``predict_recording`` from the GUI) or a
-        # bare ``rec_id`` that gets resolved through ``find_recording_root``
-        # (used by training).
-        if plane0 is not None:
-            self.plane0 = Path(plane0)
-            # ``plane0`` is ``<root>/suite2p/plane0`` -- two
-            # ``.parent`` calls reach the recording root.
-            self.root = self.plane0.parent.parent
-        else:
-            self.root = find_recording_root(rec_id)
-            self.plane0 = self.root / "suite2p" / "plane0"
+    def __init__(self, plane0: Path):
+        self.plane0 = Path(plane0)
+        # ``plane0`` is the suite2p plane folder
+        # (``<...>/suite2p/plane0``); two ``.parent`` calls reach
+        # the recording root.
+        self.root = self.plane0.parent.parent
 
         stat = np.load(self.plane0 / "stat.npy", allow_pickle=True)
         view = utils.load_plane_view(self.plane0)
@@ -253,8 +207,8 @@ class ROIDataset(Dataset):
     Constructor parameters
     ----------------------
     labels_df : pd.DataFrame
-        One row per ROI with columns ``recording_ID``, ``ROI_number``,
-        ``user_defined_cell``.
+        One row per ROI with columns ``plane0_path``,
+        ``ROI_number``, ``user_defined_cell``.
     patch_size : int
         Size of the spatial patch around the ROI centroid.
     trace_crop : int or None
@@ -265,9 +219,9 @@ class ROIDataset(Dataset):
         ``True`` for random training crops, ``False`` for centred
         deterministic crops (validation).
     cache : dict, optional
-        Pre-existing ``rec_id -> _RecordingCache`` dict. Pass the
-        same one to train and val Datasets so per-recording arrays
-        load only once across both.
+        Pre-existing ``plane0_path -> _RecordingCache`` dict. Pass
+        the same one to train and val Datasets so per-recording
+        arrays load only once across both.
     """
     def __init__(
         self,
@@ -284,21 +238,21 @@ class ROIDataset(Dataset):
         self.random_crop = random_crop
         self._cache = cache if cache is not None else {}
 
-    def _get_rec(self, rec_id: str) -> _RecordingCache:
-        if rec_id not in self._cache:
-            self._cache[rec_id] = _RecordingCache(rec_id)
-        return self._cache[rec_id]
+    def _get_rec(self, plane0_path: str) -> _RecordingCache:
+        if plane0_path not in self._cache:
+            self._cache[plane0_path] = _RecordingCache(Path(plane0_path))
+        return self._cache[plane0_path]
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, i: int):
         row = self.df.iloc[i]
-        rec_id = str(row["recording_ID"])
+        plane0_path = str(row["plane0_path"])
         roi = int(row["ROI_number"])
         label = float(row["user_defined_cell"])
 
-        rec = self._get_rec(rec_id)
+        rec = self._get_rec(plane0_path)
         patch = rec.get_patch(roi, self.patch_size)    # (3, H, W)
         trace = rec.get_trace(roi)                     # (T,)
 
@@ -328,19 +282,35 @@ def load_labels(csv_path: Path = C.LABELS_CSV) -> pd.DataFrame:
     The CSV is the human-labelled ground truth: lab members open
     each recording's ROIs in a Suite2p-like browser and tick
     "cell" / "not cell" based on visual inspection. This function:
-        1. Reads the CSV.
-        2. Coerces dtypes (recording id as string, others as int).
+        1. Reads the CSV (returns an empty DataFrame with the
+           expected columns if the file doesn't exist yet -- first
+           run before any labels have been written).
+        2. Coerces dtypes.
         3. Drops duplicates -- keeps the LAST occurrence so a later
-           re-labelling overrides an earlier mistake.
+           re-labelling overrides an earlier mistake. Uniqueness key
+           is ``(plane0_path, ROI_number)`` since the same numeric
+           ROI id under different recordings is a different ROI.
 
     Returns a DataFrame ready to feed to ``ROIDataset``.
     """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return pd.DataFrame(
+            columns=list(C.LABELS_CSV_COLUMNS)
+        )
     df = pd.read_csv(csv_path)
+    # Tolerate a CSV that's been hand-edited to omit optional columns.
+    for col in C.LABELS_CSV_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col in ("plane0_path", "recording_ID",
+                                    "timestamp_iso") else 0
+    df["plane0_path"] = df["plane0_path"].astype(str)
     df["recording_ID"] = df["recording_ID"].astype(str)
     df["ROI_number"] = df["ROI_number"].astype(int)
     df["user_defined_cell"] = df["user_defined_cell"].astype(int)
     # drop duplicates, keeping last (so corrections win)
-    df = df.drop_duplicates(subset=["recording_ID", "ROI_number"], keep="last")
+    df = df.drop_duplicates(
+        subset=["plane0_path", "ROI_number"], keep="last")
     return df.reset_index(drop=True)
 
 
@@ -359,19 +329,23 @@ def split_by_recording(
     "this is a cell because it's bright relative to the rest of
     *this exact recording*" rather than a general rule. Splitting at
     the recording level forces it to generalise across slices.
+
+    Uniqueness key is ``plane0_path`` (since the same human-readable
+    ``recording_ID`` could theoretically collide across cohorts;
+    the plane0 path is the actual disk-level recording).
     """
     rng = np.random.default_rng(seed)
     # ``np.array`` + ``rng.shuffle`` shuffles in-place. ``sorted``
     # first so the same seed gives the same split regardless of
     # input dataframe ordering.
-    recs = np.array(sorted(df["recording_ID"].unique()))
-    rng.shuffle(recs)
-    n_val = max(1, int(round(len(recs) * val_frac)))
+    plane0_paths = np.array(sorted(df["plane0_path"].unique()))
+    rng.shuffle(plane0_paths)
+    n_val = max(1, int(round(len(plane0_paths) * val_frac)))
     # Slice the first n_val shuffled recordings for validation.
-    val_recs = set(recs[:n_val].tolist())
+    val_paths = set(plane0_paths[:n_val].tolist())
     # ``df.isin(set)`` returns a boolean Series; ``~`` negates.
-    train_df = df[~df["recording_ID"].isin(val_recs)].reset_index(drop=True)
-    val_df = df[df["recording_ID"].isin(val_recs)].reset_index(drop=True)
+    train_df = df[~df["plane0_path"].isin(val_paths)].reset_index(drop=True)
+    val_df = df[df["plane0_path"].isin(val_paths)].reset_index(drop=True)
     return train_df, val_df
 
 
