@@ -286,6 +286,15 @@ class EventDetectionTab(ttk.Frame):
             padding=8)
         header.pack(fill="x", pady=(0, 6))
 
+        # Persistent recording header. ``status_var`` below carries
+        # transient state messages ("Loading...", "Ready", etc.);
+        # this label keeps the recording id + plane0 visible at all
+        # times so the user can tell which dataset the panels show.
+        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(0, 4))
+        self.recording_var = tk.StringVar(value="No recording loaded.")
+        ttk.Label(rec_row, textvariable=self.recording_var,
+                  font=("", 10, "italic")).pack(side="left")
+
         row = ttk.Frame(header); row.pack(fill="x", pady=2)
         self.render_btn = ttk.Button(
             row, text="Render", command=self._on_render,
@@ -415,11 +424,17 @@ class EventDetectionTab(ttk.Frame):
 
     def _on_plane0(self, plane0: Path) -> None:
         self._plane0 = Path(plane0)
+        from ...core.utils import infer_recording_id
+        try:
+            rec_id = infer_recording_id(self._plane0)
+        except Exception:
+            rec_id = self._plane0.parent.name
+        self.recording_var.set(
+            f"Recording: {rec_id}    plane0: {self._plane0}")
         if self._inputs_ready(self._plane0):
             self.render_btn.config(state="normal")
             self.status_var.set(
-                f"Ready. Click Render to compute and plot.  "
-                f"({self._plane0})")
+                "Ready. Click Render to compute and plot.")
         else:
             self.render_btn.config(state="disabled")
             self.status_var.set(
@@ -612,6 +627,11 @@ class EventDetectionTab(ttk.Frame):
                 "fps": data.get("fps"),
                 "T": data.get("T"),
                 "onsets_by_roi": data.get("onsets_by_roi"),
+                # Forward the per-event monotonicity scalars Tab 8's
+                # bottom panel uses so it can render from the cached
+                # result instead of re-running the 10k-shuffle sweep
+                # on every click.
+                "event_monotonicity": data.get("event_monotonicity"),
             })
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
@@ -622,13 +642,28 @@ class EventDetectionTab(ttk.Frame):
         summary_writer.update_recording_meta(
             plane0, fps=data.get("fps"),
             T=data.get("T"), N=data.get("N_kept"))
-        return summary_writer.write_events_sheets(
+        path = summary_writer.write_events_sheets(
             plane0,
             event_windows=data.get("event_windows"),
             onsets_by_roi=data.get("onsets_by_roi") or [],
             fps=data.get("fps"),
             in_seconds=True,
         )
+        # Stamp the EventMonotonicity sheet from the per-event
+        # Spearman scalars ``run_event_detection`` already computed
+        # and stashed on the data dict. Without this call the GUI
+        # path silently skips the sheet -- the headless / batch
+        # path in ``run_event_detection.run_event_detection`` writes
+        # it via the same module but only when ``write_summary=True``
+        # (the tab passes ``write_summary=False`` and runs its own
+        # writer here instead).
+        em = data.get("event_monotonicity")
+        if em:
+            try:
+                summary_writer.write_event_monotonicity_sheet(plane0, em)
+            except Exception as e:
+                print(f"[GUI] EventMonotonicity sheet write failed: {e}")
+        return path
 
     def _on_save_summary(self) -> None:
         if self._plane0 is None or self._last_data is None:

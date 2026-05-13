@@ -95,20 +95,6 @@ class PreprocessTab(ttk.Frame):
     POLL_MS = 80
 
     PARAM_SPEC: list = [
-        # Blob detector
-        {"name": "soma_diameter_px", "label": "Soma diameter (px)",
-         "type": "float", "default": 12.0, "group": "Blob detection",
-         "help": "expected soma size, used for LoG sigma range"},
-        {"name": "scale_tol", "label": "Scale tolerance",
-         "type": "float", "default": 0.5, "group": "Blob detection",
-         "help": "sigma range = r * (1 ± tol) / sqrt(2)"},
-        {"name": "min_contrast", "label": "Min contrast (LoG)",
-         "type": "float", "default": 0.10, "group": "Blob detection",
-         "help": "blob_log threshold after robust normalisation"},
-        {"name": "min_area_px", "label": "Min area (px²)",
-         "type": "int", "default": 25, "group": "Blob detection"},
-        {"name": "max_area_px", "label": "Max area (px²)",
-         "type": "int", "default": 400, "group": "Blob detection"},
         # QC gif
         {"name": "downsample_t", "label": "Time downsample factor",
          "type": "int", "default": 4, "group": "QC gif",
@@ -420,13 +406,9 @@ class PreprocessTab(ttk.Frame):
         # Snapshot params on the main thread so the worker sees a stable
         # value even if the user opens Advanced again mid-run.
         params = dict(self._params)
-        blob_keys = ("scale_tol", "min_contrast", "min_area_px",
-                     "max_area_px")
         qc_keys = ("downsample_t", "max_size_px", "playback_fps",
                    "clip_low", "clip_high")
-        blob_params = {k: params[k] for k in blob_keys if k in params}
         qc_params = {k: params[k] for k in qc_keys if k in params}
-        soma_diameter_px = float(params.get("soma_diameter_px", 12.0))
         explicit_identifier = self.identifier_var.get().strip() or None
 
         def worker():
@@ -436,9 +418,7 @@ class PreprocessTab(ttk.Frame):
                         src_tiff=srcs[0],
                         data_root=data_root,
                         recording_name=explicit_identifier,
-                        soma_diameter_px=soma_diameter_px,
                         progress_cb=lambda m: self._log_queue.put(("log", m)),
-                        blob_params=blob_params,
                         qc_params=qc_params,
                     )
                 else:
@@ -446,9 +426,7 @@ class PreprocessTab(ttk.Frame):
                         src_tiffs=srcs,
                         data_root=data_root,
                         recording_name=identifier,
-                        soma_diameter_px=soma_diameter_px,
                         progress_cb=lambda m: self._log_queue.put(("log", m)),
-                        blob_params=blob_params,
                         qc_params=qc_params,
                     )
                 self._log_queue.put(("done", result))
@@ -493,11 +471,10 @@ class PreprocessTab(ttk.Frame):
         self.rerun_btn.config(state="normal")
         n_frames_str = (f"{result.n_frames} frames"
                         if result.n_frames > 0 else "n_frames=?")
-        self.status_var.set(
-            f"Done - {result.n_blobs} preview blobs, {n_frames_str}.")
+        self.status_var.set(f"Done - {n_frames_str}.")
         self._append_log(
             f"Outputs: {result.qc_gif.name}, "
-            f"{result.shifted_tiff.name}, mean.npy, blobs.npy")
+            f"{result.shifted_tiff.name}, mean.npy")
         self.state.set_result(result)
 
     def _on_error(self, msg: str) -> None:

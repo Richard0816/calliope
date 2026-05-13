@@ -12,12 +12,6 @@ on-disk file. The data lives in source code now so:
 Tab 3's "Edit suite2p settings..." popout reads :func:`build_base_settings`
 to seed its form, then writes the user's tweaks into the per-run
 ``settings`` dict before dispatch.
-
-The intent is the same as the legacy
-``src/calliope/data/suite2p_2p_ops_240621.npy`` (which was a flat-ops dict
-in pre-1.0 suite2p format) but expressed in suite2p 1.0's nested settings
-schema. Keys not listed here inherit from
-``suite2p.parameters.default_settings()`` at build time.
 """
 
 from __future__ import annotations

@@ -50,6 +50,118 @@ _EVENT_DETECTION_FIELDS = (
 )
 
 
+def _compute_event_monotonicity(
+    plane0: Path,
+    kept_idx: np.ndarray,
+    A: np.ndarray,
+    first_time: np.ndarray,
+    event_windows,
+    fps: Optional[float],
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    n_shuffles: int = 10000,
+) -> list[dict]:
+    """Return one row per event with directional-monotonicity scalars.
+
+    Per-event rows carry ``event_id, n_active, theta_star_deg,
+    rho_obs, p_value, n_shuffles, u_x, u_y``. Rows for events with
+    fewer than 3 active ROIs (or otherwise-degenerate inputs) carry
+    ``n_active`` populated and the rest set to ``None`` so the
+    summary writer knows to leave the value cells blank.
+
+    Centroids come from a fresh ``stat.npy`` read at ``plane0``,
+    indexed by ``kept_idx`` so the row order lines up with the rows
+    of ``first_time`` / ``A``.
+    """
+    if event_windows is None or len(event_windows) == 0:
+        return []
+    try:
+        stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+    except Exception as e:
+        if progress_cb is not None:
+            progress_cb(
+                f"monotonicity: stat.npy unreadable ({e}); skipping")
+        return []
+
+    kept_idx = np.asarray(kept_idx, dtype=int)
+    try:
+        xs_all = np.array(
+            [float(np.median(np.asarray(stat[i]["xpix"])))
+             for i in kept_idx], dtype=float)
+        ys_all = np.array(
+            [float(np.median(np.asarray(stat[i]["ypix"])))
+             for i in kept_idx], dtype=float)
+    except (IndexError, KeyError, ValueError) as e:
+        if progress_cb is not None:
+            progress_cb(
+                f"monotonicity: stat mismatch ({e}); skipping")
+        return []
+
+    # Lazy import: ``spatial`` pulls matplotlib via the cyan->red
+    # cmap; importing at module top would load mpl in every headless
+    # caller that never touches monotonicity.
+    from .spatial import directional_monotonicity_spearman
+
+    A_arr = np.asarray(A, dtype=bool)
+    first = np.asarray(first_time, dtype=float)
+    n_events = int(A_arr.shape[1]) if A_arr.ndim == 2 else 0
+    rows: list[dict] = []
+    for ev_idx in range(n_events):
+        active = A_arr[:, ev_idx] & ~np.isnan(first[:, ev_idx])
+        n_active = int(active.sum())
+        base = {
+            "event_id": ev_idx,
+            "n_active": n_active,
+            "theta_star_deg": None,
+            "rho_obs": None,
+            "p_value": None,
+            "n_shuffles": None,
+            "u_x": None,
+            "u_y": None,
+        }
+        if n_active < 3:
+            rows.append(base)
+            continue
+        xs = xs_all[active]
+        ys = ys_all[active]
+        # Spearman is rank-only so frames vs seconds is equivalent;
+        # prefer integer frame indices when fps is known so the
+        # ``activation frame`` field reads cleanly in any audit
+        # tooling that re-runs the sweep from the same inputs.
+        if fps:
+            ts = np.rint(first[active, ev_idx] * float(fps)).astype(int)
+        else:
+            ts = first[active, ev_idx]
+        try:
+            result = directional_monotonicity_spearman(
+                xs, ys, ts, n_angles=360, n_shuffles=int(n_shuffles),
+                seed=0)
+        except Exception:
+            rows.append(base)
+            continue
+        if not result:
+            rows.append(base)
+            continue
+        theta = float(result["theta_star"])
+        rho = float(result["rho_obs"])
+        rows.append({
+            "event_id": ev_idx,
+            "n_active": n_active,
+            "theta_star_deg": float(np.degrees(theta)),
+            "rho_obs": rho,
+            "p_value": float(result["p_value"]),
+            "n_shuffles": int(result["null_rho"].size),
+            "u_x": float(np.cos(theta)),
+            "u_y": float(np.sin(theta)),
+        })
+    if progress_cb is not None and rows:
+        n_valid = sum(1 for r in rows if r.get("rho_obs") is not None)
+        progress_cb(
+            f"monotonicity: scored {n_valid}/{len(rows)} events "
+            f"(>=3 active ROIs); EventMonotonicity sheet written")
+    return rows
+
+
 def _resolve_keep_mask(plane0: Path, N_total: int) -> np.ndarray:
     """Pick the same keep mask Tab 5 uses (cellfilter -> iscell ->
     all)."""
@@ -241,6 +353,19 @@ def run_event_detection(
             return_diagnostics=True, **ed_kwargs,
         )
 
+    # ---- Per-event directional monotonicity --------------------------
+    # For every detected population event, run the Spearman-rank
+    # propagation-direction test (``core.spatial.
+    # directional_monotonicity_spearman``) on the participating ROIs.
+    # The scalars (``theta*, rho_obs, p_value, u_x, u_y``) land both
+    # in the returned data dict (so Tab 8 can read pre-computed values
+    # instead of re-running the sweep on every click) and in the
+    # ``EventMonotonicity`` summary sheet below.
+    event_monotonicity = _compute_event_monotonicity(
+        plane0, kept_idx, A, first_time, event_windows, fps,
+        progress_cb=progress_cb,
+    )
+
     data = {
         "heatmap": heatmap,
         "raster": raster,
@@ -257,6 +382,7 @@ def run_event_detection(
         "T": T,
         "N_kept": N_kept,
         "downsample": downsample,
+        "event_monotonicity": event_monotonicity,
     }
 
     if figures_dir is not None:
@@ -274,6 +400,14 @@ def run_event_detection(
             fps=fps,
             in_seconds=True,
         )
+        # One row per event; ``EventMonotonicity`` sheet stamps the
+        # propagation-direction scalars next to the existing
+        # ``EventWindows`` / ``EventOnsets`` / ``RoiEventTimes`` so
+        # downstream analyses can stack monotonicity stats across
+        # recordings the same way they already do for event counts.
+        if event_monotonicity:
+            summary_writer.write_event_monotonicity_sheet(
+                plane0, event_monotonicity)
 
     return data
 

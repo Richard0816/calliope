@@ -226,6 +226,13 @@ class LowpassTab(ttk.Frame):
         ttk.Label(self, textvariable=self.status_var,
                   font=("", 9, "italic")).pack(anchor="w", pady=(0, 6))
 
+        # Persistent recording header so the user can always tell
+        # which plane0 the FFT / raw / low-pass panels are showing.
+        # Updated by ``_on_plane0`` once data has loaded.
+        self.recording_var = tk.StringVar(value="No recording loaded.")
+        ttk.Label(self, textvariable=self.recording_var,
+                  font=("", 10, "italic")).pack(anchor="w", pady=(0, 6))
+
         body = ttk.Frame(self); body.pack(fill="both", expand=True)
         body.rowconfigure(0, weight=1, uniform="rows")
         body.rowconfigure(1, weight=1, uniform="rows")
@@ -291,6 +298,13 @@ class LowpassTab(ttk.Frame):
 
     def _on_plane0(self, plane0: Path) -> None:
         self._plane0 = Path(plane0)
+        from ...core.utils import infer_recording_id
+        try:
+            rec_id = infer_recording_id(self._plane0)
+        except Exception:
+            rec_id = self._plane0.parent.name
+        self.recording_var.set(
+            f"Recording: {rec_id}    plane0: {self._plane0}")
         self.status_var.set(f"Loading dF/F from {self._plane0} ...")
         self.update_idletasks()
         try:

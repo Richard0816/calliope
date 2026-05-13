@@ -64,11 +64,15 @@ A separate **Tab 0 (Batch runner)** sits in front of all of this and chains the 
 
 ## Tab 0 — Batch runner
 
-**What it does (operationally).** Tab 0 is a queue runner. You point it at a working directory, click *Scan*, and it auto-creates one row per TIFF-containing folder at the configured search depth. Each row holds an identifier, a list of TIFFs, and a per-row parameter override dialog. Hit **Run all** and the worker drives the same code paths the interactive Tabs 1, 3, 4, 5, 6, 7, 8 do — concretely the `core.batch_pipeline.run_recording` orchestrator, which calls `core.preprocess_run` → `core.detection_run` → `core.lowpass_run` → `core.event_detection_run` → `core.clustering_run` → `core.crosscorrelation_run` → `core.spatial_run` in sequence.
+**What it does (operationally).** Tab 0 is a queue runner. You point it at a working directory, click *Scan*, and it auto-creates one row per TIFF file at the configured search depth (multiple TIFFs in the same folder each get their own row; use **Merge selected** afterwards if they're actually one multi-file recording). Each row holds an identifier (defaults to the TIFF's stem, with the parent folder appended on collision), a list of TIFFs, and a per-row parameter override dialog. Hit **Run all** and the worker drives the same code paths the interactive Tabs 1, 3, 4, 5, 6, 7, 8 do — concretely the `core.batch_pipeline.run_recording` orchestrator, which calls `core.preprocess_run` → `core.detection_run` → `core.lowpass_run` → `core.event_detection_run` → `core.clustering_run` → `core.crosscorrelation_run` → `core.spatial_run` in sequence.
 
 The per-row **Edit parameters** button opens a unified Advanced dialog with every PARAM_SPEC entry from Tabs 1 + 3 + 4 + 5 plus the clustering / xcorr knobs (74 in total), grouped in pipeline order: `1. Preprocess - …` → `2. Detection - …` → `3. Low-pass - …` → `4. Events - …` → `5. Clustering` → `6. Cross-correlation` → `7. Pipeline-wide`. The top-level **Apply defaults to all rows** button opens the same dialog and writes its output into every row's params, so per-row dialogs are only needed when one recording wants different settings.
 
 **What lands on disk.** For each row, every figure each tab would normally show in the GUI is rendered headlessly to PNG under `<output>/<recording_id>/calliope_figures/<stage>/` (subfolders: `preprocess`, `detection`, `lowpass`, `event_detection`, `clustering`, `crosscorrelation`, `spatial_propagation`). The queue + per-row params snapshot to `<output>/calliope_batch.json` on every Run All so closing the GUI doesn't lose the work; a **Reload queue** button restores it. After every Run All, `<output>/batch_report.csv` summarises status / duration per stage per recording, with continue-on-error semantics so one bad recording doesn't stop the queue.
+
+**Optional fast-disk routing.** A **Scratch dir (SSD)** field next to the output folder accepts a path on a fast drive (NVMe / SSD). When set, every recording does its intermediate I/O on scratch. A daemon thread per row polls scratch every 2 s and copies new/changed files to HDD throughout the row's pipeline computation; at row end the mirror is signaled to stop, drains the last few writes, repoints `AppState.plane0` / `AppState.result` / tab-local caches to HDD, and `rmtree`s scratch.
+
+Whether scratch and output share a physical drive (detected via `os.stat(...).st_dev` at Run All start) determines a single setting: **two-drive layout** runs the mirror unthrottled (SSD reads and HDD writes don't compete when they're on separate drives); **single-drive layout** throttles the mirror to ~10 MB/s (`SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC`) so it can't starve the active stage's reads on the same physical drive. The mirror skips known intermediates (`data_raw.bin`, `sparsery_pass/`, `cellpose_pass/`, `*.tmp`) and defers files whose mtime is < 1 s old (in-flight writes). The finalize runs in a daemon thread so the next recording's preprocess can start on scratch (SSD writes) immediately while the previous row's bulk SSD→HDD copy drains in the background; `_batch_finish` waits for every in-flight copy to join before writing `batch_report.csv` so the report's plane0 paths always point at files that exist on HDD. Hardlinks between `_shared_reg/data.bin` and per-pass `data.bin` are preserved across the copy so the destination drive doesn't double-bill the registered movie. The slow output folder still receives the same outputs as before (including `_shared_reg/`, so a manual GUI re-run still skips re-registration); leave the field blank to write directly to the slow drive.
 
 **Why it matters.** Sitting in front of the GUI to drive 78 recordings through seven tabs each is unscalable. Tab 0 lets you set sensible defaults once, queue everything overnight, and come back to a folder of figures and a CSV report you can sanity-check the next morning.
 
@@ -82,19 +86,18 @@ The per-row **Edit parameters** button opens a unified Advanced dialog with ever
 
 - A **mean image** — averaging every frame in time gives you the steady spatial picture of the slice. Cell bodies become visible because they're slightly brighter and rounder than neuropil.
 - A **QC GIF** — a downsampled animated preview so you can eyeball whether the recording moved, drifted, or has obvious motion artefacts before investing in detection.
-- **Preview blobs** — a quick Laplacian-of-Gaussian blob detector on the mean image, drawn on Tab 2 as cyan circles. *This is not the final ROI list*; it's a sanity check that "yes, there are cell-shaped things in this field of view, and they're roughly the diameter you set."
 
-**Why it matters.** Two-photon recordings can be noisy. If your mean image looks blurry or your QC GIF shows the field of view sliding, no amount of downstream cleverness will save you — better to know now and either re-register or reshoot. Also, choosing the wrong soma diameter here is a common source of "Suite2p missed all my cells" complaints.
+**Why it matters.** Two-photon recordings can be noisy. If your mean image looks blurry or your QC GIF shows the field of view sliding, no amount of downstream cleverness will save you — better to know now and either re-register or reshoot.
 
 **Biological output of this stage.** None on its own. Tab 1 is a hygiene step.
 
-→ See `tabs/preprocess/README.md` for the streaming intensity shift, blob detector, and QC GIF code paths.
+→ See `tabs/preprocess/README.md` for the streaming intensity shift and QC GIF code paths.
 
 ---
 
 ## Tab 2 — QC Preview
 
-**What it does.** Pure visualization. Plays the GIF from Tab 1 next to the mean image with the preview blobs circled.
+**What it does.** Pure visualization. Plays the GIF from Tab 1 next to the mean image.
 
 **Why it matters.** This is where you catch:
 
@@ -105,7 +108,7 @@ The per-row **Edit parameters** button opens a unified Advanced dialog with ever
 
 **Biological output.** Confidence (or lack of it) in the recording. If this tab looks bad, fix the experiment, not the analysis.
 
-→ See `tabs/qc/README.md` for the (very small) GIF-playback and blob-overlay logic.
+→ See `tabs/qc/README.md` for the (very small) GIF-playback + mean-image rendering logic.
 
 ---
 
@@ -121,6 +124,8 @@ The per-row **Edit parameters** button opens a unified Advanced dialog with ever
 4. **Low-pass dF/F + first derivative** — pre-computed at default settings so Tabs 4–7 have a starting point.
 5. **Cell filter** — a small PyTorch CNN (`cellfilter/`) trained on hand-labelled ROIs that scores each ROI 0–1 as "this is a real cell" vs "this is an artefact / bright pixel / blood vessel." The user sees both panels: all detected ROIs, and only those that pass the classifier.
 
+**Interactive curation.** Click any ROI on the "All detected ROIs" panel to open a popout with five inspection panels (mean image, max projection, max + ROI, ROI footprint, ΔF/F trace) modeled on `roi_curation_app.py`. **Cell (1) / Not a cell (0)** flip `iscell.npy` in place and append to the curation CSV (`cellfilter.config.LABELS_CSV`, default `F:\roi_curation.csv`). A **Retrain cell filter** button stays disabled until the user has flipped at least one classification this session; clicking it spawns `cellfilter.train.main()` in a worker thread. Tab 3's panels 2 + 3 repaint immediately after every flip so the keep-set state stays in sync.
+
 **Why it matters biologically.** ROIs are how the entire pipeline anthropomorphises pixels into cells. Get this wrong and:
 
 - **Too many ROIs**: noise traces dominate clustering and event detection.
@@ -130,6 +135,8 @@ The per-row **Edit parameters** button opens a unified Advanced dialog with ever
 The cell-filter step gives you a reproducible "is this really a cell?" decision instead of relying on Suite2p's built-in `iscell.npy` (which is noisy across recordings).
 
 **Biological output.** A clean per-cell trace of *relative firing-related fluorescence* over the whole recording, for every cell that the classifier thinks is real.
+
+**Intermediate cleanup.** After the final outputs (`F`, `Fneu`, dF/F memmaps, cell-filter outputs) are written, the shared helper `core.detection_run.prune_detection_intermediates` prunes the ~26 GB/recording of intermediate Suite2p binaries — `detection/sparsery_pass/`, `detection/cellpose_pass/`, and `detection/_shared_reg/suite2p/plane0/data.bin`. The `_shared_reg/ops.npy` registration metadata stays for audit; the binary itself can be regenerated from the shifted TIFF in ~5 min if a manual re-detect is ever needed. The cleanup fires from both Tab 3's GUI worker and the headless `run_detection` (which `core.batch_pipeline.run_recording` invokes), so direct-run agents and external drivers get it automatically. Without this prune, an agent that runs detection over many recordings will fill the save drive (~12 recordings ≈ 312 GB).
 
 → See `tabs/suite2p/README.md` for: Sparsery + Cellpose merge logic, neuropil-correction math, the two dF/F baseline modes (rolling vs first-N-minutes), the GPU dF/F path (CuPy), and how the cell-filter CNN is loaded and applied.
 
@@ -181,11 +188,12 @@ The defaults are tuned for **short epileptiform events** (<0.5 s). If you're stu
 
 ## Tab 6 — Clustering
 
-**What it does.** Computes the pairwise Pearson correlation between every pair of cells' dF/F traces, treats `1 − r` as a distance, and runs **hierarchical clustering** (average linkage). Output: a dendrogram + a spatial map where every cell is colored by its cluster.
+**What it does.** Z-scores each cell's dF/F trace, computes pairwise Euclidean distance (which on z-scored data is equivalent to `1 − Pearson r` up to a constant: `||x − y||² = 2T · (1 − r)` so pair-ranking is identical to correlation distance), and runs **hierarchical clustering with Ward linkage** — minimum within-cluster variance, produces compact balanced clusters. Output: a dendrogram + a spatial map where every cell is colored by its cluster.
 
 The user can:
 - Slide a horizontal "cut" line up/down the dendrogram to control how fine or coarse the clustering is. Auto mode picks a target of 4–5 clusters.
 - Pick a categorical or continuous palette, or set per-cluster colors manually.
+- **Click any ROI on the spatial map** to open a popout showing the heatmap + event raster restricted to that ROI's cluster (per-row min-max ΔF/F + Tab 5 onsets when available, else a derivative-threshold fallback). The clicked ROI is highlighted with a yellow row marker.
 - "Recluster" a selected branch (or branches) in a separate window — useful when one cluster is huge and looks heterogeneous.
 - Export each cluster's ROI ids to `.npy` files for Tab 7.
 
@@ -200,7 +208,7 @@ The spatial map then asks the obvious follow-up: *do these functional clusters c
 
 **Biological output.** Per-cell cluster assignments + a per-cluster ROI list, ready to ask "does cluster A lead cluster B?"
 
-→ See `tabs/clustering/README.md` for the correlation-distance metric, average-linkage algorithm, the `auto_choose_threshold` heuristic, and the export format consumed by Tab 7.
+→ See `tabs/clustering/README.md` for the z-scored Euclidean / Ward-linkage algorithm, the `auto_choose_threshold` heuristic, and the export format consumed by Tab 7.
 
 ---
 
@@ -234,11 +242,11 @@ The pipeline's purpose, in the end, is to take a dish full of neurons firing cha
 
 ## Tab 8 — Spatial propagation
 
-**What it does.** For each population event detected in Tab 5, shows four figures: a top pair of side-by-side activation-order maps, a centred vectors-only panel below them, and a full-width "distance vs Δt frame" violin underneath. The **top-left** is the plain activation-order map: each cell is coloured by *when it fired within that event*, on a continuous cyan → blue → red scale (cyan = earliest, red = latest), with non-participating ROIs left grey — useful as a clean reference image. The **top-right** is the same map with white arrows overlaid that connect the centroid of the cells firing in each frame to the centroid for the next active frame, so you can read the temporal trajectory directly off the spatial layout. The **middle panel** strips out the cells and shows just the propagation vectors, with each frame's centroid drawn as a circle whose radius is the 2D RMS standard deviation of the contributing cells around the group centroid (so a tight, focal frame looks like a small circle and a diffuse one looks like a large blob). The **bottom panel** answers "as the wave moves through time, how does its spatial reach grow?" by treating *every* participating cell as a seed in turn (except cells in the last active frame, which would only see same-frame peers): for each seed, it accumulates distances to every other cell whose first onset lands in the same or a later frame, binned by `Δframe = (other_frame - seed_frame)`. The result is one violin per Δframe — `Δframe = 0` is the within-frame spread, larger Δframes show how far the population reaches `k` frames after any given cell fires. This averages out the bias of any single seed and gives a propagation-spread profile of the whole event. A spinner and Prev / Next buttons let you flip through events one at a time.
+**What it does.** For each population event detected in Tab 5, shows three figures: a top pair of side-by-side activation-order maps and a full-width **directional monotonicity analysis** underneath. The **top-left** is the plain activation-order map: each cell is coloured by *when it fired within that event*, on a continuous cyan → blue → red scale (cyan = earliest, red = latest), with non-participating ROIs left grey — useful as a clean reference image. The **top-right** is the same map with white arrows overlaid that connect the centroid of the cells firing in each frame to the centroid for the next active frame, so you can read the temporal trajectory directly off the spatial layout. The **bottom panel** asks the harder question: "is there a *direction* of propagation, and how strong is it?" — sweep θ ∈ [0°, 360°), project each ROI's `(x_i, y_i)` onto `u(θ) = (cos θ, sin θ)` to get `s_i(θ)`, then compute Spearman's rank correlation `ρ(θ) = SpearmanCorr(s_i(θ), t_i)`. The angle that maximises ρ is the dominant propagation axis; its ρ value (0 = no direction, 1 = perfectly monotone along that axis) is the strength of the relationship. Significance comes from a permutation test that shuffles activation times across cells and re-runs the full θ sweep per shuffle (so the p-value corrects for the multiple-direction search baked into the max-over-θ statistic). Three subplots: ROI positions coloured by `t_i` with a θ* arrow scaled by `ρ_obs`, the `ρ(θ)` curve with the peak marked, and the permutation null histogram with `ρ_obs` overlaid + the empirical p-value. A spinner and Prev / Next buttons let you flip through events one at a time.
 
 This tab is a **pure consumer of Tab 5**: it doesn't re-detect anything. Tab 5 publishes its event windows, active-mask, and per-ROI first-onset times via the shared `AppState`, and Tab 8 subscribes. Whatever knobs you tuned on Tab 5 (manual ROI subset, advanced parameters, etc.) are exactly what gets visualised — re-render Tab 5 and Tab 8 updates automatically.
 
-**Why it matters biologically.** Tab 7 tells you "cluster A consistently leads cluster B by 47 ms". Tab 8 tells you what that *looks like* in space — the very thing that's missing from the violin plots. If event after event lights up cyan in the upper-left and progresses to red in the lower-right, you're seeing a stereotyped propagation wave: the kind of result that lets you point at a specific anatomical region as the seizure-initiation zone. Per-event maps also expose **heterogeneity**: maybe most events propagate left-to-right, but a few flip direction — that's a meaningful biological observation that gets averaged away in a single summary plot.
+**Why it matters biologically.** Tab 7 tells you "cluster A consistently leads cluster B by 47 ms". Tab 8 tells you what that *looks like* in space — the very thing that's missing from the violin plots. If event after event lights up cyan in the upper-left and progresses to red in the lower-right, you're seeing a stereotyped propagation wave: the kind of result that lets you point at a specific anatomical region as the seizure-initiation zone. Per-event maps also expose **heterogeneity**: maybe most events propagate left-to-right, but a few flip direction — that's a meaningful biological observation that gets averaged away in a single summary plot. The directional monotonicity test on the bottom panel makes that "direction or no direction?" question quantitative per event: a `ρ_obs ≈ 1` event has a sharp, reproducible propagation axis; a `ρ_obs ≈ 0` event is spatially synchronous or chaotic, and the high p-value tells you not to read tea-leaves into the centroid arrows above.
 
 V1 ships only the activation-order map. Future view modes (planned, ported from the legacy `spatial_heatmap_updated.py` reference): per-event propagation arrows + speed/angle CSV, per-ROI relative-lag violin plots, and scalar feature maps (event rate, peak ΔF/F, peak derivative-z) painted on the same canvas.
 
@@ -273,21 +281,17 @@ src/calliope/
 ├── pipeline_gui.py            ← top-level Tk app, builds the 9 tabs (0-8)
 ├── pipeline_gui_walkthrough.md  ← (this file)
 ├── core/                       ← pure-Python algorithms shared across tabs
-│   ├── preprocessing.py        ← shift / mean / blobs / QC GIF
+│   ├── preprocessing.py        ← Tab 1: shift / mean / QC GIF + run_preprocess
 │   ├── sparse_plus_cellpose.py ← Suite2p + Cellpose merge
 │   ├── adaptive_detection.py   ← register-only + sparsery loops; suite2p 1.0 db/settings adapter
 │   ├── utils.py                ← dF/F, lowpass, mad_z, event detection, fps lookup
-│   ├── crosscorrelation.py     ← batched + single-pair xcorr
-│   ├── clustering_cmap.py      ← palettes + auto-threshold + dendrogram + spatial paint
-│   ├── spatial.py              ← cyan→red colormap + order-rank painting
+│   ├── crosscorrelation.py     ← Tab 7: batched + single-pair xcorr + run_crosscorrelation
+│   ├── clustering.py           ← Tab 6: palettes + auto-threshold + dendrogram + spatial paint + run_clustering
+│   ├── spatial.py              ← Tab 8: cyan→red colormap + order-rank painting + render_spatial_event_figures
 │   ├── scale.py                ← pix↔µm helpers (zoom-based + direct override)
-│   ├── preprocess_run.py       ← headless wrapper for Tab 1
 │   ├── detection_run.py        ← headless Tab 3 pipeline (spc + dF/F + cellfilter + filtered_dff)
 │   ├── lowpass_run.py          ← headless Tab 4 (compute + figures)
 │   ├── event_detection_run.py  ← headless Tab 5 (compute + figures + summary write)
-│   ├── clustering_run.py       ← headless Tab 6 (linkage + cluster export + figures)
-│   ├── crosscorrelation_run.py ← thin batch wrapper over the existing xcorr core
-│   ├── spatial_run.py          ← headless per-event PNG renderer for Tab 8
 │   ├── batch_pipeline.py       ← run_recording orchestrator (Tabs 1+3-8 chained)
 │   └── cellfilter/             ← PyTorch CNN for the keep/drop classifier
 └── tabs/

@@ -10,7 +10,8 @@ This README explains, in order:
 4. The training loop, loss, and metrics (`train.py`).
 5. Inference at prediction time (`predict.py`).
 6. Configuration (`config.py`).
-7. A re-implementation checklist.
+7. The curation workflow + how many labels you actually need.
+8. A re-implementation checklist.
 
 ---
 
@@ -120,39 +121,60 @@ One sample = one `(spatial, trace, label)` triple for one ROI:
 
 ### 3.2 The label CSV
 
-`config.LABELS_CSV` (`F:\roi_curation.csv`) has columns:
+`config.LABELS_CSV` lives **inside the project** at `src/calliope/data/cellfilter_labels.csv` (resolved relative to the package). The file is created lazily on the first curation flip and is gitignored — per-curator data, not source code.
+
+Schema (column order canonical, see `config.LABELS_CSV_COLUMNS`):
 
 ```
-recording_ID, ROI_number, user_defined_cell
-2024-07-01_00018, 0,  1
-2024-07-01_00018, 1,  0
-2024-07-01_00018, 2,  1
+plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso
+E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  0, 1, 2026-05-12T14:03:22
+E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  1, 0, 2026-05-12T14:03:25
+E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  2, 1, 2026-05-12T14:03:28
 ...
 ```
 
-`load_labels(csv_path)` reads it, casts types, and drops duplicates keeping the **last** entry (so corrections override earlier labels).
+- **`plane0_path`** — absolute path to the recording's suite2p plane0 folder. The trainer reads features directly from this path; no more `DATA_ROOT/Cx,Hip/<rec_id>` resolution. The CSV is self-locating, so curators on different machines can share labels without rewriting the recording paths.
+- **`recording_ID`** — human-readable id (typically the recording folder name). Kept for auditing; the trainer doesn't use it for lookup.
+- **`ROI_number`** — integer suite2p ROI index inside that plane0's `stat.npy`.
+- **`user_defined_cell`** — `0` or `1`.
+- **`timestamp_iso`** — when the label was written. Updated on every re-label, so the CSV reflects the curator's most recent opinion at a glance.
+
+Writes go through `_upsert_label` in the curation popout (`tabs/suite2p/curation_popout.py`): for each `(plane0_path, ROI_number)` pair the row is **replaced in place** if it exists, appended otherwise. Re-labeling an ROI doesn't accumulate history — the CSV stays as one row per labelled ROI.
+
+`load_labels(csv_path)` reads it, casts types, and drops duplicates keyed on `(plane0_path, ROI_number)` keeping the **last** entry. If the file doesn't exist yet it returns an empty DataFrame with the expected columns so `train.py` can be invoked on a fresh project without crashing.
 
 ### 3.3 Recording resolution
 
-`find_recording_root(rec_id)` looks up where the suite2p folder for `rec_id` lives:
+There is none, by design. Each row of the CSV carries the absolute `plane0_path`; `dataset.py` opens that path directly. The pre-2026-05-12 `find_recording_root(rec_id)` walker (recursive `EXTRA_DATA_ROOTS` search, falling back to `DATA_ROOT/{Cx,Hip}/<rec_id>`) is gone, along with `DATA_ROOT` and `EXTRA_DATA_ROOTS` themselves.
 
-1. Walk every `EXTRA_DATA_ROOTS` (recursive `rglob`) for a directory named `rec_id` containing `suite2p/plane0/`. First hit wins.
-2. Otherwise check `DATA_ROOT/Cx/<rec_id>` then `DATA_ROOT/Hip/<rec_id>` (the lab's two regions of interest).
-
-The result is cached in `_REC_ROOT_CACHE`.
+If a recording is moved on disk, the labels CSV needs its `plane0_path` column rewritten — but no other code path needs updating. A simple `pd.read_csv` + string replace + `to_csv` covers it.
 
 ### 3.4 Per-recording cache (`_RecordingCache`)
 
-Loading the same recording's mean/max/dff for every ROI would be wasteful, so `_RecordingCache` lazily loads each recording once and reuses it across all ROIs labelled in that recording.
+Loading the same recording's mean/max/dff for every ROI would be wasteful, so `_RecordingCache` lazily loads each recording once and reuses it across all ROIs labelled in that recording. Constructor takes the plane0 path directly:
+
+```python
+class _RecordingCache:
+    def __init__(self, plane0: Path):
+        ...
+
+# In ROIDataset.__getitem__:
+plane0_path = str(row["plane0_path"])
+rec = self._cache.setdefault(plane0_path, _RecordingCache(Path(plane0_path)))
+```
+
+Cache key is the plane0 path string (so two recordings whose `recording_ID` strings happen to collide are still treated as distinct, since their plane0_path is different).
+
+Inside the cache:
 
 ```python
 stat        = np.load(plane0/'stat.npy')                 # ROI footprints
-ops         = np.load(plane0/'ops.npy').item()           # mean/max images
-mean_img    = ops.get('meanImgE') or ops.get('meanImg')
-max_img     = ops.get('max_proj') or ops.get('maxImg') or mean_img
+view        = utils.load_plane_view(plane0)              # ops + reg/detect outputs
+mean_img    = view.get('meanImgE') or view.get('meanImg')
+max_img     = view.get('max_proj') or view.get('maxImg') or mean_img
 mean_img_z  = (mean_img - mean) / std                    # z-score
 max_img_z   = (max_img  - mean) / std
-dff, _, _, T, N = utils.s2p_open_memmaps(plane0, prefix='r0p7_')  # filtered or unfiltered
+dff, _, _, T, N = utils.s2p_open_memmaps(plane0, prefix='r0p7_')
 ```
 
 If `max_proj` is cropped to Suite2p's `yrange/xrange` (a common quirk), it's padded back to full FOV using those ranges so it spatially aligns with `mean_img`.
@@ -192,10 +214,10 @@ This augments the dataset (different temporal contexts each epoch) and ensures t
 
 Two split helpers — choose based on dataset size:
 
-- `split_by_recording(df, val_frac=0.20)` — preferred. Hold out a fraction of *recordings* (not ROIs). Validation never sees ROIs from training-set recordings, so AUROC reflects generalisation across mice/slices, not memorisation of a particular FOV. Falls down when there are very few labelled recordings.
+- `split_by_recording(df, val_frac=0.20)` — preferred once you have ≥5 labelled recordings. Hold out a fraction of *recordings* (not ROIs). Validation never sees ROIs from training-set recordings, so AUROC reflects generalisation across mice/slices, not memorisation of a particular FOV. Uniqueness key is `plane0_path` rather than `recording_ID` (post-2026-05-12 schema) so two recordings whose human-readable ids collide get treated as distinct.
 - `split_by_roi(df, val_frac=0.20)` — fallback. Random per-ROI split, stratified on label so val keeps the class balance. Looser test of generalisation but works with one or two labelled recordings.
 
-`train.py` currently calls `split_by_roi` (the lab's labelled set is small enough that recording-level splits leave too few per side).
+`train.py` currently calls `split_by_roi` (the lab's labelled set is small enough that recording-level splits leave too few per side). Swap the import in `train.py` once you have enough recordings to support a clean recording-level holdout.
 
 ---
 
@@ -263,10 +285,12 @@ These three lines must run **before** numpy/torch import. NumPy-MKL and PyTorch 
 
 ### 5.1 `predict_recording(rec_id, model, device, plane0=None)`
 
-The hot path called by Tab 3:
+The hot path called by Tab 3 and the standalone curation app:
 
 ```python
-rec = _RecordingCache(rec_id, plane0=plane0)              # mmap dF/F + load images
+if plane0 is None:
+    raise ValueError("plane0 is required")  # DATA_ROOT walker removed 2026-05-12
+rec = _RecordingCache(Path(plane0))                       # mmap dF/F + load images
 N   = rec.N
 probs = zeros(N, float32)
 for roi in range(N):
@@ -281,7 +305,11 @@ np.save(plane0/'predicted_cell_prob.npy', probs)
 np.save(plane0/'predicted_cell_mask.npy', probs >= 0.5)
 ```
 
+`rec_id` is now only used for the log line at the end; the actual feature loading is keyed on `plane0`. Callers without a clean recording id can pass `infer_recording_id(plane0)` or `plane0.parent.name`.
+
 Per-ROI loop, batch size 1 (the temporal branch handles variable `T` per recording, so naive batching across recordings would need padding/masking we don't bother with). Empirically takes ~1 s per ROI on CPU and < 0.1 s on GPU.
+
+`load_model_from_checkpoint(ckpt_path, device)` builds a fresh `CellFilter`, calls `torch.load` + `load_state_dict` + `.eval()`, and returns the model. Shared between the CLI here, the Tab 3 popout's auto-repredict-after-retrain path, and the standalone curation app's auto-predict-on-open path so all three paths use the same loader.
 
 ### 5.2 Why full traces (no crop) at inference?
 
@@ -290,17 +318,14 @@ The convolutional + global-pool architecture handles arbitrary `T`. Cropping at 
 ### 5.3 CLI usage
 
 ```
-python -m calliope.core.cellfilter.predict
-    # predicts for every recording under DATA_ROOT/{Cx,Hip}
-
-python -m calliope.core.cellfilter.predict --rec 2024-07-01_00018
-    # one specific recording id
-
-python -m calliope.core.cellfilter.predict --plane0 D:/data/.../suite2p/plane0
-    # bypass DATA_ROOT/Cx,Hip resolution and point straight at a folder
+python -m calliope.core.cellfilter.predict --plane0 D:/data/.../suite2p/plane0 [...]
+    # one or more plane0 directories; the checkpoint is loaded once
+    # and the model is reused across recordings in the batch
 ```
 
-Tab 3 invokes the function form, not the CLI.
+Tab 3 invokes the function form (`predict_recording(rec_id, model, device, plane0=plane0)`) not the CLI.
+
+The 2026-05-12 refactor removed the old `--rec ID` mode and the no-arg "scan `DATA_ROOT/{Cx,Hip}/` and predict everything" mode along with `DATA_ROOT` itself. The canonical input is now an explicit plane0 path; `predict_recording` raises `ValueError` if called without one.
 
 ### 5.4 Outputs
 
@@ -316,10 +341,9 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 
 | Key | Value | Purpose |
 |---|---|---|
-| `LABELS_CSV` | `F:\roi_curation.csv` | Hand-labelled training data. |
-| `DATA_ROOT` | `F:\data\2p_shifted` | Root with `Cx/` and `Hip/` subdirs. |
-| `EXTRA_DATA_ROOTS` | `[D:\data]` | Searched recursively before `DATA_ROOT`. |
-| `CHECKPOINT_DIR` | `F:\cellfilter_checkpoints` | Where `best.pt`, `last.pt`, `train_log.csv` live. |
+| `LABELS_CSV` | `src/calliope/data/cellfilter_labels.csv` (in-project) | Hand-labelled training data. Created lazily on the first curation flip. Gitignored so per-curator labels don't conflict. |
+| `LABELS_CSV_COLUMNS` | `(plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso)` | Canonical CSV schema. `plane0_path` is the trainer's source of truth -- no more `DATA_ROOT` resolution. |
+| `CHECKPOINT_DIR` | `~/.calliope/cellfilter_checkpoints/` | Where `best.pt`, `last.pt`, `train_log.csv` live. Outside the repo so big binary weights don't get committed. |
 | `DFF_PREFIX` | `r0p7_` | Memmap prefix the cache reads from `plane0`. |
 | `PATCH_SIZE` | 32 | Spatial patch edge in pixels. |
 | `TRACE_CROP_LEN` | 2000 | Random crop length for training. |
@@ -340,7 +364,76 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 
 ---
 
-## 7. Re-implementation checklist
+## 7. Curation workflow
+
+### 7.1 Two entry points to the same labels CSV
+
+| Entry | When you'd use it | Where it lives |
+|---|---|---|
+| **Tab 3 popout** | One-off curation while you're already inspecting a recording in the pipeline GUI. Click an ROI on the "All detected ROIs" panel; a child window opens for that ROI. Flip with `1`/`0`, close, move on. | `src/calliope/tabs/suite2p/curation_popout.py` |
+| **Standalone curation app** | Bulk training-data collection. Walks many recordings in one sitting, sorts ROIs by classifier uncertainty so the curator hits the most informative ones first. No pipeline-GUI dependency. | `src/calliope/scripts/roi_curation_app.py` |
+
+Both write to the same `cellfilter_labels.csv` via the same `_upsert_label` function. Run them in any combination — labels accumulate in one file.
+
+### 7.2 Standalone app
+
+```bash
+python -m calliope.scripts.roi_curation_app [plane0 ...] [--sort MODE] [--repredict] [--ckpt PATH]
+```
+
+Tk window with a `Listbox` of plane0 paths plus **Add plane0...** / **Remove** / **Open curation** / **Re-predict selected** / sort dropdown. Add several plane0s up front (or drip-feed via Add plane0 as you go). Selecting an entry:
+
+1. Runs `predict_recording` against it if `predicted_cell_prob.npy` is missing in that plane0 (or `--repredict` was passed).
+2. Spawns the `CurationPopout` against that plane0.
+3. Binds `Left` / `Right` for Prev / Next sorted ROI; `1` / `0` for cell / not-a-cell; `Esc` to close.
+
+Sort modes:
+
+| `--sort` | Order | Best for |
+|---|---|---|
+| `unsure` (default) | `|p(cell) - 0.5|` ascending | Active learning — the most-ambiguous ROIs come first, which is where new labels move the model the most. |
+| `prob_asc` | lowest p(cell) first | Hunting for false positives (the model said "not cell" but it actually is one). |
+| `prob_desc` | highest p(cell) first | Hunting for false negatives in the "cell" set. |
+| `index` | raw Suite2p ROI order | When you don't have a checkpoint yet, or just want a deterministic walk. |
+
+After every flip the popout auto-advances to the next sorted ROI — `1`/`0` is enough to label your way through the queue. Switching plane0s in the Listbox closes the current popout and opens a new one; labels CSV is the persistence layer across switches.
+
+### 7.3 Retrain loop (auto re-predict)
+
+The Tab 3 popout's **Retrain cell filter** button (greyed until ≥1 flip in the current session) does:
+
+1. `cellfilter.train.main()` — reads the labels CSV, writes new `best.pt` + `last.pt` to `CHECKPOINT_DIR`.
+2. `predict_recording(rec_id, model, device, plane0=self._plane0)` — scores every ROI in the *current* recording against the fresh checkpoint.
+3. Refreshes the popout's own `_probs` cache; pings parent Tab 3 via `on_iscell_changed(-1, -1)` so panels 2 + 3 repaint against the new mask without a manual re-detect.
+
+Three result states:
+
+- `("ok", msg)` — both train and re-predict succeeded; new mask on disk and visible.
+- `("warn", msg)` — train succeeded but re-predict failed (e.g., the active plane0 was moved). New `best.pt` is still on disk; the curator can run `predict.py --plane0 ...` manually.
+- `("err", msg)` — training itself failed; old checkpoint untouched.
+
+### 7.4 How many labels for a robust classifier?
+
+For this two-branch CNN (~250 K params, the existing config), expect:
+
+| Total labels | Recordings | What you get |
+|---:|---:|---|
+| ~300–500 | 3+ | Bare minimum viable. Will train, will beat Suite2p's built-in classifier on the recordings it saw. Won't generalise to new days/scope settings. |
+| ~1000–1500 | 6–10 | "It's working well now." Validation AUROC usually plateaus in here for this model size. The `split_by_recording` validator needs ≥5 recordings to be meaningful. |
+| ~2500–4000 | 10–15 | Robust / "stop curating." Past this the curve flattens — extra labels mostly fight measurement noise. Only worth pushing further if you're adding genuinely new conditions (new region, new GCaMP variant, new microscope). |
+
+What bends the curve in your favour:
+
+1. **Recording diversity > per-recording count.** 100 ROIs from each of 10 recordings beats 1000 ROIs from 1 recording. The validator can only catch overfitting if held-out recordings differ from training ones.
+2. **Spend keystrokes on ambiguous ROIs.** The default `unsure` sort puts the most-informative ROIs first. One ambiguous label is worth ~3–5 confident ones. Avoid sitting at `p ≈ 0.95` confirming the model.
+3. **Iterate, don't batch.** Label ~200–300 → Retrain (auto re-predict rescores everything) → reopen with `unsure` sort → label another ~200–300 on newly-uncertain ROIs. Three or four passes get further than 2000 labels in one sitting.
+4. **Class balance handles itself.** `BCEWithLogitsLoss(pos_weight = N_neg / N_pos)` upweights the rare class automatically. Don't artificially skip obvious cases on one side or the other.
+
+For tissue-identity experiments (e.g., the cortex+hippocampus stitch test), get ≥500 labels in the bag *before* trusting the keep-mask for downstream clustering — otherwise mask noise dominates whatever signal you're trying to measure.
+
+---
+
+## 8. Re-implementation checklist
 
 1. **Build the per-ROI sample.**
    - Compute the centroid of `(xpix, ypix)`.

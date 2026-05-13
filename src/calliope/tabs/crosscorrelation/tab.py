@@ -65,7 +65,6 @@ defined below.
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import tkinter as tk
 import traceback

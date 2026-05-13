@@ -75,6 +75,7 @@ from __future__ import annotations
 # --- standard library ---
 import os                  # OS utilities: path joining, listing, env vars
 import re                  # Regex utilities for parsing filenames
+import threading           # daemon thread for the peak-RAM monitor
 
 # --- third-party scientific stack ---
 # NumPy is the array library that underpins almost everything below.
@@ -1459,19 +1460,118 @@ def _activation_matrix_from_windows(
 # ---------------------------------------------------------------------------
 
 
-def change_batch_according_to_free_ram() -> int:
-    """Pick a Suite2p ``batch_size`` based on currently-available RAM.
+# ---- Adaptive RAM management for suite2p ---------------------------
+#
+# Suite2p's two big knobs (registration ``batch_size``, detection
+# ``nbinned``) bake in their memory footprint at the start of each run
+# -- we can't retune them mid-suite2p. So the strategy is:
+#
+#   1. Frame-size-aware initial estimate. Compute the largest
+#      batch_size whose modelled peak fits in a target fraction of
+#      total RAM, minus a fixed headroom for the OS / GUI / cellpose /
+#      everything else loaded into the process.
+#
+#   2. Closed-loop adjustment between recordings (Tab 0 batch mode).
+#      :class:`PeakMemoryMonitor` polls ``psutil.virtual_memory()``
+#      every 0.5 s during each suite2p call; after the run,
+#      :class:`AdaptiveBatchSizer` compares the observed peak to the
+#      target and scales the next recording's batch_size up or down.
+#      First recording uses the frame-size estimate; recordings 2..N
+#      self-correct.
+#
+# Tab 3 (single recording outside batch mode) only benefits from #1 --
+# the loop needs >=2 recordings to do anything.
 
-    Suite2p's per-batch memory footprint is roughly linear in
-    ``batch_size``, so we want to scale the parameter with whatever
-    RAM we've got. The linear model below was tuned empirically:
+# Default fraction of TOTAL system RAM that suite2p should consume at
+# peak. 0.80 leaves a 20% buffer for OS + GUI + matplotlib + cellpose +
+# whatever else is loaded. Override per-process by reassigning this
+# module-level constant or via :class:`AdaptiveBatchSizer` args.
+RAM_TARGET_FRACTION = 0.80
+
+# Bytes reserved off the top of total RAM as absolute headroom for the
+# OS, our own GUI process, and suite2p logging. 4 GiB is enough for the
+# Tk GUI + a comfortable OS slack on most workstations.
+RAM_HEADROOM_GIB = 4.0
+
+# Empirical multiplier on the raw frame bytes (Ly * Lx * 2) covering
+# suite2p's per-batch working buffers: registration intermediates, FFT
+# plans, dtype upcasts to float32, motion-correction overhead. Calibrated
+# against the legacy ``20*GiB - 170`` fit on 512x512 recordings.
+RAM_OVERHEAD_MULTIPLIER = 8.0
+
+# ---- GPU equivalents -----------------------------------------------
+#
+# suite2p 1.0's registration runs on torch.cuda when available, and
+# ``rigid.phasecorr`` allocates ``batch_size * Ly * Lx * 8`` bytes as
+# complex64 plus FFT workspace + mask copies. With a small GPU (e.g.
+# 6 GiB) and a normal-RAM workstation (32 GiB), system-RAM sizing
+# picks batch_size way too large for the GPU and registration crashes
+# with CUDA OOM. So whichever of {CPU, GPU} is tighter wins.
+#
+# Defaults are deliberately tighter than the CPU side: torch's CUDA
+# allocator fragments aggressively above ~80%, and we don't have the
+# luxury of OS page-cache buffering to absorb spikes.
+
+# Fraction of total GPU memory available to suite2p's registration
+# buffer. Lower than the CPU target because the CUDA allocator
+# fragments badly above ~80% and there's no OS-level buffering to
+# absorb spikes.
+RAM_TARGET_FRACTION_GPU = 0.70
+
+# Reserved off-the-top GPU memory for cellpose model weights, other
+# CUDA processes, and the torch arena's own bookkeeping.
+RAM_HEADROOM_GIB_GPU = 1.0
+
+# complex64 (8 bytes per pixel) + FFT working buffers + mask copies
+# that scale with batch_size. Calibrated against the observed OOM
+# (5524 frames * 512x512 -> 10.79 GiB complex64 alloc -> ~2 MB/frame).
+# The conservative 5.0 default budgets 5x the observed peak per frame
+# to cover (a) variation across GPU models + driver versions, (b)
+# cellpose weights when registration + detection overlap, (c) torch's
+# allocator fragmentation. Closed loop ratchets the realised use up
+# toward target_fraction_gpu in recordings 2+ once we have feedback.
+RAM_OVERHEAD_MULTIPLIER_GPU = 5.0
+
+
+def _ensure_cuda_alloc_conf() -> None:
+    """Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` unless
+    the user already configured it.
+
+    torch's own CUDA OOM error suggested this -- it switches the
+    allocator to a growable-segment scheme that resists fragmentation.
+    A run that would OOM under the default fixed-size segment
+    allocator can often complete with this set. We honour any
+    pre-existing value the user set (e.g. they tuned it for a
+    different workload), only filling in our default when the env
+    var isn't present.
+
+    Called at import time so torch picks it up the first time CUDA
+    is initialised. Setting it after torch.cuda has booted is a
+    no-op.
+    """
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
+# Apply the env var at module import. Has to happen before any
+# `import torch` that triggers CUDA init -- since this file is one of
+# the first calliope modules imported, that's well before suite2p
+# spins up its CUDA context.
+_ensure_cuda_alloc_conf()
+
+
+def change_batch_according_to_free_ram() -> int:
+    """Legacy linear fit on currently-available RAM (no frame-size input).
+
+    Kept as a fallback when no TIFF folder is available to peek at the
+    frame shape. Tuned empirically:
 
         16 GiB available  -> batch_size 150
         200 GiB available -> batch_size 4000
         less than 13.5 GiB-> floor at 100 (safe baseline)
 
-    Tab 3 calls this when seeding the Suite2p ops dict so a powerful
-    workstation gets a faster run without manual tuning.
+    New code should prefer :func:`pick_batch_size` (frame-size aware)
+    or :class:`AdaptiveBatchSizer` (frame-size aware + closed-loop).
     """
     # ``psutil.virtual_memory().available`` is bytes; convert to GiB.
     available_mem = round(psutil.virtual_memory().available / (1024 ** 3), 1)
@@ -1480,6 +1580,433 @@ def change_batch_according_to_free_ram() -> int:
     # ``int(...)`` truncates toward zero; the linear function is
     # ``20 * GiB - 170``.
     return int(20 * available_mem - 170)
+
+
+def pick_batch_size(
+    tiff_folder: Optional[str] = None,
+    *,
+    target_fraction: Optional[float] = None,
+    headroom_gib: Optional[float] = None,
+    overhead_multiplier: Optional[float] = None,
+    floor: int = 100,
+    ceiling: int = 8000,
+) -> int:
+    """Frame-size-aware Suite2p ``batch_size`` for a target RAM fraction.
+
+    Computes the largest batch_size whose modelled peak memory footprint
+    fits in ``target_fraction * total_RAM - headroom_gib``. The model:
+
+        peak_bytes_per_frame = Ly * Lx * 2 * overhead_multiplier
+        batch_size           = budget_bytes // peak_bytes_per_frame
+
+    Falls back to :func:`change_batch_according_to_free_ram` when the
+    frame shape isn't readable (no tiff_folder or no readable TIFFs).
+    """
+    target = (target_fraction if target_fraction is not None
+              else RAM_TARGET_FRACTION)
+    headroom = (headroom_gib if headroom_gib is not None
+                else RAM_HEADROOM_GIB)
+    overhead = (overhead_multiplier if overhead_multiplier is not None
+                else RAM_OVERHEAD_MULTIPLIER)
+
+    shape = _peek_tiff_frame_shape(tiff_folder) if tiff_folder else None
+    total_bytes = psutil.virtual_memory().total
+    budget = (total_bytes * float(target)) - (float(headroom) * (1024 ** 3))
+
+    if shape is None or budget <= 0:
+        # No frame shape -- legacy linear fit on available RAM.
+        fallback = change_batch_according_to_free_ram()
+        print(f"[batch_size] no frame shape ({tiff_folder!r}); "
+              f"falling back to legacy formula -> {fallback}")
+        return fallback
+
+    Ly, Lx = shape
+    per_frame_bytes = float(Ly) * float(Lx) * 2.0 * float(overhead)
+    if per_frame_bytes <= 0:
+        return change_batch_according_to_free_ram()
+
+    bs_cpu = int(budget // per_frame_bytes)
+    cpu_capped = max(floor, min(ceiling, bs_cpu))
+    total_gib = total_bytes / (1024 ** 3)
+    cpu_proj_gib = cpu_capped * per_frame_bytes / (1024 ** 3)
+    print(f"[batch_size] CPU: total={total_gib:.1f}GiB target={target:.0%} "
+          f"headroom={headroom:.1f}GiB frame={Ly}x{Lx} -> "
+          f"batch_size={cpu_capped} (peak~{cpu_proj_gib:.2f}GiB)")
+
+    # GPU clamp. suite2p 1.0 runs registration on torch.cuda; the
+    # GPU's memory budget is usually much tighter than system RAM on
+    # workstations with a small GPU + plenty of CPU memory (e.g. RTX
+    # 3050 6 GiB + 32 GiB system). Whichever is tighter wins.
+    bs_gpu = pick_batch_size_gpu(Ly, Lx, floor=floor, ceiling=ceiling)
+    if bs_gpu is not None and bs_gpu < cpu_capped:
+        print(f"[batch_size] GPU clamp wins: {bs_gpu} < CPU {cpu_capped}")
+        return bs_gpu
+
+    return cpu_capped
+
+
+def pick_batch_size_gpu(
+    Ly: int,
+    Lx: int,
+    *,
+    target_fraction: Optional[float] = None,
+    headroom_gib: Optional[float] = None,
+    overhead_multiplier: Optional[float] = None,
+    floor: int = 100,
+    ceiling: int = 8000,
+) -> Optional[int]:
+    """Pick batch_size against total GPU memory if CUDA is available.
+
+    Mirrors :func:`pick_batch_size` but targets the CUDA device's
+    ``total_memory`` instead of system RAM. Returns ``None`` when no
+    CUDA device is available or torch isn't importable -- the caller
+    treats that as "no GPU clamp" and uses the CPU estimate alone.
+
+    The per-frame model:
+
+        peak_bytes_per_frame = Ly * Lx * 8 * overhead_multiplier
+
+    8 bytes per pixel = complex64 (suite2p's phase-correlation FFT
+    dtype); the multiplier covers FFT working buffers + mask copies
+    that scale with batch_size. Calibrated against the observed
+    11 GiB / 5524 frames at 512x512 OOM = ~3.2 bytes per pixel
+    overhead over the raw complex64.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        device_idx = torch.cuda.current_device()
+        total_bytes = int(
+            torch.cuda.get_device_properties(device_idx).total_memory)
+    except Exception:
+        return None
+
+    target = (target_fraction if target_fraction is not None
+              else RAM_TARGET_FRACTION_GPU)
+    headroom = (headroom_gib if headroom_gib is not None
+                else RAM_HEADROOM_GIB_GPU)
+    overhead = (overhead_multiplier if overhead_multiplier is not None
+                else RAM_OVERHEAD_MULTIPLIER_GPU)
+
+    budget = (total_bytes * float(target)
+              - float(headroom) * (1024 ** 3))
+    if budget <= 0:
+        print(f"[batch_size] GPU: budget exhausted by headroom "
+              f"({headroom:.1f}GiB on {total_bytes / 1024**3:.1f}GiB GPU)")
+        return floor
+
+    per_frame_bytes = float(Ly) * float(Lx) * 8.0 * float(overhead)
+    if per_frame_bytes <= 0:
+        return None
+
+    bs = int(budget // per_frame_bytes)
+    capped = max(floor, min(ceiling, bs))
+    total_gib = total_bytes / (1024 ** 3)
+    proj_gib = capped * per_frame_bytes / (1024 ** 3)
+    print(f"[batch_size] GPU: total={total_gib:.1f}GiB target={target:.0%} "
+          f"headroom={headroom:.1f}GiB frame={Ly}x{Lx} -> "
+          f"batch_size={capped} (peak~{proj_gib:.2f}GiB)")
+    return capped
+
+
+def _query_gpu_peak_fraction() -> Optional[float]:
+    """Return current CUDA peak allocation as a fraction of total GPU
+    memory, or None if CUDA isn't available.
+
+    Uses ``torch.cuda.max_memory_allocated`` so the peak persists
+    across the call window; the monitor resets it before each suite2p
+    run (so the value reflects only this run, not stale history from
+    earlier work in the same process).
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        device_idx = torch.cuda.current_device()
+        peak = int(torch.cuda.max_memory_allocated(device_idx))
+        total = int(torch.cuda.get_device_properties(device_idx).total_memory)
+        if total <= 0:
+            return None
+        return float(peak) / float(total)
+    except Exception:
+        return None
+
+
+def _reset_gpu_peak() -> None:
+    """Reset torch.cuda's peak-memory tracking so the next
+    ``max_memory_allocated`` read covers only the upcoming run.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+class PeakMemoryMonitor:
+    """Daemon thread that polls system RAM and tracks the peak fractions
+    of BOTH system RAM and GPU memory across the monitored window.
+
+    Usage::
+
+        with PeakMemoryMonitor() as mon:
+            run_long_thing()
+        print(mon.peak_fraction)       # max(cpu, gpu)
+        print(mon.cpu_peak_fraction)   # system RAM only
+        print(mon.gpu_peak_fraction)   # GPU only, or 0.0 if no CUDA
+
+    The CPU peak comes from ``psutil.virtual_memory().percent`` (system-
+    wide, not process-specific). The GPU peak comes from
+    ``torch.cuda.max_memory_allocated`` divided by total GPU memory --
+    torch's allocator tracks high-water-mark across the window
+    natively, so we just reset it at __enter__ and read at __exit__.
+
+    ``peak_fraction`` returns ``max(cpu, gpu)`` -- the adaptive sizer
+    uses this so the closed loop scales against whichever resource
+    actually pressured. Without it, suite2p would happily oversize
+    batch_size against a 6 GiB GPU on a workstation with 32 GiB CPU
+    RAM (which is exactly the regression that crashed registration
+    with batch_size=5524 + 512x512 frames).
+    """
+
+    def __init__(self, sample_interval: float = 0.5):
+        self._sample_interval = float(sample_interval)
+        self._stop = threading.Event()
+        self._cpu_peak = 0.0
+        self._gpu_peak = 0.0
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def peak_fraction(self) -> float:
+        """The tighter of CPU and GPU peak. Drives the closed loop."""
+        return max(self._cpu_peak, self._gpu_peak)
+
+    @property
+    def cpu_peak_fraction(self) -> float:
+        """System-RAM peak across the monitored window."""
+        return self._cpu_peak
+
+    @property
+    def gpu_peak_fraction(self) -> float:
+        """GPU peak across the monitored window; 0.0 if no CUDA."""
+        return self._gpu_peak
+
+    def __enter__(self):
+        self._stop.clear()
+        # Seed the CPU peak with the current reading so a very short
+        # run still returns a sensible number even if the thread
+        # never samples.
+        self._cpu_peak = psutil.virtual_memory().percent / 100.0
+        # Reset torch's high-water-mark counter so the GPU peak we
+        # read at __exit__ reflects only this window.
+        _reset_gpu_peak()
+        self._gpu_peak = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="calliope-peak-mem")
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            # Short timeout: we don't care if the sampler is mid-sleep.
+            self._thread.join(timeout=2.0)
+        # Final GPU peak read after suite2p (which lives on the main
+        # thread) has finished its allocations. torch's max-allocated
+        # counter is the authoritative high-water-mark for this
+        # window; reading it here is more reliable than the polling
+        # loop, which only sees snapshots.
+        gpu = _query_gpu_peak_fraction()
+        if gpu is not None and gpu > self._gpu_peak:
+            self._gpu_peak = gpu
+
+    def _run(self):
+        # ``Event.wait`` is interruptible -- exits promptly when
+        # ``_stop`` is set. ``time.sleep`` would block the full
+        # interval before noticing the stop signal.
+        while not self._stop.is_set():
+            try:
+                frac = psutil.virtual_memory().percent / 100.0
+            except Exception:
+                frac = 0.0
+            if frac > self._cpu_peak:
+                self._cpu_peak = frac
+            # GPU peak is tracked by torch's allocator natively, but
+            # poll-sample it too so a long-running suite2p call
+            # surfaces interim GPU pressure to the log (the final
+            # authoritative read happens at __exit__).
+            gpu = _query_gpu_peak_fraction()
+            if gpu is not None and gpu > self._gpu_peak:
+                self._gpu_peak = gpu
+            self._stop.wait(self._sample_interval)
+
+
+class AdaptiveBatchSizer:
+    """Module-level singleton that picks suite2p ``batch_size`` and
+    learns from observed peak RAM across recordings.
+
+    First call uses :func:`pick_batch_size` (frame-size-aware initial
+    estimate). Subsequent calls scale the last batch_size by
+    ``target_fraction / observed_peak`` so the queue converges on the
+    target as it processes recordings.
+
+    Per-step scaling is clamped to :attr:`max_scale_per_step` so a
+    noisy peak reading doesn't whiplash batch_size by 5x in one go --
+    conservative convergence over 2-3 recordings rather than blowing
+    up on recording 2 if recording 1 happened to peak unusually low.
+
+    Used as a process-wide singleton via :func:`get_adaptive_sizer` /
+    :func:`reset_adaptive_sizer`. Tab 0's "Run All" calls reset at
+    queue start; each recording's suite2p call site calls
+    :meth:`pick` for the batch_size and :meth:`update_from_peak` after
+    its :class:`PeakMemoryMonitor` exits.
+    """
+
+    def __init__(self,
+                 target_fraction: float = RAM_TARGET_FRACTION,
+                 target_fraction_gpu: float = RAM_TARGET_FRACTION_GPU,
+                 floor: int = 100,
+                 ceiling: int = 8000,
+                 max_scale_per_step: float = 1.5):
+        self.target_fraction = float(target_fraction)
+        self.target_fraction_gpu = float(target_fraction_gpu)
+        self.floor = int(floor)
+        self.ceiling = int(ceiling)
+        self.max_scale_per_step = float(max_scale_per_step)
+        self._last_batch_size: Optional[int] = None
+        self._last_cpu_peak: Optional[float] = None
+        self._last_gpu_peak: Optional[float] = None
+        # (batch_size, cpu_peak, gpu_peak) per learning step.
+        self.history: list[tuple[int, float, float]] = []
+
+    def pick(self,
+             tiff_folder: Optional[str] = None,
+             *,
+             headroom_gib: Optional[float] = None,
+             overhead_multiplier: Optional[float] = None) -> int:
+        """Choose a batch_size. Uses learned scaling if the loop has
+        run at least once; otherwise falls back to the frame-size
+        initial estimate.
+
+        With two resources (CPU + GPU), the binding constraint is
+        whichever is closest to its target. The scale is the *minimum*
+        of ``cpu_target / cpu_peak`` and ``gpu_target / gpu_peak`` so
+        we converge on the tighter resource and stay safe on the
+        looser one.
+        """
+        have_feedback = (self._last_batch_size is not None
+                         and (self._last_cpu_peak is not None
+                              or self._last_gpu_peak is not None))
+        if not have_feedback:
+            bs = pick_batch_size(tiff_folder,
+                                 target_fraction=self.target_fraction,
+                                 headroom_gib=headroom_gib,
+                                 overhead_multiplier=overhead_multiplier,
+                                 floor=self.floor, ceiling=self.ceiling)
+            self._last_batch_size = bs
+            print(f"[adaptive] initial batch_size={bs} "
+                  f"(cpu target {self.target_fraction:.0%}, "
+                  f"gpu target {self.target_fraction_gpu:.0%})")
+            return bs
+
+        # Closed-loop step. Compute per-resource scale; bind on the
+        # tighter one (smaller scale = more conservative).
+        scales: list[tuple[str, float, float, float]] = []
+        if self._last_cpu_peak is not None:
+            cpu_peak = max(0.30, float(self._last_cpu_peak))
+            scales.append(("cpu", self._last_cpu_peak,
+                          self.target_fraction,
+                          self.target_fraction / cpu_peak))
+        if self._last_gpu_peak is not None and self._last_gpu_peak > 0:
+            gpu_peak = max(0.30, float(self._last_gpu_peak))
+            scales.append(("gpu", self._last_gpu_peak,
+                          self.target_fraction_gpu,
+                          self.target_fraction_gpu / gpu_peak))
+
+        # Pick the minimum scale = bind to whichever resource has
+        # the smallest headroom-to-target ratio. Defensive fallback
+        # if both peaks were None (shouldn't happen given have_feedback).
+        if not scales:
+            return int(self._last_batch_size or self.floor)
+
+        bind_name, bind_peak, bind_target, raw_scale = min(
+            scales, key=lambda x: x[3])
+        scale = max(1.0 / self.max_scale_per_step,
+                    min(self.max_scale_per_step, raw_scale))
+        new_bs = int(round(self._last_batch_size * scale))
+        new_bs = max(self.floor, min(self.ceiling, new_bs))
+        scale_log = " | ".join(
+            f"{n} peak={p:.1%}/target={t:.0%} -> scale {s:.2f}"
+            for n, p, t, s in scales)
+        print(f"[adaptive] {scale_log}")
+        print(f"[adaptive] bind on {bind_name} (tightest), "
+              f"clamped={scale:.2f}, "
+              f"batch_size {self._last_batch_size} -> {new_bs}")
+        self._last_batch_size = new_bs
+        return new_bs
+
+    def update_from_peak(self,
+                         peak_fraction: Optional[float] = None,
+                         *,
+                         cpu_peak: Optional[float] = None,
+                         gpu_peak: Optional[float] = None,
+                         batch_size: Optional[int] = None) -> None:
+        """Record the observed peak(s) from a completed suite2p run.
+
+        Preferred call shape: pass ``cpu_peak`` and ``gpu_peak``
+        explicitly so the loop can bind to whichever resource was
+        tighter. Legacy single-``peak_fraction`` callers are still
+        supported -- the value is recorded as the CPU peak and GPU
+        peak stays unknown.
+
+        ``batch_size`` lets the caller pin the value that was actually
+        used (in case suite2p clamped or :meth:`pick` and the
+        downstream wiring fell out of sync). When omitted, the sizer's
+        own last-pick is used.
+        """
+        if cpu_peak is not None:
+            self._last_cpu_peak = float(cpu_peak)
+        elif peak_fraction is not None and self._last_cpu_peak is None:
+            self._last_cpu_peak = float(peak_fraction)
+        if gpu_peak is not None:
+            self._last_gpu_peak = float(gpu_peak)
+        if batch_size is not None:
+            self._last_batch_size = int(batch_size)
+        self.history.append((int(self._last_batch_size or 0),
+                             float(self._last_cpu_peak or 0.0),
+                             float(self._last_gpu_peak or 0.0)))
+
+    def reset(self) -> None:
+        """Wipe learned state. Call at the start of a fresh queue."""
+        self._last_batch_size = None
+        self._last_cpu_peak = None
+        self._last_gpu_peak = None
+        self.history.clear()
+
+
+# Process-wide singleton. Batch mode drives this across every recording
+# in the queue; Tab 3 (single recording) hits ``pick`` once, never
+# gets feedback, so it stays on the initial estimate.
+_global_sizer: AdaptiveBatchSizer = AdaptiveBatchSizer()
+
+
+def get_adaptive_sizer() -> AdaptiveBatchSizer:
+    """Return the process-wide :class:`AdaptiveBatchSizer` singleton."""
+    return _global_sizer
+
+
+def reset_adaptive_sizer(target_fraction: Optional[float] = None) -> None:
+    """Wipe the singleton's learned state. Optionally retune the
+    target fraction in the same call.
+    """
+    if target_fraction is not None:
+        _global_sizer.target_fraction = float(target_fraction)
+    _global_sizer.reset()
 
 
 def _peek_tiff_frame_shape(tiff_folder: str):
@@ -1510,23 +2037,48 @@ def _peek_tiff_frame_shape(tiff_folder: str):
 
 
 def change_nbinned_according_to_free_ram(tiff_folder: str,
-                                         ram_fraction: float = 0.35,
+                                         ram_fraction: Optional[float] = None,
                                          default: int = 1500,
                                          floor: int = 500,
                                          ceiling: int = 5000,
-                                         peak_multiplier: float = 3.0) -> int:
+                                         peak_multiplier: float = 3.0,
+                                         headroom_gib: Optional[float] = None,
+                                         ) -> int:
     """Cap Suite2p's ``nbinned`` so sparsery's peak intermediate fits in RAM.
 
-    Models the peak as ``peak_multiplier * nbinned * Ly * Lx * 4`` bytes and
-    budgets ``ram_fraction`` of currently-available RAM for it. Falls back
-    to ``default`` if the TIFF frame shape can't be read.
+    Models the peak as ``peak_multiplier * nbinned * Ly * Lx * 4`` bytes
+    and budgets ``ram_fraction`` of total RAM (minus ``headroom_gib``)
+    for it. Falls back to ``default`` if the TIFF frame shape can't be
+    read.
+
+    ``ram_fraction`` defaults to roughly half of :data:`RAM_TARGET_FRACTION`
+    so nbinned and batch_size share the RAM pool without colliding --
+    they both peak during detection but at slightly different phases,
+    so 0.40 * target each is a safe budget. Override per-call to retune.
     """
-    available_bytes = psutil.virtual_memory().available
-    budget = available_bytes * ram_fraction
+    if ram_fraction is None:
+        # Default: nbinned gets a sub-fraction of the global RAM target,
+        # since batch_size already claims a large slice during
+        # registration. 0.5 of target_fraction keeps the combined budget
+        # under target_fraction with margin for working buffers.
+        ram_fraction = RAM_TARGET_FRACTION * 0.5
+    if headroom_gib is None:
+        headroom_gib = RAM_HEADROOM_GIB
+
+    # Switch from "available" to "total - headroom" so the budget is
+    # stable across runs regardless of OS cache state. Matches
+    # ``pick_batch_size``.
+    total_bytes = psutil.virtual_memory().total
+    budget = (total_bytes * float(ram_fraction)
+              - float(headroom_gib) * (1024 ** 3))
 
     shape = _peek_tiff_frame_shape(tiff_folder)
     if shape is None:
         print(f"[nbinned] could not peek TIFF shape in {tiff_folder}; "
+              f"using default={default}")
+        return default
+    if budget <= 0:
+        print(f"[nbinned] budget exhausted by headroom ({headroom_gib} GiB); "
               f"using default={default}")
         return default
 
@@ -1537,9 +2089,9 @@ def change_nbinned_according_to_free_ram(tiff_folder: str,
 
     nbinned = int(budget // bytes_per_nbinned)
     capped = max(floor, min(ceiling, nbinned))
-    avail_gb = available_bytes / (1024 ** 3)
-    print(f"[nbinned] avail={avail_gb:.1f}GB frame={Ly}x{Lx} "
-          f"raw_nbinned={nbinned} -> {capped} "
+    total_gib = total_bytes / (1024 ** 3)
+    print(f"[nbinned] total={total_gib:.1f}GiB frac={ram_fraction:.0%} "
+          f"frame={Ly}x{Lx} raw_nbinned={nbinned} -> {capped} "
           f"(peak~{capped * Ly * Lx * 4 * peak_multiplier / 1024 ** 3:.2f}GB)")
     return capped
 

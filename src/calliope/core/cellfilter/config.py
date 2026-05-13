@@ -17,9 +17,10 @@ options list.
 
 Sections
 --------
-- **Paths** - locations on the lab's F:\\ drive of the curation CSV
-  (the human-labelled cell-vs-noise ground truth), the recording
-  data, and where to save model checkpoints.
+- **Paths** - in-project labels CSV (the human-labelled
+  cell-vs-noise ground truth) and an out-of-project checkpoint
+  directory under the user's home so binary weights aren't checked
+  into version control.
 - **Data** - patch size used by both training and inference, plus
   training-only knobs (validation fraction, random seed, trace
   crop length).
@@ -29,24 +30,45 @@ Sections
   weight decay, early-stopping patience).
 - **Inference** - decision threshold and the file names the
   ``predict`` step writes into ``plane0/``.
+
+History
+-------
+Pre-2026-05-12 this module hardcoded ``LABELS_CSV =
+F:\\roi_curation.csv``, ``DATA_ROOT = F:\\data\\2p_shifted``, and
+``CHECKPOINT_DIR = F:\\cellfilter_checkpoints``. Training was fragile
+to drive-letter changes and could only find recordings whose folders
+sat in a specific ``Cx/`` or ``Hip/`` layout under ``DATA_ROOT``.
+
+The 2026-05-12 refactor moved labels in-project, switched the CSV
+schema to carry the absolute ``plane0_path`` per row (so the trainer
+no longer has to search for recordings by name), and parked
+checkpoints under ``~/.calliope/cellfilter_checkpoints/`` so the
+project tree stays free of large binary artefacts. ``DATA_ROOT`` and
+``EXTRA_DATA_ROOTS`` are gone -- the CSV is now self-locating.
 """
 from pathlib import Path
 
 # --- Paths ---
-# Curation CSV: one row per (recording, roi_id) with a 0/1 label.
-# The training pipeline reads this to decide which ROIs are "cells".
-LABELS_CSV = Path(r"F:\roi_curation.csv")
-# Where the lab keeps registered TIFF stacks + their Suite2p outputs.
-DATA_ROOT = Path(r"F:\data\2p_shifted")  # contains Cx\ and Hip\
-# Extra roots searched recursively (any depth) for a folder named <rec_id>
-# that contains suite2p/plane0. First match wins. Useful when a
-# recording has been moved to a different drive.
-EXTRA_DATA_ROOTS = [
-    Path(r"D:\data"),
-]
+# Curation CSV: one row per (plane0_path, ROI_number) with a 0/1
+# label. The training pipeline reads this; the Tab 3 popout and the
+# standalone ``scripts/roi_curation_app.py`` append to it. Lives
+# inside the project (next to the suite2p ops .npy + AAV metadata
+# .csv) so a fresh clone of the repo has everything it needs to
+# retrain without any external drive present.
+#
+# Schema: ``plane0_path, recording_ID, ROI_number,
+# user_defined_cell, timestamp_iso``. Created lazily on the first
+# label append; missing CSV is treated as "no curated labels yet"
+# by ``dataset.load_labels``.
+LABELS_CSV = (Path(__file__).resolve().parents[2]
+              / "data" / "cellfilter_labels.csv")
+
 # Where ``train.py`` saves model weights at end-of-epoch and at the
-# best AUROC seen so far.
-CHECKPOINT_DIR = Path(r"F:\cellfilter_checkpoints")
+# best AUROC seen so far. Lives under the user's home so big
+# (~50-200 MB) .pt files don't end up tracked by git. ``predict.py``
+# loads ``CHECKPOINT_DIR / "best.pt"`` by default. The directory is
+# created on first save.
+CHECKPOINT_DIR = Path.home() / ".calliope" / "cellfilter_checkpoints"
 
 # --- Data ---
 DFF_PREFIX = "r0p7_"         # neuropil-corrected dF/F memmap prefix.
@@ -82,3 +104,15 @@ THRESHOLD = 0.5              # >= THRESHOLD => cell, < => not cell.
 # back; downstream tabs key off ``predicted_cell_mask.npy``.
 PREDICTED_PROB_NAME = "predicted_cell_prob.npy"
 PREDICTED_MASK_NAME = "predicted_cell_mask.npy"
+
+
+# --- CSV schema constants ---
+# Centralised so the popout writer, the standalone curation app,
+# and ``dataset.load_labels`` all use the exact same column order.
+LABELS_CSV_COLUMNS: tuple[str, ...] = (
+    "plane0_path",
+    "recording_ID",
+    "ROI_number",
+    "user_defined_cell",
+    "timestamp_iso",
+)

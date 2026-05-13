@@ -7,9 +7,8 @@ Those frames may have negative pixel values (from dark-current
 correction) and inconsistent dynamic ranges across files. This module
 streams every frame through a "shift to non-negative + cast to
 uint16" pipeline so Suite2p can read them, and at the same time
-produces three QC artefacts: a downsampled animated GIF, the per-
-pixel mean image, and a list of candidate cell-body blobs detected
-on the mean image with a Laplacian-of-Gaussian filter.
+produces two QC artefacts: a downsampled animated GIF and the
+per-pixel mean image.
 
 Public surface
 --------------
@@ -21,7 +20,16 @@ Public surface
         NNN_shifted_<original>.tif     (multi-TIFF / group case)
         qc.gif
         mean.npy
-        blobs.npy                      (soma candidates on mean image)
+
+History
+-------
+Tab 2's right-hand panel used to overlay LoG soma-candidate
+circles on the mean image, fed by a ``detect_blobs_on_mean`` pass
+that wrote ``blobs.npy``. That overlay was a holdover from before
+Tab 3's Sparsery + Cellpose detection came online; nothing
+downstream ever consumed ``blobs.npy``, and the LoG pass was just
+paying skimage import cost on every preprocess. Removed
+2026-05-12 along with the ``blobs_path`` / ``n_blobs`` fields.
 
 Where to look in the source if you've never read NumPy / Pillow
 ---------------------------------------------------------------
@@ -45,9 +53,10 @@ from __future__ import annotations
 # ``EventDetectionParams`` in core/utils.py for the basics.
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import shutil
 # ``Callable`` is the type-hint name for "anything you can call like a
 # function" -- used below for the optional progress callback.
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 # ``tifffile`` is the de-facto Python library for scientific TIFFs
@@ -77,19 +86,15 @@ class PreprocessResult:
     shifted_tiff   : path to the uint16-shifted TIFF.
     qc_gif         : path to the QC animation.
     mean_image_path: path to ``mean.npy`` (per-pixel time average).
-    blobs_path     : path to ``blobs.npy`` (LoG soma candidates).
     n_frames       : number of frames in the movie.
     shape_yx       : (height, width) in pixels.
-    n_blobs        : number of soma candidates detected.
     """
     out_dir: Path
     shifted_tiff: Path
     qc_gif: Path
     mean_image_path: Path
-    blobs_path: Path
     n_frames: int
     shape_yx: tuple
-    n_blobs: int
 
     def to_dict(self) -> dict:
         """Serialise to a plain JSON-friendly dict (every Path -> str).
@@ -307,99 +312,6 @@ def make_qc_gif(
 
 
 # ---------------------------------------------------------------------------
-# Blob detection on the mean image
-# ---------------------------------------------------------------------------
-
-def detect_blobs_on_mean(
-    mean_img: np.ndarray,
-    soma_diameter_px: float = 12.0,
-    scale_tol: float = 0.5,
-    min_contrast: float = 0.10,
-    min_area_px: int = 25,
-    max_area_px: int = 400,
-) -> list:
-    """Lightweight Laplacian-of-Gaussian (LoG) blob detection on the
-    mean image.
-
-    What this gets us
-    -----------------
-    Tab 1 isn't running Suite2p yet -- we just want a rough sanity
-    check that "yes, there are cell-shaped objects in this field of
-    view". Tab 2 overlays the resulting circles on the mean image so
-    the user can confirm before committing to a full Suite2p run.
-
-    Algorithm
-    ---------
-    1. Subtract a local-median background (high-pass).
-    2. Normalise to ~[0, 1] by dividing by the 99.5th percentile.
-    3. Run scikit-image's ``blob_log`` searching for blobs of
-       sigma in ``[r*(1-tol), r*(1+tol)] / sqrt(2)``, where
-       r = soma_diameter / 2.
-    4. Reject blobs whose pi*radius^2 area falls outside
-       ``[min_area_px, max_area_px]``.
-
-    Returns a list of ``(y, x, radius)`` tuples in pixels.
-    """
-    # Lazy imports keep ``preprocessing.py`` cheap to import for
-    # callers (e.g. tests) that don't need blob detection.
-    from skimage.feature import blob_log
-    from scipy.ndimage import median_filter
-
-    r = float(soma_diameter_px) / 2.0
-    # LoG sigmas relate to blob radius by ``r = sigma * sqrt(2)`` for
-    # a 2-D Gaussian. So we invert that to convert the radius range
-    # into a sigma range.
-    min_sigma = (r * (1.0 - scale_tol)) / np.sqrt(2.0)
-    max_sigma = (r * (1.0 + scale_tol)) / np.sqrt(2.0)
-
-    img = mean_img.astype(np.float32)
-    # Median filter ~ "what's the typical brightness of a soma-sized
-    # patch around me". Subtracting it leaves only the pixels that
-    # rise above their local neighbourhood -- candidate cells.
-    bg_radius = max(3, int(round(soma_diameter_px)))
-    bg_local = median_filter(img, size=bg_radius)
-    # ``np.clip(x, 0, None)`` clamps below at 0, leaves above
-    # unbounded -- the high-pass result.
-    hp = np.clip(img - bg_local, 0.0, None)
-
-    # Normalise the high-pass to [0, 1] by dividing by a robust
-    # upper percentile so a single bright pixel doesn't dominate.
-    hi = float(np.quantile(hp, 0.995))
-    if hi <= 0:
-        return []
-    norm = np.clip(hp / hi, 0.0, 1.0)
-
-    # ``blob_log`` scans multi-scale; ``num_sigma=6`` samples 6
-    # scales between ``min_sigma`` and ``max_sigma``.
-    # ``threshold`` is the minimum LoG response a blob must exceed.
-    # ``overlap=0.5`` deduplicates blobs whose circles overlap by
-    # more than 50%.
-    raw = blob_log(
-        norm,
-        min_sigma=min_sigma,
-        max_sigma=max_sigma,
-        num_sigma=6,
-        threshold=float(min_contrast),
-        overlap=0.5,
-    )
-    out = []
-    if raw.size == 0:
-        return out
-
-    # Each row is (y, x, sigma). Convert to a (y, x, radius) tuple
-    # and reject blobs whose area falls outside the user-specified
-    # band -- a quick way to drop both noise specks (too small) and
-    # vessel artefacts (too big).
-    for y, x, sigma in raw:
-        radius = float(sigma) * np.sqrt(2.0)
-        area = np.pi * radius ** 2
-        if area < min_area_px or area > max_area_px:
-            continue
-        out.append((int(round(y)), int(round(x)), radius))
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
@@ -407,9 +319,7 @@ def preprocess_tiff(
     src_tiff: str | Path,
     data_root: str | Path,
     recording_name: Optional[str] = None,
-    soma_diameter_px: float = 12.0,
     progress_cb: Optional[Callable[[str], None]] = None,
-    blob_params: Optional[dict] = None,
     qc_params: Optional[dict] = None,
 ) -> PreprocessResult:
     """
@@ -423,16 +333,8 @@ def preprocess_tiff(
         Root under which per-recording folders live (e.g. ``data/``).
     recording_name
         Folder name for the recording. Defaults to the TIFF stem.
-    soma_diameter_px
-        Expected soma diameter used by the preview blob detector.
-        (Also passed through to ``detect_blobs_on_mean`` unless overridden
-        in ``blob_params``.)
     progress_cb
         Optional callback receiving status strings.
-    blob_params
-        Optional overrides for ``detect_blobs_on_mean`` (keys:
-        ``scale_tol``, ``min_contrast``, ``min_area_px``, ``max_area_px``).
-        ``soma_diameter_px`` is taken from the top-level argument.
     qc_params
         Optional overrides for ``make_qc_gif`` (keys: ``downsample_t``,
         ``max_size_px``, ``playback_fps``, ``clip_low``, ``clip_high``).
@@ -455,7 +357,6 @@ def preprocess_tiff(
     shifted_path = out_dir / f"shifted_{src.name}"
     gif_path = out_dir / "qc.gif"
     mean_path = out_dir / "mean.npy"
-    blobs_path = out_dir / "blobs.npy"
 
     # Local closure for the progress callback. Captures
     # ``progress_cb`` from the enclosing scope.
@@ -464,7 +365,7 @@ def preprocess_tiff(
             progress_cb(msg)
 
     # ---- Step 1: shift to non-negative + cast to uint16 ----
-    log(f"[1/4] Shifting {src.name} -> {shifted_path.name}")
+    log(f"[1/3] Shifting {src.name} -> {shifted_path.name}")
     shifted = shift_tiff_to_uint16(src, shifted_path, progress_cb=log)
     # Tuple-unpack the shape: ``shifted`` is ``(T, Y, X)`` so we
     # name those three.
@@ -473,22 +374,12 @@ def preprocess_tiff(
     # ---- Step 2: per-pixel mean image ----
     # ``shifted.mean(axis=0)`` averages across the time axis (the
     # first one) -> a (Y, X) image.
-    log(f"[2/4] Computing mean image ({T} frames, {Y}x{X})")
+    log(f"[2/3] Computing mean image ({T} frames, {Y}x{X})")
     mean = shifted.mean(axis=0).astype(np.float32)
     np.save(str(mean_path), mean)
 
-    # ---- Step 3: candidate-cell detection on the mean ----
-    # ``dict(blob_params or {})`` is a defensive copy of the
-    # user's overrides; ``setdefault`` only fills the key if the
-    # user hasn't already.
-    log("[3/4] Detecting preview blobs on mean image")
-    blob_kwargs = dict(blob_params or {})
-    blob_kwargs.setdefault("soma_diameter_px", soma_diameter_px)
-    blobs = detect_blobs_on_mean(mean, **blob_kwargs)
-    np.save(str(blobs_path), np.asarray(blobs, dtype=np.float32))
-
-    # ---- Step 4: animated QC GIF ----
-    log("[4/4] Writing QC gif")
+    # ---- Step 3: animated QC GIF ----
+    log("[3/3] Writing QC gif")
     make_qc_gif(shifted, gif_path, **(qc_params or {}))
 
     log(f"Done. Output -> {out_dir}")
@@ -500,10 +391,8 @@ def preprocess_tiff(
         shifted_tiff=shifted_path,
         qc_gif=gif_path,
         mean_image_path=mean_path,
-        blobs_path=blobs_path,
         n_frames=int(T),
         shape_yx=(int(Y), int(X)),
-        n_blobs=len(blobs),
     )
 
 
@@ -511,9 +400,7 @@ def preprocess_tiff_group(
     src_tiffs: list[str | Path],
     data_root: str | Path,
     recording_name: Optional[str] = None,
-    soma_diameter_px: float = 12.0,
     progress_cb: Optional[Callable[[str], None]] = None,
-    blob_params: Optional[dict] = None,
     qc_params: Optional[dict] = None,
 ) -> PreprocessResult:
     """End-to-end preprocessing for a group of raw TIFFs treated as one
@@ -524,8 +411,8 @@ def preprocess_tiff_group(
     Each shifted output is written into
     ``<data_root>/<recording_name>/NNN_shifted_<orig>.tif`` with a zero-padded
     order prefix (suite2p uses natsort on data_path, so the prefix preserves
-    input order). Mean image, preview blobs, and QC gif are computed across
-    the full concatenated stack.
+    input order). Mean image and QC gif are computed across the full
+    concatenated stack.
 
     If ``recording_name`` is omitted, defaults to the ``+``-joined stems of
     ``src_tiffs`` (in the order given).
@@ -549,7 +436,6 @@ def preprocess_tiff_group(
     ]
     gif_path = out_dir / "qc.gif"
     mean_path = out_dir / "mean.npy"
-    blobs_path = out_dir / "blobs.npy"
 
     def log(msg: str) -> None:
         if progress_cb is not None:
@@ -619,12 +505,6 @@ def preprocess_tiff_group(
     np.save(str(mean_path), mean)
     log(f"[3/4]   mean over {total_frames} frames ({Y}x{X})")
 
-    log("[3/4] Detecting preview blobs on mean image")
-    blob_kwargs = dict(blob_params or {})
-    blob_kwargs.setdefault("soma_diameter_px", soma_diameter_px)
-    blobs = detect_blobs_on_mean(mean, **blob_kwargs)
-    np.save(str(blobs_path), np.asarray(blobs, dtype=np.float32))
-
     # ---- Pass 4: QC gif from down-sampled concatenated frames -------------
     log("[4/4] Writing QC gif")
     qc_kwargs = dict(qc_params or {})
@@ -644,10 +524,8 @@ def preprocess_tiff_group(
         shifted_tiff=shifted_paths[0],
         qc_gif=gif_path,
         mean_image_path=mean_path,
-        blobs_path=blobs_path,
         n_frames=int(total_frames),
         shape_yx=(int(Y), int(X)),
-        n_blobs=len(blobs),
     )
 
 
@@ -700,22 +578,123 @@ def load_existing_preprocess(out_dir: str | Path) -> Optional[PreprocessResult]:
     )
     gif = out_dir / "qc.gif"
     mean_path = out_dir / "mean.npy"
-    blobs_path = out_dir / "blobs.npy"
 
     if not (shifted_candidates and gif.exists() and mean_path.exists()):
         return None
 
     mean = np.load(str(mean_path))
-    blobs = (np.load(str(blobs_path)) if blobs_path.exists()
-             else np.zeros((0, 3), dtype=np.float32))
 
     return PreprocessResult(
         out_dir=out_dir,
         shifted_tiff=shifted_candidates[0],
         qc_gif=gif,
         mean_image_path=mean_path,
-        blobs_path=blobs_path,
         n_frames=-1,
         shape_yx=tuple(mean.shape),
-        n_blobs=int(blobs.shape[0]) if blobs.ndim == 2 else 0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Headless orchestrator -- the entry point Tab 0's batch runner calls.
+# ---------------------------------------------------------------------------
+#
+# ``preprocess_tiff`` and ``preprocess_tiff_group`` above are already
+# pure-function entry points (no Tk dependency); this wrapper picks
+# single vs grouped automatically and exposes a uniform
+# ``run_preprocess(src_tiffs, data_root, params, ...)`` shape that
+# matches the rest of the ``core.*`` headless entry points.
+
+
+_QC_KEYS = ("downsample_t", "max_size_px", "playback_fps",
+            "clip_low", "clip_high")
+
+
+def _split_preprocess_params(params: dict) -> dict:
+    """Pull the QC-gif overrides out of the unified params dict,
+    mirroring ``PreprocessTab._start_run``.
+    """
+    return {k: params[k] for k in _QC_KEYS if k in params}
+
+
+def run_preprocess(
+    src_tiffs: Sequence[str | Path],
+    data_root: str | Path,
+    params: dict,
+    *,
+    recording_name: Optional[str] = None,
+    figures_dir: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+):
+    """Run Tab 1 preprocessing on one recording.
+
+    Parameters
+    ----------
+    src_tiffs : sequence of paths
+        One or more raw TIFFs. A single path runs ``preprocess_tiff``;
+        multiple paths run ``preprocess_tiff_group`` (concatenates
+        them in trailing-index order).
+    data_root : str | Path
+        Where to write the recording folder
+        (``<data_root>/<recording_name>/``).
+    params : dict
+        Same shape as :class:`PreprocessTab.PARAM_SPEC`: any of the
+        QC-gif keys (``downsample_t``, ``max_size_px``,
+        ``playback_fps``, ``clip_low``, ``clip_high``).
+    recording_name : str | None
+        Folder name. Defaults to single-TIFF stem or '+'-joined
+        stems for groups (matches Tab 1's
+        ``_resolved_identifier`` rule).
+    figures_dir : Path | None
+        If set, copies ``qc.gif`` (the only image artefact) into
+        this directory so the batch report's
+        ``calliope_figures/preprocess/`` subfolder picks it up.
+
+    Returns
+    -------
+    PreprocessResult
+        Same dataclass Tab 1 publishes, with a ``shifted_folder``
+        attribute attached at runtime so callers can pass it to
+        ``detection_run.run_detection`` without a second
+        ``Path.parent`` walk.
+    """
+    srcs = [Path(p) for p in src_tiffs]
+    if not srcs:
+        raise ValueError("run_preprocess: no source TIFFs supplied")
+
+    qc = _split_preprocess_params(params)
+
+    if len(srcs) == 1:
+        result = preprocess_tiff(
+            src_tiff=srcs[0],
+            data_root=str(data_root),
+            recording_name=recording_name,
+            progress_cb=progress_cb,
+            qc_params=qc,
+        )
+    else:
+        result = preprocess_tiff_group(
+            src_tiffs=srcs,
+            data_root=str(data_root),
+            recording_name=recording_name,
+            progress_cb=progress_cb,
+            qc_params=qc,
+        )
+
+    # ``shifted_tiff`` lives inside the recording folder; the
+    # detection backend takes a folder, so attach a convenience
+    # attribute pointing at it.
+    shifted_folder = Path(result.shifted_tiff).parent
+    setattr(result, "shifted_folder", shifted_folder)
+
+    if figures_dir is not None:
+        figures_dir = Path(figures_dir)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            qc_gif = Path(result.qc_gif)
+            if qc_gif.exists():
+                shutil.copy2(qc_gif, figures_dir / qc_gif.name)
+        except Exception as e:
+            if progress_cb is not None:
+                progress_cb(f"[preprocess] qc gif copy failed: {e}")
+
+    return result

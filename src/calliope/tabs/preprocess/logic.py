@@ -4,8 +4,8 @@ Why this file is so short
 -------------------------
 This is a *re-export shim*. The tab's UI lives in ``tab.py`` next to
 this file; the heavy lifting (intensity-shifting TIFFs, building
-mean images, blob-detecting candidate cells, generating QC GIFs)
-lives in ``calliope.core.preprocessing``. The shim exists so the
+mean images, generating QC GIFs) lives in
+``calliope.core.preprocessing``. The shim exists so the
 tab module can write::
 
     from . import logic as preprocessing

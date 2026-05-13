@@ -75,6 +75,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from .logic import PreprocessResult, summary_writer
+from .curation_popout import CurationPopout
 
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, open_advanced, spec_defaults,
@@ -347,6 +348,14 @@ class Suite2pTab(ttk.Frame):
         self.status_var = tk.StringVar(value="Run preprocessing first.")
         ttk.Label(row, textvariable=self.status_var).pack(side="left")
 
+        # Persistent header showing which recording the panels +
+        # popout are currently pointing at. Updated by
+        # ``_draw_panels`` whenever a plane0 finishes loading.
+        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(4, 0))
+        self.recording_var = tk.StringVar(value="No recording loaded.")
+        ttk.Label(rec_row, textvariable=self.recording_var,
+                  font=("", 10, "italic")).pack(side="left")
+
         body = ttk.Frame(self); body.pack(fill="both", expand=True)
         body.rowconfigure(0, weight=2)
         body.rowconfigure(1, weight=0)
@@ -386,6 +395,14 @@ class Suite2pTab(ttk.Frame):
         self.det_canvas = FigureCanvasTkAgg(self.det_fig, master=det_frame)
         attach_fig_toolbar(self.det_canvas, det_frame)
         self.det_canvas.get_tk_widget().pack(fill="both", expand=True)
+        # Click on the "All detected ROIs" panel to open the curation
+        # popout. We resolve the clicked ROI via the cached label image
+        # (built in ``_redraw_with_bg``) so the popout works on whichever
+        # background image the user picked.
+        self.det_canvas.mpl_connect("button_press_event",
+                                    self._on_det_click)
+        self._det_label_img: Optional[np.ndarray] = None
+        self._curation_popout: Optional[CurationPopout] = None
 
         fil_frame = ttk.LabelFrame(
             body, text="3. After cell-filter prediction mask", padding=6)
@@ -652,6 +669,12 @@ class Suite2pTab(ttk.Frame):
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
+
+            self._prune_detection_intermediates(save_folder)
+
+    def _prune_detection_intermediates(self, save_folder: Path) -> None:
+        from ...core.detection_run import prune_detection_intermediates
+        prune_detection_intermediates(save_folder, progress_cb=print)
 
     def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
         """Write the resolved µm-per-pixel onto ``plane0/ops.npy``.
@@ -995,6 +1018,19 @@ class Suite2pTab(ttk.Frame):
             img = view.get(key)
             if isinstance(img, np.ndarray) and img.ndim == 2:
                 bg_images[key] = np.ascontiguousarray(img, dtype=np.float32)
+        # Curation popout reads the full set of background images
+        # plus yrange / xrange for the max-projection padder; cache
+        # whichever fields the recording happens to carry so the
+        # popout can paint one panel per available background and
+        # the rest of the view dict can be released.
+        _ops_view_keys = (
+            tuple(k for k, _ in self.KNOWN_BG_IMAGES)
+            + ("maxImg", "yrange", "xrange")
+        )
+        ops_view = {
+            k: view.get(k) for k in _ops_view_keys
+            if view.get(k) is not None
+        }
         del view  # release every other field
 
         stat = np.load(plane0 / "stat.npy", allow_pickle=True)
@@ -1007,8 +1043,15 @@ class Suite2pTab(ttk.Frame):
 
         self._panel_cache = dict(
             plane0=plane0, bg_images=bg_images, stat=stat,
-            n_total=n_total, keep=keep, probs=probs,
+            n_total=n_total, keep=keep, probs=probs, ops_view=ops_view,
         )
+
+        from ...core.utils import infer_recording_id
+        try:
+            rec_id = infer_recording_id(plane0)
+        except Exception:
+            rec_id = plane0.parent.name
+        self.recording_var.set(f"Recording: {rec_id}    plane0: {plane0}")
 
         self._populate_bg_radios(bg_images)
         self._redraw_with_bg()
@@ -1048,6 +1091,125 @@ class Suite2pTab(ttk.Frame):
         if self._panel_cache is not None:
             self._redraw_with_bg()
 
+    def _on_det_click(self, event) -> None:
+        """Resolve the clicked ROI on the "All detected ROIs" panel
+        and open / refocus the curation popout.
+
+        Skips left-clicks while the matplotlib navigation toolbar is in
+        a pan/zoom mode (so dragging a zoom rectangle doesn't open the
+        popout) and ignores any click outside ``det_ax``.
+        """
+        if event.inaxes is not self.det_ax:
+            return
+        if event.button != 1:
+            return
+        toolbar = getattr(self.det_canvas, "toolbar", None)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return
+        if self._det_label_img is None or self._panel_cache is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        Ly, Lx = self._det_label_img.shape
+        x = int(round(event.xdata))
+        y = int(round(event.ydata))
+        if not (0 <= x < Lx and 0 <= y < Ly):
+            return
+        lbl = int(self._det_label_img[y, x])
+        if lbl <= 0:
+            # Click landed on background — give the user a hint in the
+            # status bar but don't open an empty popout.
+            self.status_var.set(
+                f"No ROI at pixel ({x}, {y}); click on a coloured "
+                f"ROI patch.")
+            return
+        roi_idx = lbl - 1
+        c = self._panel_cache
+        plane0 = c["plane0"]
+        stat = c["stat"]
+        ops_view = c.get("ops_view", {})
+        # Single-instance popout per Tab 3: re-use the existing window
+        # if it's still alive and pointing at the same plane0; build a
+        # fresh one otherwise.
+        popout = self._curation_popout
+        if (popout is None or not popout.winfo_exists()
+                or getattr(popout, "_plane0", None) != Path(plane0)):
+            try:
+                popout = CurationPopout(
+                    self.winfo_toplevel(), plane0, stat, ops_view,
+                    on_iscell_changed=self._on_iscell_flipped,
+                )
+            except Exception as e:
+                messagebox.showerror("Curation popout failed", str(e))
+                return
+            self._curation_popout = popout
+        popout.show_roi(roi_idx)
+
+    def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
+        """BatchTab calls this after a row's scratch->HDD copy so we
+        rewrite the dict-stored plane0 path inside ``_panel_cache``
+        from ``scratch`` to ``final``.
+
+        Why this hook exists separately from BatchTab's attribute-
+        walking repoint: ``_panel_cache`` is a dict whose ``"plane0"``
+        entry is the Path the curation popout reads ``iscell.npy``
+        and ``stat.npy`` from. BatchTab's loop rewrites named tab
+        attributes (``_plane0``, ``_final_plane0``, ...) but can't
+        reach inside dict values, so a stale scratch path used to
+        survive the repoint. After the rmtree improvements made the
+        scratch deletion actually succeed (instead of silently
+        failing under ``ignore_errors=True``), opening the popout
+        post-finalize produced ``iscell=?`` because the cached
+        scratch path no longer existed.
+
+        Also rewrites ``_plane0`` on any open ``CurationPopout`` so
+        subsequent flips write ``iscell.npy`` at the HDD path. The
+        popout's already-loaded ``_iscell`` / ``_probs`` arrays
+        stayed in RAM and remain valid.
+        """
+        def _rewrite(cur):
+            if cur is None:
+                return None
+            try:
+                p = Path(cur)
+                if p == scratch:
+                    return final
+                rel = p.relative_to(scratch)
+                return final / rel
+            except (TypeError, ValueError, OSError):
+                return None
+
+        cache = self._panel_cache
+        if isinstance(cache, dict):
+            new_p = _rewrite(cache.get("plane0"))
+            if new_p is not None:
+                cache["plane0"] = new_p
+
+        popout = self._curation_popout
+        if popout is not None:
+            try:
+                if popout.winfo_exists():
+                    new_p = _rewrite(getattr(popout, "_plane0", None))
+                    if new_p is not None:
+                        popout._plane0 = new_p
+            except Exception:
+                pass
+
+    def _on_iscell_flipped(self, roi_idx: int, new_value: int) -> None:
+        """Listener fired by the popout after a successful classification
+        flip. Reload the keep mask from the freshly-written iscell.npy
+        and repaint both panels so Tab 3 stays in sync with the new
+        labels.
+        """
+        c = self._panel_cache
+        if c is None:
+            return
+        try:
+            c["keep"] = self._load_keep_mask(c["plane0"], c["n_total"])
+        except Exception:
+            return
+        self._redraw_with_bg()
+
     def _redraw_with_bg(self) -> None:
         c = self._panel_cache
         if c is None:
@@ -1070,9 +1232,15 @@ class Suite2pTab(ttk.Frame):
         vmin = float(np.quantile(bg, 0.01))
 
         label_all = self._build_label_image(stat, Ly, Lx)
+        # Cache the label image so the click handler can map a
+        # (x_data, y_data) cursor position to the Suite2p ROI index
+        # that was clicked. The label image stores ``roi_idx + 1`` per
+        # pixel, ``0`` for background.
+        self._det_label_img = label_all
         self._render_panel(
             self.det_ax, self.det_canvas, bg, label_all, vmin, vmax,
-            f"All detected ROIs (n = {n_total})  [bg: {bg_label}]")
+            f"All detected ROIs (n = {n_total})  [bg: {bg_label}]"
+            f"  -- click an ROI to inspect / curate")
 
         kept_n = int(keep.sum())
         if probs is not None and probs.shape[0] == n_total:

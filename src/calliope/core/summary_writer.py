@@ -31,6 +31,10 @@ Sheet conventions
 - ``RoiEventTimes``: wide format, one column per ROI with every
   detected onset time in seconds (NaN-padded). Includes onsets that
   fall outside any population event window.
+- ``EventMonotonicity``: one row per detected event with the
+  directional-monotonicity statistics (``theta_star_deg, rho_obs,
+  p_value, u_x, u_y``) computed by
+  ``core.spatial.directional_monotonicity_spearman``.
 - ``Clusters``: one row per ROI with cluster_id, cluster_color,
   threshold.
 
@@ -44,6 +48,10 @@ Public surface
 ``write_events_sheets(plane0, event_windows, onsets_by_roi, fps)``
     -> Tab 5; produces the EventWindows + EventOnsets + RoiEventTimes
     triple in one call.
+``write_event_monotonicity_sheet(plane0, rows)`` -> Tab 5; one row
+    per detected event with the Spearman-rank directional
+    monotonicity scalars from
+    ``core.spatial.directional_monotonicity_spearman``.
 ``write_clusters_sheet(plane0, ...)`` -> Tab 6.
 """
 
@@ -52,7 +60,7 @@ from __future__ import annotations
 import datetime
 import time
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -360,6 +368,51 @@ def write_events_sheets(
         },
         filename=filename,
     )
+
+
+def write_event_monotonicity_sheet(
+    plane0,
+    monotonicity_rows: Sequence[dict],
+    *,
+    filename: str = DEFAULT_FILENAME,
+) -> Path:
+    """Write the "EventMonotonicity" sheet.
+
+    Schema: ``event_id, n_active, theta_star_deg, rho_obs, p_value,
+    n_shuffles, u_x, u_y``. One row per detected population event.
+
+    ``theta_star`` is the projection direction (in degrees, CCW from
+    +x) maximising the Spearman rank correlation between
+    ``s_i = x_i cos θ + y_i sin θ`` and the per-ROI activation time;
+    ``rho_obs`` is that maximum; ``p_value`` is the empirical
+    permutation-test p (corrects for the multiple-θ search via
+    max-over-θ on each shuffle). ``u_x = cos θ_star`` /
+    ``u_y = sin θ_star`` are written redundantly so downstream scripts
+    can read the propagation axis as a unit vector without converting
+    degrees back.
+
+    Events for which the test is undefined (fewer than 3 active ROIs,
+    no spread in activation time or in x/y) get blank value cells
+    rather than NaN so the workbook reads cleanly in Excel.
+    """
+    rows = []
+    for r in monotonicity_rows:
+        rows.append({
+            "event_id": int(r["event_id"]),
+            "n_active": int(r["n_active"]),
+            "theta_star_deg": (float(r["theta_star_deg"])
+                               if r.get("theta_star_deg") is not None
+                               else ""),
+            "rho_obs": (float(r["rho_obs"])
+                        if r.get("rho_obs") is not None else ""),
+            "p_value": (float(r["p_value"])
+                        if r.get("p_value") is not None else ""),
+            "n_shuffles": (int(r["n_shuffles"])
+                           if r.get("n_shuffles") is not None else ""),
+            "u_x": (float(r["u_x"]) if r.get("u_x") is not None else ""),
+            "u_y": (float(r["u_y"]) if r.get("u_y") is not None else ""),
+        })
+    return write_sheet(plane0, "EventMonotonicity", rows, filename=filename)
 
 
 def write_clusters_sheet(

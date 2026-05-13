@@ -43,9 +43,11 @@ After every Run All, ``<output>/batch_report.csv`` is written with
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -62,6 +64,406 @@ from ...gui_common import (
 BATCH_JSON_NAME = "calliope_batch.json"
 BATCH_REPORT_NAME = "batch_report.csv"
 TIFF_GLOBS = ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
+
+
+# Patterns dropped from each recording's scratch tree *before* the
+# bulk SSD->HDD copy. Everything else is preserved verbatim so the
+# GUI's "load existing" paths and a manual suite2p re-run with the
+# cached registration both still work. See the 2026-05-11 lab note
+# for the full audit of what stays vs goes.
+#
+# Saved bytes per recording are dominated by ``data_raw.bin`` (the
+# pre-registration movie suite2p caches when ``keep_movie_raw=True``;
+# ~8 GB on a 10-minute recording, fully redundant once the registered
+# ``data.bin`` is on disk).
+SCRATCH_PRUNE_FILE_PATTERNS: tuple[str, ...] = (
+    "**/data_raw.bin",          # suite2p pre-registration cache
+    "**/data_raw_chan2.bin",    # ditto for two-channel runs
+    "**/*.tmp",                 # partial writes
+    "**/*.lock",
+)
+
+# Subdirectories of each recording's scratch folder that are
+# detection intermediates. ``sparse_plus_cellpose.run`` writes them
+# directly under the recording folder (NOT under a ``detection/``
+# subfolder) and ``merge_and_extract`` consumes their stat/F/Fneu/
+# spks arrays into ``final/`` -- nothing in the pipeline reads them
+# after that point. The hardlinked ``data.bin`` is deduped at the
+# destination via the mirror's per-inode map, but per-pass
+# ``F.npy`` / ``Fneu.npy`` / ``spks.npy`` / ``stat.npy`` add
+# ~300-500 MB per recording of redundant arrays.
+SCRATCH_RECORDING_INTERMEDIATE_DIRS: tuple[str, ...] = (
+    "sparsery_pass",
+    "cellpose_pass",
+)
+
+# Defensive: same drop policy applied under a ``<rec>/detection/``
+# layer too, in case a future code path uses that nesting (Tab 3's
+# README documents this layout historically). No-op when the
+# subfolder doesn't exist.
+SCRATCH_DETECTION_KEEP_DIRS: frozenset = frozenset({
+    "_shared_reg",
+    "final",
+})
+
+def _prune_scratch_tree(scratch: Path) -> tuple[int, int]:
+    """Delete known-redundant files + directories under ``scratch``.
+
+    Returns ``(n_paths, bytes_freed)`` for logging. Errors on
+    individual paths are swallowed so a single weird filesystem
+    state doesn't abort the entire finalize.
+
+    The decision tree (see audit in the lab note) keeps everything
+    the GUI's reload paths read (shifted TIFF for Tab 1, suite2p
+    plane0 npys, dF/F memmaps, calliope_summary.xlsx, cluster
+    exports, figures) plus ``_shared_reg/data.bin`` so a manual
+    suite2p re-run can skip registration. It only drops:
+
+    * suite2p's pre-registration movie cache (``data_raw*.bin``) --
+      superseded once the registered ``data.bin`` is on disk.
+    * ``sparsery_pass/`` + ``cellpose_pass/`` -- intermediate
+      detection outputs that ``merge_and_extract`` already folded
+      into ``final/``. The hardlinked ``data.bin`` survives via
+      ``_shared_reg/`` + ``final/``; the per-pass F/Fneu/spks/stat
+      arrays are pure clutter (~300-500 MB per recording).
+    * Defensively, any ``<rec>/detection/<X>/`` subdirectory whose
+      name isn't ``_shared_reg`` or ``final`` -- no current code
+      path uses that nesting, but earlier docstrings reference it.
+    * ``.tmp`` / ``.lock`` partial-write artefacts.
+    """
+    def _dir_size(p: Path) -> int:
+        total = 0
+        try:
+            for dp, _dn, fn in os.walk(p):
+                for f in fn:
+                    try:
+                        total += (Path(dp) / f).stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    n_paths = 0
+    bytes_freed = 0
+    if not scratch.exists():
+        return 0, 0
+    # File-level prune: glob each pattern from the recording root.
+    for pattern in SCRATCH_PRUNE_FILE_PATTERNS:
+        for f in scratch.glob(pattern):
+            try:
+                if f.is_file() or f.is_symlink():
+                    sz = 0
+                    try:
+                        sz = f.stat().st_size
+                    except OSError:
+                        pass
+                    f.unlink()
+                    n_paths += 1
+                    bytes_freed += sz
+            except OSError:
+                continue
+    # Directory-level prune: ``sparsery_pass/`` + ``cellpose_pass/``
+    # live directly under the recording folder (NOT under a
+    # ``detection/`` layer); this is the path layout
+    # ``sparse_plus_cellpose.run`` actually writes.
+    for sub in SCRATCH_RECORDING_INTERMEDIATE_DIRS:
+        p = scratch / sub
+        if not p.is_dir():
+            continue
+        sz = _dir_size(p)
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+            n_paths += 1
+            bytes_freed += sz
+        except OSError:
+            continue
+    # Defensive: same drop policy applied if anything ever lands at
+    # ``<rec>/detection/<X>/`` for ``X not in {_shared_reg, final}``.
+    det = scratch / "detection"
+    if det.is_dir():
+        for child in det.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name in SCRATCH_DETECTION_KEEP_DIRS:
+                continue
+            sz = _dir_size(child)
+            try:
+                shutil.rmtree(child, ignore_errors=True)
+                n_paths += 1
+                bytes_freed += sz
+            except OSError:
+                continue
+    return n_paths, bytes_freed
+
+
+# Single-drive finalize throttle. When scratch and output share a
+# drive, the row-end finalize would otherwise hammer the HDD with
+# writes while the next row's preprocess is trying to read source
+# TIFFs from the same drive -- net throughput collapses for both.
+# Capping the finalize write rate at 10 MB/s leaves most of the
+# HDD's bandwidth for the active stage's reads at the cost of a
+# slower (but unattended) background transfer. 10 GB takes ~17 min
+# at 10 MB/s vs ~67 s unthrottled; the trade-off is "GUI feels
+# responsive" vs "transfer wraps up sooner". Two-drive mode skips
+# the throttle entirely (no contention to manage).
+SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC: int = 10 * 1024 * 1024  # 10 MB/s
+
+
+def _throttled_copy2(src: str, dst: str, *,
+                     rate_bytes_per_sec: int,
+                     chunk_bytes: int = 1024 * 1024) -> None:
+    """``shutil.copy2`` equivalent that paces its writes to roughly
+    ``rate_bytes_per_sec``. Implements the rate cap by sleeping
+    between fixed-size chunks: ``expected_elapsed = bytes_written /
+    rate``, ``actual_elapsed = time.time() - t0``, sleep the diff
+    when positive. Drift correction comes for free because the next
+    chunk's expected_elapsed is computed from cumulative bytes.
+
+    ``shutil.copystat`` at the end mirrors what ``copy2`` does (mode,
+    mtime, atime, flags). Fast-path for tiny files: nothing to throttle
+    when the whole file fits in one chunk and lands well under the
+    per-second budget.
+    """
+    t0 = time.time()
+    bytes_written = 0
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(chunk_bytes)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            bytes_written += len(chunk)
+            expected = bytes_written / rate_bytes_per_sec
+            elapsed = time.time() - t0
+            sleep_for = expected - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    shutil.copystat(src, dst)
+
+
+def _is_scratch_mirror_skippable(rel_path: Path, scratch_rec: Path) -> bool:
+    """Return True iff this scratch-relative path is something the
+    continuous mirror should NOT copy to HDD.
+
+    Mirrors the row-end ``_prune_scratch_tree`` logic so the mirror
+    doesn't waste bandwidth on artefacts the row-end finalize would
+    have dropped anyway:
+    - ``data_raw.bin`` / ``data_raw_chan2.bin`` -- suite2p's
+      pre-registration cache, redundant once ``data.bin`` is on disk
+    - ``*.tmp`` / ``*.lock`` -- partial writes
+    - Anything under ``sparsery_pass/`` or ``cellpose_pass/`` --
+      detection-pass intermediates folded into ``final/`` already
+    - Anything under ``<rec>/detection/<X>/`` for X not in
+      {``_shared_reg``, ``final``} -- defensive (legacy layout)
+    """
+    parts = rel_path.parts
+    if not parts:
+        return False
+    name = parts[-1]
+    if name in ("data_raw.bin", "data_raw_chan2.bin"):
+        return True
+    if name.endswith(".tmp") or name.endswith(".lock"):
+        return True
+    if parts[0] in ("sparsery_pass", "cellpose_pass"):
+        return True
+    if (len(parts) >= 2 and parts[0] == "detection"
+            and parts[1] not in SCRATCH_DETECTION_KEEP_DIRS):
+        return True
+    return False
+
+
+def _measure_tree(root: Path) -> tuple[int, int]:
+    """Return (n_files, total_bytes) for everything under ``root``.
+
+    Used by the finalize + batch-end paths to report leftover scratch
+    contents when the bulk-rmtree didn't clear everything (typically a
+    Windows file lock survived two rmtree attempts).
+    """
+    n = 0
+    nb = 0
+    if not root.exists():
+        return 0, 0
+    for dirpath, _dn, files in os.walk(str(root)):
+        for fname in files:
+            try:
+                nb += (Path(dirpath) / fname).stat().st_size
+                n += 1
+            except OSError:
+                continue
+    return n, nb
+
+
+def _synchronous_final_sweep(scratch: Path, final: Path,
+                             inode_to_dst: dict) -> tuple[int, int]:
+    """Walk scratch and copy every non-skip file that isn't already at
+    HDD (or is shorter at HDD than at scratch). Synchronous; no daemon
+    thread; no time bound.
+
+    Belt-and-braces safety net before bulk-rmtree. The continuous
+    mirror's final pass races with the finalize's ``rmtree`` when the
+    HDD is contending with the next row's preprocess writes -- the
+    mirror exits via timeout but its in-flight copies are mid-write
+    when the source dir gets nuked. Running this sweep on the
+    finalize thread (which we control) guarantees that every output
+    file is at HDD before we delete the scratch copy.
+
+    Comparison is by ``st.st_size``: if HDD has the same size, assume
+    up-to-date (the mirror already wrote it). Otherwise copy. We can't
+    rely on mtime alone because ``shutil.copy2`` preserves mtime, so
+    a partial copy + stat would falsely report "up to date".
+
+    Hardlinks are preserved via the shared ``inode_to_dst`` map so the
+    `_shared_reg/data.bin` <-> `final/data.bin` pair stays hardlinked
+    at the destination.
+    """
+    if not scratch.exists():
+        return 0, 0
+    n_copied = 0
+    bytes_copied = 0
+    for dirpath, _dn, files in os.walk(str(scratch)):
+        for fname in files:
+            sp = Path(dirpath) / fname
+            try:
+                rel = sp.relative_to(scratch)
+            except ValueError:
+                continue
+            if _is_scratch_mirror_skippable(rel, scratch):
+                continue
+            try:
+                src_st = sp.stat()
+            except OSError:
+                continue
+            dp = final / rel
+            # Size check: if HDD already has it at full size, skip.
+            # Otherwise (missing or short) re-copy.
+            if dp.exists():
+                try:
+                    if dp.stat().st_size == src_st.st_size:
+                        continue
+                except OSError:
+                    pass
+            try:
+                dp.parent.mkdir(parents=True, exist_ok=True)
+                # Remove the short/stale HDD copy before re-copying;
+                # _copy_one_dedup doesn't overwrite.
+                if dp.exists():
+                    try:
+                        dp.unlink()
+                    except OSError:
+                        continue
+                _copy_one_dedup(sp, dp, inode_to_dst)
+                n_copied += 1
+                bytes_copied += int(src_st.st_size)
+            except OSError:
+                continue
+    return n_copied, bytes_copied
+
+
+def _mirror_sync_pass(scratch: Path, final: Path,
+                      seen: dict, inode_to_dst: dict,
+                      *, stability_window_s: float = 1.0,
+                      throttle_bytes_per_sec: Optional[int] = None
+                      ) -> bool:
+    """Walk ``scratch`` once and copy every file that's new or has
+    changed since the previous pass to its mirror under ``final``.
+
+    Returns True iff at least one file was copied this pass (the
+    worker uses this to back off polling when caught up).
+
+    ``seen`` maps ``Path -> (size, mtime)``. ``inode_to_dst`` is the
+    same hardlink-dedup map ``_copy_one_dedup`` uses elsewhere -- a
+    file whose inode was already mirrored gets ``os.link``-ed at the
+    destination instead of re-copied, so ``_shared_reg/data.bin`` <->
+    ``final/data.bin`` stay hardlinked at the HDD twin.
+
+    Files whose mtime is younger than ``stability_window_s`` are
+    skipped -- they're likely mid-write (suite2p flushing ``data.bin``
+    incrementally, e.g.). The next pass will catch them once writes
+    settle.
+
+    When ``throttle_bytes_per_sec`` is set, each copy is rate-limited
+    via ``_throttled_copy2`` -- used in single-drive mode so the
+    mirror doesn't starve the active stage's reads on the same
+    physical disk.
+    """
+    if not scratch.exists():
+        return False
+    now = time.time()
+    changed = False
+    for dirpath, _dn, files in os.walk(str(scratch)):
+        for fname in files:
+            sp = Path(dirpath) / fname
+            try:
+                rel = sp.relative_to(scratch)
+            except ValueError:
+                continue
+            if _is_scratch_mirror_skippable(rel, scratch):
+                continue
+            try:
+                st = sp.stat()
+            except OSError:
+                continue
+            sig = (st.st_size, st.st_mtime)
+            if seen.get(sp) == sig:
+                continue
+            # Stability check: if the file was modified within the
+            # last ``stability_window_s`` it's probably still being
+            # written. Skip and try next pass.
+            if now - st.st_mtime < stability_window_s:
+                continue
+            dp = final / rel
+            try:
+                dp.parent.mkdir(parents=True, exist_ok=True)
+                # Remove an out-of-date HDD copy before re-copying;
+                # ``_copy_one_dedup`` doesn't overwrite.
+                if dp.exists():
+                    try:
+                        dp.unlink()
+                    except OSError:
+                        continue
+                _copy_one_dedup(
+                    sp, dp, inode_to_dst,
+                    throttle_bytes_per_sec=throttle_bytes_per_sec)
+                seen[sp] = sig
+                changed = True
+            except OSError:
+                continue
+    return changed
+
+
+def _copy_one_dedup(sp: Path, dp: Path,
+                    inode_to_dst: dict,
+                    *,
+                    throttle_bytes_per_sec: Optional[int] = None) -> None:
+    """Copy or hardlink a single file from scratch to HDD, recording
+    the (st_dev, st_ino) -> destination map so subsequent hits for
+    the same inode become hardlinks at the destination instead of
+    independent byte-for-byte copies. Raises on copy failure.
+
+    When ``throttle_bytes_per_sec`` is set, the copy is rate-limited
+    via :func:`_throttled_copy2`. Hardlinks bypass the throttle --
+    they're a metadata op, not bandwidth-bound.
+    """
+    try:
+        st = sp.stat()
+        key = (st.st_dev, st.st_ino) if st.st_ino else None
+    except OSError:
+        key = None
+    existing = inode_to_dst.get(key) if key else None
+    if existing is not None:
+        try:
+            os.link(existing, str(dp))
+            return
+        except (OSError, NotImplementedError):
+            pass
+    if throttle_bytes_per_sec is not None:
+        _throttled_copy2(str(sp), str(dp),
+                         rate_bytes_per_sec=throttle_bytes_per_sec)
+    else:
+        shutil.copy2(str(sp), str(dp))
+    if key is not None:
+        inode_to_dst[key] = str(dp)
 
 
 def _build_batch_param_spec() -> list:
@@ -436,8 +838,291 @@ class BatchTab(ttk.Frame):
         self._log_queue: queue.Queue = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._abort_flag = threading.Event()
+
+        # Deferred-cleanup janitor: a long-lived daemon thread that
+        # retries ``shutil.rmtree`` on scratch_rec dirs the row-end
+        # finalize couldn't remove on the first pass. Windows holds
+        # file handles open on ``np.memmap`` files even after the
+        # corresponding Python object is GC'd; downstream tabs
+        # (Tab 4 / 5 / 6 / ...) viewing the just-finished recording
+        # keep memmap handles on its scratch files until they're
+        # reopened against a different recording or the app closes.
+        # The janitor keeps retrying every ~30 s; eventually those
+        # handles release (next recording's repoint reopens the
+        # tab's memmaps elsewhere, or the user navigates away) and
+        # the rmtree succeeds. No manual cleanup is ever required.
+        #
+        # Row status is kept in sync via ``_cleanup_row_map``: when
+        # ``_finalize_worker`` enqueues a scratch_rec it also maps
+        # the path -> (row, base_status) so the janitor can flip
+        # the row label from ``"<status> (cleanup pending)"`` to
+        # ``"<status> (done)"`` once rmtree succeeds. The map's
+        # mutation lives under the same lock as the queue itself.
+        self._cleanup_queue_lock = threading.Lock()
+        self._cleanup_queue: list[Path] = []
+        self._cleanup_row_map: dict[Path, tuple] = {}
+        self._cleanup_thread = threading.Thread(
+            target=self._scratch_janitor_loop,
+            name="calliope-scratch-janitor",
+            daemon=True)
+        self._cleanup_thread.start()
+
         self._build_ui()
         self.after(self.POLL_MS, self._drain_log_queue)
+
+    # ---- Scratch capacity pre-flight ----------------------------------
+
+    # Multiplier on the row's source TIFF size that approximates the
+    # peak scratch footprint while the row's pipeline is in flight:
+    #   - shifted TIFF written by preprocess  ≈ 1.0x source
+    #   - registered binary (_shared_reg/data.bin) ≈ 1.0x source
+    #   - sparsery pass binary (sparsery_pass/data.bin) ≈ 1.0x source
+    #   - final outputs (F/Fneu/stat/dff memmaps, npy arrays) ≈ 0.2x
+    # The detection-stage prune drops the two ~1.0x binaries after
+    # extraction folds into final/, but the peak (mid-detection)
+    # holds all of them simultaneously. Sized to that peak so the
+    # guard prevents the failure mode we actually hit.
+    _SCRATCH_BUDGET_MULTIPLIER: float = 3.2
+
+    # Extra safety margin on top of the per-row budget so we don't
+    # arm-wrestle the disk-full threshold with millisecond-level
+    # precision. Filesystem overhead + suite2p's transient working
+    # files + a buffer for the OS page cache.
+    _SCRATCH_SAFETY_MARGIN_BYTES: int = 2 * 1024 * 1024 * 1024  # 2 GB
+
+    # How often the pre-flight re-checks free space when we're
+    # waiting on background cleanups to free things up. Scheduled
+    # via ``self.after`` so the GUI stays responsive.
+    _SCRATCH_PREFLIGHT_RETRY_MS: int = 15_000
+
+    # Throttle for the "scratch low, waiting for cleanup" log message
+    # so the run log doesn't fill up if a finalize is slow.
+    _SCRATCH_WAIT_LOG_INTERVAL_S: float = 60.0
+
+    def _row_scratch_budget(self, row: "BatchRow") -> int:
+        """Estimate the peak scratch footprint (bytes) for ``row``.
+
+        Sums the row's source TIFFs and multiplies by
+        ``_SCRATCH_BUDGET_MULTIPLIER``. TIFFs we can't ``stat``
+        contribute 0 -- worst case the guard under-estimates and
+        the pipeline catches the disk-full further down. The pre-
+        flight is a heuristic, not a hard guarantee.
+        """
+        total = 0
+        for t in row.tiff_list():
+            try:
+                total += Path(t).stat().st_size
+            except OSError:
+                continue
+        return int(total * self._SCRATCH_BUDGET_MULTIPLIER)
+
+    def _check_scratch_capacity(self, row: "BatchRow") -> str:
+        """Return one of ``"ok"`` / ``"wait"`` / ``"fail"`` for whether
+        we can safely start ``row``'s pipeline given current scratch
+        free space and what's in flight.
+
+        Behavior:
+          - free >= needed + margin -> ``ok``
+          - low free, anything in flight (finalize thread alive OR
+            cleanup queue non-empty) -> ``wait`` (caller re-arms)
+          - low free, nothing in flight -> ``fail`` (nothing will
+            ever free up; honest error beats hanging forever)
+
+        Logs a "scratch low, waiting" line at most once per
+        ``_SCRATCH_WAIT_LOG_INTERVAL_S`` so the run log doesn't
+        spam when a finalize is genuinely slow.
+        """
+        if self._batch_scratch_root is None:
+            return "ok"
+        needed = self._row_scratch_budget(row)
+        try:
+            free = shutil.disk_usage(
+                str(self._batch_scratch_root)).free
+        except OSError:
+            # Can't measure -- defer to runtime disk-full handling.
+            return "ok"
+        if free >= needed + self._SCRATCH_SAFETY_MARGIN_BYTES:
+            return "ok"
+        # Low space. Anything pending that could free things up?
+        with self._cleanup_queue_lock:
+            pending_cleanup = len(self._cleanup_queue)
+        in_flight_finalize = sum(
+            1 for t in self._batch_finalize_threads if t.is_alive())
+        if pending_cleanup == 0 and in_flight_finalize == 0:
+            return "fail"
+        now = time.time()
+        last = getattr(self, "_last_scratch_wait_log", 0.0)
+        if now - last >= self._SCRATCH_WAIT_LOG_INTERVAL_S:
+            self._last_scratch_wait_log = now
+            self._append_log(
+                f"  [batch] scratch low: {free / 1e9:.1f} GB free, "
+                f"need ~{needed / 1e9:.1f} GB for '{row.identifier}' "
+                f"(+ {self._SCRATCH_SAFETY_MARGIN_BYTES / 1e9:.0f} GB "
+                f"margin); waiting for {in_flight_finalize} "
+                f"finalize + {pending_cleanup} janitor cleanup to "
+                f"drain before starting next row")
+        return "wait"
+
+    def _fail_row_no_space(self, row: "BatchRow") -> None:
+        """Mark ``row`` failed with an insufficient-scratch error,
+        record it in ``_batch_results`` and the row label, and emit
+        a single explanatory log line. Called when the pre-flight
+        determines no cleanup will free enough space.
+        """
+        ident = row.identifier
+        try:
+            free = shutil.disk_usage(
+                str(self._batch_scratch_root)).free
+        except OSError:
+            free = 0
+        needed = self._row_scratch_budget(row)
+        err = (
+            f"insufficient scratch space: {free / 1e9:.1f} GB free "
+            f"on {self._batch_scratch_root}, need "
+            f"~{needed / 1e9:.1f} GB + "
+            f"{self._SCRATCH_SAFETY_MARGIN_BYTES / 1e9:.0f} GB "
+            f"margin, no background cleanup in flight")
+        self._append_log(f"[{ident}] FAILED: {err}")
+        row.set_status("failed (no scratch space)")
+        self._batch_results.append({
+            "recording_id": ident,
+            "status": "failed",
+            "plane0": "",
+            "stages": {},
+            "total_s": 0.0,
+            "error": err,
+        })
+
+    # ---- Deferred scratch cleanup --------------------------------------
+
+    _CLEANUP_RETRY_INTERVAL_S: float = 30.0
+
+    def _sweep_scratch_orphans(self, scratch_root: Path) -> None:
+        """Queue every subdirectory of ``scratch_root`` that isn't a
+        recording identifier in the about-to-start batch.
+
+        Called once at the top of ``_on_run_all`` (scratch-routing
+        mode only). Catches the case where a previous batch crashed,
+        was force-quit, or hit a hard lock that survived the
+        janitor's retry window when the app exited -- on fresh
+        startup all file handles are released, so these orphans
+        clear on the first janitor pass.
+
+        Does NOT touch directories that match the current queue's
+        identifiers: those are about to be rewritten by
+        ``_batch_next_row``'s force-rerun rmtree.
+        """
+        if not scratch_root.exists():
+            return
+        active_idents = {r.identifier for r in self._rows}
+        try:
+            children = [c for c in scratch_root.iterdir() if c.is_dir()]
+        except OSError:
+            return
+        orphans = [c for c in children if c.name not in active_idents]
+        for p in orphans:
+            self._enqueue_scratch_cleanup(p)
+        if orphans:
+            self._log_queue.put((
+                "log",
+                f"  [batch] scratch janitor: queued {len(orphans)} "
+                f"orphan dir{'' if len(orphans) == 1 else 's'} from "
+                f"a previous session for cleanup"))
+
+    def _after_safe(self, fn, *args) -> None:
+        """``self.after(0, fn, *args)`` from a background thread, with
+        the ``TclError`` you get when the widget is being destroyed
+        suppressed so a late janitor callback can't crash on app
+        shutdown.
+        """
+        try:
+            self.after(0, lambda: fn(*args))
+        except Exception:
+            pass
+
+    def _mark_row_cleanup_done(self, row, base_status: str) -> None:
+        """Update a row's status label to reflect that the janitor
+        successfully cleared its scratch_rec. Runs on the Tk main
+        thread (scheduled via ``_after_safe``).
+        """
+        try:
+            row.set_status(
+                f"{base_status} (done)" if base_status else "done")
+        except Exception:
+            pass
+
+    def _enqueue_scratch_cleanup(self, scratch_rec: Path,
+                                 *, row=None,
+                                 base_status: str = "") -> None:
+        """Queue ``scratch_rec`` for periodic rmtree retries by the
+        janitor thread. Idempotent: re-enqueuing an already-queued
+        path is a no-op. The janitor removes entries that no longer
+        exist on disk so this stays bounded over a long session.
+
+        ``row`` + ``base_status`` are optional UI-binding fields:
+        when supplied, the janitor flips the row's status label
+        from ``"<base_status> (cleanup pending)"`` to
+        ``"<base_status> (done)"`` once rmtree succeeds, so the
+        Tab 0 status column reflects real cleanup progress.
+        """
+        with self._cleanup_queue_lock:
+            if scratch_rec not in self._cleanup_queue:
+                self._cleanup_queue.append(scratch_rec)
+            if row is not None:
+                self._cleanup_row_map[scratch_rec] = (row, base_status)
+
+    def _scratch_janitor_loop(self) -> None:
+        """Background loop that retries rmtree on queued scratch_recs.
+
+        Runs forever (daemon). Each pass:
+          - Snapshots the queue under the lock
+          - For each entry: drop if already gone, else try rmtree
+          - Successful entries are removed from the queue
+          - Sleeps ``_CLEANUP_RETRY_INTERVAL_S`` between passes
+
+        ``shutil.rmtree(ignore_errors=False)`` raises on first lock
+        failure -- we catch and leave the entry queued for the next
+        pass. ``gc.collect()`` runs before each retry so any
+        recently-released Python memmap references give up their
+        Windows handles before we try again.
+        """
+        while True:
+            try:
+                with self._cleanup_queue_lock:
+                    snapshot = list(self._cleanup_queue)
+
+                for path in snapshot:
+                    try:
+                        cleared_now = False
+                        if not path.exists():
+                            cleared_now = True
+                        else:
+                            gc.collect()
+                            shutil.rmtree(str(path), ignore_errors=False)
+                            cleared_now = True
+                            self._log_queue.put((
+                                "log",
+                                f"  [batch] scratch janitor: cleared "
+                                f"{path}"))
+                        if cleared_now:
+                            with self._cleanup_queue_lock:
+                                if path in self._cleanup_queue:
+                                    self._cleanup_queue.remove(path)
+                                binding = self._cleanup_row_map.pop(
+                                    path, None)
+                            if binding is not None:
+                                row, base = binding
+                                self._after_safe(
+                                    self._mark_row_cleanup_done,
+                                    row, base)
+                    except OSError:
+                        # Still locked; try again next pass.
+                        continue
+            except Exception:
+                # The janitor must never die -- any unexpected error
+                # would leak scratch indefinitely.
+                pass
+            time.sleep(self._CLEANUP_RETRY_INTERVAL_S)
 
     # -- UI ----------------------------------------------------------------
 
@@ -469,6 +1154,36 @@ class BatchTab(ttk.Frame):
         ttk.Button(row, text="Reload queue", width=14,
                    command=self._on_reload_queue) \
             .pack(side="left", padx=(8, 0))
+        # CSV export / import. JSON-via-output-folder (Reload queue
+        # above) is the canonical roundtrip; CSV is the spreadsheet-
+        # friendly alternative: one row per recording, columns
+        # ``identifier`` and ``tiffs`` (semicolon-separated paths).
+        # Per-row params are NOT in the CSV -- they stay in the JSON
+        # sidecar or get applied via "Apply defaults to all rows" so
+        # the CSV stays editable in Excel without escaping nightmares.
+        ttk.Button(row, text="Export CSV...", width=14,
+                   command=self._on_export_queue_csv) \
+            .pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Load CSV...", width=12,
+                   command=self._on_load_queue_csv) \
+            .pack(side="left", padx=(4, 0))
+
+        # Optional scratch dir on a fast drive (SSD/NVMe). When set, every
+        # recording's intermediate I/O — preprocessed shifted TIFF, the
+        # suite2p ``data.bin`` (read many times during detection) — lives
+        # on this scratch path during the run. At end of each row the full
+        # tree is bulk-copied to the slow output folder above and the
+        # scratch copy is deleted. Hardlinks between ``_shared_reg/`` and
+        # per-pass ``data.bin`` are preserved across the copy.
+        row = ttk.Frame(top); row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Scratch dir (SSD):", width=16).pack(side="left")
+        self.scratch_dir_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.scratch_dir_var) \
+            .pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(row, text="Browse...", width=10,
+                   command=self._on_pick_scratch).pack(side="left")
+        ttk.Label(row, text="(optional; outputs still land in the folder "
+                            "above)").pack(side="left", padx=(8, 0))
 
         row = ttk.Frame(top); row.pack(fill="x", pady=(6, 2))
         ttk.Button(row, text="Apply defaults to all rows",
@@ -506,8 +1221,17 @@ class BatchTab(ttk.Frame):
             ttk.Label(headers, text=txt, width=w, anchor="w") \
                 .pack(side="left", padx=(0, 4))
 
-        body = ttk.LabelFrame(self, text="Recordings", padding=4)
-        body.pack(fill="both", expand=True, pady=(0, 6))
+        # Rows + console split by a draggable vertical sash, so the
+        # user can drag the divider down when they want more of the
+        # run log on screen (long batches with verbose suite2p logs)
+        # or up when they want more queued-rows visibility. Weights
+        # 2:1 set the default rows/console ratio when the tab first
+        # opens; the sash position survives until the user moves it.
+        paned = ttk.PanedWindow(self, orient="vertical")
+        paned.pack(fill="both", expand=True, pady=(0, 6))
+
+        body = ttk.LabelFrame(paned, text="Recordings", padding=4)
+        paned.add(body, weight=2)
         canvas = tk.Canvas(body, highlightthickness=0)
         canvas.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
@@ -527,8 +1251,8 @@ class BatchTab(ttk.Frame):
         canvas.bind("<Configure>", _on_canvas_resize)
 
         # Console -----------------------------------------------------------
-        console_frame = ttk.LabelFrame(self, text="Run log", padding=4)
-        console_frame.pack(fill="both", expand=True)
+        console_frame = ttk.LabelFrame(paned, text="Run log", padding=4)
+        paned.add(console_frame, weight=1)
         self.log = tk.Text(console_frame, height=10, wrap="word",
                            state="disabled")
         log_sb = ttk.Scrollbar(console_frame, orient="vertical",
@@ -648,9 +1372,27 @@ class BatchTab(ttk.Frame):
         if path:
             self.outdir_var.set(path)
 
+    def _on_pick_scratch(self) -> None:
+        path = filedialog.askdirectory(title="Scratch directory (SSD)")
+        if path:
+            self.scratch_dir_var.set(path)
+
     def _on_scan(self) -> None:
         """Walk the working directory up to ``depth`` levels and add
-        one row per folder that contains TIFFs.
+        one row per TIFF file.
+
+        Each ``.tif`` / ``.tiff`` becomes its own queue row keyed by
+        the file's stem (filename without extension). When a folder
+        holds multiple TIFFs, each one gets its own row -- the user
+        can still combine them into a grouped recording afterwards
+        via "Merge selected" if they're actually a multi-file series.
+
+        Identifier collisions (two TIFFs with the same stem under
+        different folders) are disambiguated by appending the
+        parent folder name: ``<stem>__<parent_folder>``. Without
+        the suffix the queue would write both rows into the same
+        ``<output>/<ident>/`` and the second run would clobber the
+        first.
         """
         root = self.workdir_var.get().strip()
         if not root:
@@ -662,21 +1404,43 @@ class BatchTab(ttk.Frame):
         if not root_path.is_dir():
             messagebox.showerror("Bad path", f"{root} is not a folder.")
             return
-        found: dict[Path, list[str]] = {}
+
+        # Collect every TIFF we find at any depth, deduped by
+        # resolved path so a folder appearing twice in the walk
+        # doesn't double-add.
+        tiff_paths: list[Path] = []
+        seen: set[str] = set()
         for path in self._walk_to_depth(root_path, depth):
-            tiffs = self._tiffs_in(path)
-            if tiffs:
-                found[path] = tiffs
-        if not found:
+            for t in self._tiffs_in(path):
+                key = str(Path(t).resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                tiff_paths.append(Path(t))
+        if not tiff_paths:
             messagebox.showinfo(
                 "No TIFFs",
                 f"Found no .tif/.tiff files under {root_path} "
                 f"at depth {depth}.")
             return
-        for folder, tiffs in sorted(found.items()):
-            ident = folder.name
-            self.add_row(identifier=ident, tiffs=tiffs)
-        self._log(f"Scan: added {len(found)} rows from {root_path}")
+
+        # Build identifiers from each file's stem, disambiguating
+        # collisions with a parent-folder suffix. Sort by resolved
+        # path so the queue order is reproducible.
+        tiff_paths.sort()
+        stem_counts: dict[str, int] = {}
+        for t in tiff_paths:
+            stem_counts[t.stem] = stem_counts.get(t.stem, 0) + 1
+        for t in tiff_paths:
+            stem = t.stem
+            if stem_counts[stem] > 1:
+                ident = f"{stem}__{t.parent.name}"
+            else:
+                ident = stem
+            self.add_row(identifier=ident, tiffs=[str(t)])
+        self._log(
+            f"Scan: added {len(tiff_paths)} rows "
+            f"(one per TIFF) from {root_path}")
 
     @staticmethod
     def _walk_to_depth(root: Path, depth: int):
@@ -737,6 +1501,9 @@ class BatchTab(ttk.Frame):
         defaults = data.get("default_params")
         if isinstance(defaults, dict):
             self.default_params = defaults
+        scratch = data.get("scratch_dir")
+        if isinstance(scratch, str):
+            self.scratch_dir_var.set(scratch)
         for entry in data.get("rows", []):
             self.add_row(
                 identifier=entry.get("identifier", ""),
@@ -744,6 +1511,118 @@ class BatchTab(ttk.Frame):
                 params=entry.get("params", {}),
             )
         self._log(f"Loaded {len(self._rows)} rows from {path}")
+
+    # -- CSV import / export ----------------------------------------------
+    #
+    # Schema: a flat two-column CSV that Excel / pandas can edit
+    # without ceremony. Columns:
+    #   identifier  -- the row's name (drives the output folder)
+    #   tiffs       -- semicolon-separated absolute paths to TIFFs
+    # Header row required. Extra columns are ignored on read (for
+    # future-proofing -- e.g. someone could add a 'notes' column and
+    # share the CSV with a collaborator). Per-row params are not in
+    # the CSV; use the JSON sidecar (Reload queue) for full state
+    # roundtrip, or "Apply defaults to all rows" to push uniform
+    # params after a CSV load.
+
+    _CSV_HEADERS = ("identifier", "tiffs")
+
+    def _on_export_queue_csv(self) -> None:
+        """Write the current queue to a CSV the user picks. One row
+        per recording. Skips empty rows (no identifier + no TIFFs).
+        """
+        if not self._rows:
+            messagebox.showinfo("Empty queue",
+                                "Add at least one row before exporting.")
+            return
+        # Default to the output folder if set, otherwise the working
+        # dir, otherwise wherever the user last chose.
+        initial_dir = (self.outdir_var.get().strip()
+                       or self.workdir_var.get().strip())
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export queue to CSV",
+            defaultextension=".csv",
+            initialdir=initial_dir or None,
+            initialfile="calliope_queue.csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            n_written = 0
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(self._CSV_HEADERS)
+                for r in self._rows:
+                    tiffs = r.tiff_list()
+                    ident = r.id_var.get().strip()
+                    if not ident and not tiffs:
+                        continue
+                    # Re-join with "; " (space after semicolon) to
+                    # match the GUI's display format. CSV's own
+                    # quoting handles any commas inside paths.
+                    w.writerow([ident, "; ".join(tiffs)])
+                    n_written += 1
+            self._log(f"Exported {n_written} rows to {path}")
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def _on_load_queue_csv(self) -> None:
+        """Pick a CSV (with the same schema ``_on_export_queue_csv``
+        writes) and replace the queue with its contents. Per-row
+        params default to empty -- the tab's current defaults apply
+        at run time via the existing merge order.
+        """
+        initial_dir = (self.outdir_var.get().strip()
+                       or self.workdir_var.get().strip())
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Load queue from CSV",
+            initialdir=initial_dir or None,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None or \
+                        "tiffs" not in reader.fieldnames:
+                    messagebox.showerror(
+                        "Bad CSV",
+                        f"{path} doesn't have a 'tiffs' column. "
+                        f"Expected headers: "
+                        f"{', '.join(self._CSV_HEADERS)}")
+                    return
+                rows: list[tuple[str, list[str]]] = []
+                for entry in reader:
+                    ident = (entry.get("identifier") or "").strip()
+                    raw_tiffs = (entry.get("tiffs") or "").strip()
+                    if not raw_tiffs and not ident:
+                        continue
+                    # Accept either "; " or ";" as the separator so
+                    # hand-edited CSVs work whether or not the user
+                    # kept the GUI's trailing space.
+                    tiffs = [s.strip() for s in raw_tiffs.split(";")
+                             if s.strip()]
+                    rows.append((ident, tiffs))
+        except OSError as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        except csv.Error as e:
+            messagebox.showerror("Bad CSV", f"Parse error: {e}")
+            return
+        if not rows:
+            messagebox.showinfo("Empty CSV",
+                                f"{path} had no rows to load.")
+            return
+        self._clear_rows()
+        for ident, tiffs in rows:
+            # ``params={}`` falls through to the tab's current defaults
+            # at run time via the existing merge order.
+            self.add_row(identifier=ident, tiffs=tiffs, params={})
+        self._log(f"Loaded {len(rows)} rows from {path}")
 
     # -- Persistence ------------------------------------------------------
 
@@ -755,6 +1634,7 @@ class BatchTab(ttk.Frame):
         out_path.mkdir(parents=True, exist_ok=True)
         payload = {
             "default_params": self.default_params,
+            "scratch_dir": self.scratch_dir_var.get().strip(),
             "rows": [r.to_dict() for r in self._rows],
         }
         (out_path / BATCH_JSON_NAME).write_text(
@@ -804,6 +1684,75 @@ class BatchTab(ttk.Frame):
         "spatial_propagation": 8,
     }
 
+    def _check_drive_collisions(self, out: str) -> list[str]:
+        """Return a list of warning strings describing R/W contention
+        risks for the planned run. Empty list = layout is clean.
+
+        Compares ``os.stat(path).st_dev`` (the OS device id of a
+        path's underlying filesystem) across:
+
+        - the output folder
+        - every queued row's source TIFFs
+        - the scratch dir (if set)
+
+        Same ``st_dev`` = same partition = same physical drive (in
+        practice -- this can miss exotic LVM / RAID setups, but
+        covers the standard single-disk-per-mountpoint case on
+        Windows + Linux). Failures to stat are silently dropped so
+        the warning is best-effort and never blocks the run.
+
+        Two concrete contention modes called out:
+        - Source TIFFs and Output on the same drive: HDD seeks
+          between the next row's preprocess read and the previous
+          row's finalize write. 2-5x throughput drop.
+        - Scratch and Output on the same drive: defeats the
+          purpose of scratch -- every byte still passes through
+          the slow drive once.
+        """
+        out_path = Path(out)
+        try:
+            out_dev = out_path.resolve().stat().st_dev
+        except OSError:
+            return []
+
+        # Map device id -> example path for nicer warning messages.
+        source_devs: dict[int, str] = {}
+        for row in self._rows:
+            for t in row.tiff_list():
+                try:
+                    parent = Path(t).resolve().parent
+                    dev = parent.stat().st_dev
+                    source_devs.setdefault(dev, str(parent))
+                except OSError:
+                    continue
+
+        scratch = self.scratch_dir_var.get().strip()
+        scratch_dev: Optional[int] = None
+        scratch_path: Optional[Path] = None
+        if scratch:
+            try:
+                scratch_path = Path(scratch)
+                scratch_dev = scratch_path.resolve().stat().st_dev
+            except OSError:
+                pass
+
+        issues: list[str] = []
+        if out_dev in source_devs:
+            issues.append(
+                f"Source TIFFs and Output folder are on the same "
+                f"physical drive (example source: {source_devs[out_dev]} "
+                f"vs output: {out_path}). HDDs collapse to ~30-60 MB/s "
+                f"during mixed reads+writes -- expect 2-5x slower "
+                f"preprocess + finalize overlap.")
+        if (scratch_dev is not None and scratch_path is not None
+                and scratch_dev == out_dev):
+            issues.append(
+                f"Scratch dir and Output folder are on the same "
+                f"physical drive ({scratch_path} <-> {out_path}). "
+                f"The SSD->HDD transfer becomes same-drive copying; "
+                f"the fast-disk savings disappear.")
+        return issues
+
     def _on_run_all(self) -> None:
         if getattr(self, "_batch_active", False):
             messagebox.showinfo("Busy", "A batch run is already in progress.")
@@ -823,6 +1772,32 @@ class BatchTab(ttk.Frame):
                 "Empty TIFFs",
                 f"Row '{bad[0].identifier}' has no TIFF files.")
             return
+        # Same-drive contention warning. When source TIFFs and the
+        # output folder live on the same physical drive, the HDD has
+        # to context-switch heads between reading source data for
+        # the next row's preprocess and writing the previous row's
+        # finalize -- net throughput collapses to 30-60 MB/s
+        # (2-5x slower than separate-drive). When scratch dir is on
+        # the same drive as the output folder, the SSD->HDD path
+        # becomes SSD->SSD->SSD and the slow-drive savings vanish.
+        # Best-effort: if anything looks wrong, warn the user and
+        # let them proceed anyway.
+        issues = self._check_drive_collisions(out)
+        if issues:
+            joined = "\n\n".join(f"- {msg}" for msg in issues)
+            if not messagebox.askyesno(
+                    "Same-drive contention warning",
+                    "The drive layout for this batch has potential "
+                    "I/O contention:\n\n"
+                    f"{joined}\n\n"
+                    "Mitigations:\n"
+                    "- Move source TIFFs to a separate physical "
+                    "drive (best).\n"
+                    "- Set a Scratch dir on a fast drive (SSD/NVMe) "
+                    "different from the output folder.\n"
+                    "- Or just accept the slowdown.\n\n"
+                    "Run anyway?"):
+                return
         # Single overwrite confirmation up front. Tab 1's _on_force_rerun
         # would otherwise pop a "this will overwrite existing outputs"
         # dialog per row, which is annoying when the user has 30 of them.
@@ -840,9 +1815,96 @@ class BatchTab(ttk.Frame):
         self._app = self.winfo_toplevel()
 
         self._batch_active = True
+        # Reset the suite2p batch_size adaptive sizer so the queue
+        # starts fresh: first recording uses the frame-size-aware
+        # initial estimate, recordings 2..N learn from observed peak
+        # RAM. Without this reset, batch_size would carry over from a
+        # previous queue (potentially mis-tuned for a different
+        # cohort's frame sizes).
+        from ...core import utils as _core_utils
+        _core_utils.reset_adaptive_sizer()
         self._batch_queue = list(self._rows)
         self._batch_results: list[dict] = []
-        self._batch_out_root = Path(out)
+        # In-flight scratch->HDD copies. Each daemon thread does its
+        # own copytree/rmtree without blocking the next row's start.
+        # _batch_finish polls this list and writes the report only
+        # once every thread has joined, so user-facing paths in the
+        # report are guaranteed to exist on disk.
+        self._batch_finalize_threads: list[threading.Thread] = []
+        self._finalize_waiting = False
+        # Continuous-mirror state when scratch is on a different
+        # physical drive from the output folder: one daemon thread
+        # per row that polls scratch and copies new files to HDD
+        # while the pipeline is still computing. See
+        # ``_start_mirror_for_row`` / ``_drain_mirror_for_row``.
+        self._mirror_workers: dict[str, dict] = {}
+        # True iff scratch and output are on different physical
+        # drives -- only set when scratch routing is enabled.
+        # Toggles between continuous-mirror mode (two-drive) and
+        # the row-end semantic-priority finalize (single-drive).
+        self._two_drive_layout: bool = False
+        self._batch_final_out_root = Path(out)
+        # Resolve the optional scratch dir. When set, every recording
+        # writes its intermediates to scratch (fast disk) and the full
+        # tree is copied to ``_batch_final_out_root`` at row end. When
+        # blank, ``_batch_out_root`` and ``_batch_final_out_root`` are
+        # the same path and the row state machine behaves identically
+        # to the pre-scratch implementation.
+        scratch = self.scratch_dir_var.get().strip()
+        self._batch_scratch_root: Optional[Path] = None
+        if scratch:
+            scratch_root = Path(scratch)
+            try:
+                same = (scratch_root.resolve()
+                        == self._batch_final_out_root.resolve())
+            except OSError:
+                same = False
+            if same:
+                messagebox.showerror(
+                    "Bad scratch dir",
+                    "Scratch dir is the same as the output folder. "
+                    "Pick a separate location on the fast drive.")
+                return
+            try:
+                scratch_root.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror(
+                    "Bad scratch dir",
+                    f"Could not create scratch directory:\n{e}")
+                return
+            self._batch_scratch_root = scratch_root
+            self._batch_out_root = scratch_root
+            # Determine whether scratch and output sit on different
+            # physical drives. ``os.stat(...).st_dev`` is the OS
+            # device id of a path's underlying filesystem; same
+            # value = same partition = same drive (covers the
+            # common single-disk-per-mountpoint case on Windows +
+            # Linux). When the answer is yes, we use continuous
+            # mirror mode (background copy throughout the row) so
+            # the transfer time overlaps with pipeline computation.
+            # Otherwise the row-end semantic-priority finalize
+            # runs as before -- there's no advantage to copying
+            # mid-row when it just steals bandwidth from the
+            # active stage.
+            try:
+                scratch_dev = scratch_root.resolve().stat().st_dev
+                out_dev = self._batch_final_out_root.resolve().stat().st_dev
+                self._two_drive_layout = (scratch_dev != out_dev)
+            except OSError:
+                # If we can't stat, fall back to the safer
+                # single-drive behavior (row-end finalize).
+                self._two_drive_layout = False
+            # Sweep orphans from a previous session (app crash,
+            # power loss, anti-virus killing the process mid-rmtree).
+            # Anything in scratch root that isn't an identifier in
+            # the current queue gets queued for janitor cleanup --
+            # since this is the start of a fresh batch, prior file
+            # handles from the previous process are gone and the
+            # first rmtree pass almost always succeeds.
+            self._sweep_scratch_orphans(scratch_root)
+        else:
+            self._batch_out_root = self._batch_final_out_root
+            self._two_drive_layout = False
         self._abort_flag.clear()
 
         # Pause Tab 2's QC GIF animation for the duration of the batch.
@@ -865,12 +1927,86 @@ class BatchTab(ttk.Frame):
             row.set_status("queued")
 
         self._append_log("=== Batch run starting ===")
+        if self._batch_scratch_root is not None:
+            mode = ("continuous mirror (two-drive)"
+                    if self._two_drive_layout
+                    else "row-end finalize (single-drive)")
+            self._append_log(
+                f"  scratch dir: {self._batch_scratch_root} "
+                f"-> {self._batch_final_out_root}  [{mode}]")
         self.after(0, self._batch_next_row)
 
     def _on_abort(self) -> None:
+        """Request a graceful stop after the current pipeline stage
+        finishes.
+
+        Why "after current stage" and not "right now"
+        ---------------------------------------------
+        Pipeline stages (suite2p register-only, suite2p run_plane,
+        dF/F GPU compute, cluster linkage, ...) write incrementally
+        to disk. Killing them mid-flight would leave half-written
+        binaries that ``suite2p._find_existing_binaries`` would
+        latch onto on the next run -- corrupting state and
+        producing silent failures. So abort is graceful by design:
+
+        1. Set the flag immediately.
+        2. The currently-running stage finishes naturally (could be
+           seconds for lowpass, minutes for detection).
+        3. When that stage publishes its completion signal,
+           ``_begin_stage(next_stage)`` checks the flag, marks the
+           current row "aborted", and calls ``_on_row_done``.
+        4. ``_on_row_done`` triggers
+           ``_finalize_via_mirror_async`` which signals
+           ``stop_event`` on the current row's mirror -- the mirror
+           does one final drain pass (catches files written between
+           stage-end and stop), then exits.
+        5. ``_batch_next_row`` sees the abort flag and goes straight
+           to ``_batch_finish``, which polls in-flight finalize
+           threads (any previous rows' mirrors still draining) and
+           joins them before writing the report.
+
+        Background agents are NOT abandoned -- they drain whatever's
+        left on scratch to HDD before exiting, so the HDD copy is
+        consistent. The trade-off is that abort isn't instant: it
+        can take anywhere from seconds (between-stages click) to
+        the full remaining stage runtime to complete. The button
+        flips to "Aborting..." on click so the user knows the
+        request landed.
+        """
+        if self._abort_flag.is_set():
+            # Second click while abort is already in progress: just
+            # remind the user we're still waiting.
+            self._append_log(
+                "[batch] abort already requested; current stage "
+                "still running -- please wait.")
+            return
         self._abort_flag.set()
+        # Disable + relabel so the user can see the request was
+        # registered. Restored in _batch_finish.
+        self.abort_btn.config(state="disabled", text="Aborting...")
+        cur_stage = getattr(self, "_current_stage", None) or "?"
+        ident = (self._current_row.identifier
+                 if getattr(self, "_current_row", None) is not None
+                 else "?")
         self._append_log(
-            "[batch] abort requested; finishing current stage then stopping.")
+            f"[batch] ABORT requested.\n"
+            f"  - Current stage '{cur_stage}' on row '{ident}' will "
+            f"finish first (cannot kill suite2p / GPU compute "
+            f"mid-flight without corrupting state).\n"
+            f"  - Row '{ident}' will then be marked 'aborted' and "
+            f"the rest of its stages skipped.\n"
+            f"  - The mirror worker drains any unsynced files from "
+            f"scratch to HDD before exiting (no data loss).\n"
+            f"  - Remaining queued rows will NOT start.\n"
+            f"  - Batch finish waits for every in-flight finalize "
+            f"thread to join before writing the report.")
+        # Mark the current row visually so the user can scan the
+        # status column and see "aborting".
+        try:
+            self._current_row.set_status(
+                f"aborting (waiting for {cur_stage} to finish)")
+        except Exception:
+            pass
 
     # ---- Row + stage state machine -------------------------------------
 
@@ -883,10 +2019,41 @@ class BatchTab(ttk.Frame):
             self._batch_finish()
             return
 
+        # Scratch space pre-flight. Peek (don't pop yet) at the next
+        # row, estimate its peak scratch footprint, and bail vs wait
+        # vs proceed based on free space + what's in flight:
+        #   - enough free space: proceed (normal path)
+        #   - low space, finalize threads still draining or cleanup
+        #     queue non-empty: wait 15 s and re-check (re-arm via
+        #     ``after`` so the GUI stays responsive)
+        #   - low space, nothing in flight: nothing will free up;
+        #     fail the row with a clear error and advance to the next
+        if (self._batch_scratch_root is not None
+                and self._batch_queue):
+            next_row = self._batch_queue[0]
+            verdict = self._check_scratch_capacity(next_row)
+            if verdict == "wait":
+                self.after(self._SCRATCH_PREFLIGHT_RETRY_MS,
+                           self._batch_next_row)
+                return
+            if verdict == "fail":
+                failed = self._batch_queue.pop(0)
+                self._fail_row_no_space(failed)
+                self.after(0, self._batch_next_row)
+                return
+
         self._current_row = self._batch_queue.pop(0)
         ident = self._current_row.identifier
         rec_save = self._batch_out_root / ident
         try:
+            # In scratch mode, wipe any stale scratch leftovers from a
+            # previous interrupted run for this identifier — the user
+            # already answered the force-rerun confirmation in
+            # _on_run_all and a half-written scratch dir would confuse
+            # downstream caching (suite2p's _find_existing_binaries
+            # would match on the partial folder).
+            if self._batch_scratch_root is not None and rec_save.exists():
+                shutil.rmtree(rec_save, ignore_errors=True)
             rec_save.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self._append_log(
@@ -921,7 +2088,37 @@ class BatchTab(ttk.Frame):
             for t in tiffs:
                 self._append_log(f"      {Path(t).name}")
             self._append_log("---")
-        self._append_log(f"  output -> {rec_save}")
+        if self._batch_scratch_root is not None:
+            final_rec = self._batch_final_out_root / ident
+            self._append_log(f"  scratch -> {rec_save}")
+            self._append_log(f"  final   -> {final_rec}")
+            # Always start the continuous mirror in scratch mode.
+            # Two-drive: ``throttle_provider=None`` -> always
+            # unthrottled (no HDD contention to manage).
+            # Single-drive: pass a closure that returns the
+            # throttle only when the active stage is preprocess
+            # (the one stage that reads source TIFFs from the
+            # same drive). All other stages operate on scratch
+            # files + GPU, so the mirror can saturate disk
+            # bandwidth without hurting them.
+            if self._two_drive_layout:
+                throttle_provider = None
+            else:
+                def throttle_provider() -> Optional[int]:
+                    # ``self._current_stage`` is set on the Tk
+                    # main thread and read here from the mirror
+                    # daemon. Atomic single-attribute read under
+                    # the GIL is safe; up to ~one pass of
+                    # staleness across a stage transition is
+                    # tolerable.
+                    if getattr(self, "_current_stage", None) == "preprocess":
+                        return SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC
+                    return None
+            self._start_mirror_for_row(
+                ident, rec_save, final_rec,
+                throttle_provider=throttle_provider)
+        else:
+            self._append_log(f"  output -> {rec_save}")
 
         self._begin_stage("preprocess")
 
@@ -1110,6 +2307,16 @@ class BatchTab(ttk.Frame):
         Both Tab 7 entry points push to the same set_xcorr_ready
         channel, so we use a two-step internal counter: first publish
         triggers _on_run_per_event; second publish advances the batch.
+
+        (Previously this had a cluster-fragmentation guard that
+        skipped per-event xcorr when ``n_clusters > 20`` AND >70% of
+        clusters had <5 ROIs. The guard was a workaround for a bug
+        in ``auto_choose_threshold`` which counted dendrogram colour
+        groups instead of real ``fcluster`` labels -- the auto-pick
+        could land at "5 clusters visible" while fcluster returned
+        30+, producing the over-fragmented input the guard was
+        catching. Bug fixed 2026-05-11 in
+        ``clustering_cmap.auto_choose_threshold``; guard removed.)
         """
         xc = self._app.xcorr_tab
         self._xcorr_step = "full"
@@ -1182,25 +2389,601 @@ class BatchTab(ttk.Frame):
         self._row_results["total_s"] = elapsed
         if self._row_results["status"] == "running":
             self._row_results["status"] = "ok"
+
+        # Finalize: copy this recording's tree from scratch to the real
+        # output folder, then delete the scratch copy. We do this on
+        # success AND failure paths so the user gets whatever partial
+        # outputs the pipeline produced before a crash, and scratch
+        # never accumulates abandoned runs across the queue.
+        #
+        # The copy runs in a daemon thread so the next recording can
+        # start its preprocess (and SSD writes) immediately while the
+        # previous row's bulk SSD->HDD transfer drains in the
+        # background. The plane0 path rewrite happens synchronously
+        # against the *projected* final location -- the file may not
+        # exist on HDD yet when we record the path here, but
+        # _batch_finish joins every in-flight thread before writing
+        # the report, so by the time anything reads _batch_results
+        # the path is real on disk.
+        status = self._row_results["status"]
+        # Track whether this row spawned a background finalize so the
+        # status label can show "(transferring)" -> "(done)" instead of
+        # the bare status. In non-scratch mode the row's status stays
+        # exactly the same as before.
+        scratch_in_flight = False
+        if self._batch_scratch_root is not None:
+            ident = self._current_row.identifier
+            scratch_rec = self._batch_scratch_root / ident
+            final_rec = self._batch_final_out_root / ident
+            plane0 = self._row_results.get("plane0")
+            if plane0:
+                try:
+                    rel = Path(plane0).relative_to(scratch_rec)
+                    self._row_results["plane0"] = str(final_rec / rel)
+                except ValueError:
+                    pass
+            # Pass the row reference so the async worker can update the
+            # status label when the copy finishes -- by that time
+            # ``self._current_row`` will already be pointing at a
+            # different row.
+            #
+            # Unified finalize: both two-drive and single-drive layouts
+            # use the continuous mirror started in ``_batch_next_row``.
+            # The mirror's throttle setting differs per layout (see
+            # ``_start_mirror_for_row``); the finalize logic is
+            # identical: signal stop, drain, repoint, rmtree.
+            self._finalize_via_mirror_async(
+                ident, scratch_rec, final_rec,
+                row=self._current_row, base_status=status)
+            scratch_in_flight = True
+
         self._batch_results.append(self._row_results)
-        self._current_row.set_status(self._row_results["status"])
+        if scratch_in_flight:
+            self._current_row.set_status(f"{status} (transferring)")
+        else:
+            self._current_row.set_status(status)
         self._append_log(
             f"--- '{self._current_row.identifier}' "
-            f"{self._row_results['status']} in {elapsed:.1f}s ---")
+            f"{status} in {elapsed:.1f}s ---")
         self.after(0, self._batch_next_row)
 
+    def _start_mirror_for_row(self, ident: str,
+                              scratch_rec: Path,
+                              final_rec: Path,
+                              *,
+                              throttle_provider=None) -> None:
+        """Spawn a daemon thread that continuously mirrors
+        ``scratch_rec`` -> ``final_rec`` while the row's pipeline
+        runs.
+
+        Fires whenever scratch routing is enabled, in both
+        single-drive and two-drive layouts. The throttle is now
+        stage-aware via ``throttle_provider``: a zero-arg callable
+        the worker calls at the start of each sync pass to get
+        the current ``int|None`` throttle rate.
+
+        Why a callable instead of a fixed rate
+        --------------------------------------
+        On a single-drive setup, the mirror only contends with
+        the active pipeline stage when *that stage* is reading
+        from the same physical drive. The main offender is the
+        preprocess stage reading source TIFFs from HDD; the other
+        stages (detection / lowpass / events / clustering / xcorr
+        / spatial) operate on scratch files + GPU and don't pull
+        big bandwidth off the output drive. So during preprocess
+        we throttle the mirror; during other stages we let it
+        saturate the disk (user wanted "100% disk usage when
+        there's no real reader to share with").
+
+        Two-drive layout passes ``throttle_provider=None``
+        (unthrottled always). Single-drive layout passes a
+        closure that returns ``SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC``
+        only when ``self._current_stage == "preprocess"``, ``None``
+        otherwise. See ``_batch_next_row`` for the wiring.
+
+        Thread safety: ``self._current_stage`` is set on the Tk
+        main thread (in ``_begin_stage``) and read by the mirror
+        daemon. Python's GIL makes single-attribute reads atomic
+        and string references are immutable, so the worst case is
+        one cycle of staleness across a stage transition -- the
+        mirror might throttle for one extra pass after preprocess
+        ends, or run unthrottled for one extra pass before
+        preprocess starts. Both windows are <2 s; not worth a
+        lock.
+
+        The worker polls every 2 s when nothing's changed, every
+        0.2 s after a copy lands (to drain bursts quickly). Skips
+        files whose mtime is < 1 s old (in-flight writes) and
+        anything ``_is_scratch_mirror_skippable`` says is an
+        intermediate the row-end prune would have dropped.
+
+        Tracked in ``self._mirror_workers[ident]`` as a dict of
+        ``{thread, stop, synced, seen, inode_to_dst,
+        throttle_provider}`` so ``_finalize_via_mirror_async``
+        can signal stop + wait for the final pass to complete.
+        """
+        if self._batch_scratch_root is None:
+            return
+        stop_evt = threading.Event()
+        synced_evt = threading.Event()
+        seen: dict[Path, tuple[int, float]] = {}
+        inode_to_dst: dict[tuple[int, int], str] = {}
+        # Persist final_rec.mkdir up front so the mirror doesn't
+        # race the first file's parent creation.
+        final_rec.mkdir(parents=True, exist_ok=True)
+
+        def _emit(line: str) -> None:
+            self.after(0, lambda l=line: self._append_log(l))
+
+        def _resolve_throttle() -> Optional[int]:
+            """Best-effort throttle lookup; the provider may raise
+            during teardown, in which case fall back to no
+            throttle."""
+            if throttle_provider is None:
+                return None
+            try:
+                return throttle_provider()
+            except Exception:
+                return None
+
+        def _worker() -> None:
+            # Mode message describes the throttle policy at start.
+            # The actual rate per pass is resolved at runtime via
+            # ``_resolve_throttle``.
+            if throttle_provider is None:
+                mode_msg = "unthrottled (two-drive)"
+            else:
+                mode_msg = (f"throttled to "
+                            f"{SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC / 1e6:.0f} "
+                            f"MB/s during preprocess only "
+                            f"(single-drive)")
+            _emit(f"  [batch] [{ident}] mirror: started, {mode_msg}")
+            n_passes = 0
+            while True:
+                current_throttle = _resolve_throttle()
+                try:
+                    changed = _mirror_sync_pass(
+                        scratch_rec, final_rec, seen, inode_to_dst,
+                        throttle_bytes_per_sec=current_throttle)
+                except Exception as e:
+                    _emit(f"  [batch] [{ident}] mirror: pass failed: "
+                          f"{e} -- continuing")
+                    changed = False
+                n_passes += 1
+                if stop_evt.is_set():
+                    break
+                # Brief sleep when caught up so the worker doesn't
+                # spin; shorter sleep right after a busy pass to
+                # drain bursts of new files quickly.
+                time.sleep(0.2 if changed else 2.0)
+            # Final sync pass after stop signal, with the stability
+            # window dropped to zero so files written milliseconds
+            # before stop_evt still get caught. Use the current
+            # throttle (which is likely None by now because the
+            # row's pipeline is done -- preprocess only fires
+            # mid-row).
+            try:
+                _mirror_sync_pass(
+                    scratch_rec, final_rec, seen, inode_to_dst,
+                    stability_window_s=0.0,
+                    throttle_bytes_per_sec=_resolve_throttle())
+            except Exception as e:
+                _emit(f"  [batch] [{ident}] mirror: final pass "
+                      f"failed: {e}")
+            _emit(f"  [batch] [{ident}] mirror: drained after "
+                  f"{n_passes} passes, {len(seen)} files at HDD")
+            synced_evt.set()
+
+        t = threading.Thread(
+            target=_worker,
+            name=f"calliope-mirror-{ident}",
+            daemon=True)
+        self._mirror_workers[ident] = {
+            "thread": t,
+            "stop": stop_evt,
+            "synced": synced_evt,
+            "seen": seen,
+            "inode_to_dst": inode_to_dst,
+            "throttle_provider": throttle_provider,
+        }
+        t.start()
+        self._batch_finalize_threads.append(t)
+
+    def _finalize_via_mirror_async(self, ident: str,
+                                   scratch_rec: Path,
+                                   final_rec: Path,
+                                   *,
+                                   row=None,
+                                   base_status: str = "") -> None:
+        """Two-drive finalize: stop the row's continuous mirror,
+        wait for it to drain, then repoint AppState + rmtree
+        scratch. Runs in a daemon thread so the orchestrator can
+        advance to the next row immediately.
+
+        Most of the SSD->HDD copy already happened during pipeline
+        computation -- the drain is typically <5 s of catching the
+        last few stage-output writes.
+        """
+        worker = self._mirror_workers.pop(ident, None)
+        if worker is None:
+            # Defensive: mirror should always be running in scratch
+            # mode (started in ``_batch_next_row``). If somehow it's
+            # not, log + bulk-rmtree without drain so we don't leak
+            # scratch -- the user loses any unwritten outputs but
+            # gets a clean state.
+            def _emit_orphan(line: str) -> None:
+                self.after(0, lambda l=line: self._append_log(l))
+            _emit_orphan(
+                f"  [batch] [{ident}] finalize: mirror state "
+                f"missing; rmtreeing scratch without drain")
+            shutil.rmtree(str(scratch_rec), ignore_errors=True)
+            if row is not None:
+                self.after(
+                    0, lambda: row.set_status(
+                        f"{base_status} (transfer failed)"
+                        if base_status else "transfer failed"))
+            return
+
+        def _emit(line: str) -> None:
+            self.after(0, lambda l=line: self._append_log(l))
+
+        def _set_row_status(label: str) -> None:
+            if row is None:
+                return
+            self.after(0, lambda: row.set_status(label))
+
+        def _finalize_worker() -> None:
+            # Phase 1: signal the mirror to stop + drain.
+            _emit(f"  [batch] [{ident}] finalize: signaling mirror "
+                  f"to drain")
+            t0 = time.time()
+            worker["stop"].set()
+            # Wait up to 30 min for the mirror's final pass to
+            # finish. On a contended HDD (next row's preprocess
+            # already writing to the same disk) the drain of ~20-30
+            # GB of registered binaries can take 5-10 min; the
+            # original 5-min timeout fired mid-copy and races with
+            # the rmtree below. The synchronous sweep that follows
+            # this wait is the actual safety net -- this timeout is
+            # just an upper bound to keep stuck mirrors from
+            # blocking the queue forever.
+            if not worker["synced"].wait(timeout=1800.0):
+                _emit(f"  [batch] [{ident}] finalize: mirror drain "
+                      f"timed out after 30 min; sync sweep will "
+                      f"catch remaining files")
+            # Phase 2: prune (drops sparsery_pass etc. -- mirror
+            # already skipped them, this catches anything that
+            # might have slipped through e.g. data_raw.bin written
+            # late). Just to be safe.
+            n_pruned, bytes_pruned = _prune_scratch_tree(scratch_rec)
+            prune_msg = ""
+            if n_pruned > 0:
+                prune_msg = (f" (pruned {n_pruned} skipped path"
+                             f"{'' if n_pruned == 1 else 's'}, "
+                             f"{bytes_pruned / 1e9:.2f} GB)")
+            # Phase 3: SYNCHRONOUS final sweep. Walks scratch one
+            # more time on our own thread (no daemon, no time
+            # bound) and copies any non-skip file that isn't already
+            # at HDD. If the mirror's drain finished cleanly this is
+            # a no-op walk; if it timed out or raced with rmtree,
+            # this is the safety net that copies whatever it left
+            # behind. Either way: by the time this returns, every
+            # output file is at HDD and rmtree below is safe.
+            n_swept, bytes_swept = _synchronous_final_sweep(
+                scratch_rec, final_rec, worker["inode_to_dst"])
+            sweep_msg = ""
+            if n_swept > 0:
+                sweep_msg = (f" (sync sweep recovered {n_swept} file"
+                             f"{'' if n_swept == 1 else 's'}, "
+                             f"{bytes_swept / 1e9:.2f} GB the mirror "
+                             f"missed)")
+            # Phase 4: marshal repoint to Tk main thread + block.
+            repoint_done = threading.Event()
+
+            def _repoint_and_signal() -> None:
+                try:
+                    self._repoint_pipeline_after_copy(
+                        scratch_rec, final_rec)
+                finally:
+                    repoint_done.set()
+
+            self.after(0, _repoint_and_signal)
+            if not repoint_done.wait(timeout=30.0):
+                _emit(f"  [batch] [{ident}] finalize: repoint "
+                      f"timed out; proceeding with rmtree")
+            # Phase 5: bulk rmtree scratch. Sync sweep above
+            # guarantees every output file is already at HDD, so
+            # this is safe regardless of whether the mirror drained
+            # cleanly or timed out.
+            #
+            # First attempt: standard rmtree. On Windows this can
+            # fail silently when a file handle is still open
+            # (suite2p memmap not yet GC'd, Explorer window in
+            # scratch, antivirus scanning, or downstream tabs --
+            # Tab 4 / 5 / 6 / ... -- holding ``np.memmap`` objects
+            # on the just-finished recording's scratch files). One
+            # retry after a 2-s pause covers transient locks.
+            # Anything still locked after that gets handed off to
+            # the long-lived scratch janitor (see
+            # ``_scratch_janitor_loop``) which retries every ~30 s
+            # until the handles release -- typically when the next
+            # recording's repoint causes the tabs to reopen their
+            # memmaps elsewhere, or when the user navigates away
+            # from a stale view. No manual cleanup is ever needed.
+            gc.collect()
+            shutil.rmtree(str(scratch_rec), ignore_errors=True)
+            if scratch_rec.exists():
+                time.sleep(2.0)
+                gc.collect()
+                shutil.rmtree(str(scratch_rec), ignore_errors=True)
+            deferred_msg = ""
+            handed_to_janitor = False
+            if scratch_rec.exists():
+                n_left, bytes_left = _measure_tree(scratch_rec)
+                if n_left > 0:
+                    self._enqueue_scratch_cleanup(
+                        scratch_rec, row=row, base_status=base_status)
+                    handed_to_janitor = True
+                    deferred_msg = (
+                        f" [deferred: {n_left} file"
+                        f"{'' if n_left == 1 else 's'} "
+                        f"({bytes_left / 1e9:.2f} GB) still locked; "
+                        f"janitor will retry every "
+                        f"{int(self._CLEANUP_RETRY_INTERVAL_S)}s]")
+            n_synced = len(worker["seen"]) + n_swept
+            _emit(f"  [batch] [{ident}] finalize: mirror drained "
+                  f"+ repointed + scratch cleared "
+                  f"({n_synced} files on HDD, "
+                  f"{time.time() - t0:.1f}s){prune_msg}{sweep_msg}"
+                  f"{deferred_msg}")
+            if handed_to_janitor:
+                _set_row_status(
+                    f"{base_status} (cleanup pending)"
+                    if base_status else "cleanup pending")
+            else:
+                _set_row_status(
+                    f"{base_status} (done)" if base_status else "done")
+
+        t = threading.Thread(
+            target=_finalize_worker,
+            name=f"calliope-mirror-finalize-{ident}",
+            daemon=True)
+        t.start()
+        self._batch_finalize_threads.append(t)
+
+    def _repoint_pipeline_after_copy(self, scratch: Path,
+                                     final: Path) -> None:
+        """Swap any in-memory plane0 references from ``scratch`` to
+        the corresponding path under ``final``.
+
+        Tk main thread only. Called between the SSD->HDD copy and
+        the bulk scratch rmtree so the GUI's reactive reload paths
+        (Tab 4 reading dF/F memmaps from ``plane0``, Tab 6 reloading
+        cluster files, etc.) never end up pointed at a path we're
+        about to delete.
+
+        We bypass ``AppState.set_plane0`` / ``set_lowpass_ready``
+        and write the attributes directly -- those setters fire
+        every subscribed listener, which on the active row would
+        re-trigger Tab 4's lowpass recompute / Tab 5's render. A
+        path rewrite shouldn't have side effects, so we just swap
+        the values in place.
+
+        Tab-local ``_plane0`` / ``_final_plane0`` / ``_plane0_path``
+        caches get the same direct rewrite. We touch every tab the
+        pipeline_gui exposes -- a stale cache on any one of them
+        would survive the AppState swap.
+        """
+        def _rewrite(cur):
+            """Return the HDD path under ``final`` that mirrors
+            ``cur`` under ``scratch`` -- or ``None`` if ``cur``
+            isn't under scratch (so the caller can leave it alone).
+            """
+            if cur is None:
+                return None
+            try:
+                cur_p = Path(cur)
+                if cur_p == scratch:
+                    return final
+                rel = cur_p.relative_to(scratch)
+                return final / rel
+            except (TypeError, ValueError, OSError):
+                return None
+
+        # AppState channels. Direct attribute write avoids re-firing
+        # listeners (which would, e.g., recompute Tab 4's lowpass
+        # from a path that's about to disappear).
+        state = self.state
+        for attr in ("plane0", "lowpass_plane0"):
+            new_p = _rewrite(getattr(state, attr, None))
+            if new_p is not None:
+                setattr(state, attr, new_p)
+
+        # ``AppState.event_results`` is a dict that carries plane0
+        # inside it. If Tab 5 published with the scratch path,
+        # rewrite the value in place so Tab 8 / cluster popout /
+        # anyone else reading ``state.event_results["plane0"]`` gets
+        # the HDD twin.
+        evr = getattr(state, "event_results", None)
+        if isinstance(evr, dict):
+            new_p = _rewrite(evr.get("plane0"))
+            if new_p is not None:
+                evr["plane0"] = new_p
+
+        # ``AppState.result`` is the PreprocessResult dataclass.
+        # Phase 1 (``_repoint_preprocess_result``) may have already
+        # swapped the four file paths during the row; this row-end
+        # pass also rewrites the ``out_dir`` field (left at scratch
+        # during the row because Tabs 4-8 were still writing there).
+        # Idempotent: if Phase 1 already ran, the four file paths
+        # are already at HDD and ``_rewrite`` returns ``None`` for
+        # them (no-op).
+        pre_result = getattr(state, "result", None)
+        if pre_result is not None:
+            for fld in ("out_dir", "shifted_tiff", "qc_gif",
+                        "mean_image_path"):
+                new_p = _rewrite(getattr(pre_result, fld, None))
+                if new_p is not None:
+                    try:
+                        setattr(pre_result, fld, new_p)
+                    except (AttributeError, TypeError):
+                        continue
+
+        # Tab-local caches. The pipeline_gui exposes each tab as a
+        # named attribute on the toplevel; iterate the standard list
+        # and try every field name we know stashes a plane0.
+        app = getattr(self, "_app", None) or self.winfo_toplevel()
+        tab_attrs = ("preprocess_tab", "qc_tab", "detection_tab",
+                     "lowpass_tab", "event_tab", "clustering_tab",
+                     "xcorr_tab", "spatial_tab")
+        plane0_fields = ("_plane0", "_final_plane0", "_plane0_path",
+                         "_current_plane0", "plane0")
+        for tab_attr in tab_attrs:
+            tab = getattr(app, tab_attr, None)
+            if tab is None:
+                continue
+            for fld in plane0_fields:
+                new_p = _rewrite(getattr(tab, fld, None))
+                if new_p is not None:
+                    try:
+                        setattr(tab, fld, new_p)
+                    except (AttributeError, TypeError):
+                        # Property without a setter, or read-only;
+                        # leave it and move on.
+                        continue
+
+        # Dict-stored plane0 caches. Some tabs stash the recording's
+        # plane0 path INSIDE a dict-valued attribute (e.g. Tab 3's
+        # ``_panel_cache["plane0"]`` carries the path the curation
+        # popout reads ``iscell.npy`` / ``stat.npy`` from). The
+        # attribute-walking loop above can't reach inside those
+        # dicts, so we ask each tab to repoint its own structured
+        # caches via an opt-in ``_repoint_after_copy`` method. Tabs
+        # that don't implement the hook are unaffected.
+        for tab_attr in tab_attrs:
+            tab = getattr(app, tab_attr, None)
+            if tab is None:
+                continue
+            hook = getattr(tab, "_repoint_after_copy", None)
+            if callable(hook):
+                try:
+                    hook(scratch, final)
+                except Exception:
+                    continue
+
+        # Memmap-handle release. We deliberately do NOT explicitly
+        # null tab-level ``np.memmap`` caches here (Tab 7's
+        # ``_dff_cache`` is the only one that exists today): the
+        # next row's pipeline naturally publishes a new plane0
+        # which fires ``_set_plane0`` on Tab 7 and drops the cache;
+        # the long-lived scratch janitor picks up the released
+        # handle on its next 30 s pass and rmtree succeeds. For
+        # the LAST row of a batch the orphan sweep at the next
+        # batch start catches anything still locked. Keeping the
+        # repoint stage decoupled from tab-internal cache field
+        # names means new tab-level memmap caches don't need a
+        # corresponding entry in this function.
+        gc.collect()
+
     def _batch_finish(self) -> None:
+        # Wait phase: if background scratch->HDD finalizes are still
+        # running, poll every 500 ms until they all join. Without this
+        # wait the report would reference paths that the worker hasn't
+        # written yet (the report itself is fine — it goes to a
+        # non-scratch HDD location — but the plane0 paths inside it
+        # would point at not-yet-existing files).
+        pending = [t for t in self._batch_finalize_threads
+                   if t.is_alive()]
+        if pending:
+            if not self._finalize_waiting:
+                verb = ("aborted" if self._abort_flag.is_set()
+                        else "done")
+                self._append_log(
+                    f"=== Batch processing {verb}; waiting for "
+                    f"{len(pending)} background scratch -> HDD "
+                    f"copies to finish... ===")
+                self._finalize_waiting = True
+            self.after(500, self._batch_finish)
+            return
+        self._finalize_waiting = False
+
         self._batch_active = False
         self.run_btn.config(state="normal")
-        self.abort_btn.config(state="disabled")
+        # Restore the abort button's label + (disabled) state ready
+        # for the next batch. _on_abort flipped it to "Aborting..."
+        # while the request was in flight.
+        self.abort_btn.config(state="disabled", text="Abort")
         if self._abort_flag.is_set():
             self._append_log("=== Batch run aborted ===")
         else:
             self._append_log("=== Batch run done ===")
+        # Report goes to the user-facing output folder, not scratch —
+        # scratch may already be partially deleted by per-row finalize.
         try:
-            self._write_report(self._batch_out_root, self._batch_results)
+            self._write_report(
+                self._batch_final_out_root, self._batch_results)
         except Exception as e:
             self._append_log(f"[batch] report write failed: {e}")
+        # End-of-batch scratch verification. Each row's finalize
+        # already rmtree'd its own scratch_rec; we walk the whole
+        # scratch root here as a belt-and-braces check that nothing
+        # leaked through (Windows file-lock survivors, finalize crash
+        # mid-rmtree, downstream tabs still holding memmaps on a
+        # just-finished recording, etc.). Cases:
+        #   - scratch root empty -> rmdir the root, log "clean"
+        #   - leftovers exist    -> hand them to the long-lived
+        #                           scratch janitor (started in
+        #                           __init__, retries every 30 s
+        #                           until handles release). The user
+        #                           sees a one-line status report;
+        #                           no manual intervention required.
+        if self._batch_scratch_root is not None:
+            scratch_root = self._batch_scratch_root
+            leftover_subdirs: list[Path] = []
+            try:
+                for entry in scratch_root.iterdir():
+                    leftover_subdirs.append(entry)
+            except OSError as e:
+                self._append_log(
+                    f"[batch] scratch root unreadable at end of "
+                    f"batch ({scratch_root}): {e}")
+                leftover_subdirs = []
+
+            if not leftover_subdirs:
+                # Empty scratch root -- rmdir the per-batch root we
+                # created so we don't leave a dangling empty folder.
+                try:
+                    scratch_root.rmdir()
+                    self._append_log(
+                        f"[batch] scratch dir clean -- removed "
+                        f"{scratch_root}")
+                except OSError as e:
+                    # Empty but rmdir failed (probably the user's
+                    # configured scratch root, not a per-batch
+                    # subfolder we'd be allowed to remove). Fine.
+                    self._append_log(
+                        f"[batch] scratch dir empty; rmdir skipped: "
+                        f"{e}")
+            else:
+                total_n = 0
+                total_b = 0
+                for sub in leftover_subdirs:
+                    n, b = _measure_tree(sub)
+                    total_n += n
+                    total_b += b
+                    self._enqueue_scratch_cleanup(sub)
+                names = ", ".join(p.name for p in leftover_subdirs[:5])
+                if len(leftover_subdirs) > 5:
+                    names += f", +{len(leftover_subdirs) - 5} more"
+                self._append_log(
+                    f"[batch] {len(leftover_subdirs)} "
+                    f"subdir{'' if len(leftover_subdirs) == 1 else 's'} "
+                    f"still locked at batch end "
+                    f"({total_n} files, {total_b / 1e9:.2f} GB); "
+                    f"janitor will retry every "
+                    f"{int(self._CLEANUP_RETRY_INTERVAL_S)}s until "
+                    f"handles release. No action needed.\n"
+                    f"  pending: {names}")
         # Restore the user's Tab 2 animation preference.
         if self._qc_animate_was:
             try:
