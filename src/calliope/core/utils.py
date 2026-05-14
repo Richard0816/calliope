@@ -955,6 +955,59 @@ def _build_density(
     return centers, counts, smooth
 
 
+def compute_candidate_prominences(
+        smoothed: np.ndarray,
+        params: Optional["EventDetectionParams"] = None,
+) -> np.ndarray:
+    """Return the full prominence distribution for the smoothed onset density.
+
+    Re-runs ``scipy.signal.find_peaks`` with the same width / distance /
+    wlen gates used by ``detect_event_windows`` but with the prominence
+    floor dropped to ~0, so every candidate peak's prominence is
+    returned -- including those that the real detection rejected as
+    too small.
+
+    Used by Tab 5's prominence-distribution popout to visualise where
+    the user's ``min_prominence`` threshold sits relative to the noise
+    floor. Cheap on the smoothed density (~10k samples typical), so
+    the popout can refresh on the fly without re-running detection.
+
+    Parameters
+    ----------
+    smoothed : 1D ndarray
+        The Gaussian-smoothed onset-density trace
+        (``diagnostics["smoothed_density"]`` from
+        ``detect_event_windows``).
+    params : EventDetectionParams, optional
+        Width / distance / wlen / bin_sec come from here. Uses
+        defaults if None.
+
+    Returns
+    -------
+    prominences : 1D ndarray of float
+        One entry per candidate peak.
+    """
+    if params is None:
+        params = EventDetectionParams()
+    smoothed = np.asarray(smoothed, dtype=np.float64)
+    if smoothed.size == 0:
+        return np.empty(0, dtype=np.float64)
+    wlen_bins_val = max(
+        3,
+        int(round(params.prominence_wlen_s / max(params.bin_sec, 1e-9))) | 1,
+    )
+    kw = dict(
+        prominence=1e-12,  # floor -- not 0, which scipy treats as disabled
+        width=params.min_width_bins,
+        distance=max(1, int(round(params.min_distance_bins))),
+    )
+    if wlen_bins_val >= 3:
+        kw["wlen"] = int(wlen_bins_val)
+    _peaks, props = find_peaks(smoothed, **kw)
+    proms = np.asarray(props.get("prominences", []), dtype=np.float64)
+    return proms
+
+
 def _detect_density_peaks(
         smooth: np.ndarray,
         min_prominence: float,
@@ -1490,7 +1543,7 @@ RAM_TARGET_FRACTION = 0.80
 
 # Bytes reserved off the top of total RAM as absolute headroom for the
 # OS, our own GUI process, and suite2p logging. 4 GiB is enough for the
-# Tk GUI + a comfortable OS slack on most workstations.
+# customtkinter GUI + a comfortable OS slack on most workstations.
 RAM_HEADROOM_GIB = 4.0
 
 # Empirical multiplier on the raw frame bytes (Ly * Lx * 2) covering

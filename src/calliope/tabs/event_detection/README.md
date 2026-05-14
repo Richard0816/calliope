@@ -6,6 +6,8 @@
 
 Three panels: a sorted heatmap of low-pass dF/F, a sorted onset raster, and the population-density trace with detected event windows shaded.
 
+A **Prominence distribution...** button (header, next to *Advanced...*) opens a popout with the histogram of every candidate peak's prominence in the smoothed onset density. A draggable slider over the X axis lets you preview the `min_prominence` threshold against the distribution — drop it into the valley between noise and real events, watch the "keeping N / M" count update live, click **Apply** and Tab 5 re-renders against the new threshold automatically. Reset restores the previously-applied value; Cancel/Esc closes without changes.
+
 ---
 
 ## 1. Inputs
@@ -222,7 +224,7 @@ Defaults are tuned for **<0.5 s epileptiform events**. Every entry below is edit
 | `bin_sec` | 0.025 | Density histogram bin width. |
 | `smooth_sigma_bins` | 1.5 | Gaussian smoothing of the density. |
 | `normalize_by_num_rois` | True | Normalise to onsets/ROI/bin. |
-| `min_prominence` | 0.002 | `find_peaks` prominence floor. |
+| `min_prominence` | 0.002 | `find_peaks` prominence floor. Also editable visually via the *Prominence distribution...* popout. |
 | `min_width_bins` | 1.0 | Peak min width. |
 | `min_distance_bins` | 4.0 | Min separation between peaks (~100 ms). |
 | `prominence_wlen_s` | 1.0 | Local window for prominence. |
@@ -274,3 +276,13 @@ Manual subset (UI-only, not in `PARAM_SPEC`):
 9. The display heatmap is per-ROI 1st/99th-percentile-normalised `lp_ds` with rows sorted by event count (descending). The raster is binary onsets at downsampled bin resolution.
 
 The full annotated reference is in `core/utils.py` lines ~250–820.
+
+
+## UI affordances
+
+Tab 5 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Per-panel resize grips.** All three stacked matplotlib panels (1. heatmap, 2. event raster, 3. population event detection) carry a draggable handle below them. Drag any grip to grow that panel — the scrollable tab body absorbs the extra height. The other panels stay at their current size (no PanedWindow sash redistribution).
+- **Popouts.**
+  - **Prominence distribution** (`ProminencePopout`) — opens from the "Prominence distribution..." button after a render completes; resizable Toplevel with a histogram of candidate-peak prominences and a slider for picking `min_prominence` interactively.
+- **Onset source** + **Manual ROI subset** rows let you pick between derivative / Suite2p `spks` and optionally restrict the heatmap + raster to a user-supplied ROI list.

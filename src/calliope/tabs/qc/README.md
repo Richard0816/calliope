@@ -14,6 +14,8 @@ A `PreprocessResult` published by Tab 1 (or loaded from a folder). Specifically:
 
 A "Reload from folder…" button calls `load_existing_preprocess(path)` and re-publishes the result, letting you point Tab 2 at a previously processed recording without re-running Tab 1.
 
+If the folder has been through Tab 3's post-detection archive — shifted TIFF gone, compressed raw at top level — the reload transparently regenerates the shifted from the raw before returning (driven by the `_calliope_raw_paths.json` sidecar). Expect a brief stall (~1 min for a 9 GB recording) while the reshift runs.
+
 History: the right-hand panel used to overlay LoG soma-candidate circles on the mean image, fed by a `detect_blobs_on_mean` pass that wrote `blobs.npy`. The overlay was a holdover from before Tab 3's Sparsery + Cellpose detection came online; nothing downstream ever consumed `blobs.npy`. Removed 2026-05-12.
 
 ---
@@ -60,11 +62,13 @@ None — Tab 2 is read-only.
 
 ## 4. UI layout
 
-Two side-by-side panels in a `ttk.Frame`:
-- **Left**: a `ttk.Label` whose `image` attribute is the current animated frame, plus a status string ("`<N> frames`" or "Animate off (single frame)").
-- **Right**: a `matplotlib.Figure` with the mean image, wrapped in a `FigureCanvasTkAgg` and the standard `attach_fig_toolbar` (pan/zoom + Save Figure).
+Two side-by-side panels inside a `CTkFrame` content host (dark theme via customtkinter):
+- **Left**: a `ttk.Label` whose `image` attribute is the current animated frame, plus a status string ("`<N> frames`" or "Animate off (single frame)"). The label stays `ttk.Label` because it hosts a Pillow `ImageTk.PhotoImage`, which `CTkLabel` cannot wrap.
+- **Right**: a `matplotlib.Figure` with the mean image, wrapped in a `FigureCanvasTkAgg` and the standard `attach_fig_toolbar` (pan/zoom + Save Figure). Matplotlib figures keep their white facecolor — "dark frame, light plots" — while the toolbar itself is dark-skinned by `restyle_matplotlib_toolbar`.
 
-The header shows `"Recording: <name>   (<Y> x <X>)"` once a result is available.
+The header shows `"Recording: <name>   (<Y> x <X>)"` once a result is available, and a **Reload from folder...** `CTkButton` opens a directory picker so the user can re-load an already-preprocessed recording from disk.
+
+History: the tab was migrated to customtkinter dark mode in May 2026 along with the rest of the GUI; previously this section described a plain `ttk.Frame` + system-theme look.
 
 ---
 

@@ -76,6 +76,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+import customtkinter as ctk
+
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -83,8 +85,8 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, format_roi_indices, open_advanced,
-    parse_manual_roi_spec, spec_defaults,
+    AppState, attach_fig_toolbar, drain_queue, format_roi_indices,
+    open_advanced, parse_manual_roi_spec, spec_defaults,
 )
 
 
@@ -138,7 +140,11 @@ class LowpassTab(ttk.Frame):
         self._T: int = 0
 
         self._build_ui()
-        self.after(self.POLL_MS, self._drain_compute_queue)
+        drain_queue(self, self._compute_queue,
+                    {"status": self.compute_status_var.set,
+                     "done": self._on_compute_done,
+                     "error": self._on_compute_error},
+                    poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
         if state.plane0 is not None:
             self._on_plane0(state.plane0)
@@ -151,75 +157,80 @@ class LowpassTab(ttk.Frame):
             padding=8)
         header.pack(fill="x", pady=(0, 6))
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Cutoff (Hz):", width=12).pack(side="left")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="Cutoff (Hz):", width=90,
+                     anchor="w").pack(side="left")
         self.cutoff_var = tk.DoubleVar(value=self.CUTOFF_DEFAULT)
-        self.slider = ttk.Scale(
+        self.slider = ctk.CTkSlider(
             row, from_=self.CUTOFF_MIN, to=self.CUTOFF_MAX,
-            orient="horizontal", variable=self.cutoff_var,
+            orientation="horizontal", variable=self.cutoff_var,
             command=self._on_slider,
         )
         self.slider.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.cutoff_str = tk.StringVar(value=f"{self.CUTOFF_DEFAULT:.2f}")
-        entry = ttk.Entry(row, textvariable=self.cutoff_str, width=8)
+        entry = ctk.CTkEntry(row, textvariable=self.cutoff_str, width=80)
         entry.pack(side="left")
         entry.bind("<Return>", self._on_entry)
-        ttk.Label(row, text="Hz").pack(side="left", padx=(2, 8))
-        ttk.Button(row, text="Advanced...",
-                   command=self._on_advanced).pack(side="right",
-                                                   padx=(0, 6))
-        ttk.Button(row, text="Reload from folder...",
-                   command=self._reload_from_folder).pack(side="right")
+        ctk.CTkLabel(row, text="Hz").pack(side="left", padx=(2, 8))
+        ctk.CTkButton(row, text="Advanced...", width=90,
+                      command=self._on_advanced).pack(side="right",
+                                                      padx=(0, 6))
+        ctk.CTkButton(row, text="Reload from folder...", width=150,
+                      command=self._reload_from_folder).pack(side="right")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=(4, 0))
-        ttk.Label(row, text="", width=12).pack(side="left")
-        self.compute_btn = ttk.Button(
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(row, text="", width=90).pack(side="left")
+        self.compute_btn = ctk.CTkButton(
             row, text="Compute low-pass + derivative (write memmaps)",
-            command=self._on_compute, state="disabled")
+            command=self._on_compute, state="disabled", width=320)
         self.compute_btn.pack(side="left")
-        self.compute_progress = ttk.Progressbar(
-            row, mode="indeterminate", length=160)
+        self.compute_progress = ctk.CTkProgressBar(
+            row, mode="indeterminate", width=160)
         self.compute_progress.pack(side="left", padx=12)
         self.compute_status_var = tk.StringVar(value="")
         ttk.Label(row, textvariable=self.compute_status_var,
                   font=("", 9, "italic")).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=(4, 0))
-        ttk.Label(row, text="Trace source:", width=12).pack(side="left")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(row, text="Trace source:", width=90,
+                     anchor="w").pack(side="left")
         self.source_var = tk.StringVar(value="mean")
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             row, text="Mean across kept ROIs",
             value="mean", variable=self.source_var,
             command=self._on_source_change,
         ).pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             row, text="Median across kept ROIs",
             value="median", variable=self.source_var,
             command=self._on_source_change,
         ).pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             row, text="Best-scoring ROI (max predicted_cell_prob)",
             value="best", variable=self.source_var,
             command=self._on_source_change,
         ).pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             row, text="Manual ROI(s):",
             value="manual", variable=self.source_var,
             command=self._on_source_change,
         ).pack(side="left")
         self.manual_roi_var = tk.StringVar(value="0")
-        manual_entry = ttk.Entry(row, textvariable=self.manual_roi_var,
-                                 width=18)
+        manual_entry = ctk.CTkEntry(row, textvariable=self.manual_roi_var,
+                                    width=180)
         manual_entry.pack(side="left", padx=(2, 0))
         manual_entry.bind("<Return>", self._on_manual_entry)
         manual_entry.bind("<FocusOut>", self._on_manual_entry)
         # Aggregation for multi-ROI manual input (single-ROI inputs ignore it).
         self.manual_agg_var = tk.StringVar(value="mean")
-        manual_agg = ttk.Combobox(
-            row, textvariable=self.manual_agg_var,
-            values=["mean", "median"], state="readonly", width=7)
+        manual_agg = ctk.CTkComboBox(
+            row, variable=self.manual_agg_var,
+            values=["mean", "median"], state="readonly", width=90,
+            command=lambda _v: self._on_manual_entry())
         manual_agg.pack(side="left", padx=(4, 0))
-        manual_agg.bind("<<ComboboxSelected>>", self._on_manual_entry)
 
         self.status_var = tk.StringVar(
             value="Run detection first (or reload from a finished folder).")
@@ -233,7 +244,8 @@ class LowpassTab(ttk.Frame):
         ttk.Label(self, textvariable=self.recording_var,
                   font=("", 10, "italic")).pack(anchor="w", pady=(0, 6))
 
-        body = ttk.Frame(self); body.pack(fill="both", expand=True)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
         body.rowconfigure(0, weight=1, uniform="rows")
         body.rowconfigure(1, weight=1, uniform="rows")
         body.rowconfigure(2, weight=1, uniform="rows")
@@ -244,14 +256,15 @@ class LowpassTab(ttk.Frame):
         # Y-axis scale toggle. Log is the default (better for visualising
         # power-law roll-off at higher frequencies); linear is useful for
         # sanity-checking a single dominant peak at e.g. line frequency.
-        fft_top = ttk.Frame(f1); fft_top.pack(fill="x")
-        ttk.Label(fft_top, text="y-axis:").pack(side="left", padx=(0, 4))
+        fft_top = ctk.CTkFrame(f1, fg_color="transparent")
+        fft_top.pack(fill="x")
+        ctk.CTkLabel(fft_top, text="y-axis:").pack(side="left", padx=(0, 4))
         self.fft_yscale_var = tk.StringVar(value="log")
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             fft_top, text="log", value="log",
             variable=self.fft_yscale_var,
             command=self._draw_fft).pack(side="left")
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             fft_top, text="linear", value="linear",
             variable=self.fft_yscale_var,
             command=self._draw_fft).pack(side="left", padx=(4, 0))
@@ -311,7 +324,7 @@ class LowpassTab(ttk.Frame):
             self._load_data(self._plane0)
         except Exception as e:
             self.status_var.set(f"Load error: {e}")
-            self.compute_btn.config(state="disabled")
+            self.compute_btn.configure(state="disabled")
             return
         self._draw_fft()
         self._draw_raw()
@@ -319,7 +332,7 @@ class LowpassTab(ttk.Frame):
         self.status_var.set(
             f"Loaded T={self._mean_dff.size}  N_kept={self._n_kept}  "
             f"fps={self._fps:.2f}  cutoff={self.cutoff_var.get():.3f} Hz")
-        self.compute_btn.config(state="normal")
+        self.compute_btn.configure(state="normal")
 
     def _load_data(self, plane0: Path) -> None:
         from . import logic as utils
@@ -601,8 +614,8 @@ class LowpassTab(ttk.Frame):
         N = self._n_kept
         fps = self._fps
 
-        self.compute_btn.config(state="disabled")
-        self.compute_progress.start(12)
+        self.compute_btn.configure(state="disabled")
+        self.compute_progress.start()
         self.compute_status_var.set(
             f"Writing lowpass + derivative @ {cutoff:.3f} Hz ...")
 
@@ -639,30 +652,22 @@ class LowpassTab(ttk.Frame):
             progress_cb=lambda msg: self._compute_queue.put(("status", msg)),
         )
 
-    def _drain_compute_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._compute_queue.get_nowait()
-                if kind == "status":
-                    self.compute_status_var.set(payload)
-                elif kind == "done":
-                    self.compute_progress.stop()
-                    self.compute_btn.config(state="normal")
-                    self.compute_status_var.set(
-                        f"Wrote r0p7_filtered_dff_lowpass.memmap.float32 + "
-                        f"r0p7_filtered_dff_dt.memmap.float32 "
-                        f"@ {payload:.3f} Hz")
-                    if self._plane0 is not None:
-                        try:
-                            self.state.set_lowpass_ready(self._plane0)
-                        except Exception as e:
-                            print(f"lowpass_ready publish error: {e}")
-                elif kind == "error":
-                    self.compute_progress.stop()
-                    self.compute_btn.config(state="normal")
-                    self.compute_status_var.set("Error.")
-                    messagebox.showerror(
-                        "Compute failed", payload.split("\n", 1)[0])
-        except queue.Empty:
-            pass
-        self.after(self.POLL_MS, self._drain_compute_queue)
+    def _on_compute_done(self, cutoff_hz: float) -> None:
+        self.compute_progress.stop()
+        self.compute_btn.configure(state="normal")
+        self.compute_status_var.set(
+            f"Wrote r0p7_filtered_dff_lowpass.memmap.float32 + "
+            f"r0p7_filtered_dff_dt.memmap.float32 "
+            f"@ {cutoff_hz:.3f} Hz")
+        if self._plane0 is not None:
+            try:
+                self.state.set_lowpass_ready(self._plane0)
+            except Exception as e:
+                print(f"lowpass_ready publish error: {e}")
+
+    def _on_compute_error(self, payload: str) -> None:
+        self.compute_progress.stop()
+        self.compute_btn.configure(state="normal")
+        self.compute_status_var.set("Error.")
+        messagebox.showerror(
+            "Compute failed", payload.split("\n", 1)[0])

@@ -156,3 +156,12 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 5. A live slider that calls (1) per drag and updates a Matplotlib axvline + the low-pass plot. Debounce via `after(80, …)` to avoid melting the GUI thread.
 6. A worker that re-runs the SOS filter + SG derivative once per ROI (re-using the cached `sos`) and writes two `(T, N)` `float32` memmaps with the standardised filenames.
 7. The trace-source rules: aggregate over the kept-only memmap for mean/median/best, but reach into the full `(T, N_total)` memmap when the user passes Suite2p ROI ids manually.
+
+
+## UI affordances
+
+Tab 4 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Cutoff slider.** `CTkSlider` driving the cutoff value; the numeric Entry next to it lets the user type an exact value.
+- **Three stacked matplotlib panels** (FFT power spectrum, raw dF/F, low-pass + derivative preview) live in `ttk.LabelFrame`s — matplotlib figures keep their white facecolor; the surrounding chrome is dark. Each canvas has a dark-skinned navigation toolbar (pan/zoom/save + Save data CSV).
+- **No popouts.** Advanced parameters open in the standard `AdvancedDialog`.

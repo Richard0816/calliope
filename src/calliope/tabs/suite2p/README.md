@@ -225,6 +225,32 @@ The same helper is called from `core.detection_run.run_detection` so headless dr
 
 `gc.collect()` runs before the prune so any lingering suite2p `np.memmap` references are released and Windows lets `unlink`/`rmtree` succeed on the first pass. Errors on individual paths are caught and reported via `progress_cb` so a single file lock doesn't abort the whole cleanup.
 
+### Step 6 — Post-detection archive
+
+Immediately after the prune, `core.detection_run.archive_recording_post_detection(save_folder, ...)` collapses the recording folder to the smallest stable footprint:
+
+1. **Compress raws into the recording folder.** Reads `_calliope_raw_paths.json` (written by Tab 1's `run_preprocess`) to locate the originals, then re-encodes each as Zstd-19 + horizontal predictor and writes it to `<rec>/<raw.name>.tif` at top level. Byte-equality is verified by decompressing the temp file and comparing to the original array before an atomic rename swaps it into place — the source is never overwritten unless the round-trip matches exactly. ~50–60% size reduction is typical on int16/int32 fluorescence TIFFs.
+2. **Delete the shifted TIFFs.** Top-level `*shifted_*.tif` files go away once compression has succeeded for every raw. They're regenerable from the compressed raw via `load_existing_preprocess` (Tab 2's reload path) — see Tab 1's README §4.
+3. **Delete `<rec>/detection/final/suite2p/plane0/data.bin`.** This is the hardlink twin of the now-pruned `_shared_reg/data.bin`; both sides have to be unlinked to actually free the ~9 GB on disk. Nothing downstream (Tabs 4–8) reads it — only `merge_and_extract` opens it during extraction, after which F.npy / Fneu.npy / spks.npy carry forward.
+4. **Optionally delete the user's external raw originals** (off by default; opt-in via `delete_external_raw_after_archive`).
+
+If compression fails on any raw, the archive step aborts **before** any deletions so the recording stays in a re-runnable state.
+
+Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 GB (compressed raw + npy outputs).
+
+**Param keys** (read from the same `params` dict that drives the rest of detection):
+
+| Key | Default | Effect |
+|---|---|---|
+| `archive_post_detection` | `True` | Master switch for the archive step. |
+| `compress_raw_post_detection` | `True` | Compress raws into the recording folder. |
+| `delete_shifted_post_detection` | `True` | Remove top-level `*shifted_*.tif`. |
+| `delete_final_data_bin_post_detection` | `True` | Remove `detection/final/.../data.bin`. |
+| `delete_external_raw_after_archive` | `False` | Destructive opt-in: delete the original raw at its source path after a verified compressed copy lands. |
+| `raw_compression_level` | `19` | Zstd compression level (1–22). |
+
+**Re-detection cost.** Once archived, re-running detection costs an extra ~1 min for `load_existing_preprocess` to regenerate the shifted from the compressed raw, plus the usual ~5 min of registration + detection. The acceptable trade for ~13 GB/recording saved.
+
 ---
 
 ## 3. Outputs (in `plane0/`)
@@ -326,3 +352,13 @@ without any further user input.
 6. Train (or load) a small CNN that takes the dF/F + footprint of an ROI and outputs `P(real cell)`. Save mask and prob to `predicted_cell_mask.npy`, `predicted_cell_prob.npy`. Fall back to `iscell.npy[:,0] > 0` if no model.
 7. Slice the dF/F memmap by the keep mask in chunks (≤ 4096 frames at a time) to write `r0p7_filtered_dff.memmap.float32`.
 8. Honour the on-disk filename conventions exactly — every later tab and figure script reads `r0p7_filtered_dff.memmap.float32` and `predicted_cell_mask.npy` by name.
+
+
+## UI affordances
+
+Tab 3 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Resizable console.** The "Suite2p console" (Panel 1, top) carries a draggable handle below it — drag down to grow the log without squeezing the detection panels beneath; the scrollable tab body absorbs the extra height.
+- **Detection panels** (2: raw ROIs, 3: after cell-filter mask). Matplotlib figures keep their white facecolor; toolbars are dark-skinned.
+- **Click an ROI** on the detected-ROIs panel to open the **CurationPopout** (`CurationPopout`) — resizable Toplevel that displays five per-ROI panels (locator + trace + four backgrounds) and lets the user re-label cells / retrain the cell-filter.
+- **Edit suite2p settings...** opens a second `AdvancedDialog`-style popout for arbitrary `ops` overrides; "Advanced..." opens the standard PARAM_SPEC form.

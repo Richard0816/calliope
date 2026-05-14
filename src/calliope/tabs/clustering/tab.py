@@ -84,6 +84,8 @@ import queue
 import threading
 import tkinter as tk
 import traceback
+
+import customtkinter as ctk
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Optional
@@ -103,17 +105,24 @@ from scipy.cluster.hierarchy import (
 )
 from scipy.spatial.distance import pdist
 
+from .logic import (
+    ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
+    ReclusterWindow, build_label_image, load_filter_mask,
+    load_filtered_dff, spatial_image, stat_for_prefix, summary_writer,
+    utils, ward_linkage,
+)
 from .logic import clustering as cmap_mod
-from .logic import summary_writer
-from .logic import utils
 from .cluster_popout import ClusterPopout
 
-from ...gui_common import format_roi_indices
+from ...gui_common import (
+    apply_dark_to_tk_widget, attach_fig_toolbar, drain_queue,
+    format_roi_indices,
+)
 
 
-DEFAULT_PREFIX = "r0p7_filtered_"
-DEFAULT_PALETTE = "tab10"
-ABOVE_CUT_COLOR = "gray"
+# ``DEFAULT_PREFIX``, ``DEFAULT_PALETTE``, ``ABOVE_CUT_COLOR`` are
+# imported from ``.logic`` above so ``ReclusterWindow`` (now in
+# ``logic.py``) and ``ClusteringTab`` share the same constants.
 # Cluster ROI .npy files are written directly into
 # ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster"
 # subfolder. Tab 7 + the headless ``crosscorrelation_run`` already
@@ -123,402 +132,9 @@ POLL_MS = 80
 
 
 # ---------------------------------------------------------------------------
-# Backend helpers
+# Backend helpers and dialogs live in ``.logic`` (this file is the GUI).
 # ---------------------------------------------------------------------------
 
-
-def _attach_fig_toolbar(canvas: FigureCanvasTkAgg,
-                        parent_frame,
-                        data_basename: str = "plot_data"
-                        ) -> NavigationToolbar2Tk:
-    """Attach a matplotlib navigation toolbar (pan / zoom / Save Figure)
-    above ``canvas`` inside ``parent_frame``. Caller must pack/grid the
-    canvas widget AFTER this call so the toolbar lands above it.
-
-    A "Save data..." button is added next to the toolbar; it dumps the
-    underlying Line2D / image data to CSV via
-    ``plot_data_export.save_figure_data``."""
-    from ... import plot_data_export
-    tb_frame = ttk.Frame(parent_frame)
-    tb_frame.pack(side="top", fill="x")
-    tb = NavigationToolbar2Tk(canvas, tb_frame, pack_toolbar=False)
-    tb.update()
-    tb.pack(side="left", fill="x")
-    ttk.Button(
-        tb_frame, text="Save data...",
-        command=lambda c=canvas, p=tb_frame, b=data_basename:
-            plot_data_export.save_figure_data(c.figure, p, b),
-    ).pack(side="left", padx=(8, 0))
-    return tb
-
-
-def _ward_linkage(dff: np.ndarray, method: str = "ward") -> np.ndarray:
-    """Ward linkage on z-scored ROI traces with Euclidean distance.
-
-    Z-scoring each ROI to ``(mean=0, std=1)`` flattens amplitude so
-    two cells with very different baseline brightness or scale but
-    the same activity *shape* land close together. With z-scoring
-    applied, squared Euclidean distance and (1 - Pearson r) are
-    equivalent up to a constant (``||x - y||^2 = 2T * (1 - r)``)
-    so the *pair-ranking* is identical to correlation distance --
-    we just use Euclidean to keep scipy's Ward implementation
-    happy (Ward requires a Euclidean metric).
-
-    Why Ward and not average:
-    - Ward minimises within-cluster sum-of-squares (Lance-Williams).
-      Produces compact, roughly balanced clusters -- the typical
-      "4-5 modes" shape lab members find useful.
-    - Average linkage merges by mean pairwise distance. On
-      unbalanced data it can collapse to "1 huge cluster + a few
-      tiny outliers", which is what triggered the earlier
-      cluster-fragmentation guard on cross-correlation.
-
-    History: the pre-2026-05-11 GUI used average + correlation
-    here. The docstring claimed Ward was off the table because
-    "Ward needs Euclidean" -- technically true, but irrelevant
-    once we've z-scored. Switched to Ward after the user pointed
-    out that z-scoring already kills amplitude differences.
-    """
-    dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
-    dist = pdist(dff_z.T, metric="euclidean")
-    return linkage(dist, method=method)
-
-
-# Backward-compat alias for any caller that still imports the old name.
-_correlation_linkage = _ward_linkage
-
-
-def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
-    """Cell-filter keep mask for a Suite2p plane0 directory.
-
-    Tries, in order:
-      1. predicted_cell_mask.npy (cell-filter classifier output, preferred)
-      2. iscell.npy (suite2p classifier fallback)
-    Returns ``None`` if neither file exists.
-    """
-    pred_path = plane0 / "predicted_cell_mask.npy"
-    if pred_path.exists():
-        return np.load(pred_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-    return None
-
-
-def _load_filtered_dff(plane0: Path, prefix: str):
-    """Open ``<prefix>dff.memmap.float32`` against the cell-filter mask.
-
-    For a "filtered" prefix (e.g. ``r0p7_filtered_``) the memmap was written
-    at the size of the cell-filter keep mask, so we need that exact mask to
-    interpret the column count. For an unfiltered prefix, the memmap holds
-    every Suite2p ROI.
-
-    Returns (dff_array, T, N_kept, keep_mask). ``keep_mask`` is ``None`` when
-    the prefix is unfiltered.
-    """
-    plane0 = Path(plane0)
-    F = np.load(plane0 / "F.npy", mmap_mode="r")
-    N_total, T = F.shape
-    is_filtered = "filtered" in prefix.split("_")
-
-    if is_filtered:
-        mask = _load_filter_mask(plane0)
-        if mask is None:
-            raise FileNotFoundError(
-                f"{plane0}: prefix {prefix!r} requires a cell-filter mask "
-                "(predicted_cell_mask.npy or iscell.npy).")
-        if mask.size != N_total:
-            raise ValueError(
-                f"{plane0}: cell-filter mask length {mask.size} does not "
-                f"match F.npy ROI count {N_total}.")
-        N_kept = int(mask.sum())
-    else:
-        mask = None
-        N_kept = N_total
-
-    dff_path = plane0 / f"{prefix}dff.memmap.float32"
-    if not dff_path.exists():
-        raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
-    dff = np.memmap(dff_path, dtype="float32", mode="r",
-                    shape=(T, N_kept))
-    return dff, T, N_kept, mask
-
-
-def _stat_for_prefix(plane0: Path, prefix: str):
-    """Stat list aligned with the columns of the dF/F memmap.
-
-    For filtered prefixes, restrict ``stat`` to the cell-filter keep mask so
-    the i-th stat entry matches the i-th column of dF/F.
-    """
-    full_stat = list(np.load(plane0 / "stat.npy", allow_pickle=True))
-    if "filtered" in prefix.split("_"):
-        mask = _load_filter_mask(plane0)
-        if mask is not None:
-            return ([s for s, keep in zip(full_stat, mask) if keep],
-                    np.where(mask)[0])
-    return full_stat, None
-
-
-def _build_label_image(stat, Ly: int, Lx: int) -> np.ndarray:
-    """Return a ``(Ly, Lx)`` int32 array where each painted pixel
-    holds ``filtered_idx + 1`` (0 = background).
-
-    Used by the spatial-click handler to map a cursor position to
-    the position in Tab 6's filtered stat list. Mirrors
-    ``Suite2pTab._build_label_image`` so click semantics stay
-    consistent across the two tabs.
-    """
-    label = np.zeros((int(Ly), int(Lx)), dtype=np.int32)
-    for i, s in enumerate(stat, start=1):
-        yp = np.asarray(s["ypix"]); xp = np.asarray(s["xpix"])
-        ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
-        label[yp[ok], xp[ok]] = i
-    return label
-
-
-def _spatial_image(stat, Lx, Ly, roi_rgb: np.ndarray) -> np.ndarray:
-    """Paint a per-ROI RGB array onto the FOV (NaN background)."""
-    R = utils.paint_spatial(roi_rgb[:, 0], stat, Ly, Lx)
-    G = utils.paint_spatial(roi_rgb[:, 1], stat, Ly, Lx)
-    B = utils.paint_spatial(roi_rgb[:, 2], stat, Ly, Lx)
-    img = np.dstack([R, G, B])
-    coverage = utils.paint_spatial(np.ones(len(stat)), stat, Ly, Lx)
-    img[coverage == 0] = np.nan
-    return img
-
-
-# ---------------------------------------------------------------------------
-# Per-cluster custom-color dialog
-# ---------------------------------------------------------------------------
-
-
-class CustomColorDialog(tk.Toplevel):
-    """Modal dialog to override the per-cluster color list.
-
-    `initial_colors` is a list of hex strings (length = current cluster count).
-    Clicking a swatch opens askcolor; OK writes the new list to `result`.
-    """
-
-    def __init__(self, master, initial_colors: list[str]) -> None:
-        super().__init__(master)
-        self.title("Per-cluster colors")
-        self.transient(master)
-        self.resizable(False, False)
-        self._colors = list(initial_colors)
-        self.result: Optional[list[str]] = None
-        self._swatches: list[tk.Button] = []
-        self._build_ui()
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-
-    def _build_ui(self) -> None:
-        frm = ttk.Frame(self, padding=10)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="Click a swatch to pick that cluster's color.",
-                  foreground="gray").grid(row=0, column=0, columnspan=3,
-                                          sticky="w", pady=(0, 6))
-        for i, hex_color in enumerate(self._colors):
-            ttk.Label(frm, text=f"Cluster {i + 1}").grid(
-                row=i + 1, column=0, sticky="w", padx=(0, 8), pady=2)
-            btn = tk.Button(frm, width=6, bg=hex_color,
-                            relief="ridge",
-                            command=lambda idx=i: self._pick(idx))
-            btn.grid(row=i + 1, column=1, sticky="w", pady=2)
-            self._swatches.append(btn)
-            ttk.Label(frm, textvariable=tk.StringVar(value=hex_color)).grid(
-                row=i + 1, column=2, sticky="w", padx=(8, 0))
-
-        bar = ttk.Frame(self, padding=(10, 0, 10, 10))
-        bar.pack(fill="x")
-        ttk.Button(bar, text="Cancel", command=self._cancel).pack(side="right")
-        ttk.Button(bar, text="OK",
-                   command=self._ok).pack(side="right", padx=(0, 6))
-
-    def _pick(self, idx: int) -> None:
-        rgb, hex_color = colorchooser.askcolor(
-            color=self._colors[idx], parent=self,
-            title=f"Pick color for cluster {idx + 1}")
-        if hex_color:
-            self._colors[idx] = hex_color
-            self._swatches[idx].configure(bg=hex_color)
-
-    def _ok(self) -> None:
-        self.result = list(self._colors)
-        self.grab_release()
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.grab_release()
-        self.destroy()
-
-
-# ---------------------------------------------------------------------------
-# Recluster inspection window
-# ---------------------------------------------------------------------------
-
-
-class ReclusterWindow(tk.Toplevel):
-    """Read-only sub-tree view: dendrogram + spatial map for a chosen union
-    of branches, with its own threshold slider. Does not modify the parent
-    tab's state in any way."""
-
-    def __init__(self, master, *, Z: np.ndarray, stat, Lx: int, Ly: int,
-                 init_threshold: float, zmax: float,
-                 palette_resolver, branch_label: str, n_rois: int) -> None:
-        super().__init__(master)
-        self.title(f"Recluster - branch(es) {branch_label}  "
-                   f"({n_rois} ROIs)")
-        self.geometry("1200x600")
-
-        self._Z = Z
-        self._stat = stat
-        self._Lx = int(Lx)
-        self._Ly = int(Ly)
-        self._zmax = float(zmax)
-        self._T = float(init_threshold)
-        self._palette_resolver = palette_resolver
-        self._slider_user_driven = True
-
-        self._build_ui()
-        self._render()
-
-    def _build_ui(self) -> None:
-        body = ttk.Frame(self, padding=6)
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=0)
-        body.columnconfigure(2, weight=2)
-        body.rowconfigure(0, weight=1)
-
-        # Dendrogram.
-        dframe = ttk.LabelFrame(body, text="Sub-dendrogram", padding=4)
-        dframe.grid(row=0, column=0, sticky="nsew")
-        self.d_fig = plt.Figure(figsize=(6.5, 4.5), tight_layout=True)
-        self.d_ax = self.d_fig.add_subplot(111)
-        self.d_canvas = FigureCanvasTkAgg(self.d_fig, master=dframe)
-        _attach_fig_toolbar(self.d_canvas, dframe)
-        self.d_canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        # Slider.
-        sframe = ttk.Frame(body)
-        sframe.grid(row=0, column=1, sticky="ns", padx=4)
-        ttk.Label(sframe, text="cut").pack(side="top")
-        self.threshold_scale = tk.Scale(
-            sframe, from_=self._zmax, to=0.0,
-            resolution=max(self._zmax / 1000.0, 1e-6),
-            orient=tk.VERTICAL, length=320, showvalue=False,
-            command=self._on_slider)
-        self._slider_user_driven = False
-        self.threshold_scale.set(self._T)
-        self._slider_user_driven = True
-        self.threshold_scale.pack(side="top", fill="y", expand=True)
-        self.threshold_readout = tk.StringVar(value=f"{self._T:.3f}")
-        ttk.Label(sframe, textvariable=self.threshold_readout,
-                  width=8, anchor="center").pack(side="top")
-
-        # Spatial.
-        sp_frame = ttk.LabelFrame(body, text="Sub-spatial (cluster colors)",
-                                  padding=4)
-        sp_frame.grid(row=0, column=2, sticky="nsew")
-        self.s_fig = plt.Figure(figsize=(5.5, 4.5), tight_layout=True)
-        self.s_ax = self.s_fig.add_subplot(111)
-        self.s_canvas = FigureCanvasTkAgg(self.s_fig, master=sp_frame)
-        _attach_fig_toolbar(self.s_canvas, sp_frame)
-        self.s_canvas.get_tk_widget().pack(fill="both", expand=True)
-
-    def _on_slider(self, raw: str) -> None:
-        if not self._slider_user_driven:
-            return
-        try:
-            self._T = float(raw)
-        except ValueError:
-            return
-        self._render()
-
-    def _render(self) -> None:
-        T = float(self._T)
-        labels = fcluster(self._Z, t=T, criterion="distance")
-        n_clusters = int(np.unique(labels).size)
-        palette_hex = self._palette_resolver(n_clusters)
-
-        # Build a per-label color table in visual (left-to-right) order so
-        # the dendrogram, spatial map, and any future lookups all agree —
-        # without depending on scipy's palette cycling.
-        info = dendrogram(self._Z, no_plot=True, color_threshold=T,
-                          above_threshold_color=ABOVE_CUT_COLOR)
-        leaves = list(info["leaves"])
-        seen: list[int] = []
-        for leaf_idx in leaves:
-            lbl = int(labels[leaf_idx])
-            if lbl not in seen:
-                seen.append(lbl)
-        if len(palette_hex) < len(seen):
-            palette_hex = list(palette_hex) + [palette_hex[-1]] * (
-                len(seen) - len(palette_hex))
-        try:
-            label_to_color = {lbl: mpl.colors.to_hex(palette_hex[i])
-                              for i, lbl in enumerate(seen)}
-        except (ValueError, TypeError):
-            label_to_color = {lbl: "#cccccc" for lbl in seen}
-
-        # link_color_func gives explicit per-link control instead of trusting
-        # scipy's color counter ordering.
-        Z = self._Z
-        n = Z.shape[0] + 1
-        leaf_of_node: dict[int, int] = {}
-        for i in range(n - 1):
-            a = int(Z[i, 0])
-            leaf_of_node[n + i] = a if a < n else leaf_of_node[a]
-
-        def link_color_func(link_id: int) -> str:
-            i = link_id - n
-            if i < 0 or i >= n - 1 or Z[i, 2] >= T:
-                return ABOVE_CUT_COLOR
-            return label_to_color.get(int(labels[leaf_of_node[link_id]]),
-                                      ABOVE_CUT_COLOR)
-
-        # --- Dendrogram ---
-        ax = self.d_ax
-        ax.clear()
-        dendrogram(self._Z, ax=ax,
-                   link_color_func=link_color_func,
-                   above_threshold_color=ABOVE_CUT_COLOR,
-                   no_labels=True)
-        ax.axhline(T, linestyle="--", linewidth=1.5, color="black")
-        ax.set_ylabel("1 - r  (linkage distance)")
-        ax.set_xlabel(f"{self._Z.shape[0] + 1} ROIs ({n_clusters} clusters)")
-        ax.set_title(f"sub-cut @ {T:.3f}  ({T / self._zmax:.2f} x max)")
-        self.d_canvas.draw_idle()
-        self.threshold_readout.set(f"{T:.3f}")
-
-        # --- Spatial ---
-        N = n
-        roi_rgb = np.zeros((N, 3))
-        for leaf_idx in range(N):
-            hex_color = label_to_color.get(int(labels[leaf_idx]),
-                                           ABOVE_CUT_COLOR)
-            roi_rgb[leaf_idx, :] = mpl.colors.to_rgb(hex_color)
-
-        if self._stat is None or len(self._stat) != N:
-            self.s_ax.clear()
-            self.s_ax.set_axis_off()
-            self.s_ax.text(0.5, 0.5,
-                           "Spatial unavailable (stat / dF/F mismatch).",
-                           ha="center", va="center",
-                           transform=self.s_ax.transAxes)
-            self.s_canvas.draw_idle()
-            return
-
-        img = _spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
-        ax = self.s_ax
-        ax.clear()
-        ax.imshow(img, origin="upper", aspect="equal")
-        ax.set_title(f"{n_clusters} sub-clusters")
-        ax.set_xlabel("x (px)")
-        ax.set_ylabel("y (px)")
-        self.s_canvas.draw_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +193,11 @@ class ClusteringTab(ttk.Frame):
         self._summary_after_id: Optional[str] = None  # debounce id for auto-write
 
         self._build_ui()
-        self.after(POLL_MS, self._drain_queue)
+        drain_queue(self, self._q,
+                    {"done": self._on_done,
+                     "reloaded": self._on_reloaded,
+                     "error": self._on_error},
+                    poll_ms=POLL_MS)
 
         # If used inside pipeline_gui, subscribe to plane0 broadcasts.
         if state is not None:
@@ -600,23 +220,26 @@ class ClusteringTab(ttk.Frame):
             padding=8)
         head.pack(fill="x", pady=(0, 6))
 
-        row1 = ttk.Frame(head); row1.pack(fill="x", pady=2)
-        ttk.Label(row1, text="plane0:").pack(side="left")
+        row1 = ctk.CTkFrame(head, fg_color="transparent")
+        row1.pack(fill="x", pady=2)
+        ctk.CTkLabel(row1, text="plane0:").pack(side="left")
         self.path_var = tk.StringVar(value="")
-        ttk.Entry(row1, textvariable=self.path_var, width=70).pack(
+        ctk.CTkEntry(row1, textvariable=self.path_var, width=560).pack(
             side="left", padx=(4, 4), fill="x", expand=True)
-        ttk.Button(row1, text="Browse...",
-                   command=self._on_browse).pack(side="left")
+        ctk.CTkButton(row1, text="Browse...", width=90,
+                      command=self._on_browse).pack(side="left")
 
-        row2 = ttk.Frame(head); row2.pack(fill="x", pady=2)
-        self.run_btn = ttk.Button(
+        row2 = ctk.CTkFrame(head, fg_color="transparent")
+        row2.pack(fill="x", pady=2)
+        self.run_btn = ctk.CTkButton(
             row2, text="Run analysis", command=self._on_run, state="disabled")
         self.run_btn.pack(side="left")
-        self.reload_btn = ttk.Button(
-            row2, text="Reload clusters",
+        self.reload_btn = ctk.CTkButton(
+            row2, text="Reload clusters", width=130,
             command=self._on_reload_clusters, state="disabled")
         self.reload_btn.pack(side="left", padx=(6, 0))
-        self.progress = ttk.Progressbar(row2, mode="indeterminate", length=140)
+        self.progress = ctk.CTkProgressBar(row2, mode="indeterminate",
+                                           width=140)
         self.progress.pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="Pick a plane0 folder.")
         ttk.Label(row2, textvariable=self.status_var,
@@ -624,68 +247,82 @@ class ClusteringTab(ttk.Frame):
 
         # Recluster controls: drill into one or more clusters (branches) at
         # the current cut and re-cluster only those ROIs at a finer threshold.
-        row3 = ttk.Frame(head); row3.pack(fill="x", pady=2)
-        ttk.Label(row3, text="Recluster branch(es):").pack(side="left")
+        row3 = ctk.CTkFrame(head, fg_color="transparent")
+        row3.pack(fill="x", pady=2)
+        ctk.CTkLabel(row3, text="Recluster branch(es):").pack(side="left")
         self._cluster_vars: dict[int, tk.BooleanVar] = {}
         self.cluster_menu = tk.Menu(self, tearoff=False)
+        # ttk.Menubutton kept -- customtkinter has no equivalent cascade menu.
         self.cluster_menu_btn = ttk.Menubutton(
             row3, text="Pick clusters...", width=24, state="disabled")
         self.cluster_menu_btn.config(menu=self.cluster_menu)
         self.cluster_menu_btn.pack(side="left", padx=(8, 0))
 
-        ttk.Label(row3, text="new threshold (1 - r):").pack(
+        ctk.CTkLabel(row3, text="new threshold (1 - r):").pack(
             side="left", padx=(8, 2))
         self.recluster_thr_var = tk.StringVar(value="")
-        ttk.Entry(row3, textvariable=self.recluster_thr_var, width=8).pack(
+        ctk.CTkEntry(row3, textvariable=self.recluster_thr_var, width=80).pack(
             side="left")
-        self.recluster_btn = ttk.Button(
-            row3, text="Recluster (new window)", command=self._on_recluster,
-            state="disabled")
+        self.recluster_btn = ctk.CTkButton(
+            row3, text="Recluster (new window)", width=180,
+            command=self._on_recluster, state="disabled")
         self.recluster_btn.pack(side="left", padx=(8, 0))
 
         # ROI list of the currently-picked clusters (Suite2p ROI ids).
         # Read-only display + Copy button so the user can paste into Tab 4
         # / Tab 5 manual-ROI entries or external scripts. Auto-refreshes on
         # every menu toggle and every threshold/palette change.
-        row3b = ttk.Frame(head); row3b.pack(fill="x", pady=2)
-        ttk.Label(row3b, text="ROIs in picked clusters (Suite2p ids):").pack(
+        row3b = ctk.CTkFrame(head, fg_color="transparent")
+        row3b.pack(fill="x", pady=2)
+        ctk.CTkLabel(row3b, text="ROIs in picked clusters (Suite2p ids):").pack(
             side="left")
         self.roi_list_var = tk.StringVar(value="")
-        self.roi_list_entry = ttk.Entry(
+        self.roi_list_entry = ctk.CTkEntry(
             row3b, textvariable=self.roi_list_var, state="readonly")
         self.roi_list_entry.pack(side="left", fill="x", expand=True,
                                  padx=(8, 4))
-        self.copy_rois_btn = ttk.Button(
-            row3b, text="Copy", command=self._on_copy_roi_list,
+        self.copy_rois_btn = ctk.CTkButton(
+            row3b, text="Copy", width=80, command=self._on_copy_roi_list,
             state="disabled")
         self.copy_rois_btn.pack(side="left")
 
-        # Body: dendrogram + slider + spatial.
-        body = ttk.Frame(self); body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=0)
-        body.columnconfigure(2, weight=2)
-        body.rowconfigure(0, weight=1)
+        # Body: a single horizontal sash splits (dendrogram + cut
+        # slider) from the spatial canvas. Dragging redistributes width
+        # between exactly two panes (matching Tab 7's behaviour) so the
+        # slider stays tied to the dendrogram it controls.
+        body = ttk.PanedWindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        left_pane = ttk.Frame(body)
+        body.add(left_pane, weight=3)
+        left_pane.columnconfigure(0, weight=1)
+        left_pane.columnconfigure(1, weight=0)
+        left_pane.rowconfigure(0, weight=1)
 
         # Dendrogram canvas.
-        dframe = ttk.LabelFrame(body, text="Dendrogram", padding=4)
+        dframe = ttk.LabelFrame(left_pane, text="Dendrogram", padding=4)
         dframe.grid(row=0, column=0, sticky="nsew")
         self.d_fig = plt.Figure(figsize=(6.5, 4.5), tight_layout=True)
         self.d_ax = self.d_fig.add_subplot(111)
         self._placeholder(self.d_ax, "Run analysis to populate.")
         self.d_canvas = FigureCanvasTkAgg(self.d_fig, master=dframe)
-        _attach_fig_toolbar(self.d_canvas, dframe)
+        attach_fig_toolbar(self.d_canvas, dframe)
         self.d_canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Vertical slider for the cut.
-        sframe = ttk.Frame(body)
+        # Vertical slider for the cut, glued to the right edge of the
+        # dendrogram pane (not its own sash pane).
+        sframe = ttk.Frame(left_pane)
         sframe.grid(row=0, column=1, sticky="ns", padx=4)
-        ttk.Label(sframe, text="cut").pack(side="top")
+        ttk.Label(sframe, text="cut").pack(side="top", pady=(4, 0))
+        # tk.Scale (not ttk.Scale) kept here -- its ``resolution`` and
+        # ``showvalue`` knobs have no clean CTkSlider equivalent, and the
+        # apply_dark_to_tk_widget skin already matches the dark surround.
         self.threshold_scale = tk.Scale(
             sframe, from_=1.0, to=0.0, resolution=0.001,
             orient=tk.VERTICAL, length=320, showvalue=False,
             command=self._on_slider, state="disabled")
         self.threshold_scale.pack(side="top", fill="y", expand=True)
+        apply_dark_to_tk_widget(self.threshold_scale)
         self.threshold_readout = tk.StringVar(value="-")
         ttk.Label(sframe, textvariable=self.threshold_readout,
                   width=8, anchor="center").pack(side="top")
@@ -693,12 +330,12 @@ class ClusteringTab(ttk.Frame):
         # Spatial canvas.
         sp_frame = ttk.LabelFrame(body, text="Spatial (cluster colors)",
                                   padding=4)
-        sp_frame.grid(row=0, column=2, sticky="nsew")
+        body.add(sp_frame, weight=2)
         self.s_fig = plt.Figure(figsize=(5.5, 4.5), tight_layout=True)
         self.s_ax = self.s_fig.add_subplot(111)
         self._placeholder(self.s_ax, "Run analysis to populate.")
         self.s_canvas = FigureCanvasTkAgg(self.s_fig, master=sp_frame)
-        _attach_fig_toolbar(self.s_canvas, sp_frame)
+        attach_fig_toolbar(self.s_canvas, sp_frame)
         self.s_canvas.get_tk_widget().pack(fill="both", expand=True)
         # Click an ROI on the spatial map to open a popout showing the
         # heatmap + raster for that ROI's cluster. Resolved via a
@@ -710,38 +347,38 @@ class ClusteringTab(ttk.Frame):
         self._cluster_popout: Optional[ClusterPopout] = None
 
         # Bottom controls.
-        ctl = ttk.Frame(self, padding=(0, 6, 0, 0))
-        ctl.pack(fill="x")
+        ctl = ctk.CTkFrame(self, fg_color="transparent")
+        ctl.pack(fill="x", pady=(6, 0))
 
         self.manual_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             ctl, text="Manual threshold", variable=self.manual_var,
             command=self._on_manual_toggle).pack(side="left")
 
-        ttk.Label(ctl, text="   palette:").pack(side="left")
+        ctk.CTkLabel(ctl, text="   palette:").pack(side="left")
         self.palette_var = tk.StringVar(value=DEFAULT_PALETTE)
-        palette_box = ttk.Combobox(
-            ctl, textvariable=self.palette_var, state="readonly", width=12,
-            values=list(cmap_mod.AVAILABLE_PALETTES))
+        palette_box = ctk.CTkComboBox(
+            ctl, variable=self.palette_var, state="readonly", width=140,
+            values=list(cmap_mod.AVAILABLE_PALETTES),
+            command=lambda _v: self._on_palette_change())
         palette_box.pack(side="left", padx=4)
-        palette_box.bind("<<ComboboxSelected>>", self._on_palette_change)
 
-        ttk.Button(ctl, text="Per-cluster colors...",
-                   command=self._on_custom_colors).pack(side="left", padx=4)
-        ttk.Button(ctl, text="Reset palette",
-                   command=self._on_reset_palette).pack(side="left", padx=4)
+        ctk.CTkButton(ctl, text="Per-cluster colors...", width=160,
+                      command=self._on_custom_colors).pack(side="left", padx=4)
+        ctk.CTkButton(ctl, text="Reset palette", width=110,
+                      command=self._on_reset_palette).pack(side="left", padx=4)
 
-        ttk.Label(ctl, text="prefix:").pack(side="left", padx=(20, 2))
+        ctk.CTkLabel(ctl, text="prefix:").pack(side="left", padx=(20, 2))
         self.prefix_var = tk.StringVar(value=DEFAULT_PREFIX)
-        ttk.Entry(ctl, textvariable=self.prefix_var, width=18).pack(
+        ctk.CTkEntry(ctl, textvariable=self.prefix_var, width=140).pack(
             side="left")
 
-        self.export_btn = ttk.Button(
-            ctl, text="Export *_rois.npy",
+        self.export_btn = ctk.CTkButton(
+            ctl, text="Export *_rois.npy", width=150,
             command=self._on_export, state="disabled")
         self.export_btn.pack(side="right")
-        self.summary_btn = ttk.Button(
-            ctl, text="Save summary",
+        self.summary_btn = ctk.CTkButton(
+            ctl, text="Save summary", width=120,
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="right", padx=(0, 6))
 
@@ -771,7 +408,7 @@ class ClusteringTab(ttk.Frame):
     def _set_plane0(self, plane0: Path) -> None:
         self._plane0 = plane0
         ok = self._inputs_ready(plane0, self.prefix_var.get())
-        self.run_btn.config(state="normal" if ok else "disabled")
+        self.run_btn.configure(state="normal" if ok else "disabled")
         self._refresh_reload_btn()
         if ok:
             self.status_var.set(f"Ready. ({plane0})")
@@ -797,12 +434,12 @@ class ClusteringTab(ttk.Frame):
 
     def _refresh_reload_btn(self) -> None:
         if self._plane0 is None:
-            self.reload_btn.config(state="disabled")
+            self.reload_btn.configure(state="disabled")
             return
         prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
         ok = (self._inputs_ready(self._plane0, prefix)
               and self._has_existing_clusters(self._plane0, prefix))
-        self.reload_btn.config(state="normal" if ok else "disabled")
+        self.reload_btn.configure(state="normal" if ok else "disabled")
 
     # -- Run worker --------------------------------------------------------
 
@@ -817,8 +454,8 @@ class ClusteringTab(ttk.Frame):
             return
 
         self._prefix = prefix
-        self.run_btn.config(state="disabled")
-        self.progress.start(12)
+        self.run_btn.configure(state="disabled")
+        self.progress.start()
         self.status_var.set("Computing linkage...")
 
         def worker():
@@ -832,10 +469,10 @@ class ClusteringTab(ttk.Frame):
         self._worker.start()
 
     def _compute(self, plane0: Path, prefix: str) -> dict:
-        dff_mm, T, N, _ = _load_filtered_dff(plane0, prefix)
+        dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
         dff = dff_mm
-        Z = _correlation_linkage(dff)
-        stat, _ = _stat_for_prefix(plane0, prefix)
+        Z = ward_linkage(dff)
+        stat, _ = stat_for_prefix(plane0, prefix)
         view = utils.load_plane_view(plane0)
         Lx, Ly = int(view["Lx"]), int(view["Ly"])
         auto_frac = cmap_mod.auto_choose_threshold(Z, target_counts=(4, 5))
@@ -871,9 +508,9 @@ class ClusteringTab(ttk.Frame):
             return
 
         self._prefix = prefix
-        self.run_btn.config(state="disabled")
-        self.reload_btn.config(state="disabled")
-        self.progress.start(12)
+        self.run_btn.configure(state="disabled")
+        self.reload_btn.configure(state="disabled")
+        self.progress.start()
         self.status_var.set("Reloading saved clusters...")
 
         def worker():
@@ -891,7 +528,7 @@ class ClusteringTab(ttk.Frame):
         Z = np.load(cluster_dir / "linkage.npy")
         thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
                                dtype=float).ravel()[0])
-        dff_mm, T, N, _ = _load_filtered_dff(plane0, prefix)
+        dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
         # The loaded linkage was computed on N_kept ROIs; if the cell-filter
         # mask has changed since the export the shapes won't agree and any
         # downstream recolouring would be silently wrong.
@@ -901,7 +538,7 @@ class ClusteringTab(ttk.Frame):
                 f"Saved linkage has {n_leaves} leaves but the current "
                 f"dF/F memmap has {N} columns. Re-run analysis instead "
                 f"of reloading.")
-        stat, _ = _stat_for_prefix(plane0, prefix)
+        stat, _ = stat_for_prefix(plane0, prefix)
         view = utils.load_plane_view(plane0)
         Lx, Ly = int(view["Lx"]), int(view["Ly"])
         zmax = float(np.max(Z[:, 2]))
@@ -911,28 +548,17 @@ class ClusteringTab(ttk.Frame):
             "T": T, "N": N, "cluster_dir": cluster_dir,
         }
 
-    def _drain_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._q.get_nowait()
-                if kind == "done":
-                    self._on_done(payload)
-                elif kind == "reloaded":
-                    self._on_reloaded(payload)
-                elif kind == "error":
-                    self.progress.stop()
-                    self.run_btn.config(state="normal")
-                    self._refresh_reload_btn()
-                    self.status_var.set("Analysis failed.")
-                    messagebox.showerror(
-                        "Analysis failed", payload.split("\n", 1)[0])
-        except queue.Empty:
-            pass
-        self.after(POLL_MS, self._drain_queue)
+    def _on_error(self, payload: str) -> None:
+        self.progress.stop()
+        self.run_btn.configure(state="normal")
+        self._refresh_reload_btn()
+        self.status_var.set("Analysis failed.")
+        messagebox.showerror(
+            "Analysis failed", payload.split("\n", 1)[0])
 
     def _on_done(self, data: dict) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
 
         self._Z = data["Z"]
         self._stat = data["stat"]
@@ -953,9 +579,9 @@ class ClusteringTab(ttk.Frame):
         self._slider_user_driven = True
 
         self._custom_colors = None  # palette resets to dropdown choice
-        self.export_btn.config(state="normal")
-        self.summary_btn.config(state="normal")
-        self.recluster_btn.config(state="normal")
+        self.export_btn.configure(state="normal")
+        self.summary_btn.configure(state="normal")
+        self.recluster_btn.configure(state="normal")
         self.cluster_menu_btn.config(state="normal")
         # Seed the recluster threshold with half the current cut.
         self.recluster_thr_var.set(f"{self._manual_T / 2.0:.3f}")
@@ -986,7 +612,7 @@ class ClusteringTab(ttk.Frame):
 
     def _on_reloaded(self, data: dict) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
 
         self._Z = data["Z"]
         self._stat = data["stat"]
@@ -1013,9 +639,9 @@ class ClusteringTab(ttk.Frame):
         self._slider_user_driven = True
 
         self._custom_colors = None
-        self.export_btn.config(state="normal")
-        self.summary_btn.config(state="normal")
-        self.recluster_btn.config(state="normal")
+        self.export_btn.configure(state="normal")
+        self.summary_btn.configure(state="normal")
+        self.recluster_btn.configure(state="normal")
         self.cluster_menu_btn.config(state="normal")
         self.recluster_thr_var.set(f"{self._manual_T / 2.0:.3f}")
 
@@ -1336,7 +962,7 @@ class ClusteringTab(ttk.Frame):
         # active prefix is filtered (mirrors _export_clusters).
         if ("filtered" in self._prefix.split("_")
                 and self._plane0 is not None):
-            mask = _load_filter_mask(self._plane0)
+            mask = load_filter_mask(self._plane0)
             if mask is not None and int(mask.sum()) == len(labels):
                 translator = np.where(
                     np.asarray(mask, dtype=bool))[0].astype(int)
@@ -1347,10 +973,10 @@ class ClusteringTab(ttk.Frame):
         ids = self._picked_cluster_roi_ids()
         if not ids:
             self.roi_list_var.set("")
-            self.copy_rois_btn.config(state="disabled")
+            self.copy_rois_btn.configure(state="disabled")
             return
         self.roi_list_var.set(format_roi_indices(ids))
-        self.copy_rois_btn.config(state="normal")
+        self.copy_rois_btn.configure(state="normal")
 
     def _on_copy_roi_list(self) -> None:
         text = self.roi_list_var.get()
@@ -1432,7 +1058,7 @@ class ClusteringTab(ttk.Frame):
 
         dff_subset = self._dff[:, global_idx]
         try:
-            Z_sub = _correlation_linkage(dff_subset)
+            Z_sub = ward_linkage(dff_subset)
         except Exception as e:
             messagebox.showerror("Recluster failed", str(e))
             return
@@ -1535,12 +1161,12 @@ class ClusteringTab(ttk.Frame):
             self.s_canvas.draw_idle()
             return
 
-        img = _spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
+        img = spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
         # Parallel int label image so the click handler can map a
         # cursor pixel back to the filtered-list ROI index. Encoded
         # as ``filtered_idx + 1`` (0 = background); rebuilt on every
         # render so a re-cluster / palette change keeps it in sync.
-        self._spatial_label_img = _build_label_image(
+        self._spatial_label_img = build_label_image(
             self._stat, self._Ly, self._Lx)
         ax = self.s_ax
         ax.clear()
@@ -1585,7 +1211,7 @@ class ClusteringTab(ttk.Frame):
         # mask the loaders use.
         filtered_to_suite2p: Optional[np.ndarray] = None
         if "filtered" in self._prefix.split("_"):
-            mask = _load_filter_mask(self._plane0)
+            mask = load_filter_mask(self._plane0)
             if mask is not None and int(mask.sum()) == len(labels):
                 filtered_to_suite2p = np.where(
                     np.asarray(mask, dtype=bool))[0].astype(int)
@@ -1675,7 +1301,7 @@ class ClusteringTab(ttk.Frame):
         # Suite2p ROI indices so the Clusters sheet's `roi` column lines
         # up with the ROIs sheet (where `roi` is the Suite2p index).
         if "filtered" in self._prefix.split("_"):
-            mask = _load_filter_mask(self._plane0)
+            mask = load_filter_mask(self._plane0)
             if mask is not None and int(mask.sum()) == len(labels):
                 roi_indices = np.where(mask)[0].astype(int).tolist()
             else:
@@ -1720,7 +1346,15 @@ class ClusteringTab(ttk.Frame):
 
 
 def main() -> None:
-    root = tk.Tk()
+    """Stand-alone launcher for hot-running Tab 6 without the full
+    ``pipeline_gui`` app. Mirrors the dark-mode + ttk-restyle setup
+    ``pipeline_gui.main`` does so the tab still reads correctly.
+    """
+    from ...gui_common import apply_ttk_dark_theme
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
+    apply_ttk_dark_theme(root)
     root.title("CalLIOPE - Cross-correlation clustering")
     root.geometry("1300x780")
     tab = ClusteringTab(root, state=None)

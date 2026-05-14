@@ -866,18 +866,16 @@ load_base_ops = load_base_settings
 
 
 # ============================================================================
-# ROI mask, residual image, blob detection
+# ROI pixel mask
 # ============================================================================
 
 def build_roi_pixel_mask(stat, Ly: int, Lx: int) -> np.ndarray:
     """Binary ``(Ly, Lx)`` mask of all pixels belonging to any ROI in
     ``stat``.
 
-    Used both as a deduplication tool (``filter_non_overlapping_cellpose``
-    in ``sparse_plus_cellpose``) and as the foundation for "residual
-    image" generation -- the mean image with every detected ROI's
-    pixels masked out -- so we can run a follow-up blob detector on
-    cells the first pass missed.
+    Used as a deduplication tool by ``filter_non_overlapping_cellpose``
+    in ``sparse_plus_cellpose``: any Cellpose ROI whose footprint
+    overlaps too much with an existing Sparsery ROI is rejected.
 
     ``stat`` is Suite2p's per-ROI dict list; each entry exposes
     ``ypix`` / ``xpix`` arrays.

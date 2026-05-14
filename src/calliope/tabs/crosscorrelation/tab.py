@@ -81,6 +81,11 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 
+import customtkinter as ctk
+
+from ...gui_common import (
+    apply_dark_to_tk_widget, drain_queue, restyle_matplotlib_toolbar,
+)
 from .logic import xc
 from .logic import utils
 
@@ -306,7 +311,7 @@ def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str) -> None:
               frameon=False, ncol=3, fontsize=8)
 
 
-class ViolinWindow(tk.Toplevel):
+class ViolinWindow(ctk.CTkToplevel):
     """Inspection window that renders zero-lag-correlation and best-lag
     violins per cluster pair from full-recording cross-correlation outputs.
 
@@ -321,6 +326,7 @@ class ViolinWindow(tk.Toplevel):
         self.title(f"Cross-correlation violins  -  {xcorr_root.name}"
                    + (f"  ({recording_label})" if recording_label else ""))
         self.geometry("1000x740")
+        self.wm_minsize(720, 540)
 
         self._xcorr_root = xcorr_root
         # Recording label = human-readable name shown in the title
@@ -338,8 +344,10 @@ class ViolinWindow(tk.Toplevel):
         self._pair_data = _load_pair_data(xcorr_root)
 
         if not self._pair_data:
+            # Theme-safe error red -- "red" on the dark theme reads too
+            # dim; this hex pops against the gray17 surround.
             ttk.Label(
-                self, padding=20, foreground="red",
+                self, padding=20, foreground="#ff6b6b",
                 text=("No CAxCB/*_summary.csv files found in:\n"
                       f"{xcorr_root}\n\n"
                       "Run the full-recording cross-correlation first."),
@@ -363,10 +371,11 @@ class ViolinWindow(tk.Toplevel):
         self._render()
 
     def _build_ui(self) -> None:
-        ctl = ttk.Frame(self, padding=(6, 6, 6, 0))
-        ctl.pack(fill="x")
-        ttk.Label(ctl, text="Include clusters:").pack(side="left")
+        ctl = ctk.CTkFrame(self, fg_color="transparent")
+        ctl.pack(fill="x", padx=6, pady=(6, 0))
+        ctk.CTkLabel(ctl, text="Include clusters:").pack(side="left")
         self.cluster_menu = tk.Menu(self, tearoff=False)
+        # ttk.Menubutton kept -- customtkinter has no cascade-menu equiv.
         self.cluster_menu_btn = ttk.Menubutton(ctl, text="all", width=24)
         self.cluster_menu_btn.config(menu=self.cluster_menu)
         self.cluster_menu_btn.pack(side="left", padx=(8, 0))
@@ -385,14 +394,15 @@ class ViolinWindow(tk.Toplevel):
             self.cluster_menu.add_command(
                 label="Clear", command=self._clear_clusters)
 
-        self.apply_btn = ttk.Button(
-            ctl, text="Apply", command=self._on_apply_clusters,
-            state="disabled")
+        self.apply_btn = ctk.CTkButton(
+            ctl, text="Apply", width=90,
+            command=self._on_apply_clusters, state="disabled")
         self.apply_btn.pack(side="left", padx=(6, 0))
 
         self._pair_count_var = tk.StringVar(value="")
-        ttk.Label(ctl, textvariable=self._pair_count_var,
-                  foreground="gray").pack(side="left", padx=(12, 0))
+        # ttk.Label retained for the textvariable binding.
+        ttk.Label(ctl, textvariable=self._pair_count_var
+                  ).pack(side="left", padx=(12, 0))
 
         self.fig = plt.Figure(figsize=(10, 7), constrained_layout=True)
         self.ax_corr = self.fig.add_subplot(2, 1, 1)
@@ -404,6 +414,7 @@ class ViolinWindow(tk.Toplevel):
         self.toolbar = NavigationToolbar2Tk(
             self.canvas, tb_frame, pack_toolbar=False)
         self.toolbar.update()
+        restyle_matplotlib_toolbar(self.toolbar)
         self.toolbar.pack(side="left", fill="x")
         ttk.Button(
             tb_frame, text="Save data...",
@@ -471,9 +482,9 @@ class ViolinWindow(tk.Toplevel):
         # so the Apply button only lights up when there's work to do.
         current = frozenset(self._included_clusters())
         if current != self._applied_clusters:
-            self.apply_btn.config(state="normal")
+            self.apply_btn.configure(state="normal")
         else:
-            self.apply_btn.config(state="disabled")
+            self.apply_btn.configure(state="disabled")
 
     def _on_cluster_toggle(self) -> None:
         self._mark_pending()
@@ -490,7 +501,7 @@ class ViolinWindow(tk.Toplevel):
 
     def _on_apply_clusters(self) -> None:
         self._render()
-        self.apply_btn.config(state="disabled")
+        self.apply_btn.configure(state="disabled")
 
     # -- Render ------------------------------------------------------------
 
@@ -606,7 +617,13 @@ class CrossCorrelationTab(ttk.Frame):
         self._abort_event: threading.Event = threading.Event()
 
         self._build_ui()
-        self.after(POLL_MS, self._drain_queue)
+        drain_queue(self, self._q,
+                    {"progress": self._on_xc_progress,
+                     "done_full": self._on_xc_done_full,
+                     "done_per_event": self._on_xc_done_per_event,
+                     "aborted": self._on_xc_aborted,
+                     "error": self._on_xc_error},
+                    poll_ms=POLL_MS)
 
         if state is not None:
             try:
@@ -631,80 +648,82 @@ class CrossCorrelationTab(ttk.Frame):
                        "(batched matmul, best lag + zero lag)", padding=8)
         head.pack(fill="x", pady=(0, 6))
 
-        row1 = ttk.Frame(head); row1.pack(fill="x", pady=2)
-        ttk.Label(row1, text="plane0:").pack(side="left")
+        row1 = ctk.CTkFrame(head, fg_color="transparent")
+        row1.pack(fill="x", pady=2)
+        ctk.CTkLabel(row1, text="plane0:").pack(side="left")
         self.path_var = tk.StringVar(value="")
-        ttk.Entry(row1, textvariable=self.path_var, width=70).pack(
+        ctk.CTkEntry(row1, textvariable=self.path_var, width=560).pack(
             side="left", padx=(4, 4), fill="x", expand=True)
-        ttk.Button(row1, text="Browse...",
-                   command=self._on_browse).pack(side="left")
+        ctk.CTkButton(row1, text="Browse...", width=90,
+                      command=self._on_browse).pack(side="left")
 
-        row2 = ttk.Frame(head); row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="prefix:").pack(side="left")
+        row2 = ctk.CTkFrame(head, fg_color="transparent")
+        row2.pack(fill="x", pady=2)
+        ctk.CTkLabel(row2, text="prefix:").pack(side="left")
         self.prefix_var = tk.StringVar(value=DEFAULT_PREFIX)
-        ttk.Entry(row2, textvariable=self.prefix_var, width=18).pack(
+        ctk.CTkEntry(row2, textvariable=self.prefix_var, width=140).pack(
             side="left", padx=(4, 12))
 
-        ttk.Label(row2, text="cluster folder:").pack(side="left")
+        ctk.CTkLabel(row2, text="cluster folder:").pack(side="left")
         self.cfolder_var = tk.StringVar(value=DEFAULT_CLUSTER_FOLDER)
-        ttk.Entry(row2, textvariable=self.cfolder_var, width=18).pack(
+        ctk.CTkEntry(row2, textvariable=self.cfolder_var, width=140).pack(
             side="left", padx=(4, 12))
 
-        ttk.Label(row2, text="fps:").pack(side="left")
+        ctk.CTkLabel(row2, text="fps:").pack(side="left")
         self.fps_var = tk.StringVar(value="15.07")
-        ttk.Entry(row2, textvariable=self.fps_var, width=8).pack(
+        ctk.CTkEntry(row2, textvariable=self.fps_var, width=70).pack(
             side="left", padx=(4, 0))
 
-        # Algorithm parameters
+        # Algorithm parameters -- ttk.LabelFrame kept for the bordered box.
         row3 = ttk.LabelFrame(head, text="Search parameters", padding=6)
         row3.pack(fill="x", pady=(6, 0))
 
-        ttk.Label(row3, text="max_lag (s):").pack(side="left")
+        ctk.CTkLabel(row3, text="max_lag (s):").pack(side="left")
         self.maxlag_var = tk.StringVar(value=str(DEFAULT_MAX_LAG_S))
-        ttk.Entry(row3, textvariable=self.maxlag_var, width=6).pack(
+        ctk.CTkEntry(row3, textvariable=self.maxlag_var, width=70).pack(
             side="left", padx=(4, 12))
 
         self.zero_lag_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="also output zero-lag corr",
+        ctk.CTkCheckBox(row3, text="also output zero-lag corr",
                         variable=self.zero_lag_var).pack(
             side="left", padx=(4, 12))
 
         self.gpu_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="use GPU if available",
+        ctk.CTkCheckBox(row3, text="use GPU if available",
                         variable=self.gpu_var).pack(side="left")
 
         # Run buttons
         run_frame = ttk.LabelFrame(self, text="Run", padding=8)
         run_frame.pack(fill="x", pady=(0, 6))
 
-        self.full_btn = ttk.Button(
+        self.full_btn = ctk.CTkButton(
             run_frame, text="Run full-recording cross-correlation",
             command=self._on_run_full, state="disabled")
         self.full_btn.pack(side="left")
 
-        self.per_event_btn = ttk.Button(
+        self.per_event_btn = ctk.CTkButton(
             run_frame, text="Run per-event cross-correlation",
             command=self._on_run_per_event, state="disabled")
         self.per_event_btn.pack(side="left", padx=(8, 0))
 
-        self.refresh_btn = ttk.Button(
-            run_frame, text="Reload event windows",
+        self.refresh_btn = ctk.CTkButton(
+            run_frame, text="Reload event windows", width=160,
             command=self._on_refresh_events)
         self.refresh_btn.pack(side="left", padx=(8, 0))
 
-        self.reload_btn = ttk.Button(
-            run_frame, text="Reload dF/F & clusters",
+        self.reload_btn = ctk.CTkButton(
+            run_frame, text="Reload dF/F & clusters", width=170,
             command=self._on_reload_inputs)
         self.reload_btn.pack(side="left", padx=(8, 0))
 
-        self.violin_btn = ttk.Button(
-            run_frame, text="Violin plot",
+        self.violin_btn = ctk.CTkButton(
+            run_frame, text="Violin plot", width=100,
             command=self._on_violin, state="disabled")
         self.violin_btn.pack(side="left", padx=(8, 0))
 
         # Abort button: only enabled while a worker is alive.
-        self.abort_btn = ttk.Button(
-            run_frame, text="Abort",
+        self.abort_btn = ctk.CTkButton(
+            run_frame, text="Abort", width=80,
             command=self._on_abort, state="disabled")
         self.abort_btn.pack(side="left", padx=(8, 0))
 
@@ -712,9 +731,12 @@ class CrossCorrelationTab(ttk.Frame):
         ttk.Label(run_frame, textvariable=self.event_count_var).pack(
             side="left", padx=(12, 0))
 
-        # Progress + status
-        prog = ttk.Frame(self); prog.pack(fill="x", pady=(0, 6))
-        self.progress = ttk.Progressbar(prog, mode="determinate", length=320)
+        # Progress + status. CTkProgressBar uses 0..1 scale; ``_set_progress``
+        # below normalises the legacy ``value=N, maximum=M`` call-site idiom.
+        prog = ctk.CTkFrame(self, fg_color="transparent")
+        prog.pack(fill="x", pady=(0, 6))
+        self.progress = ctk.CTkProgressBar(prog, mode="determinate", width=320)
+        self.progress.set(0)
         self.progress.pack(side="left")
         self.status_var = tk.StringVar(value="Pick a plane0 folder.")
         ttk.Label(prog, textvariable=self.status_var,
@@ -735,33 +757,35 @@ class CrossCorrelationTab(ttk.Frame):
                            command=self.log_text.yview)
         sb.pack(fill="y", side="right")
         self.log_text.config(yscrollcommand=sb.set)
+        apply_dark_to_tk_widget(self.log_text)
 
         # -- Single-pair preview pane
         sp_frame = ttk.LabelFrame(
             bottom, text="Single-pair cross-correlation curve", padding=6)
         bottom.add(sp_frame, weight=2)
 
-        ctrl = ttk.Frame(sp_frame); ctrl.pack(fill="x", pady=(0, 4))
-        ttk.Label(ctrl, text="ROI A:").pack(side="left")
+        ctrl = ctk.CTkFrame(sp_frame, fg_color="transparent")
+        ctrl.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(ctrl, text="ROI A:").pack(side="left")
         self.sp_roiA_var = tk.StringVar(value="0")
-        ttk.Entry(ctrl, textvariable=self.sp_roiA_var, width=7).pack(
+        ctk.CTkEntry(ctrl, textvariable=self.sp_roiA_var, width=70).pack(
             side="left", padx=(2, 8))
-        ttk.Label(ctrl, text="ROI B:").pack(side="left")
+        ctk.CTkLabel(ctrl, text="ROI B:").pack(side="left")
         self.sp_roiB_var = tk.StringVar(value="1")
-        ttk.Entry(ctrl, textvariable=self.sp_roiB_var, width=7).pack(
+        ctk.CTkEntry(ctrl, textvariable=self.sp_roiB_var, width=70).pack(
             side="left", padx=(2, 8))
-        ttk.Label(ctrl, text="lag window (s):").pack(side="left")
+        ctk.CTkLabel(ctrl, text="lag window (s):").pack(side="left")
         self.sp_lag_var = tk.StringVar(value=str(DEFAULT_MAX_LAG_S))
-        ttk.Entry(ctrl, textvariable=self.sp_lag_var, width=6).pack(
+        ctk.CTkEntry(ctrl, textvariable=self.sp_lag_var, width=60).pack(
             side="left", padx=(2, 8))
         self.sp_event_var = tk.StringVar(value="full recording")
-        ttk.Label(ctrl, text="event:").pack(side="left")
-        self.sp_event_combo = ttk.Combobox(
-            ctrl, textvariable=self.sp_event_var, state="readonly",
-            width=22, values=["full recording"])
+        ctk.CTkLabel(ctrl, text="event:").pack(side="left")
+        self.sp_event_combo = ctk.CTkComboBox(
+            ctrl, variable=self.sp_event_var, state="readonly",
+            width=200, values=["full recording"])
         self.sp_event_combo.pack(side="left", padx=(2, 8))
-        self.sp_plot_btn = ttk.Button(
-            ctrl, text="Plot", command=self._on_plot_single_pair,
+        self.sp_plot_btn = ctk.CTkButton(
+            ctrl, text="Plot", width=80, command=self._on_plot_single_pair,
             state="disabled")
         self.sp_plot_btn.pack(side="left")
 
@@ -769,14 +793,16 @@ class CrossCorrelationTab(ttk.Frame):
         self.sp_ax = self.sp_fig.add_subplot(111)
         self._sp_placeholder("Pick two ROIs and click Plot.")
         self.sp_canvas = FigureCanvasTkAgg(self.sp_fig, master=sp_frame)
-        tb_frame = ttk.Frame(sp_frame); tb_frame.pack(fill="x")
+        tb_frame = ctk.CTkFrame(sp_frame, fg_color="transparent")
+        tb_frame.pack(fill="x")
         self.sp_toolbar = NavigationToolbar2Tk(
             self.sp_canvas, tb_frame, pack_toolbar=False)
         self.sp_toolbar.update()
+        restyle_matplotlib_toolbar(self.sp_toolbar)
         self.sp_toolbar.pack(side="left", fill="x")
         from ... import plot_data_export as _pde
-        ttk.Button(
-            tb_frame, text="Save data...",
+        ctk.CTkButton(
+            tb_frame, text="Save data...", width=110,
             command=lambda: _pde.save_figure_data(
                 self.sp_fig, tb_frame, "single_pair_xcorr"),
         ).pack(side="left", padx=(8, 0))
@@ -929,18 +955,18 @@ class CrossCorrelationTab(ttk.Frame):
             pass
         self._on_refresh_events()
         ok = self._inputs_ready()
-        self.full_btn.config(state="normal" if ok else "disabled")
-        self.per_event_btn.config(
+        self.full_btn.configure(state="normal" if ok else "disabled")
+        self.per_event_btn.configure(
             state="normal" if (ok and self._event_windows) else "disabled")
         # Single-pair preview only needs the dF/F memmap, not the cluster files.
         prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
         sp_ok = (plane0 is not None
                  and (plane0 / f"{prefix}dff.memmap.float32").exists())
-        self.sp_plot_btn.config(state="normal" if sp_ok else "disabled")
+        self.sp_plot_btn.configure(state="normal" if sp_ok else "disabled")
         # Violin plot needs only the per-pair summary CSVs to exist on disk;
         # we keep the button enabled whenever a plane0 is selected and check
         # the actual files at click time.
-        self.violin_btn.config(
+        self.violin_btn.configure(
             state="normal" if plane0 is not None else "disabled")
         if ok:
             self.status_var.set(f"Ready. ({plane0})")
@@ -995,13 +1021,13 @@ class CrossCorrelationTab(ttk.Frame):
             self.event_count_var.set("events: -")
         else:
             self.event_count_var.set(f"events: {len(evts)}")
-        self.per_event_btn.config(
+        self.per_event_btn.configure(
             state="normal" if (self._inputs_ready() and evts) else "disabled")
         labels = ["full recording"] + [
             f"event {i:04d}  [{s:.2f}-{e:.2f}s]"
             for i, (s, e) in enumerate(evts)
         ]
-        self.sp_event_combo.config(values=labels)
+        self.sp_event_combo.configure(values=labels)
         if self.sp_event_var.get() not in labels:
             self.sp_event_var.set("full recording")
 
@@ -1074,10 +1100,11 @@ class CrossCorrelationTab(ttk.Frame):
         self.log_text.see("end")
 
     def _set_progress(self, done: int, total: int) -> None:
+        # CTkProgressBar is always 0..1 (no separate ``maximum`` arg).
         if total <= 0:
-            self.progress.config(value=0, maximum=1)
+            self.progress.set(0)
             return
-        self.progress.config(value=done, maximum=total)
+        self.progress.set(max(0.0, min(1.0, done / total)))
 
     # -- Run: full recording -----------------------------------------------
 
@@ -1100,19 +1127,19 @@ class CrossCorrelationTab(ttk.Frame):
         }
 
     def _disable_run(self) -> None:
-        self.full_btn.config(state="disabled")
-        self.per_event_btn.config(state="disabled")
+        self.full_btn.configure(state="disabled")
+        self.per_event_btn.configure(state="disabled")
         # Worker is starting -- arm the abort button.
         self._abort_event.clear()
-        self.abort_btn.config(state="normal")
+        self.abort_btn.configure(state="normal")
 
     def _enable_run(self) -> None:
         ok = self._inputs_ready()
-        self.full_btn.config(state="normal" if ok else "disabled")
-        self.per_event_btn.config(
+        self.full_btn.configure(state="normal" if ok else "disabled")
+        self.per_event_btn.configure(
             state="normal" if (ok and self._event_windows) else "disabled")
         # No worker running -- abort makes no sense.
-        self.abort_btn.config(state="disabled")
+        self.abort_btn.configure(state="disabled")
         self._abort_event.clear()
 
     def _on_abort(self) -> None:
@@ -1121,7 +1148,7 @@ class CrossCorrelationTab(ttk.Frame):
         if self._worker is None or not self._worker.is_alive():
             return
         self._abort_event.set()
-        self.abort_btn.config(state="disabled")
+        self.abort_btn.configure(state="disabled")
         self.status_var.set("Aborting... waiting for current batch to finish.")
         self._log("[abort] requested")
 
@@ -1135,7 +1162,7 @@ class CrossCorrelationTab(ttk.Frame):
         params = self._gather_params()
         plane0 = self._plane0
         self._disable_run()
-        self.progress.config(value=0, maximum=1)
+        self.progress.set(0)
         self.status_var.set("Running full-recording cross-correlation...")
         self._log(f"\n[full] plane0={plane0}")
         self._log(f"[full] params={params}")
@@ -1176,7 +1203,7 @@ class CrossCorrelationTab(ttk.Frame):
         plane0 = self._plane0
         evts = list(self._event_windows)
         self._disable_run()
-        self.progress.config(value=0, maximum=len(evts))
+        self._set_progress(0, len(evts))
         self.status_var.set(
             f"Running per-event cross-correlation ({len(evts)} events)...")
         self._log(f"\n[per-event] plane0={plane0}")
@@ -1202,54 +1229,59 @@ class CrossCorrelationTab(ttk.Frame):
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
 
-    # -- Queue drain -------------------------------------------------------
+    # -- Queue handlers ----------------------------------------------------
 
-    def _drain_queue(self) -> None:
+    def _on_xc_progress(self, payload) -> None:
+        done, total, label = payload
+        self._set_progress(done, total)
+        self.status_var.set(f"{label} ({done}/{total})")
+
+    def _on_xc_done_full(self, payload: str) -> None:
+        self._set_progress(1, 1)
+        self.status_var.set(f"Done. Output: {payload}")
+        self._log(f"[full] done -> {payload}")
+        self._enable_run()
+        # Tab 0's batch runner subscribes to advance to spatial.
         try:
-            while True:
-                kind, payload = self._q.get_nowait()
-                if kind == "progress":
-                    done, total, label = payload
-                    self._set_progress(done, total)
-                    self.status_var.set(f"{label} ({done}/{total})")
-                elif kind == "done_full":
-                    self._set_progress(1, 1)
-                    self.status_var.set(f"Done. Output: {payload}")
-                    self._log(f"[full] done -> {payload}")
-                    self._enable_run()
-                    # Tab 0's batch runner subscribes to advance to spatial.
-                    try:
-                        self.state.set_xcorr_ready(Path(payload))
-                    except Exception as e:
-                        print(f"[GUI] xcorr_ready publish failed: {e}")
-                elif kind == "done_per_event":
-                    n = int(self.progress.cget("maximum"))
-                    self._set_progress(n, n)
-                    self.status_var.set(f"Done. Output: {payload}")
-                    self._log(f"[per-event] done -> {payload}")
-                    self._enable_run()
-                    try:
-                        self.state.set_xcorr_ready(Path(payload))
-                    except Exception as e:
-                        print(f"[GUI] xcorr_ready publish failed: {e}")
-                elif kind == "aborted":
-                    self.status_var.set("Aborted by user.")
-                    self._log(f"[abort] {payload} run aborted by user")
-                    self._enable_run()
-                elif kind == "error":
-                    self.status_var.set("Cross-correlation failed.")
-                    self._log("[error] " + payload)
-                    self._enable_run()
-                    messagebox.showerror(
-                        "Cross-correlation failed",
-                        payload.split("\n", 1)[0])
-        except queue.Empty:
-            pass
-        self.after(POLL_MS, self._drain_queue)
+            self.state.set_xcorr_ready(Path(payload))
+        except Exception as e:
+            print(f"[GUI] xcorr_ready publish failed: {e}")
+
+    def _on_xc_done_per_event(self, payload: str) -> None:
+        # CTkProgressBar uses 0..1, so finish by pinning to 1.0.
+        self._set_progress(1, 1)
+        self.status_var.set(f"Done. Output: {payload}")
+        self._log(f"[per-event] done -> {payload}")
+        self._enable_run()
+        try:
+            self.state.set_xcorr_ready(Path(payload))
+        except Exception as e:
+            print(f"[GUI] xcorr_ready publish failed: {e}")
+
+    def _on_xc_aborted(self, payload: str) -> None:
+        self.status_var.set("Aborted by user.")
+        self._log(f"[abort] {payload} run aborted by user")
+        self._enable_run()
+
+    def _on_xc_error(self, payload: str) -> None:
+        self.status_var.set("Cross-correlation failed.")
+        self._log("[error] " + payload)
+        self._enable_run()
+        messagebox.showerror(
+            "Cross-correlation failed",
+            payload.split("\n", 1)[0])
 
 
 def main() -> None:
-    root = tk.Tk()
+    """Stand-alone launcher for hot-running Tab 7 without the full
+    ``pipeline_gui`` app. Mirrors the dark-mode + ttk-restyle setup
+    ``pipeline_gui.main`` does so the tab still reads correctly.
+    """
+    from ...gui_common import apply_ttk_dark_theme
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
+    apply_ttk_dark_theme(root)
     root.title("CalLIOPE - Cross-correlation")
     root.geometry("1100x720")
     tab = CrossCorrelationTab(root, state=None)

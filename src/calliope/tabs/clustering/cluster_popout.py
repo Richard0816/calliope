@@ -39,6 +39,8 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Optional
 
+import customtkinter as ctk
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -103,13 +105,14 @@ def _slice_state_raster(event_results: Optional[dict],
     return rs
 
 
-class ClusterPopout(tk.Toplevel):
+class ClusterPopout(ctk.CTkToplevel):
     """Heatmap + raster Toplevel for the clicked ROI's cluster."""
 
     def __init__(self, master, plane0: Path) -> None:
         super().__init__(master)
         self.title("Cluster heatmap + raster")
         self.geometry("1300x720")
+        self.wm_minsize(900, 500)
 
         self._plane0 = Path(plane0)
 
@@ -131,13 +134,13 @@ class ClusterPopout(tk.Toplevel):
         self._canvas.get_tk_widget().pack(side="top", fill="both",
                                           expand=True)
 
-        status_frame = ttk.Frame(self, padding=6)
-        status_frame.pack(side="top", fill="x")
+        status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        status_frame.pack(side="top", fill="x", padx=6, pady=6)
         self._status_var = tk.StringVar(value="No cluster selected.")
         ttk.Label(status_frame, textvariable=self._status_var,
                   anchor="w").pack(side="left", fill="x", expand=True)
-        ttk.Button(status_frame, text="Close (Esc)", width=10,
-                   command=self._on_close).pack(side="right")
+        ctk.CTkButton(status_frame, text="Close (Esc)", width=110,
+                      command=self._on_close).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda _e: self._on_close())

@@ -82,20 +82,25 @@ For groups, the per-file downsampled frames are concatenated before encoding, wi
 ├── shifted_<orig>.tif        ← single-file path
 │   or 000_shifted_<orig>.tif, 001_shifted_<orig>.tif, ...   ← group path
 ├── mean.npy                  ← float32, shape (Y, X)
-└── qc.gif
+├── qc.gif
+└── _calliope_raw_paths.json  ← raw source paths for the archive step
 ```
 
 The `PreprocessResult` dataclass that gets passed to other tabs records:
 - `out_dir`, `shifted_tiff`, `qc_gif`, `mean_image_path`
 - `n_frames` (group total; `-1` when loaded from disk)
 - `shape_yx`
+- `raw_paths` — absolute paths to the original raw TIFF(s) used for this recording
+- `shifted_paths` — every shifted TIFF written for this recording
+
+`_calliope_raw_paths.json` is a small JSON sidecar holding the raw source paths. Tab 3's post-detection archive step reads it back to compress the originals into the recording folder once detection has succeeded — see Tab 3's README, section *Post-detection archive*.
 
 ---
 
 ## 4. Discovery helpers
 
 - `list_tiffs(folder, max_depth=0)` — BFS over the working directory, returns sorted `Path`s of `.tif/.tiff`. Default `max_depth=0` only scans the top level; the GUI's spinbox lets the user dig N levels deep.
-- `load_existing_preprocess(out_dir)` — reads `shifted_*.tif`, `mean.npy`, `qc.gif` from disk; returns a `PreprocessResult` with `n_frames=-1` (unknown without reopening). Used by the "load existing" code paths in Tabs 1 and 2.
+- `load_existing_preprocess(out_dir, *, progress_cb=None)` — reads `shifted_*.tif`, `mean.npy`, `qc.gif` from disk; returns a `PreprocessResult` with `n_frames=-1` (unknown without reopening). Used by the "load existing" code paths in Tabs 1 and 2. **Archived-state recovery:** if the shifted TIFFs have been deleted by Tab 3's post-detection archive step but `_calliope_raw_paths.json` is present, the shifted is regenerated on demand from the (now-compressed) raw — single-file recordings re-run `shift_tiff_to_uint16`, multi-file groups re-run `preprocess_tiff_group` so the shared global shift constant is recovered.
 
 ---
 
@@ -120,3 +125,12 @@ To reproduce Tab 1 from scratch you need:
 4. The decision tree: try in-RAM shift, on `MemoryError` fall back to two-pass streaming.
 5. The group invariant: one shared shift constant across all files, computed before any writes begin.
 6. The output filename conventions (`shifted_<orig>.tif` or `NNN_shifted_<orig>.tif`) — Suite2p's `natsort` depends on the leading numeric prefix to read multi-file groups in order.
+
+
+## UI affordances
+
+Tab 1 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Resizable panels (drag grips).** Panel 2 (TIFF files listbox) and Panel 5 (Log) each carry a draggable handle below them. Drag down to extend that panel — the scrollable tab body absorbs the extra height. Panels 1 (Working directory), 3 (Output root), and 4 (Run) stay at natural height.
+- **Scroll on hover.** Spinning the wheel anywhere over the TIFF list scrolls the listbox; elsewhere on the tab it scrolls the tab body when content overflows.
+- **No popouts.** TIFF picking is inline in the listbox; the Advanced parameters open in a modal `AdvancedDialog` (resizable; live PARAM_SPEC form).

@@ -196,3 +196,12 @@ None in v1. Everything is in-memory. Saving per-event PNG batches and
 a `coactivation_summary.csv` (per-ROI timing per event) is on the
 roadmap and will mirror the layout written by the legacy
 `spatial_heatmap_updated.coactivation_maps`.
+
+
+## UI affordances
+
+Tab 8 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Three stacked matplotlib panels** (Activation order map, Activation order with arrows, Monotonicity panels) — matplotlib figures keep their white facecolor; navigation toolbars below each are dark-skinned.
+- **Event navigation row.** Prev / Next `CTkButton`s + a `ttk.Spinbox` (no CTk spinbox equivalent) to step through events.
+- **No popouts.** The Refresh button re-reads the event list from Tab 5 / from the EventWindows sheet on disk.

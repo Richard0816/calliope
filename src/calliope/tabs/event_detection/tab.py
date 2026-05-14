@@ -57,6 +57,8 @@ import queue
 import threading
 import tkinter as tk
 import traceback
+
+import customtkinter as ctk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -70,8 +72,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from .logic import summary_writer
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, format_roi_indices, open_advanced,
-    parse_manual_roi_spec, spec_defaults,
+    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue,
+    format_roi_indices, open_advanced, parse_manual_roi_spec,
+    spec_defaults,
 )
 
 
@@ -263,6 +266,9 @@ class EventDetectionTab(ttk.Frame):
         self._render_worker: Optional[threading.Thread] = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
+        # Single-instance reference to the prominence-distribution
+        # popout (Tab 5 only allows one at a time per tab instance).
+        self._prominence_popout = None
         # Onset source: 'derivative' (default, MAD-z + hysteresis on
         # the SG derivative of the lowpass dF/F) or 'spks' (MAD-z +
         # hysteresis on Suite2p's deconvolved spike trace from
@@ -270,7 +276,10 @@ class EventDetectionTab(ttk.Frame):
         self.onset_source_var = tk.StringVar(value="derivative")
 
         self._build_ui()
-        self.after(self.POLL_MS, self._drain_render_queue)
+        drain_queue(self, self._render_queue,
+                    {"done": self._on_render_done,
+                     "error": self._on_render_error},
+                    poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
         state.subscribe_lowpass_ready(self._on_plane0)
         if state.lowpass_plane0 is not None:
@@ -290,88 +299,92 @@ class EventDetectionTab(ttk.Frame):
         # transient state messages ("Loading...", "Ready", etc.);
         # this label keeps the recording id + plane0 visible at all
         # times so the user can tell which dataset the panels show.
-        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(0, 4))
+        rec_row = ctk.CTkFrame(header, fg_color="transparent")
+        rec_row.pack(fill="x", pady=(0, 4))
         self.recording_var = tk.StringVar(value="No recording loaded.")
         ttk.Label(rec_row, textvariable=self.recording_var,
                   font=("", 10, "italic")).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        self.render_btn = ttk.Button(
-            row, text="Render", command=self._on_render,
-            state="disabled")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        self.render_btn = ctk.CTkButton(
+            row, text="Render", width=100,
+            command=self._on_render, state="disabled")
         self.render_btn.pack(side="left")
-        self.render_progress = ttk.Progressbar(
-            row, mode="indeterminate", length=160)
+        self.render_progress = ctk.CTkProgressBar(
+            row, mode="indeterminate", width=160)
         self.render_progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(
             value="Compute lowpass + derivative on tab 4 first.")
         ttk.Label(row, textvariable=self.status_var,
                   font=("", 9, "italic")).pack(side="left")
-        ttk.Button(row, text="Advanced...",
-                   command=self._on_advanced).pack(side="right",
-                                                   padx=(0, 6))
-        self.summary_btn = ttk.Button(
-            row, text="Save summary",
+        ctk.CTkButton(row, text="Advanced...", width=100,
+                      command=self._on_advanced).pack(side="right",
+                                                      padx=(0, 6))
+        self.prominence_btn = ctk.CTkButton(
+            row, text="Prominence distribution...", width=200,
+            command=self._on_open_prominence_popout, state="disabled")
+        self.prominence_btn.pack(side="right", padx=(0, 6))
+        self.summary_btn = ctk.CTkButton(
+            row, text="Save summary", width=110,
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(row, text="Reload from folder...",
-                   command=self._reload_from_folder).pack(side="right")
+        ctk.CTkButton(row, text="Reload from folder...", width=160,
+                      command=self._reload_from_folder).pack(side="right")
 
         # ---- Onset source row ----
         # Default uses MAD-z + hysteresis on the Savitzky-Golay
         # derivative of the lowpass dF/F (everything Tab 4 produced).
         # The "spks" alternative loads Suite2p's deconvolved
         # ``spks.npy`` and runs the same MAD-z + hysteresis on it.
-        # Same parameter knobs (z_enter / z_exit / min_sep_s) apply
-        # to either; downstream population-event detection and
-        # AppState publish are identical.
-        src_row = ttk.Frame(header); src_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(src_row, text="Onset source:").pack(side="left")
-        ttk.Radiobutton(
+        src_row = ctk.CTkFrame(header, fg_color="transparent")
+        src_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(src_row, text="Onset source:").pack(side="left")
+        ctk.CTkRadioButton(
             src_row, text="Derivative (default; MAD-z hysteresis on dt)",
             value="derivative", variable=self.onset_source_var,
         ).pack(side="left", padx=(8, 12))
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             src_row, text="Suite2p spks (deconvolved)",
             value="spks", variable=self.onset_source_var,
         ).pack(side="left")
-        ttk.Label(
+        ctk.CTkLabel(
             src_row,
             text="  -- spks mode reads <plane0>/spks.npy (one onset "
                  "per MAD-z hysteresis crossing on the spike trace).",
-            foreground="gray", font=("", 8, "italic"),
+            text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left", padx=(8, 0))
 
         # Manual ROI subset row: when enabled, only those Suite2p ROI ids
         # (intersected with the cell-filter keep mask) feed the heatmap,
         # raster, and population event detection.
-        sub_row = ttk.Frame(header); sub_row.pack(fill="x", pady=(4, 0))
+        sub_row = ctk.CTkFrame(header, fg_color="transparent")
+        sub_row.pack(fill="x", pady=(4, 0))
         self.manual_subset_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             sub_row, text="Restrict to manual ROI subset (Suite2p ids):",
             variable=self.manual_subset_var,
         ).pack(side="left")
         self.manual_roi_var = tk.StringVar(value="")
-        ttk.Entry(sub_row, textvariable=self.manual_roi_var, width=28).pack(
+        ctk.CTkEntry(sub_row, textvariable=self.manual_roi_var, width=240).pack(
             side="left", padx=(4, 4), fill="x", expand=True)
-        ttk.Label(
+        ctk.CTkLabel(
             sub_row,
             text="(e.g. 0,3,5-9; ids outside the keep mask are skipped)",
-            foreground="gray",
+            text_color="gray",
         ).pack(side="left")
 
-        body = ttk.Frame(self); body.pack(fill="both", expand=True)
-        # Panel 3 is the interactive event-detection trace and gets the
-        # bulk of the height + a navigation toolbar (mirrors plt.show()).
-        body.rowconfigure(0, weight=1)
-        body.rowconfigure(1, weight=1)
-        body.rowconfigure(2, weight=4)
-        body.columnconfigure(0, weight=1)
-
+        # Three stacked matplotlib panels, each in its own ``tk.Frame``
+        # wrap so the height is controllable. A draggable grip below
+        # each panel lets the user grow that panel independently --
+        # without squeezing its neighbours -- and the scrollable wrapper
+        # extends the tab body to absorb the new height.
+        f1_wrap = tk.Frame(self)
+        f1_wrap.pack(fill="x", padx=4, pady=(0, 0))
         f1 = ttk.LabelFrame(
-            body, text="1. Filtered lowpass dF/F heatmap "
+            f1_wrap, text="1. Filtered lowpass dF/F heatmap "
                        "(sorted by event count)", padding=4)
-        f1.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        f1.pack(fill="both", expand=True)
         self.hm_fig = plt.Figure(figsize=(8, 1.6), tight_layout=True)
         self.hm_ax = self.hm_fig.add_subplot(111)
         self.hm_ax.set_axis_off()
@@ -382,11 +395,15 @@ class EventDetectionTab(ttk.Frame):
             self.hm_canvas, f1, data_basename="event_heatmap",
             data_provider=lambda p: self._save_panel_csv(p, "heatmap"))
         self.hm_canvas.get_tk_widget().pack(fill="both", expand=True)
+        attach_resize_handle(self, f1_wrap, min_height=140,
+                             initial_height=180)
 
+        f2_wrap = tk.Frame(self)
+        f2_wrap.pack(fill="x", padx=4, pady=(0, 0))
         f2 = ttk.LabelFrame(
-            body, text="2. Filtered event raster (sorted by event count)",
+            f2_wrap, text="2. Filtered event raster (sorted by event count)",
             padding=4)
-        f2.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        f2.pack(fill="both", expand=True)
         self.er_fig = plt.Figure(figsize=(8, 1.6), tight_layout=True)
         self.er_ax = self.er_fig.add_subplot(111)
         self.er_ax.set_axis_off()
@@ -397,11 +414,15 @@ class EventDetectionTab(ttk.Frame):
             self.er_canvas, f2, data_basename="event_raster",
             data_provider=lambda p: self._save_panel_csv(p, "raster"))
         self.er_canvas.get_tk_widget().pack(fill="both", expand=True)
+        attach_resize_handle(self, f2_wrap, min_height=140,
+                             initial_height=180)
 
+        f3_wrap = tk.Frame(self)
+        f3_wrap.pack(fill="x", padx=4, pady=(0, 0))
         f3 = ttk.LabelFrame(
-            body, text="3. Population event detection "
+            f3_wrap, text="3. Population event detection "
                        "(utils.plot_event_detection)", padding=4)
-        f3.grid(row=2, column=0, sticky="nsew")
+        f3.pack(fill="both", expand=True)
         self.ed_fig = plt.Figure(figsize=(8, 4.8), tight_layout=True)
         self.ed_ax = self.ed_fig.add_subplot(111)
         self.ed_ax.set_axis_off()
@@ -411,6 +432,8 @@ class EventDetectionTab(ttk.Frame):
         self.ed_toolbar = attach_fig_toolbar(self.ed_canvas, f3)
         self.ed_canvas.get_tk_widget().pack(side="top", fill="both",
                                             expand=True)
+        attach_resize_handle(self, f3_wrap, min_height=240,
+                             initial_height=380)
 
     # -- Plane0 / readiness handling ---------------------------------------
 
@@ -432,11 +455,11 @@ class EventDetectionTab(ttk.Frame):
         self.recording_var.set(
             f"Recording: {rec_id}    plane0: {self._plane0}")
         if self._inputs_ready(self._plane0):
-            self.render_btn.config(state="normal")
+            self.render_btn.configure(state="normal")
             self.status_var.set(
                 "Ready. Click Render to compute and plot.")
         else:
-            self.render_btn.config(state="disabled")
+            self.render_btn.configure(state="disabled")
             self.status_var.set(
                 "Filtered lowpass / derivative memmaps not present yet. "
                 "Compute them on tab 4 first.")
@@ -457,6 +480,74 @@ class EventDetectionTab(ttk.Frame):
             self.status_var.set(
                 "Advanced parameters updated. Click Render to recompute "
                 "with the new settings.")
+
+    # -- Prominence-distribution popout -------------------------------------
+
+    def _on_open_prominence_popout(self) -> None:
+        """Open (or focus) the prominence-distribution popout.
+
+        Pulls the cached smoothed onset density from the most recent
+        render's diagnostics, computes every candidate peak's
+        prominence (find_peaks with the same width/distance/wlen as
+        detection but prominence floor lifted to ~0), and shows the
+        full distribution with a draggable threshold line.
+        """
+        existing = getattr(self, "_prominence_popout", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_set()
+            return
+        if self._last_data is None:
+            messagebox.showinfo(
+                "No data",
+                "Click Render at least once before opening the "
+                "prominence-distribution popout.")
+            return
+        diagnostics = self._last_data.get("diagnostics") or {}
+        smoothed = diagnostics.get("smoothed_density")
+        if smoothed is None or len(smoothed) == 0:
+            messagebox.showinfo(
+                "No density",
+                "The last render did not produce a smoothed density "
+                "trace. Re-render Tab 5 and try again.")
+            return
+
+        from ...core.utils import (
+            EventDetectionParams, compute_candidate_prominences,
+        )
+        # Mirror the field set in EventDetectionParams; ignore any
+        # PARAM_SPEC keys that aren't part of the dataclass so the
+        # constructor doesn't raise on UI-only knobs (manual_subset_*,
+        # onset_source, ...).
+        edp_fields = {f for f in EventDetectionParams.__dataclass_fields__}
+        edp_kwargs = {k: v for k, v in self._params.items()
+                      if k in edp_fields}
+        try:
+            params = EventDetectionParams(**edp_kwargs)
+        except TypeError:
+            params = EventDetectionParams()
+        proms = compute_candidate_prominences(np.asarray(smoothed),
+                                              params=params)
+
+        from .prominence_popout import ProminencePopout
+        self._prominence_popout = ProminencePopout(
+            self,
+            prominences=proms,
+            current_value=float(self._params.get("min_prominence",
+                                                 params.min_prominence)),
+            on_apply=self._on_prominence_apply,
+        )
+
+    def _on_prominence_apply(self, new_value: float) -> None:
+        """Callback from the popout's Apply button: update
+        ``min_prominence`` and kick off a re-render."""
+        self._params["min_prominence"] = float(new_value)
+        self.status_var.set(
+            f"min_prominence set to {new_value:.4f}. Re-rendering...")
+        # Trigger the normal render path so all downstream artefacts
+        # (heatmap, raster, diagnostic panel, AppState.event_results,
+        # summary workbook) refresh against the new threshold.
+        self._on_render()
 
     # -- Render worker ------------------------------------------------------
 
@@ -492,8 +583,8 @@ class EventDetectionTab(ttk.Frame):
                 f"Derivative onset source.")
             return
 
-        self.render_btn.config(state="disabled")
-        self.render_progress.start(12)
+        self.render_btn.configure(state="disabled")
+        self.render_progress.start()
         self.status_var.set("Rendering ...")
 
         def worker():
@@ -524,26 +615,17 @@ class EventDetectionTab(ttk.Frame):
         )
 
 
-    def _drain_render_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._render_queue.get_nowait()
-                if kind == "done":
-                    self._on_render_done(payload)
-                elif kind == "error":
-                    self.render_progress.stop()
-                    self.render_btn.config(state="normal")
-                    self.status_var.set("Render error.")
-                    messagebox.showerror(
-                        "Render failed", payload.split("\n", 1)[0])
-        except queue.Empty:
-            pass
-        self.after(self.POLL_MS, self._drain_render_queue)
+    def _on_render_error(self, payload: str) -> None:
+        self.render_progress.stop()
+        self.render_btn.configure(state="normal")
+        self.status_var.set("Render error.")
+        messagebox.showerror(
+            "Render failed", payload.split("\n", 1)[0])
 
     def _on_render_done(self, data: dict) -> None:
         from . import logic as utils
         self.render_progress.stop()
-        self.render_btn.config(state="normal")
+        self.render_btn.configure(state="normal")
 
         hm = data["heatmap"]
         rs = data["raster"]
@@ -608,7 +690,8 @@ class EventDetectionTab(ttk.Frame):
         data.pop("heatmap", None)
         data.pop("raster", None)
         self._last_data = data
-        self.summary_btn.config(state="normal")
+        self.summary_btn.configure(state="normal")
+        self.prominence_btn.configure(state="normal")
         if self._plane0 is not None:
             try:
                 self._write_summary(self._plane0, data)

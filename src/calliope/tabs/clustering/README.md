@@ -272,3 +272,15 @@ return best_frac
 8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
 9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate filtered-list positions to Suite2p ROI ids using the keep mask if the prefix is filtered, sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
 10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `_correlation_linkage` call entirely.
+
+
+## UI affordances
+
+Tab 6 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Horizontal sash** splits `(Dendrogram + cut slider) | Spatial map`. Drag the sash left or right to redistribute width between the two canvases; the cut slider stays glued to the right edge of the dendrogram pane.
+- **Popouts.**
+  - **Per-cluster colors** (`CustomColorDialog`) — opens from "Per-cluster colors..." in the bottom controls; non-resizable color-picker dialog with one swatch button per cluster.
+  - **Recluster (new window)** (`ReclusterWindow`) — opens from the recluster row; resizable Toplevel hosting a sub-dendrogram + sub-spatial map plus its own slider. Read-only.
+  - **Cluster heatmap + raster** (`ClusterPopout`) — opens on click of an ROI in the spatial map; resizable Toplevel showing the heatmap + raster for that ROI's cluster.
+- All matplotlib toolbars route through `gui_common.attach_fig_toolbar` and pick up the dark restyle automatically.
