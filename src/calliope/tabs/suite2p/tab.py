@@ -65,6 +65,8 @@ import time
 import tkinter as tk
 import traceback
 from pathlib import Path
+
+import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
@@ -74,11 +76,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from .logic import PreprocessResult, summary_writer
+from .logic import (
+    PreprocessResult, build_label_image, build_score_image,
+    candidate_plane0, count_leaves, load_keep_mask, plane0_has_outputs,
+    render_panel, render_score_panel, summary_writer,
+)
 from .curation_popout import CurationPopout
 
 from ...gui_common import (
-    AppState, QueueWriter, attach_fig_toolbar, open_advanced, spec_defaults,
+    AppState, QueueWriter, apply_dark_to_tk_widget, attach_fig_toolbar,
+    attach_resize_handle, drain_queue, open_advanced, spec_defaults,
 )
 
 
@@ -87,20 +94,6 @@ from ...gui_common import (
 # detection modules from calliope.core (sparse_plus_cellpose, utils,
 # cellfilter) — see the worker bodies below.
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
-
-
-def _count_leaves(d: dict) -> int:
-    """Recursively count non-dict leaves in a nested dict.
-
-    Used to summarise the popout's overrides count in the run log.
-    """
-    n = 0
-    for v in d.values():
-        if isinstance(v, dict):
-            n += _count_leaves(v)
-        else:
-            n += 1
-    return n
 
 
 class Suite2pTab(ttk.Frame):
@@ -249,7 +242,12 @@ class Suite2pTab(ttk.Frame):
         self._panel_cache: Optional[dict] = None
 
         self._build_ui()
-        self.after(self.POLL_MS, self._drain_log_queue)
+        drain_queue(self, self._log_queue,
+                    {"log": self._append_log,
+                     "plane0": self._on_plane0_payload,
+                     "done": lambda _p: self._on_done(),
+                     "error": self._on_error},
+                    poll_ms=self.POLL_MS)
         state.subscribe(self._on_preprocess_result)
 
     # -- UI -----------------------------------------------------------------
@@ -266,84 +264,90 @@ class Suite2pTab(ttk.Frame):
         # (in-source) and per-session edits go through the
         # "Edit suite2p settings..." popout next to the Run button.
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Cell filter:", width=12).pack(side="left")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="Cell filter:", width=90,
+                     anchor="w").pack(side="left")
         self.ckpt_var = tk.StringVar(value=str(self.DEFAULT_CKPT_PATH))
-        ttk.Entry(row, textvariable=self.ckpt_var).pack(
+        ctk.CTkEntry(row, textvariable=self.ckpt_var).pack(
             side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", command=self._browse_ckpt).pack(
-            side="left")
+        ctk.CTkButton(row, text="Browse...", width=90,
+                      command=self._browse_ckpt).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="dF/F baseline:", width=12).pack(side="left")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="dF/F baseline:", width=90,
+                     anchor="w").pack(side="left")
         # Default = first-N-minutes mode at 2 minutes. The lab's
         # standard recordings have a clean baseline at the start, and
         # rolling has both higher CPU cost and worse behaviour on long
         # epileptiform sweeps where the rolling window can sit inside
         # an event.
         self.baseline_var = tk.StringVar(value="first_n")
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             row, text="First N minutes:",
             value="first_n", variable=self.baseline_var,
         ).pack(side="left", padx=(0, 4))
         self.baseline_min_var = tk.StringVar(value="2")
-        ttk.Entry(row, textvariable=self.baseline_min_var,
-                  width=6).pack(side="left", padx=(0, 2))
-        ttk.Label(row, text="min").pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(
+        ctk.CTkEntry(row, textvariable=self.baseline_min_var,
+                     width=60).pack(side="left", padx=(0, 2))
+        ctk.CTkLabel(row, text="min").pack(side="left", padx=(0, 12))
+        ctk.CTkRadioButton(
             row, text="Rolling (45 s window, 10th pct)",
             value="rolling", variable=self.baseline_var,
         ).pack(side="left")
 
         # ---- GCaMP variant picker (drives Suite2p's tau) ----
-        # Default keeps the legacy AAV-CSV-driven lookup for users
-        # who haven't migrated. Picking a specific variant short-
-        # circuits the lookup and writes its tau directly into the
-        # Suite2p ops dict. See GCAMP_OPTIONS class attribute above.
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="GCaMP variant:", width=14).pack(side="left")
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="GCaMP variant:", width=110,
+                     anchor="w").pack(side="left")
         self.gcamp_var = tk.StringVar(value=self.GCAMP_OPTIONS[0][0])
-        gcamp_combo = ttk.Combobox(
-            row, textvariable=self.gcamp_var, state="readonly",
+        gcamp_combo = ctk.CTkComboBox(
+            row, variable=self.gcamp_var, state="readonly",
             values=[label for label, _tau in self.GCAMP_OPTIONS],
-            width=28,
+            width=240,
         )
         gcamp_combo.pack(side="left", padx=(0, 8))
-        ttk.Label(
+        ctk.CTkLabel(
             row,
             text=("Pick the GECI you injected; \"Auto\" reads the AAV "
                   "metadata CSV by recording filename."),
-            foreground="gray", font=("", 8, "italic"),
+            text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
         self.csv_dff_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             row,
             text="Also write filtered dF/F as CSV  "
                  "(column headers = Suite2p ROI ids)",
             variable=self.csv_dff_var,
         ).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=(4, 0))
-        self.run_btn = ttk.Button(
-            row, text="Run detection + cell filter",
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=(4, 0))
+        self.run_btn = ctk.CTkButton(
+            row, text="Run detection + cell filter", width=220,
             command=self._on_run, state="disabled")
         self.run_btn.pack(side="left")
-        self.load_btn = ttk.Button(
-            row, text="Load existing panels", command=self._on_load_existing,
-            state="disabled")
+        self.load_btn = ctk.CTkButton(
+            row, text="Load existing panels", width=170,
+            command=self._on_load_existing, state="disabled")
         self.load_btn.pack(side="left", padx=(6, 0))
-        self.summary_btn = ttk.Button(
-            row, text="Save summary",
+        self.summary_btn = ctk.CTkButton(
+            row, text="Save summary", width=120,
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="Advanced...",
-                   command=self._on_advanced).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="Edit suite2p settings...",
-                   command=self._on_edit_suite2p_settings).pack(
-                       side="left", padx=(6, 0))
-        self.progress = ttk.Progressbar(row, mode="indeterminate", length=200)
+        ctk.CTkButton(row, text="Advanced...", width=110,
+                      command=self._on_advanced).pack(side="left",
+                                                      padx=(6, 0))
+        ctk.CTkButton(row, text="Edit suite2p settings...", width=180,
+                      command=self._on_edit_suite2p_settings).pack(
+                          side="left", padx=(6, 0))
+        self.progress = ctk.CTkProgressBar(row, mode="indeterminate",
+                                           width=200)
         self.progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(value="Run preprocessing first.")
         ttk.Label(row, textvariable=self.status_var).pack(side="left")
@@ -351,21 +355,22 @@ class Suite2pTab(ttk.Frame):
         # Persistent header showing which recording the panels +
         # popout are currently pointing at. Updated by
         # ``_draw_panels`` whenever a plane0 finishes loading.
-        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(4, 0))
+        rec_row = ctk.CTkFrame(header, fg_color="transparent")
+        rec_row.pack(fill="x", pady=(4, 0))
         self.recording_var = tk.StringVar(value="No recording loaded.")
         ttk.Label(rec_row, textvariable=self.recording_var,
                   font=("", 10, "italic")).pack(side="left")
 
-        body = ttk.Frame(self); body.pack(fill="both", expand=True)
-        body.rowconfigure(0, weight=2)
-        body.rowconfigure(1, weight=0)
-        body.rowconfigure(2, weight=3)
-        body.columnconfigure(0, weight=1, uniform="cols")
-        body.columnconfigure(1, weight=1, uniform="cols")
-
-        log_frame = ttk.LabelFrame(body, text="1. Suite2p console", padding=4)
-        log_frame.grid(row=0, column=0, columnspan=2, sticky="nsew",
-                       pady=(0, 6))
+        # Log on top with a draggable grip below it -- dragging extends
+        # the log down without changing the size of the detection
+        # panels beneath. The surrounding scrollable tab body absorbs
+        # the extra height. tk.Frame wrap so the height drag actually
+        # sticks (ttk widgets recompute reqh from content).
+        log_wrap = tk.Frame(self)
+        log_wrap.pack(fill="x", padx=4, pady=(0, 0))
+        log_frame = ttk.LabelFrame(log_wrap, text="1. Suite2p console",
+                                   padding=4)
+        log_frame.pack(fill="both", expand=True)
         self.log = tk.Text(log_frame, height=10, wrap="word",
                            state="disabled", font=("Consolas", 9))
         self.log.pack(fill="both", expand=True, side="left")
@@ -373,10 +378,19 @@ class Suite2pTab(ttk.Frame):
                            command=self.log.yview)
         sb.pack(fill="y", side="right")
         self.log.config(yscrollcommand=sb.set)
+        apply_dark_to_tk_widget(self.log)
+        attach_resize_handle(self, log_wrap, min_height=160)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=4)
+        body.rowconfigure(0, weight=0)
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1, uniform="cols")
+        body.columnconfigure(1, weight=1, uniform="cols")
 
         bg_row = ttk.LabelFrame(
             body, text="Background image (panels 2 & 3)", padding=4)
-        bg_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        bg_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self._bg_radio_holder = ttk.Frame(bg_row)
         self._bg_radio_holder.pack(side="left", fill="x", expand=True)
         ttk.Label(
@@ -386,7 +400,7 @@ class Suite2pTab(ttk.Frame):
 
         det_frame = ttk.LabelFrame(
             body, text="2. Detected ROIs (raw suite2p output)", padding=6)
-        det_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 3))
+        det_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 3))
         self.det_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.det_ax = self.det_fig.add_subplot(111)
         self.det_ax.set_axis_off()
@@ -406,7 +420,7 @@ class Suite2pTab(ttk.Frame):
 
         fil_frame = ttk.LabelFrame(
             body, text="3. After cell-filter prediction mask", padding=6)
-        fil_frame.grid(row=2, column=1, sticky="nsew", padx=(3, 0))
+        fil_frame.grid(row=1, column=1, sticky="nsew", padx=(3, 0))
         self.fil_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.fil_ax = self.fil_fig.add_subplot(111)
         self.fil_ax.set_axis_off()
@@ -426,28 +440,19 @@ class Suite2pTab(ttk.Frame):
             self.ckpt_var.set(path)
 
     def _on_preprocess_result(self, result: PreprocessResult) -> None:
-        self.run_btn.config(state="normal")
-        existing = self._candidate_plane0(result)
-        if existing is not None and self._plane0_has_outputs(existing):
-            self.load_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
+        existing = candidate_plane0(result)
+        if existing is not None and plane0_has_outputs(existing):
+            self.load_btn.configure(state="normal")
             self.status_var.set(
                 f"Ready: {result.shifted_tiff.name}  "
                 f"(existing detection at {existing} - 'Load existing' "
                 f"will render without re-running)")
         else:
-            self.load_btn.config(state="disabled")
+            self.load_btn.configure(state="disabled")
             self.status_var.set(
                 f"Ready: {result.shifted_tiff.name}  "
                 f"({result.shape_yx[0]}x{result.shape_yx[1]})")
-
-    @staticmethod
-    def _candidate_plane0(result: PreprocessResult) -> Path:
-        return result.out_dir / "detection" / "final" / "suite2p" / "plane0"
-
-    @staticmethod
-    def _plane0_has_outputs(plane0: Path) -> bool:
-        return (plane0 / "stat.npy").exists() and \
-               (plane0 / "ops.npy").exists()
 
     def _on_load_existing(self) -> None:
         result = self.state.result
@@ -456,8 +461,8 @@ class Suite2pTab(ttk.Frame):
                 "Missing input",
                 "Run preprocessing first so I know which folder to load.")
             return
-        plane0 = self._candidate_plane0(result)
-        if not self._plane0_has_outputs(plane0):
+        plane0 = candidate_plane0(result)
+        if not plane0_has_outputs(plane0):
             messagebox.showerror(
                 "No data",
                 f"Expected stat.npy / ops.npy at:\n{plane0}\n"
@@ -517,7 +522,7 @@ class Suite2pTab(ttk.Frame):
         else:
             self._append_log(
                 f"[GUI] suite2p settings updated "
-                f"({_count_leaves(new_overrides)} overrides). "
+                f"({count_leaves(new_overrides)} overrides). "
                 "Re-run detection to apply.")
 
     def _on_run(self) -> None:
@@ -567,8 +572,8 @@ class Suite2pTab(ttk.Frame):
         save_folder = result.out_dir / "detection"
         rec_id = result.out_dir.name
 
-        self.run_btn.config(state="disabled")
-        self.progress.start(12)
+        self.run_btn.configure(state="disabled")
+        self.progress.start()
         self.status_var.set("Running...")
         self._append_log(
             f"--- Starting detection on {tiff_folder.name} "
@@ -671,10 +676,37 @@ class Suite2pTab(ttk.Frame):
             self._run_filtered_dff(final_plane0)
 
             self._prune_detection_intermediates(save_folder)
+            self._archive_recording(save_folder, params)
 
     def _prune_detection_intermediates(self, save_folder: Path) -> None:
         from ...core.detection_run import prune_detection_intermediates
         prune_detection_intermediates(save_folder, progress_cb=print)
+
+    def _archive_recording(self, save_folder: Path, params: dict) -> None:
+        """Compress raw TIFFs into the recording folder, drop shifted +
+        final/data.bin. Reads the same param keys as the headless
+        ``detection_run.run_detection`` archive hook so Tab 3 behaves
+        identically to the batch pipeline.
+        """
+        if not bool(params.get("archive_post_detection", True)):
+            return
+        from ...core.detection_run import archive_recording_post_detection
+        try:
+            archive_recording_post_detection(
+                save_folder,
+                compress_raw=bool(
+                    params.get("compress_raw_post_detection", True)),
+                delete_shifted=bool(
+                    params.get("delete_shifted_post_detection", True)),
+                delete_final_bin=bool(
+                    params.get("delete_final_data_bin_post_detection", True)),
+                delete_external_raw=bool(
+                    params.get("delete_external_raw_after_archive", False)),
+                level=int(params.get("raw_compression_level", 19)),
+                progress_cb=print,
+            )
+        except Exception as e:
+            print(f"[archive] step failed: {e}")
 
     def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
         """Write the resolved µm-per-pixel onto ``plane0/ops.npy``.
@@ -827,7 +859,7 @@ class Suite2pTab(ttk.Frame):
                   "rolling mode falls back to CPU.")
             return False
         try:
-            import analyze_output_gpu as gpu
+            from calliope.core import analyze_output_gpu as gpu
         except Exception as e:
             print(f"[GUI] analyze_output_gpu not importable ({e}); "
                   "using CPU.")
@@ -869,7 +901,7 @@ class Suite2pTab(ttk.Frame):
         F = np.load(plane0 / "F.npy", mmap_mode="r")
         N_total, T = F.shape
 
-        mask = self._load_keep_mask(plane0, N_total)
+        mask = load_keep_mask(plane0, N_total)
         N_kept = int(mask.sum())
         if N_kept == 0:
             print("[GUI] filtered dF/F: 0 ROIs survive the mask; "
@@ -953,21 +985,10 @@ class Suite2pTab(ttk.Frame):
 
     # -- Log queue + completion --------------------------------------------
 
-    def _drain_log_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._log_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "plane0":
-                    self._final_plane0 = Path(payload)
-                elif kind == "done":
-                    self._on_done()
-                elif kind == "error":
-                    self._on_error(payload)
-        except queue.Empty:
-            pass
-        self.after(self.POLL_MS, self._drain_log_queue)
+    def _on_plane0_payload(self, payload) -> None:
+        # Worker thread ships the final ``plane0`` path through the
+        # queue; capture it for ``_on_done`` to consume.
+        self._final_plane0 = Path(payload)
 
     def _append_log(self, text: str) -> None:
         self.log.config(state="normal")
@@ -977,7 +998,7 @@ class Suite2pTab(ttk.Frame):
 
     def _on_done(self) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
         plane0 = self._final_plane0
         if plane0 is None:
             self.status_var.set("Done (no plane0 returned).")
@@ -996,7 +1017,7 @@ class Suite2pTab(ttk.Frame):
 
     def _on_error(self, msg: str) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
         self.status_var.set("Error.")
         self._append_log(f"ERROR: {msg}")
         messagebox.showerror("Detection failed", msg.split("\n", 1)[0])
@@ -1036,7 +1057,7 @@ class Suite2pTab(ttk.Frame):
         stat = np.load(plane0 / "stat.npy", allow_pickle=True)
         n_total = len(stat)
 
-        keep = self._load_keep_mask(plane0, n_total)
+        keep = load_keep_mask(plane0, n_total)
         prob_path = plane0 / "predicted_cell_prob.npy"
         probs = (np.load(prob_path).astype(np.float32)
                  if prob_path.exists() else None)
@@ -1056,7 +1077,7 @@ class Suite2pTab(ttk.Frame):
         self._populate_bg_radios(bg_images)
         self._redraw_with_bg()
 
-        self.summary_btn.config(state="normal")
+        self.summary_btn.configure(state="normal")
         try:
             self._write_summary(plane0, stat, keep, probs)
         except Exception as e:
@@ -1070,8 +1091,8 @@ class Suite2pTab(ttk.Frame):
                      if key in bg_images]
 
         if not available:
-            ttk.Label(self._bg_radio_holder,
-                      text="(no 2D images in ops.npy)").pack(side="left")
+            ctk.CTkLabel(self._bg_radio_holder,
+                         text="(no 2D images in ops.npy)").pack(side="left")
             return
 
         keys = {k for k, _ in available}
@@ -1081,7 +1102,7 @@ class Suite2pTab(ttk.Frame):
                              else available[0][0])
 
         for key, label in available:
-            ttk.Radiobutton(
+            ctk.CTkRadioButton(
                 self._bg_radio_holder, text=label, value=key,
                 variable=self._bg_var,
                 command=self._on_bg_changed,
@@ -1205,7 +1226,7 @@ class Suite2pTab(ttk.Frame):
         if c is None:
             return
         try:
-            c["keep"] = self._load_keep_mask(c["plane0"], c["n_total"])
+            c["keep"] = load_keep_mask(c["plane0"], c["n_total"])
         except Exception:
             return
         self._redraw_with_bg()
@@ -1231,66 +1252,34 @@ class Suite2pTab(ttk.Frame):
         vmax = float(np.quantile(bg, 0.995))
         vmin = float(np.quantile(bg, 0.01))
 
-        label_all = self._build_label_image(stat, Ly, Lx)
+        label_all = build_label_image(stat, Ly, Lx)
         # Cache the label image so the click handler can map a
         # (x_data, y_data) cursor position to the Suite2p ROI index
         # that was clicked. The label image stores ``roi_idx + 1`` per
         # pixel, ``0`` for background.
         self._det_label_img = label_all
-        self._render_panel(
+        render_panel(
             self.det_ax, self.det_canvas, bg, label_all, vmin, vmax,
             f"All detected ROIs (n = {n_total})  [bg: {bg_label}]"
             f"  -- click an ROI to inspect / curate")
 
         kept_n = int(keep.sum())
         if probs is not None and probs.shape[0] == n_total:
-            score_img = self._build_score_image(stat, keep, probs, Ly, Lx)
+            score_img = build_score_image(stat, keep, probs, Ly, Lx)
             title = (f"After filter (n = {kept_n} / {n_total})  "
                      f"[bg: {bg_label}, coloured by predicted_cell_prob]")
-            self._render_score_panel(
+            render_score_panel(
                 self.fil_ax, self.fil_canvas, bg, score_img,
                 vmin, vmax, title)
         else:
             kept_stat = [s for i, s in enumerate(stat) if keep[i]]
-            label_kept = self._build_label_image(kept_stat, Ly, Lx)
+            label_kept = build_label_image(kept_stat, Ly, Lx)
             keep_src = "iscell.npy (suite2p classifier)"
-            self._render_panel(
+            render_panel(
                 self.fil_ax, self.fil_canvas, bg, label_kept,
                 vmin, vmax,
                 f"After filter (n = {kept_n} / {n_total})  "
                 f"[bg: {bg_label}, {keep_src}]")
-
-    @staticmethod
-    def _build_label_image(stat, Ly: int, Lx: int) -> np.ndarray:
-        label = np.zeros((Ly, Lx), dtype=np.int32)
-        for i, s in enumerate(stat, start=1):
-            yp = np.asarray(s["ypix"]); xp = np.asarray(s["xpix"])
-            ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
-            label[yp[ok], xp[ok]] = i
-        return label
-
-    @staticmethod
-    def _build_score_image(stat, keep: np.ndarray, probs: np.ndarray,
-                           Ly: int, Lx: int) -> np.ndarray:
-        img = np.full((Ly, Lx), np.nan, dtype=np.float32)
-        for i, s in enumerate(stat):
-            if not keep[i]:
-                continue
-            yp = np.asarray(s["ypix"]); xp = np.asarray(s["xpix"])
-            ok = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
-            img[yp[ok], xp[ok]] = float(probs[i])
-        return img
-
-    @staticmethod
-    def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
-        mask_path = plane0 / "predicted_cell_mask.npy"
-        if mask_path.exists():
-            return np.load(mask_path).astype(bool)
-        iscell_path = plane0 / "iscell.npy"
-        if iscell_path.exists():
-            ic = np.load(iscell_path)
-            return (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0).astype(bool)
-        return np.ones(n_total, dtype=bool)
 
     # -- Summary export -----------------------------------------------------
 
@@ -1323,7 +1312,7 @@ class Suite2pTab(ttk.Frame):
         try:
             stat = np.load(plane0 / "stat.npy", allow_pickle=True)
             n_total = len(stat)
-            keep = self._load_keep_mask(plane0, n_total)
+            keep = load_keep_mask(plane0, n_total)
             prob_path = plane0 / "predicted_cell_prob.npy"
             probs = (np.load(prob_path).astype(np.float32)
                      if prob_path.exists() else None)
@@ -1332,35 +1321,3 @@ class Suite2pTab(ttk.Frame):
         except Exception as e:
             messagebox.showerror("Summary failed", str(e))
 
-    @staticmethod
-    def _render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:
-        ax.clear(); ax.set_axis_off()
-        ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
-        if label_img.max() > 0:
-            overlay = np.ma.masked_where(label_img == 0, label_img)
-            ax.imshow(overlay, cmap="nipy_spectral", alpha=0.45,
-                      interpolation="nearest")
-        ax.set_title(title, fontsize=9)
-        canvas.draw_idle()
-
-    @staticmethod
-    def _render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
-                            title) -> None:
-        """Same overlay style as _render_panel but coloured by score across
-        [0.5, 1.0] (the cell-filter pass range)."""
-        fig = ax.figure
-        for old_ax in list(fig.axes):
-            if old_ax is not ax:
-                fig.delaxes(old_ax)
-        ax.clear(); ax.set_axis_off()
-        ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
-        overlay = np.ma.masked_invalid(score_img)
-        if overlay.count() > 0:
-            im = ax.imshow(overlay, cmap="viridis", alpha=0.45,
-                           vmin=0.5, vmax=1.0, interpolation="nearest")
-            cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
-            cb.set_label("predicted_cell_prob (>= 0.5 only)",
-                         fontsize=8)
-            cb.ax.tick_params(labelsize=7)
-        ax.set_title(title, fontsize=9)
-        canvas.draw_idle()

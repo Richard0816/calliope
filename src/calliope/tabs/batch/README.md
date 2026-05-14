@@ -7,7 +7,7 @@ the user having to click each tab one recording at a time.
 
 ## What the user sees
 
-- **Resizable layout.** The recordings list and the run log live in a vertical `ttk.PanedWindow`, so the user can drag the horizontal sash between them. Default ratio is 2:1 (rows above, log below).
+- **Resizable layout.** The recordings list and the run log each have their own draggable grip below them — drag down to grow either panel; the scrollable tab body absorbs the extra height. Default heights: recordings ~260 px, run log ~220 px.
 - **Top bar.** Working dir + recursion **Depth** + **Scan**, output folder +
   **Reload queue**, optional **Scratch dir (SSD)** for fast intermediate I/O,
   **Apply defaults to all rows**, **+ Add row**, **Run all** / **Abort**.
@@ -129,26 +129,36 @@ HDD copy doesn't waste bandwidth on artefacts the GUI can't reach.
 
 **Kept:**
 
-- `shifted_*.tif` — Tab 1's `load_existing_preprocess` reads this
-  for the reload path. Also the only input a *fresh*
-  `do_registration=True` rerun could start from.
-- `detection/_shared_reg/suite2p/plane0/` — the cached registration
-  (large `data.bin` + small ops/db/settings/reg_outputs npys). User
-  can re-run suite2p with `do_registration=False` and reuse this
-  binary, skipping the most expensive step entirely.
+- `<raw.name>.tif` — the Zstd-compressed raw written by Tab 3's
+  post-detection archive step. Top-level. Source of truth for any
+  future re-shift / re-register; readable transparently by
+  `tifffile.imread`.
+- `_calliope_raw_paths.json` — sidecar listing the original raw
+  source paths. Tab 1's reload uses it to find the raw when
+  regenerating a missing shifted; the archive step writes it
+  during preprocess.
+- `detection/_shared_reg/suite2p/plane0/` — registration metadata
+  only (`ops.npy`, `db.npy`, `settings.npy`, `reg_outputs/`). The
+  `data.bin` binary is pruned by `prune_detection_intermediates`
+  and the hardlink twin under `final/` is dropped by the archive
+  step.
 - `detection/final/suite2p/plane0/` — all suite2p detection outputs
   (`F.npy`, `Fneu.npy`, `stat.npy`, `iscell.npy`, `spks.npy`,
   `ops.npy`, `db.npy`, `settings.npy`, `detect_outputs.npy`,
-  `data.bin` (hardlink, dedup-copytree handles it),
   `predicted_cell_prob.npy`, `predicted_cell_mask.npy`,
   `r0p7_dff*.memmap.float32`, `r0p7_filtered_*.memmap.float32`,
   `r0p7_cell_mask_bool.npy`, `calliope_calibration.npy`,
-  `calliope_summary.xlsx`).
+  `calliope_summary.xlsx`). Note: `data.bin` is **no longer kept**
+  — the archive step drops it because nothing downstream reads it.
 - `r0p7_filtered_cluster_results/` — `C*_rois.npy`, `linkage.npy`,
   `threshold_used.npy`, `_indices_are_suite2p` marker.
 - `calliope_figures/<stage>/` — every batch-report PNG.
-- `qc.gif`, `mean.npy`, `blobs.npy` — Tab 1 outputs at the recording
-  root.
+- `qc.gif`, `mean.npy` — Tab 1 outputs at the recording root.
+
+The shifted TIFF (`shifted_*.tif`) is **no longer kept** after the
+archive step. If a future workflow needs it (`load_existing_preprocess`
+for QC reload, or a fresh `do_registration=True` rerun), it is
+regenerated on demand from the compressed raw in ~1 min per 9 GB.
 
 The patterns + keep set live in `SCRATCH_PRUNE_FILE_PATTERNS` and
 `SCRATCH_DETECTION_KEEP_DIRS` at the top of `tab.py`. Add to them if
@@ -303,8 +313,13 @@ to decide whether scratch has room for the row's peak footprint:
   That covers the peak mid-detection footprint:
   shifted TIFF (~1.0×) + registered `_shared_reg/data.bin` (~1.0×)
   + `sparsery_pass/data.bin` (~1.0×) + final outputs (~0.2×). The
-  per-row prune drops the two ~1.0× binaries after extraction, but
-  the budget is sized to the peak, not the residual.
+  per-row prune drops the two ~1.0× binaries after extraction, and
+  the post-detection archive (Tab 3 step 6) then compresses the
+  raw into the recording folder, deletes the shifted, and drops
+  the orphaned `final/data.bin` — the residual stabilises around
+  ~0.7× source-size per recording (~0.5× compressed raw + ~0.2×
+  npy outputs). Budget is still sized to the peak, not the
+  residual.
 - **Margin:** `_SCRATCH_SAFETY_MARGIN_BYTES = 2 GB` so filesystem
   overhead and suite2p's transient working files don't push us
   over a tight budget.
@@ -525,9 +540,11 @@ the slow output folder, matching pre-scratch behavior.
 
 ```
 <output>/<identifier>/
-├── shifted_<…>.tif                    ← Tab 1 (single) or NNN_shifted_<…>.tif (group)
-├── mean.npy, blobs.npy, qc.gif        ← Tab 1
-├── detection/final/suite2p/plane0/    ← Tab 3 (F/Fneu/stat/ops/iscell + dF/F memmaps + cellfilter)
+├── <raw.name>.tif                     ← Zstd-compressed raw (archive step)
+├── _calliope_raw_paths.json           ← sidecar locating the originals
+├── mean.npy, qc.gif                   ← Tab 1
+├── detection/final/suite2p/plane0/    ← Tab 3 (F/Fneu/stat/ops/iscell + dF/F memmaps + cellfilter; data.bin dropped)
+├── detection/_shared_reg/suite2p/plane0/   ← registration metadata only (no data.bin)
 ├── calliope_summary.xlsx              ← ROIs + EventWindows + Clusters sheets
 ├── calliope_figures/
 │   ├── preprocess/qc.gif              ← copy of Tab 1's QC GIF
@@ -539,6 +556,8 @@ the slow output folder, matching pre-scratch behavior.
 │   └── spatial_propagation/event_001.png, event_002.png, ...
 └── (cluster_results / cross_correlation_full subfolders as Tabs 6/7 produce)
 ```
+
+Per-recording footprint: ~6.5 GB on a 10-min 512×512 @ 15 fps recording (~4.5 GB compressed raw + ~1.9 GB npy outputs). Down from ~20 GB in the pre-archive layout. The `shifted_*.tif` (~9 GB) and `data.bin` (~9 GB, hardlinked) are both dropped post-detection.
 
 Across the whole batch:
 
@@ -585,7 +604,7 @@ queue).
 `BatchTab.PARAM_SPEC` is a unified list assembled by `_build_batch_param_spec`
 from:
 
-- `PreprocessTab.PARAM_SPEC` — 10 knobs (blob detection + QC GIF).
+- `PreprocessTab.PARAM_SPEC` — 5 knobs (QC GIF).
 - `Suite2pTab.PARAM_SPEC` — 23 knobs (Sparsery / Cellpose / Merge / dF/F /
   Default low-pass / Pixel scale / GPU).
 - `LowpassTab.PARAM_SPEC` — 5 knobs + an injected `cutoff_hz` (which Tab 4
@@ -597,7 +616,7 @@ from:
 - Pipeline-wide (`baseline_mode`, `baseline_min`).
 
 Each source group's label is rewritten with a numbered stage prefix
-(`1. Preprocess - Blob detection`, `3. Low-pass - Butterworth`, …) so the
+(`1. Preprocess - QC GIF`, `3. Low-pass - Butterworth`, …) so the
 Advanced dialog reads top-to-bottom in operation order.
 
 ---

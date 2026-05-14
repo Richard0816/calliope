@@ -43,6 +43,8 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Optional
 
+import customtkinter as ctk
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import (
@@ -212,7 +214,7 @@ def _upsert_label(csv_path: Path, plane0_path: Path,
         writer.writerows(rows)
 
 
-class CurationPopout(tk.Toplevel):
+class CurationPopout(ctk.CTkToplevel):
     """Toplevel curation window for one Suite2p ROI.
 
     Reuse by calling :meth:`show_roi` to switch focus to a different
@@ -239,6 +241,7 @@ class CurationPopout(tk.Toplevel):
         super().__init__(master)
         self.title("ROI curation")
         self.geometry("1500x720")
+        self.wm_minsize(960, 520)
 
         self._plane0 = Path(plane0)
         self._stat = stat
@@ -366,6 +369,9 @@ class CurationPopout(tk.Toplevel):
         self._toolbar = NavigationToolbar2Tk(
             self._canvas, self, pack_toolbar=False)
         self._toolbar.update()
+        # Dark-skin the toolbar to match the rest of the popout chrome.
+        from ...gui_common import restyle_matplotlib_toolbar
+        restyle_matplotlib_toolbar(self._toolbar)
         # Drop focus-traversal from every toolbar child so clicking
         # a pan/zoom tool doesn't move keyboard focus onto the
         # toolbar. The tool's mouse handlers still fire normally
@@ -383,35 +389,38 @@ class CurationPopout(tk.Toplevel):
                                           expand=True)
 
         # Status + control row.
-        status_frame = ttk.Frame(self, padding=6)
-        status_frame.pack(side="top", fill="x")
+        status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        status_frame.pack(side="top", fill="x", padx=6, pady=6)
         self._status_var = tk.StringVar(value="No ROI selected.")
+        # ttk.Label kept for the textvariable binding (CTkLabel has none).
         ttk.Label(status_frame, textvariable=self._status_var,
                   anchor="w").pack(side="left", fill="x", expand=True)
 
-        btn_frame = ttk.Frame(self, padding=(6, 0, 6, 6))
-        btn_frame.pack(side="top", fill="x")
-        self._cell_btn = ttk.Button(
-            btn_frame, text="Cell (1)", width=14,
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(side="top", fill="x", padx=6, pady=(0, 6))
+        self._cell_btn = ctk.CTkButton(
+            btn_frame, text="Cell (1)", width=130,
             command=lambda: self._set_label(1))
         self._cell_btn.pack(side="left", padx=(0, 6))
-        self._not_cell_btn = ttk.Button(
-            btn_frame, text="Not a cell (0)", width=14,
+        self._not_cell_btn = ctk.CTkButton(
+            btn_frame, text="Not a cell (0)", width=130,
             command=lambda: self._set_label(0))
         self._not_cell_btn.pack(side="left", padx=(0, 6))
         # Retrain stays disabled until the user has flipped at least
         # one ROI's classification this session.
-        self._retrain_btn = ttk.Button(
-            btn_frame, text="Retrain cell filter", width=22,
+        self._retrain_btn = ctk.CTkButton(
+            btn_frame, text="Retrain cell filter", width=180,
             state="disabled", command=self._on_retrain)
         self._retrain_btn.pack(side="left", padx=(20, 0))
 
         self._train_status_var = tk.StringVar(value="")
-        ttk.Label(btn_frame, textvariable=self._train_status_var,
-                  foreground="#444").pack(side="left", padx=(10, 0))
+        # ttk.Label retained for the textvariable; dark ttk theme reads
+        # legible by default (no ``foreground=`` override).
+        ttk.Label(btn_frame, textvariable=self._train_status_var
+                  ).pack(side="left", padx=(10, 0))
 
-        ttk.Button(btn_frame, text="Close (Esc)", width=10,
-                   command=self._on_close).pack(side="right")
+        ctk.CTkButton(btn_frame, text="Close (Esc)", width=110,
+                      command=self._on_close).pack(side="right")
 
     # -- Public ------------------------------------------------------------
 
@@ -598,7 +607,7 @@ class CurationPopout(tk.Toplevel):
                 f"{self._csv_path}\ncould not be written:\n{e}")
 
         self._flipped.add(self._roi_idx)
-        self._retrain_btn.config(state="normal")
+        self._retrain_btn.configure(state="normal")
         if self._on_iscell_changed is not None:
             try:
                 self._on_iscell_changed(self._roi_idx, value)
@@ -619,7 +628,7 @@ class CurationPopout(tk.Toplevel):
                 f"GUI stays responsive but the popout will block "
                 f"further flips until training finishes."):
             return
-        self._retrain_btn.config(state="disabled")
+        self._retrain_btn.configure(state="disabled")
         self._train_status_var.set("Training... see console for epoch log")
         self._train_thread = threading.Thread(
             target=self._train_worker, daemon=True)
@@ -695,7 +704,7 @@ class CurationPopout(tk.Toplevel):
         self._train_status_var.set(msg)
         # Leave the button enabled so the user can iterate (more flips
         # -> more training rounds).
-        self._retrain_btn.config(state="normal")
+        self._retrain_btn.configure(state="normal")
         if kind == "err":
             messagebox.showerror("Cell filter training", msg)
         elif kind == "warn":

@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 [project]
 name = "calliope"
 version = "0.1.0"
-description = "Calcium Live-imaging Output Pipeline for Epileptiform-recordings (CalLIOPE) - Tk GUI for Suite2p-based 2P calcium imaging analysis."
+description = "Calcium Live-imaging Output Pipeline for Epileptiform-recordings (CalLIOPE) - customtkinter dark-mode GUI for Suite2p-based 2P calcium imaging analysis."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -35,6 +35,9 @@ keywords = [
     "neuroscience",
     "two-photon",
     "epileptiform",
+    "gui",
+    "dark-mode",
+    "customtkinter",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -55,13 +58,19 @@ dependencies = [
     "openpyxl",
     "Pillow",
     "psutil",
-    "tifffile",
+    "tifffile>=2022.2.2",
+    "imagecodecs",
     "torch",
     "suite2p",
     "cellpose",
+    "customtkinter>=5.2",
 ]
 
 [project.optional-dependencies]
+# Dev tooling: ``pip install -e ".[dev]"`` then ``pytest tests/``.
+# Currently a smoke-test suite (package imports + headless GUI walk).
+dev = ["pytest>=7"]
+
 # GPU cross-correlation needs a prebuilt CuPy wheel that matches the
 # host CUDA toolkit. The plain ``cupy`` source distribution would try to
 # compile from source and fails on anything older than CUDA 12, so split

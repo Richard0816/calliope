@@ -46,6 +46,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+import customtkinter as ctk
+
 import matplotlib
 # Tell matplotlib to use the Tk-Agg backend BEFORE pyplot is
 # imported; needed so the figure canvas integrates cleanly into Tk.
@@ -104,16 +106,18 @@ class QcTab(ttk.Frame):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self)
+        header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", pady=(0, 6))
         self.header_var = tk.StringVar(
             value="No preprocessing result yet. Run it in the first tab.")
+        # ``ttk.Label`` retained where ``textvariable=`` is needed -- CTkLabel
+        # has no equivalent. The global dark ttk style keeps it on-theme.
         ttk.Label(header, textvariable=self.header_var,
                   font=("", 10, "italic")).pack(side="left")
-        ttk.Button(header, text="Reload from folder...",
-                   command=self._reload_from_folder).pack(side="right")
+        ctk.CTkButton(header, text="Reload from folder...",
+                      command=self._reload_from_folder).pack(side="right")
 
-        body = ttk.Frame(self)
+        body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1, uniform="cols")
         body.columnconfigure(1, weight=1, uniform="cols")
@@ -124,14 +128,16 @@ class QcTab(ttk.Frame):
         # Animate-toggle row at the top: unchecking drops the frame buffer
         # to a single still (saves ~1 MB per 512x512 frame); rechecking
         # reloads the GIF from disk and resumes playback.
-        toggle_row = ttk.Frame(gif_frame)
+        toggle_row = ctk.CTkFrame(gif_frame, fg_color="transparent")
         toggle_row.pack(anchor="w", pady=(0, 4))
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             toggle_row,
             text="Animate (uncheck to free frame buffer; still image stays)",
             variable=self._gif_animate_var,
             command=self._on_animate_toggle,
         ).pack(side="left")
+        # gif_label holds a Pillow ImageTk.PhotoImage -- keep ttk.Label.
+        # CTkLabel only accepts CTkImage which can't wrap a Tk PhotoImage.
         self.gif_label = ttk.Label(gif_frame, anchor="center")
         self.gif_label.pack(fill="both", expand=True)
         self.gif_status = tk.StringVar(value="")

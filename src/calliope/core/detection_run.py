@@ -41,6 +41,7 @@ import numpy as np
 from . import utils
 from . import scale as scale_mod
 from . import sparse_plus_cellpose as spc
+from . import preprocessing as _pre
 
 
 # Intermediate-binary cleanup. ``sparse_plus_cellpose.run`` leaves two
@@ -155,6 +156,174 @@ def prune_detection_intermediates(
     return n_paths, bytes_freed
 
 
+def archive_recording_post_detection(
+    save_folder,
+    *,
+    compress_raw: bool = True,
+    delete_shifted: bool = True,
+    delete_final_bin: bool = True,
+    delete_external_raw: bool = False,
+    level: int = 19,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Compress raw TIFFs into the recording folder and drop the now-
+    redundant shifted TIFFs + ``final/.../data.bin``.
+
+    Order of operations (each step gated by its flag):
+
+    1. Compress every raw listed in ``_calliope_raw_paths.json``
+       (written by ``run_preprocess``) into the recording folder
+       root, as ``<rec>/<raw.name>.tif``. Verifies byte-equality
+       before swap. If the raw already lives in the recording folder
+       (Path equal to dst), the compression is in-place.
+    2. Delete the top-level ``*shifted_*.tif`` files. Only runs if
+       step 1 succeeded for at least one raw (or was disabled).
+    3. Delete ``detection/final/suite2p/plane0/data.bin``. (The
+       ``_shared_reg/data.bin`` hardlink twin is already removed by
+       ``prune_detection_intermediates``; both sides must be gone to
+       actually free bytes.)
+    4. Optionally delete the user's external raw at its original path
+       (off by default; destructive).
+
+    Returns a dict with counters / bytes-freed for logging:
+        {compressed: int, shifted_deleted: int, bin_deleted: bool,
+         external_raw_deleted: int, bytes_freed: int,
+         compressed_bytes_in: int, compressed_bytes_out: int}
+
+    Errors during compression are caught -- on failure of any single
+    raw, the archive step aborts BEFORE any deletions so the
+    recording stays in a re-runnable state.
+    """
+    rec_root = Path(save_folder)
+    summary = {
+        "compressed": 0,
+        "shifted_deleted": 0,
+        "bin_deleted": False,
+        "external_raw_deleted": 0,
+        "bytes_freed": 0,
+        "compressed_bytes_in": 0,
+        "compressed_bytes_out": 0,
+    }
+
+    def _log(msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(msg)
+
+    if not rec_root.is_dir():
+        return summary
+
+    # ----- Step 1: compress raws into recording folder ---------------------
+    compression_ok = True
+    compressed_dst_for_src: dict[Path, Path] = {}
+
+    if compress_raw:
+        raw_sources = _pre.read_raw_paths_sidecar(rec_root)
+        if not raw_sources:
+            _log(
+                "[archive] no _calliope_raw_paths.json found; skipping "
+                "raw compression"
+            )
+        else:
+            for src in raw_sources:
+                src = Path(src)
+                if not src.exists():
+                    _log(
+                        f"[archive] raw missing on disk, skipping: {src}"
+                    )
+                    compression_ok = False
+                    continue
+                dst = rec_root / src.name
+                try:
+                    in_bytes, out_bytes = _pre.compress_raw_tiff(
+                        src, dst, level=level, progress_cb=progress_cb,
+                    )
+                    summary["compressed"] += 1
+                    summary["compressed_bytes_in"] += in_bytes
+                    summary["compressed_bytes_out"] += out_bytes
+                    compressed_dst_for_src[src.resolve()] = dst.resolve()
+                except Exception as e:
+                    _log(
+                        f"[archive] compression FAILED for {src.name}: {e}"
+                    )
+                    compression_ok = False
+                    break
+
+    if not compression_ok:
+        _log("[archive] aborting deletions because compression had errors")
+        return summary
+
+    # ----- Step 2: delete top-level shifted TIFFs --------------------------
+    if delete_shifted:
+        for p in sorted(rec_root.iterdir()):
+            if (
+                p.is_file()
+                and p.suffix.lower() in (".tif", ".tiff")
+                and "shifted_" in p.name
+            ):
+                try:
+                    sz = p.stat().st_size
+                    p.unlink()
+                    summary["shifted_deleted"] += 1
+                    summary["bytes_freed"] += sz
+                except OSError as e:
+                    _log(
+                        f"[archive] could not unlink shifted "
+                        f"{p.name}: {e}"
+                    )
+
+    # ----- Step 3: delete final/.../data.bin -------------------------------
+    if delete_final_bin:
+        final_bin = (
+            rec_root
+            / "detection"
+            / "final"
+            / "suite2p"
+            / "plane0"
+            / "data.bin"
+        )
+        if final_bin.is_file():
+            try:
+                sz = final_bin.stat().st_size
+                final_bin.unlink()
+                summary["bin_deleted"] = True
+                summary["bytes_freed"] += sz
+            except OSError as e:
+                _log(
+                    f"[archive] could not unlink final data.bin: {e}"
+                )
+
+    # ----- Step 4: optionally delete external raw originals ----------------
+    if delete_external_raw and compressed_dst_for_src:
+        for src, dst in compressed_dst_for_src.items():
+            try:
+                if src == dst:
+                    # In-place compress; nothing external to delete.
+                    continue
+                if not dst.is_file():
+                    continue
+                if not src.is_file():
+                    continue
+                sz = src.stat().st_size
+                src.unlink()
+                summary["external_raw_deleted"] += 1
+                summary["bytes_freed"] += sz
+            except OSError as e:
+                _log(
+                    f"[archive] could not delete external raw "
+                    f"{src}: {e}"
+                )
+
+    if progress_cb is not None:
+        _log(
+            f"[archive] compressed={summary['compressed']} "
+            f"shifted_deleted={summary['shifted_deleted']} "
+            f"bin_deleted={summary['bin_deleted']} "
+            f"external_raw_deleted={summary['external_raw_deleted']} "
+            f"freed={summary['bytes_freed'] / 1e9:.2f} GB"
+        )
+    return summary
+
+
 def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
     """Resolve the µm/pixel calibration and write it to
     ``calliope_calibration.npy`` next to the plane.
@@ -196,7 +365,7 @@ def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
     if baseline_mode != "first_n":
         return False
     try:
-        import analyze_output_gpu as gpu
+        from calliope.core import analyze_output_gpu as gpu
     except Exception:
         return False
     if not getattr(gpu, "_CUPY_OK", False):
@@ -514,6 +683,31 @@ def run_detection(
     compute_filtered_dff(plane0)
 
     prune_detection_intermediates(save_folder, progress_cb=progress_cb)
+
+    # Post-detection archive: compress raws into the recording folder
+    # (as <rec>/<raw.name>.tif), then drop the redundant shifted TIFFs
+    # and the orphaned final/data.bin. Defaults match the design:
+    # auto-on for compression + shifted/final-bin deletion, off for the
+    # destructive external-raw delete. Each toggle is a per-job param
+    # key so Tab 3 / batch tab can override.
+    if bool(params.get("archive_post_detection", True)):
+        try:
+            archive_recording_post_detection(
+                save_folder,
+                compress_raw=bool(
+                    params.get("compress_raw_post_detection", True)),
+                delete_shifted=bool(
+                    params.get("delete_shifted_post_detection", True)),
+                delete_final_bin=bool(
+                    params.get("delete_final_data_bin_post_detection", True)),
+                delete_external_raw=bool(
+                    params.get("delete_external_raw_after_archive", False)),
+                level=int(params.get("raw_compression_level", 19)),
+                progress_cb=progress_cb,
+            )
+        except Exception as e:
+            if progress_cb is not None:
+                progress_cb(f"[archive] step failed: {e}")
 
     figs: list[str] = []
     if figures_dir is not None:

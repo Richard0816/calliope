@@ -272,3 +272,14 @@ For the violin permutation test: `n_perm=10000`, `chunk=256`, `seed=0`.
 6. **Sign-flip permutation:** random ±1 signs over the values array, recompute mean, count `|permuted| ≥ |observed|`. Chunk the random-sign matrix to bound memory.
 7. **Single-pair full curve:** same z-scoring, but use `numpy.lib.stride_tricks.sliding_window_view` and one `(2L+1, T) · (T,)` matmul to get all lags in one shot.
 8. **Output schema:** per-pair `{summary.csv, best_lag.npy, max_corr.npy, zero_lag.npy}` so downstream analyses can read the CSV summaries or the dense matrices as needed.
+
+
+## UI affordances
+
+Tab 7 inherits the global customtkinter dark theme from `pipeline_gui`.
+
+- **Horizontal sash** splits the run log (left) from the single-pair cross-correlation preview (right). Drag the sash to redistribute.
+- **Log console** is hover-scrollable: spin the wheel anywhere over the log to scroll it.
+- **Popouts.**
+  - **Violin plot** (`ViolinWindow`) — opens from the "Violin plot" button after a full-recording run completes; resizable Toplevel showing zero-lag and best-lag violin distributions per cluster pair. Cascade menu lets the user mask out specific clusters.
+- Matplotlib navigation toolbars in both the main panel and the single-pair preview are dark-skinned via `restyle_matplotlib_toolbar`.

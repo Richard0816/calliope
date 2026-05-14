@@ -54,675 +54,23 @@ import tkinter as tk
 import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+import customtkinter as ctk
 from typing import Optional
 
 from ...gui_common import (
-    AppState, open_advanced, spec_defaults,
+    AppState, apply_dark_to_tk_widget, attach_resize_handle,
+    bind_mousewheel_to_scrollable, drain_queue, open_advanced,
+    pick_tiffs_dialog, spec_defaults,
 )
-
-
-BATCH_JSON_NAME = "calliope_batch.json"
-BATCH_REPORT_NAME = "batch_report.csv"
-TIFF_GLOBS = ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
-
-
-# Patterns dropped from each recording's scratch tree *before* the
-# bulk SSD->HDD copy. Everything else is preserved verbatim so the
-# GUI's "load existing" paths and a manual suite2p re-run with the
-# cached registration both still work. See the 2026-05-11 lab note
-# for the full audit of what stays vs goes.
-#
-# Saved bytes per recording are dominated by ``data_raw.bin`` (the
-# pre-registration movie suite2p caches when ``keep_movie_raw=True``;
-# ~8 GB on a 10-minute recording, fully redundant once the registered
-# ``data.bin`` is on disk).
-SCRATCH_PRUNE_FILE_PATTERNS: tuple[str, ...] = (
-    "**/data_raw.bin",          # suite2p pre-registration cache
-    "**/data_raw_chan2.bin",    # ditto for two-channel runs
-    "**/*.tmp",                 # partial writes
-    "**/*.lock",
+from .logic import (
+    BATCH_JSON_NAME, BATCH_REPORT_NAME, SCRATCH_DETECTION_KEEP_DIRS,
+    SCRATCH_PRUNE_FILE_PATTERNS, SCRATCH_RECORDING_INTERMEDIATE_DIRS,
+    SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC, TIFF_GLOBS,
+    build_batch_param_spec, copy_one_dedup, is_scratch_mirror_skippable,
+    measure_tree, mirror_sync_pass, prune_scratch_tree,
+    synchronous_final_sweep, throttled_copy2,
 )
-
-# Subdirectories of each recording's scratch folder that are
-# detection intermediates. ``sparse_plus_cellpose.run`` writes them
-# directly under the recording folder (NOT under a ``detection/``
-# subfolder) and ``merge_and_extract`` consumes their stat/F/Fneu/
-# spks arrays into ``final/`` -- nothing in the pipeline reads them
-# after that point. The hardlinked ``data.bin`` is deduped at the
-# destination via the mirror's per-inode map, but per-pass
-# ``F.npy`` / ``Fneu.npy`` / ``spks.npy`` / ``stat.npy`` add
-# ~300-500 MB per recording of redundant arrays.
-SCRATCH_RECORDING_INTERMEDIATE_DIRS: tuple[str, ...] = (
-    "sparsery_pass",
-    "cellpose_pass",
-)
-
-# Defensive: same drop policy applied under a ``<rec>/detection/``
-# layer too, in case a future code path uses that nesting (Tab 3's
-# README documents this layout historically). No-op when the
-# subfolder doesn't exist.
-SCRATCH_DETECTION_KEEP_DIRS: frozenset = frozenset({
-    "_shared_reg",
-    "final",
-})
-
-def _prune_scratch_tree(scratch: Path) -> tuple[int, int]:
-    """Delete known-redundant files + directories under ``scratch``.
-
-    Returns ``(n_paths, bytes_freed)`` for logging. Errors on
-    individual paths are swallowed so a single weird filesystem
-    state doesn't abort the entire finalize.
-
-    The decision tree (see audit in the lab note) keeps everything
-    the GUI's reload paths read (shifted TIFF for Tab 1, suite2p
-    plane0 npys, dF/F memmaps, calliope_summary.xlsx, cluster
-    exports, figures) plus ``_shared_reg/data.bin`` so a manual
-    suite2p re-run can skip registration. It only drops:
-
-    * suite2p's pre-registration movie cache (``data_raw*.bin``) --
-      superseded once the registered ``data.bin`` is on disk.
-    * ``sparsery_pass/`` + ``cellpose_pass/`` -- intermediate
-      detection outputs that ``merge_and_extract`` already folded
-      into ``final/``. The hardlinked ``data.bin`` survives via
-      ``_shared_reg/`` + ``final/``; the per-pass F/Fneu/spks/stat
-      arrays are pure clutter (~300-500 MB per recording).
-    * Defensively, any ``<rec>/detection/<X>/`` subdirectory whose
-      name isn't ``_shared_reg`` or ``final`` -- no current code
-      path uses that nesting, but earlier docstrings reference it.
-    * ``.tmp`` / ``.lock`` partial-write artefacts.
-    """
-    def _dir_size(p: Path) -> int:
-        total = 0
-        try:
-            for dp, _dn, fn in os.walk(p):
-                for f in fn:
-                    try:
-                        total += (Path(dp) / f).stat().st_size
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return total
-
-    n_paths = 0
-    bytes_freed = 0
-    if not scratch.exists():
-        return 0, 0
-    # File-level prune: glob each pattern from the recording root.
-    for pattern in SCRATCH_PRUNE_FILE_PATTERNS:
-        for f in scratch.glob(pattern):
-            try:
-                if f.is_file() or f.is_symlink():
-                    sz = 0
-                    try:
-                        sz = f.stat().st_size
-                    except OSError:
-                        pass
-                    f.unlink()
-                    n_paths += 1
-                    bytes_freed += sz
-            except OSError:
-                continue
-    # Directory-level prune: ``sparsery_pass/`` + ``cellpose_pass/``
-    # live directly under the recording folder (NOT under a
-    # ``detection/`` layer); this is the path layout
-    # ``sparse_plus_cellpose.run`` actually writes.
-    for sub in SCRATCH_RECORDING_INTERMEDIATE_DIRS:
-        p = scratch / sub
-        if not p.is_dir():
-            continue
-        sz = _dir_size(p)
-        try:
-            shutil.rmtree(p, ignore_errors=True)
-            n_paths += 1
-            bytes_freed += sz
-        except OSError:
-            continue
-    # Defensive: same drop policy applied if anything ever lands at
-    # ``<rec>/detection/<X>/`` for ``X not in {_shared_reg, final}``.
-    det = scratch / "detection"
-    if det.is_dir():
-        for child in det.iterdir():
-            if not child.is_dir():
-                continue
-            if child.name in SCRATCH_DETECTION_KEEP_DIRS:
-                continue
-            sz = _dir_size(child)
-            try:
-                shutil.rmtree(child, ignore_errors=True)
-                n_paths += 1
-                bytes_freed += sz
-            except OSError:
-                continue
-    return n_paths, bytes_freed
-
-
-# Single-drive finalize throttle. When scratch and output share a
-# drive, the row-end finalize would otherwise hammer the HDD with
-# writes while the next row's preprocess is trying to read source
-# TIFFs from the same drive -- net throughput collapses for both.
-# Capping the finalize write rate at 10 MB/s leaves most of the
-# HDD's bandwidth for the active stage's reads at the cost of a
-# slower (but unattended) background transfer. 10 GB takes ~17 min
-# at 10 MB/s vs ~67 s unthrottled; the trade-off is "GUI feels
-# responsive" vs "transfer wraps up sooner". Two-drive mode skips
-# the throttle entirely (no contention to manage).
-SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC: int = 10 * 1024 * 1024  # 10 MB/s
-
-
-def _throttled_copy2(src: str, dst: str, *,
-                     rate_bytes_per_sec: int,
-                     chunk_bytes: int = 1024 * 1024) -> None:
-    """``shutil.copy2`` equivalent that paces its writes to roughly
-    ``rate_bytes_per_sec``. Implements the rate cap by sleeping
-    between fixed-size chunks: ``expected_elapsed = bytes_written /
-    rate``, ``actual_elapsed = time.time() - t0``, sleep the diff
-    when positive. Drift correction comes for free because the next
-    chunk's expected_elapsed is computed from cumulative bytes.
-
-    ``shutil.copystat`` at the end mirrors what ``copy2`` does (mode,
-    mtime, atime, flags). Fast-path for tiny files: nothing to throttle
-    when the whole file fits in one chunk and lands well under the
-    per-second budget.
-    """
-    t0 = time.time()
-    bytes_written = 0
-    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        while True:
-            chunk = fsrc.read(chunk_bytes)
-            if not chunk:
-                break
-            fdst.write(chunk)
-            bytes_written += len(chunk)
-            expected = bytes_written / rate_bytes_per_sec
-            elapsed = time.time() - t0
-            sleep_for = expected - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-    shutil.copystat(src, dst)
-
-
-def _is_scratch_mirror_skippable(rel_path: Path, scratch_rec: Path) -> bool:
-    """Return True iff this scratch-relative path is something the
-    continuous mirror should NOT copy to HDD.
-
-    Mirrors the row-end ``_prune_scratch_tree`` logic so the mirror
-    doesn't waste bandwidth on artefacts the row-end finalize would
-    have dropped anyway:
-    - ``data_raw.bin`` / ``data_raw_chan2.bin`` -- suite2p's
-      pre-registration cache, redundant once ``data.bin`` is on disk
-    - ``*.tmp`` / ``*.lock`` -- partial writes
-    - Anything under ``sparsery_pass/`` or ``cellpose_pass/`` --
-      detection-pass intermediates folded into ``final/`` already
-    - Anything under ``<rec>/detection/<X>/`` for X not in
-      {``_shared_reg``, ``final``} -- defensive (legacy layout)
-    """
-    parts = rel_path.parts
-    if not parts:
-        return False
-    name = parts[-1]
-    if name in ("data_raw.bin", "data_raw_chan2.bin"):
-        return True
-    if name.endswith(".tmp") or name.endswith(".lock"):
-        return True
-    if parts[0] in ("sparsery_pass", "cellpose_pass"):
-        return True
-    if (len(parts) >= 2 and parts[0] == "detection"
-            and parts[1] not in SCRATCH_DETECTION_KEEP_DIRS):
-        return True
-    return False
-
-
-def _measure_tree(root: Path) -> tuple[int, int]:
-    """Return (n_files, total_bytes) for everything under ``root``.
-
-    Used by the finalize + batch-end paths to report leftover scratch
-    contents when the bulk-rmtree didn't clear everything (typically a
-    Windows file lock survived two rmtree attempts).
-    """
-    n = 0
-    nb = 0
-    if not root.exists():
-        return 0, 0
-    for dirpath, _dn, files in os.walk(str(root)):
-        for fname in files:
-            try:
-                nb += (Path(dirpath) / fname).stat().st_size
-                n += 1
-            except OSError:
-                continue
-    return n, nb
-
-
-def _synchronous_final_sweep(scratch: Path, final: Path,
-                             inode_to_dst: dict) -> tuple[int, int]:
-    """Walk scratch and copy every non-skip file that isn't already at
-    HDD (or is shorter at HDD than at scratch). Synchronous; no daemon
-    thread; no time bound.
-
-    Belt-and-braces safety net before bulk-rmtree. The continuous
-    mirror's final pass races with the finalize's ``rmtree`` when the
-    HDD is contending with the next row's preprocess writes -- the
-    mirror exits via timeout but its in-flight copies are mid-write
-    when the source dir gets nuked. Running this sweep on the
-    finalize thread (which we control) guarantees that every output
-    file is at HDD before we delete the scratch copy.
-
-    Comparison is by ``st.st_size``: if HDD has the same size, assume
-    up-to-date (the mirror already wrote it). Otherwise copy. We can't
-    rely on mtime alone because ``shutil.copy2`` preserves mtime, so
-    a partial copy + stat would falsely report "up to date".
-
-    Hardlinks are preserved via the shared ``inode_to_dst`` map so the
-    `_shared_reg/data.bin` <-> `final/data.bin` pair stays hardlinked
-    at the destination.
-    """
-    if not scratch.exists():
-        return 0, 0
-    n_copied = 0
-    bytes_copied = 0
-    for dirpath, _dn, files in os.walk(str(scratch)):
-        for fname in files:
-            sp = Path(dirpath) / fname
-            try:
-                rel = sp.relative_to(scratch)
-            except ValueError:
-                continue
-            if _is_scratch_mirror_skippable(rel, scratch):
-                continue
-            try:
-                src_st = sp.stat()
-            except OSError:
-                continue
-            dp = final / rel
-            # Size check: if HDD already has it at full size, skip.
-            # Otherwise (missing or short) re-copy.
-            if dp.exists():
-                try:
-                    if dp.stat().st_size == src_st.st_size:
-                        continue
-                except OSError:
-                    pass
-            try:
-                dp.parent.mkdir(parents=True, exist_ok=True)
-                # Remove the short/stale HDD copy before re-copying;
-                # _copy_one_dedup doesn't overwrite.
-                if dp.exists():
-                    try:
-                        dp.unlink()
-                    except OSError:
-                        continue
-                _copy_one_dedup(sp, dp, inode_to_dst)
-                n_copied += 1
-                bytes_copied += int(src_st.st_size)
-            except OSError:
-                continue
-    return n_copied, bytes_copied
-
-
-def _mirror_sync_pass(scratch: Path, final: Path,
-                      seen: dict, inode_to_dst: dict,
-                      *, stability_window_s: float = 1.0,
-                      throttle_bytes_per_sec: Optional[int] = None
-                      ) -> bool:
-    """Walk ``scratch`` once and copy every file that's new or has
-    changed since the previous pass to its mirror under ``final``.
-
-    Returns True iff at least one file was copied this pass (the
-    worker uses this to back off polling when caught up).
-
-    ``seen`` maps ``Path -> (size, mtime)``. ``inode_to_dst`` is the
-    same hardlink-dedup map ``_copy_one_dedup`` uses elsewhere -- a
-    file whose inode was already mirrored gets ``os.link``-ed at the
-    destination instead of re-copied, so ``_shared_reg/data.bin`` <->
-    ``final/data.bin`` stay hardlinked at the HDD twin.
-
-    Files whose mtime is younger than ``stability_window_s`` are
-    skipped -- they're likely mid-write (suite2p flushing ``data.bin``
-    incrementally, e.g.). The next pass will catch them once writes
-    settle.
-
-    When ``throttle_bytes_per_sec`` is set, each copy is rate-limited
-    via ``_throttled_copy2`` -- used in single-drive mode so the
-    mirror doesn't starve the active stage's reads on the same
-    physical disk.
-    """
-    if not scratch.exists():
-        return False
-    now = time.time()
-    changed = False
-    for dirpath, _dn, files in os.walk(str(scratch)):
-        for fname in files:
-            sp = Path(dirpath) / fname
-            try:
-                rel = sp.relative_to(scratch)
-            except ValueError:
-                continue
-            if _is_scratch_mirror_skippable(rel, scratch):
-                continue
-            try:
-                st = sp.stat()
-            except OSError:
-                continue
-            sig = (st.st_size, st.st_mtime)
-            if seen.get(sp) == sig:
-                continue
-            # Stability check: if the file was modified within the
-            # last ``stability_window_s`` it's probably still being
-            # written. Skip and try next pass.
-            if now - st.st_mtime < stability_window_s:
-                continue
-            dp = final / rel
-            try:
-                dp.parent.mkdir(parents=True, exist_ok=True)
-                # Remove an out-of-date HDD copy before re-copying;
-                # ``_copy_one_dedup`` doesn't overwrite.
-                if dp.exists():
-                    try:
-                        dp.unlink()
-                    except OSError:
-                        continue
-                _copy_one_dedup(
-                    sp, dp, inode_to_dst,
-                    throttle_bytes_per_sec=throttle_bytes_per_sec)
-                seen[sp] = sig
-                changed = True
-            except OSError:
-                continue
-    return changed
-
-
-def _copy_one_dedup(sp: Path, dp: Path,
-                    inode_to_dst: dict,
-                    *,
-                    throttle_bytes_per_sec: Optional[int] = None) -> None:
-    """Copy or hardlink a single file from scratch to HDD, recording
-    the (st_dev, st_ino) -> destination map so subsequent hits for
-    the same inode become hardlinks at the destination instead of
-    independent byte-for-byte copies. Raises on copy failure.
-
-    When ``throttle_bytes_per_sec`` is set, the copy is rate-limited
-    via :func:`_throttled_copy2`. Hardlinks bypass the throttle --
-    they're a metadata op, not bandwidth-bound.
-    """
-    try:
-        st = sp.stat()
-        key = (st.st_dev, st.st_ino) if st.st_ino else None
-    except OSError:
-        key = None
-    existing = inode_to_dst.get(key) if key else None
-    if existing is not None:
-        try:
-            os.link(existing, str(dp))
-            return
-        except (OSError, NotImplementedError):
-            pass
-    if throttle_bytes_per_sec is not None:
-        _throttled_copy2(str(sp), str(dp),
-                         rate_bytes_per_sec=throttle_bytes_per_sec)
-    else:
-        shutil.copy2(str(sp), str(dp))
-    if key is not None:
-        inode_to_dst[key] = str(dp)
-
-
-def _build_batch_param_spec() -> list:
-    """Assemble the union PARAM_SPEC.
-
-    Entries are emitted in pipeline order (preprocess -> detection ->
-    low-pass -> events -> clustering -> xcorr -> pipeline-wide) and
-    each source group's label is rewritten with a numbered stage
-    prefix so the Advanced dialog reads top-to-bottom in operation
-    order. Tab 4's "Low-pass" cutoff knob (which Tab 4 binds to a
-    slider, not a PARAM_SPEC entry) is inserted alongside the
-    rest of the low-pass section.
-    """
-    # Original-group -> renamed-group. Anything not in the map keeps
-    # its native label.
-    rename = {
-        # 1. Preprocess (Tab 1)
-        "Blob detection": "1. Preprocess - Blob detection",
-        "QC gif": "1. Preprocess - QC GIF",
-        # 2. Detection (Tab 3)
-        "Sparsery": "2. Detection - Sparsery",
-        "Cellpose": "2. Detection - Cellpose",
-        "Merge": "2. Detection - Merge",
-        "dF/F": "2. Detection - dF/F",
-        "Default low-pass": "2. Detection - Default low-pass",
-        "Pixel scale": "2. Detection - Pixel scale",
-        "GPU": "2. Detection - GPU",
-        # 3. Low-pass + derivative (Tab 4)
-        "Low-pass": "3. Low-pass - Cutoff",
-        "Low-pass filter": "3. Low-pass - Butterworth",
-        "Derivative": "3. Low-pass - SG derivative",
-        "Slider bounds": "3. Low-pass - Slider bounds",
-        # 4. Event detection (Tab 5)
-        "Per-ROI hysteresis": "4. Events - Per-ROI hysteresis",
-        "Display": "4. Events - Display",
-        "Population events - density":
-            "4. Events - Population density",
-        "Population events - peaks":
-            "4. Events - Population peaks",
-        "Population events - baseline":
-            "4. Events - Population baseline",
-        "Population events - boundaries":
-            "4. Events - Population boundaries",
-        "Population events - gaussian fit":
-            "4. Events - Population Gaussian fit",
-        # 5. Clustering / 6. Xcorr / 7. Pipeline-wide added below
-    }
-
-    spec: list = []
-    seen: set[str] = set()
-
-    def _extend(items):
-        for entry in items:
-            name = entry.get("name")
-            if not name or name in seen:
-                continue
-            new = dict(entry)
-            grp = new.get("group", "Parameters")
-            new["group"] = rename.get(grp, grp)
-            spec.append(new)
-            seen.add(name)
-
-    # 1. Preprocess
-    try:
-        from ..preprocess.tab import PreprocessTab
-        _extend(PreprocessTab.PARAM_SPEC)
-    except Exception:
-        pass
-
-    # 2. Detection
-    try:
-        from ..suite2p.tab import Suite2pTab
-        _extend(Suite2pTab.PARAM_SPEC)
-    except Exception:
-        pass
-
-    # 3. Low-pass: cutoff first (binds to the slider value), then the
-    # Tab 4 PARAM_SPEC entries for filter / derivative / slider bounds.
-    spec.append({
-        "name": "cutoff_hz", "label": "Low-pass cutoff (Hz)",
-        "type": "float", "default": 1.0,
-        "group": "3. Low-pass - Cutoff",
-        "help": "cutoff applied to every kept ROI when batch runs Tab 4",
-    })
-    seen.add("cutoff_hz")
-    try:
-        from ..lowpass.tab import LowpassTab
-        _extend(LowpassTab.PARAM_SPEC)
-    except Exception:
-        pass
-
-    # 4. Event detection
-    try:
-        from ..event_detection.tab import EventDetectionTab
-        _extend(EventDetectionTab.PARAM_SPEC)
-    except Exception:
-        pass
-
-    # 5. Clustering (no source PARAM_SPEC)
-    spec.extend([
-        {"name": "prefix", "label": "dF/F prefix",
-         "type": "str", "default": "r0p7_filtered_",
-         "group": "5. Clustering",
-         "help": "memmap prefix; filtered_ uses the cell-filter mask"},
-        {"name": "threshold",
-         "label": "Cluster threshold (0=auto)",
-         "type": "float", "default": 0.0, "group": "5. Clustering",
-         "help": "linkage cut height; 0 -> auto via auto_choose_threshold"},
-        {"name": "palette", "label": "Cluster palette",
-         "type": "str", "default": "tab10", "group": "5. Clustering"},
-    ])
-
-    # 6. Cross-correlation (no source PARAM_SPEC)
-    spec.extend([
-        {"name": "max_lag_seconds", "label": "xcorr max lag (s)",
-         "type": "float", "default": 2.0,
-         "group": "6. Cross-correlation"},
-        {"name": "zero_lag", "label": "Compute zero-lag correlation",
-         "type": "bool", "default": True,
-         "group": "6. Cross-correlation"},
-        {"name": "use_gpu", "label": "Use GPU for xcorr",
-         "type": "bool", "default": True,
-         "group": "6. Cross-correlation"},
-    ])
-
-    # 7. Pipeline-wide
-    spec.extend([
-        {"name": "baseline_mode", "label": "dF/F baseline mode",
-         "type": "choice", "choices": ["first_n", "rolling"],
-         "default": "first_n", "group": "7. Pipeline-wide"},
-        {"name": "baseline_min", "label": "Baseline duration (min)",
-         "type": "float", "default": 2.0, "group": "7. Pipeline-wide",
-         "help": "first-N-min baseline length when baseline_mode=first_n"},
-    ])
-
-    return spec
-
-
-def _pick_tiffs_dialog(parent: tk.Misc, *, title: str,
-                       initial_dir: str = "",
-                       current_paths: Optional[list[str]] = None,
-                       initial_depth: int = 0) -> Optional[list[str]]:
-    """Modal Listbox-based TIFF picker (same UX as Tab 1).
-
-    Shows the TIFFs under ``initial_dir`` (recursing to ``initial_depth``
-    sub-levels) in a multi-select Listbox. Returns the list of absolute
-    paths the user confirmed, or ``None`` if the dialog was cancelled.
-
-    The user can change the search root + depth and hit "Refresh" to
-    re-populate the list. Items already in ``current_paths`` are
-    pre-selected.
-    """
-    from ...core import preprocessing
-
-    win = tk.Toplevel(parent)
-    win.title(title)
-    win.transient(parent.winfo_toplevel())
-    win.grab_set()
-    win.geometry("700x520")
-
-    body = ttk.Frame(win, padding=8)
-    body.pack(fill="both", expand=True)
-
-    row = ttk.Frame(body)
-    row.pack(fill="x", pady=(0, 6))
-    ttk.Label(row, text="Folder:", width=10).pack(side="left")
-    dir_var = tk.StringVar(value=initial_dir or "")
-    ttk.Entry(row, textvariable=dir_var).pack(
-        side="left", fill="x", expand=True, padx=(0, 4))
-    ttk.Button(
-        row, text="Browse...", width=10,
-        command=lambda: dir_var.set(
-            filedialog.askdirectory(title="Pick search folder",
-                                    parent=win) or dir_var.get())
-    ).pack(side="left")
-
-    row = ttk.Frame(body)
-    row.pack(fill="x", pady=(0, 6))
-    ttk.Label(row, text="Depth:", width=10).pack(side="left")
-    depth_var = tk.IntVar(value=max(0, int(initial_depth)))
-    ttk.Spinbox(row, from_=0, to=6, width=4,
-                textvariable=depth_var).pack(side="left")
-    refresh_btn = ttk.Button(row, text="Refresh", width=10)
-    refresh_btn.pack(side="left", padx=(8, 0))
-    status_var = tk.StringVar(value="")
-    ttk.Label(row, textvariable=status_var,
-              font=("", 9, "italic")).pack(side="left", padx=(8, 0))
-
-    list_holder = ttk.Frame(body)
-    list_holder.pack(fill="both", expand=True)
-    list_holder.columnconfigure(0, weight=1)
-    list_holder.rowconfigure(0, weight=1)
-    listbox = tk.Listbox(list_holder, selectmode="extended",
-                         exportselection=False)
-    listbox.grid(row=0, column=0, sticky="nsew")
-    sb = ttk.Scrollbar(list_holder, orient="vertical",
-                       command=listbox.yview)
-    sb.grid(row=0, column=1, sticky="ns")
-    listbox.configure(yscrollcommand=sb.set)
-
-    paths_state: list[str] = []  # mutated by _refresh; lives in closure
-    current_set = {str(Path(p).resolve()) for p in (current_paths or [])}
-
-    def _refresh():
-        d = dir_var.get().strip()
-        listbox.delete(0, "end")
-        paths_state.clear()
-        if not d:
-            status_var.set("Pick a folder.")
-            return
-        if not Path(d).is_dir():
-            status_var.set(f"Not a folder: {d}")
-            return
-        depth = max(0, int(depth_var.get()))
-        try:
-            paths = preprocessing.list_tiffs(d, max_depth=depth)
-        except Exception as e:
-            status_var.set(f"List error: {e}")
-            return
-        d_path = Path(d)
-        for p in paths:
-            try:
-                rel = Path(p).relative_to(d_path).as_posix()
-            except ValueError:
-                rel = str(p)
-            paths_state.append(str(p))
-            listbox.insert("end", rel)
-        # Pre-select rows whose absolute path matches current_paths.
-        for i, abs_p in enumerate(paths_state):
-            if str(Path(abs_p).resolve()) in current_set:
-                listbox.selection_set(i)
-        n_sel = len(listbox.curselection())
-        status_var.set(
-            f"{len(paths)} TIFFs"
-            + (f"  ({n_sel} pre-selected)" if n_sel else ""))
-
-    refresh_btn.configure(command=_refresh)
-
-    foot = ttk.Frame(body)
-    foot.pack(fill="x", pady=(8, 0))
-    result: dict = {"paths": None}
-
-    def _confirm():
-        sel = listbox.curselection()
-        result["paths"] = [paths_state[i] for i in sel]
-        win.destroy()
-
-    def _cancel():
-        result["paths"] = None
-        win.destroy()
-
-    ttk.Button(foot, text="Cancel", width=10,
-               command=_cancel).pack(side="right")
-    ttk.Button(foot, text="Confirm",
-               command=_confirm).pack(side="right", padx=(0, 6))
-
-    _refresh()
-    parent.wait_window(win)
-    return result["paths"]
 
 
 class BatchRow:
@@ -735,8 +83,8 @@ class BatchRow:
                  tiffs: Optional[list[str]] = None,
                  params: Optional[dict] = None) -> None:
         self.tab = tab
-        self.frame = ttk.Frame(parent, padding=(2, 4))
-        self.frame.pack(fill="x", padx=4)
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.pack(fill="x", padx=4, pady=2)
 
         self.id_var = tk.StringVar(value=identifier)
         self.tiff_var = tk.StringVar(
@@ -748,23 +96,24 @@ class BatchRow:
         # mirrors Tab 1's "select multiple TIFFs as one recording" path.
         self.selected_var = tk.BooleanVar(value=False)
 
-        ttk.Checkbutton(self.frame, variable=self.selected_var) \
+        ctk.CTkCheckBox(self.frame, text="", width=24,
+                        variable=self.selected_var) \
             .grid(row=0, column=0, padx=(0, 4))
-        ttk.Entry(self.frame, textvariable=self.id_var, width=22) \
+        ctk.CTkEntry(self.frame, textvariable=self.id_var, width=200) \
             .grid(row=0, column=1, padx=(0, 6))
-        ttk.Entry(self.frame, textvariable=self.tiff_var, width=46) \
+        ctk.CTkEntry(self.frame, textvariable=self.tiff_var, width=360) \
             .grid(row=0, column=2, padx=(0, 4), sticky="ew")
-        ttk.Button(self.frame, text="Browse...", width=10,
-                   command=self._on_browse) \
+        ctk.CTkButton(self.frame, text="Browse...", width=90,
+                      command=self._on_browse) \
             .grid(row=0, column=3, padx=(0, 4))
-        ttk.Button(self.frame, text="Edit params", width=12,
-                   command=self._on_edit_params) \
+        ctk.CTkButton(self.frame, text="Edit params", width=110,
+                      command=self._on_edit_params) \
             .grid(row=0, column=4, padx=(0, 4))
         ttk.Label(self.frame, textvariable=self.status_var,
                   width=18, anchor="w") \
             .grid(row=0, column=5, padx=(0, 4))
-        ttk.Button(self.frame, text="x", width=2,
-                   command=self._on_remove) \
+        ctk.CTkButton(self.frame, text="x", width=28,
+                      command=self._on_remove) \
             .grid(row=0, column=6)
         self.frame.columnconfigure(2, weight=1)
 
@@ -797,7 +146,7 @@ class BatchRow:
         self.frame.destroy()
 
     def _on_browse(self) -> None:
-        paths = _pick_tiffs_dialog(
+        paths = pick_tiffs_dialog(
             self.tab,
             title=f"TIFFs for '{self.identifier}'",
             initial_dir=self.tab.workdir_var.get().strip()
@@ -827,7 +176,7 @@ class BatchTab(ttk.Frame):
 
     POLL_MS = 100
 
-    PARAM_SPEC = _build_batch_param_spec()
+    PARAM_SPEC = build_batch_param_spec()
 
     def __init__(self, master, state: AppState) -> None:
         super().__init__(master, padding=10)
@@ -868,7 +217,11 @@ class BatchTab(ttk.Frame):
         self._cleanup_thread.start()
 
         self._build_ui()
-        self.after(self.POLL_MS, self._drain_log_queue)
+        drain_queue(self, self._log_queue,
+                    {"log": self._on_log_payload,
+                     "status": self._on_status_payload,
+                     "done": self._on_batch_done},
+                    poll_ms=self.POLL_MS)
 
     # ---- Scratch capacity pre-flight ----------------------------------
 
@@ -1130,90 +483,85 @@ class BatchTab(ttk.Frame):
         top = ttk.LabelFrame(self, text="Batch run setup", padding=8)
         top.pack(fill="x", pady=(0, 6))
 
-        row = ttk.Frame(top); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Working dir:", width=16).pack(side="left")
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="Working dir:", width=110,
+                     anchor="w").pack(side="left")
         self.workdir_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.workdir_var) \
+        ctk.CTkEntry(row, textvariable=self.workdir_var) \
             .pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", width=10,
-                   command=self._on_pick_workdir).pack(side="left")
-        ttk.Label(row, text="Depth:").pack(side="left", padx=(8, 2))
+        ctk.CTkButton(row, text="Browse...", width=90,
+                      command=self._on_pick_workdir).pack(side="left")
+        ctk.CTkLabel(row, text="Depth:").pack(side="left", padx=(8, 2))
         self.depth_var = tk.IntVar(value=2)
         ttk.Spinbox(row, from_=0, to=6, width=4,
                     textvariable=self.depth_var).pack(side="left")
-        ttk.Button(row, text="Scan", width=8,
-                   command=self._on_scan).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(row, text="Scan", width=80,
+                      command=self._on_scan).pack(side="left", padx=(8, 0))
 
-        row = ttk.Frame(top); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Output folder:", width=16).pack(side="left")
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="Output folder:", width=110,
+                     anchor="w").pack(side="left")
         self.outdir_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.outdir_var) \
+        ctk.CTkEntry(row, textvariable=self.outdir_var) \
             .pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", width=10,
-                   command=self._on_pick_outdir).pack(side="left")
-        ttk.Button(row, text="Reload queue", width=14,
-                   command=self._on_reload_queue) \
+        ctk.CTkButton(row, text="Browse...", width=90,
+                      command=self._on_pick_outdir).pack(side="left")
+        ctk.CTkButton(row, text="Reload queue", width=120,
+                      command=self._on_reload_queue) \
             .pack(side="left", padx=(8, 0))
-        # CSV export / import. JSON-via-output-folder (Reload queue
-        # above) is the canonical roundtrip; CSV is the spreadsheet-
-        # friendly alternative: one row per recording, columns
-        # ``identifier`` and ``tiffs`` (semicolon-separated paths).
-        # Per-row params are NOT in the CSV -- they stay in the JSON
-        # sidecar or get applied via "Apply defaults to all rows" so
-        # the CSV stays editable in Excel without escaping nightmares.
-        ttk.Button(row, text="Export CSV...", width=14,
-                   command=self._on_export_queue_csv) \
+        # CSV export / import. JSON-via-output-folder is the canonical
+        # roundtrip; CSV is the spreadsheet-friendly alternative.
+        ctk.CTkButton(row, text="Export CSV...", width=120,
+                      command=self._on_export_queue_csv) \
             .pack(side="left", padx=(4, 0))
-        ttk.Button(row, text="Load CSV...", width=12,
-                   command=self._on_load_queue_csv) \
+        ctk.CTkButton(row, text="Load CSV...", width=110,
+                      command=self._on_load_queue_csv) \
             .pack(side="left", padx=(4, 0))
 
         # Optional scratch dir on a fast drive (SSD/NVMe). When set, every
-        # recording's intermediate I/O — preprocessed shifted TIFF, the
-        # suite2p ``data.bin`` (read many times during detection) — lives
-        # on this scratch path during the run. At end of each row the full
-        # tree is bulk-copied to the slow output folder above and the
-        # scratch copy is deleted. Hardlinks between ``_shared_reg/`` and
-        # per-pass ``data.bin`` are preserved across the copy.
-        row = ttk.Frame(top); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Scratch dir (SSD):", width=16).pack(side="left")
+        # recording's intermediate I/O lives on this scratch path during
+        # the run, then bulk-copies to the slow output folder above.
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text="Scratch dir (SSD):", width=110,
+                     anchor="w").pack(side="left")
         self.scratch_dir_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.scratch_dir_var) \
+        ctk.CTkEntry(row, textvariable=self.scratch_dir_var) \
             .pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", width=10,
-                   command=self._on_pick_scratch).pack(side="left")
-        ttk.Label(row, text="(optional; outputs still land in the folder "
-                            "above)").pack(side="left", padx=(8, 0))
+        ctk.CTkButton(row, text="Browse...", width=90,
+                      command=self._on_pick_scratch).pack(side="left")
+        ctk.CTkLabel(row,
+                     text="(optional; outputs still land in the folder above)",
+                     text_color="gray").pack(side="left", padx=(8, 0))
 
-        row = ttk.Frame(top); row.pack(fill="x", pady=(6, 2))
-        ttk.Button(row, text="Apply defaults to all rows",
-                   command=self._on_edit_defaults) \
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", pady=(6, 2))
+        ctk.CTkButton(row, text="Apply defaults to all rows", width=200,
+                      command=self._on_edit_defaults) \
             .pack(side="left")
-        ttk.Button(row, text="+ Add row", width=12,
-                   command=self.add_row) \
+        ctk.CTkButton(row, text="+ Add row", width=110,
+                      command=self.add_row) \
             .pack(side="left", padx=(8, 0))
-        # Merge selected (checked) rows into one grouped recording, the
-        # same shape Tab 1 produces when the user selects multiple
-        # TIFFs in its listbox: identifier = +-joined stems, TIFFs
-        # concatenated in trailing-index order, params from the first
-        # checked row.
-        ttk.Button(row, text="Merge selected", width=14,
-                   command=self._on_merge_selected) \
+        # Merge selected (checked) rows into one grouped recording.
+        ctk.CTkButton(row, text="Merge selected", width=130,
+                      command=self._on_merge_selected) \
             .pack(side="left", padx=(8, 0))
-        self.run_btn = ttk.Button(
-            row, text="Run all", width=12,
+        self.run_btn = ctk.CTkButton(
+            row, text="Run all", width=110,
             command=self._on_run_all)
         self.run_btn.pack(side="right")
-        self.abort_btn = ttk.Button(
-            row, text="Abort", width=10,
+        self.abort_btn = ctk.CTkButton(
+            row, text="Abort", width=90,
             command=self._on_abort, state="disabled")
         self.abort_btn.pack(side="right", padx=(0, 6))
 
         # Headers + scrollable rows -----------------------------------------
         # First column = the per-row selection checkbox (no header text);
         # the rest match BatchRow's grid order.
-        headers = ttk.Frame(self, padding=(4, 0))
-        headers.pack(fill="x")
+        headers = ctk.CTkFrame(self, fg_color="transparent")
+        headers.pack(fill="x", padx=4)
         for txt, w in (("", 3),
                        ("Identifier", 22),
                        ("TIFF file(s) (semicolon-sep)", 50),
@@ -1221,17 +569,15 @@ class BatchTab(ttk.Frame):
             ttk.Label(headers, text=txt, width=w, anchor="w") \
                 .pack(side="left", padx=(0, 4))
 
-        # Rows + console split by a draggable vertical sash, so the
-        # user can drag the divider down when they want more of the
-        # run log on screen (long batches with verbose suite2p logs)
-        # or up when they want more queued-rows visibility. Weights
-        # 2:1 set the default rows/console ratio when the tab first
-        # opens; the sash position survives until the user moves it.
-        paned = ttk.PanedWindow(self, orient="vertical")
-        paned.pack(fill="both", expand=True, pady=(0, 6))
-
-        body = ttk.LabelFrame(paned, text="Recordings", padding=4)
-        paned.add(body, weight=2)
+        # Recordings list and Run log each live in their own ``tk.Frame``
+        # wrap with a draggable grip below. Resizing one extends just
+        # that panel and the surrounding scrollable wrapper grows the
+        # tab body to absorb it -- no top-level PanedWindow so dragging
+        # one panel never shrinks the other.
+        body_wrap = tk.Frame(self)
+        body_wrap.pack(fill="x", padx=4, pady=(0, 0))
+        body = ttk.LabelFrame(body_wrap, text="Recordings", padding=4)
+        body.pack(fill="both", expand=True)
         canvas = tk.Canvas(body, highlightthickness=0)
         canvas.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
@@ -1249,10 +595,15 @@ class BatchTab(ttk.Frame):
 
         self._rows_frame.bind("<Configure>", _on_frame_resize)
         canvas.bind("<Configure>", _on_canvas_resize)
+        attach_resize_handle(self, body_wrap, min_height=180,
+                             initial_height=260)
 
         # Console -----------------------------------------------------------
-        console_frame = ttk.LabelFrame(paned, text="Run log", padding=4)
-        paned.add(console_frame, weight=1)
+        console_wrap = tk.Frame(self)
+        console_wrap.pack(fill="x", padx=4, pady=(0, 0))
+        console_frame = ttk.LabelFrame(console_wrap, text="Run log",
+                                       padding=4)
+        console_frame.pack(fill="both", expand=True)
         self.log = tk.Text(console_frame, height=10, wrap="word",
                            state="disabled")
         log_sb = ttk.Scrollbar(console_frame, orient="vertical",
@@ -1260,6 +611,15 @@ class BatchTab(ttk.Frame):
         self.log.configure(yscrollcommand=log_sb.set)
         log_sb.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
+        apply_dark_to_tk_widget(self.log)
+        # Also dark-skin the embedded rows canvas so the queue list
+        # doesn't render on a bright white background.
+        apply_dark_to_tk_widget(canvas)
+        # Scroll-on-hover: spin the wheel anywhere over the Recordings
+        # panel to scroll the row list, not just on its scrollbar.
+        bind_mousewheel_to_scrollable(body, scroll_target=canvas)
+        attach_resize_handle(self, console_wrap, min_height=160,
+                             initial_height=220)
 
     # -- Row management ---------------------------------------------------
 
@@ -1921,8 +1281,8 @@ class BatchTab(ttk.Frame):
         except Exception:
             pass
 
-        self.run_btn.config(state="disabled")
-        self.abort_btn.config(state="normal")
+        self.run_btn.configure(state="disabled")
+        self.abort_btn.configure(state="normal")
         for row in self._rows:
             row.set_status("queued")
 
@@ -1983,7 +1343,7 @@ class BatchTab(ttk.Frame):
         self._abort_flag.set()
         # Disable + relabel so the user can see the request was
         # registered. Restored in _batch_finish.
-        self.abort_btn.config(state="disabled", text="Aborting...")
+        self.abort_btn.configure(state="disabled", text="Aborting...")
         cur_stage = getattr(self, "_current_stage", None) or "?"
         ident = (self._current_row.identifier
                  if getattr(self, "_current_row", None) is not None
@@ -2141,7 +1501,7 @@ class BatchTab(ttk.Frame):
         try:
             tab_idx = self._STAGE_TAB_INDEX.get(stage)
             if tab_idx is not None:
-                self._app._nb.select(tab_idx)
+                self._app._show_tab(tab_idx)
         except Exception:
             pass
 
@@ -2542,7 +1902,7 @@ class BatchTab(ttk.Frame):
             while True:
                 current_throttle = _resolve_throttle()
                 try:
-                    changed = _mirror_sync_pass(
+                    changed = mirror_sync_pass(
                         scratch_rec, final_rec, seen, inode_to_dst,
                         throttle_bytes_per_sec=current_throttle)
                 except Exception as e:
@@ -2563,7 +1923,7 @@ class BatchTab(ttk.Frame):
             # row's pipeline is done -- preprocess only fires
             # mid-row).
             try:
-                _mirror_sync_pass(
+                mirror_sync_pass(
                     scratch_rec, final_rec, seen, inode_to_dst,
                     stability_window_s=0.0,
                     throttle_bytes_per_sec=_resolve_throttle())
@@ -2655,7 +2015,7 @@ class BatchTab(ttk.Frame):
             # already skipped them, this catches anything that
             # might have slipped through e.g. data_raw.bin written
             # late). Just to be safe.
-            n_pruned, bytes_pruned = _prune_scratch_tree(scratch_rec)
+            n_pruned, bytes_pruned = prune_scratch_tree(scratch_rec)
             prune_msg = ""
             if n_pruned > 0:
                 prune_msg = (f" (pruned {n_pruned} skipped path"
@@ -2669,7 +2029,7 @@ class BatchTab(ttk.Frame):
             # this is the safety net that copies whatever it left
             # behind. Either way: by the time this returns, every
             # output file is at HDD and rmtree below is safe.
-            n_swept, bytes_swept = _synchronous_final_sweep(
+            n_swept, bytes_swept = synchronous_final_sweep(
                 scratch_rec, final_rec, worker["inode_to_dst"])
             sweep_msg = ""
             if n_swept > 0:
@@ -2719,7 +2079,7 @@ class BatchTab(ttk.Frame):
             deferred_msg = ""
             handed_to_janitor = False
             if scratch_rec.exists():
-                n_left, bytes_left = _measure_tree(scratch_rec)
+                n_left, bytes_left = measure_tree(scratch_rec)
                 if n_left > 0:
                     self._enqueue_scratch_cleanup(
                         scratch_rec, row=row, base_status=base_status)
@@ -2908,11 +2268,11 @@ class BatchTab(ttk.Frame):
         self._finalize_waiting = False
 
         self._batch_active = False
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
         # Restore the abort button's label + (disabled) state ready
         # for the next batch. _on_abort flipped it to "Aborting..."
         # while the request was in flight.
-        self.abort_btn.config(state="disabled", text="Abort")
+        self.abort_btn.configure(state="disabled", text="Abort")
         if self._abort_flag.is_set():
             self._append_log("=== Batch run aborted ===")
         else:
@@ -2968,7 +2328,7 @@ class BatchTab(ttk.Frame):
                 total_n = 0
                 total_b = 0
                 for sub in leftover_subdirs:
-                    n, b = _measure_tree(sub)
+                    n, b = measure_tree(sub)
                     total_n += n
                     total_b += b
                     self._enqueue_scratch_cleanup(sub)
@@ -2994,7 +2354,7 @@ class BatchTab(ttk.Frame):
                 pass
         # Return the user to the batch tab so they see the summary.
         try:
-            self._app._nb.select(0)
+            self._app._show_tab(0)
         except Exception:
             pass
 
@@ -3031,25 +2391,20 @@ class BatchTab(ttk.Frame):
                     row.append(f"{info.get('duration_s', 0.0):.2f}")
                 w.writerow(row)
 
-    # -- Console drain ----------------------------------------------------
+    # -- Console handlers ------------------------------------------------
 
-    def _drain_log_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._log_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(str(payload))
-                elif kind == "status":
-                    row, status = payload
-                    if row in self._rows:
-                        row.set_status(str(status))
-                elif kind == "done":
-                    self.run_btn.config(state="normal")
-                    self.abort_btn.config(state="disabled")
-                    self._append_log("[batch] all rows processed.")
-        except queue.Empty:
-            pass
-        self.after(self.POLL_MS, self._drain_log_queue)
+    def _on_log_payload(self, payload) -> None:
+        self._append_log(str(payload))
+
+    def _on_status_payload(self, payload) -> None:
+        row, status = payload
+        if row in self._rows:
+            row.set_status(str(status))
+
+    def _on_batch_done(self, _payload) -> None:
+        self.run_btn.configure(state="normal")
+        self.abort_btn.configure(state="disabled")
+        self._append_log("[batch] all rows processed.")
 
     def _append_log(self, text: str) -> None:
         if not text:

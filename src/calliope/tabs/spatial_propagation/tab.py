@@ -58,6 +58,8 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Optional
 
+import customtkinter as ctk
+
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -135,19 +137,21 @@ class SpatialPropagationTab(ttk.Frame):
         # plane0 the activation-order maps + monotonicity panels
         # come from. Updated by ``_ingest_results`` when Tab 5
         # publishes a new event_results dict.
-        rec_row = ttk.Frame(header); rec_row.pack(fill="x", pady=(0, 4))
+        rec_row = ctk.CTkFrame(header, fg_color="transparent")
+        rec_row.pack(fill="x", pady=(0, 4))
         self.recording_var = tk.StringVar(value="No recording loaded.")
         ttk.Label(rec_row, textvariable=self.recording_var,
                   font=("", 10, "italic")).pack(side="left")
 
-        row = ttk.Frame(header); row.pack(fill="x", pady=2)
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", pady=2)
         self.status_var = tk.StringVar(
             value="Run Tab 5 first; this tab will populate automatically "
                   "once events are detected.")
         ttk.Label(row, textvariable=self.status_var,
                   font=("", 9, "italic")).pack(side="left")
-        ttk.Button(row, text="Refresh from Tab 5",
-                   command=self._refresh).pack(side="right")
+        ctk.CTkButton(row, text="Refresh from Tab 5",
+                      command=self._refresh).pack(side="right")
 
         # ---- Spks override toggle ----
         # Tab 5's hysteresis-onset detector is the default activation-
@@ -157,28 +161,32 @@ class SpatialPropagationTab(ttk.Frame):
         # pipeline downstream; only the ``first_time`` /``A`` matrices
         # change. Mirrors the experimental ``spks`` signal kind in
         # ``Calcium_imaging_suite2p/lead_lag_prototype.py``.
-        toggle_row = ttk.Frame(header); toggle_row.pack(fill="x", pady=(2, 0))
+        toggle_row = ctk.CTkFrame(header, fg_color="transparent")
+        toggle_row.pack(fill="x", pady=(2, 0))
         self._use_spks_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             toggle_row,
             text="Use Suite2p spks (deconvolved) instead of "
                  "hysteresis onsets for first-activation time",
             variable=self._use_spks_var,
             command=self._on_use_spks_toggle,
         ).pack(side="left")
-        ttk.Label(
+        ctk.CTkLabel(
             toggle_row,
             text="(activation = first frame with spks > 0 inside the "
                  "event window)",
-            foreground="gray", font=("", 8, "italic"),
+            text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left", padx=(8, 0))
 
         # Event navigation row.
-        nav = ttk.Frame(header); nav.pack(fill="x", pady=(6, 0))
-        self.prev_btn = ttk.Button(
-            nav, text="< Prev", command=self._on_prev, state="disabled")
+        nav = ctk.CTkFrame(header, fg_color="transparent")
+        nav.pack(fill="x", pady=(6, 0))
+        self.prev_btn = ctk.CTkButton(
+            nav, text="< Prev", command=self._on_prev, state="disabled",
+            width=80)
         self.prev_btn.pack(side="left")
         self.event_var = tk.IntVar(value=1)
+        # ttk.Spinbox kept -- customtkinter has no equivalent spinbox widget.
         self.event_spin = ttk.Spinbox(
             nav, from_=1, to=1, width=6, textvariable=self.event_var,
             command=self._on_spin)
@@ -186,14 +194,16 @@ class SpatialPropagationTab(ttk.Frame):
         self.event_spin.state(["disabled"])
         self.event_spin.bind("<Return>", lambda _e: self._on_spin())
         self.event_spin.bind("<FocusOut>", lambda _e: self._on_spin())
-        self.next_btn = ttk.Button(
-            nav, text="Next >", command=self._on_next, state="disabled")
+        self.next_btn = ctk.CTkButton(
+            nav, text="Next >", command=self._on_next, state="disabled",
+            width=80)
         self.next_btn.pack(side="left")
         self.event_label_var = tk.StringVar(value="")
         ttk.Label(nav, textvariable=self.event_label_var,
                   font=("", 9, "italic")).pack(side="left", padx=(12, 0))
 
-        body = ttk.Frame(self); body.pack(fill="both", expand=True)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
         body.columnconfigure(0, weight=1)
@@ -359,8 +369,8 @@ class SpatialPropagationTab(ttk.Frame):
                 f"Tab 5 detected 0 events for {plane0}.")
             self.event_spin.config(from_=1, to=1)
             self.event_spin.state(["disabled"])
-            self.prev_btn.config(state="disabled")
-            self.next_btn.config(state="disabled")
+            self.prev_btn.configure(state="disabled")
+            self.next_btn.configure(state="disabled")
             self.event_label_var.set("")
             for fig, canvas in (
                     (self.fig_map_plain, self.canvas_map_plain),
@@ -535,14 +545,14 @@ class SpatialPropagationTab(ttk.Frame):
 
     def _update_nav_buttons(self) -> None:
         if self._data is None:
-            self.prev_btn.config(state="disabled")
-            self.next_btn.config(state="disabled")
+            self.prev_btn.configure(state="disabled")
+            self.next_btn.configure(state="disabled")
             return
         n = int(self._data["event_windows"].shape[0])
         i = self._event_index
-        self.prev_btn.config(
+        self.prev_btn.configure(
             state=("normal" if (n > 1 and i > 0) else "disabled"))
-        self.next_btn.config(
+        self.next_btn.configure(
             state=("normal" if (n > 1 and i < n - 1) else "disabled"))
 
     def _on_prev(self) -> None:

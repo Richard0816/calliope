@@ -51,7 +51,9 @@ from __future__ import annotations
 
 # ``dataclass`` decorator and ``asdict`` helper -- see the comment on
 # ``EventDetectionParams`` in core/utils.py for the basics.
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
+import json
+import os
 from pathlib import Path
 import shutil
 # ``Callable`` is the type-hint name for "anything you can call like a
@@ -88,6 +90,13 @@ class PreprocessResult:
     mean_image_path: path to ``mean.npy`` (per-pixel time average).
     n_frames       : number of frames in the movie.
     shape_yx       : (height, width) in pixels.
+    raw_paths      : original raw TIFF source paths (absolute). Used
+                     by the post-detection archive step to locate the
+                     source of truth for re-encoding into the
+                     recording folder as compressed TIFFs.
+    shifted_paths  : every shifted TIFF written for this recording
+                     (single-element for ``preprocess_tiff``; one per
+                     group member for ``preprocess_tiff_group``).
     """
     out_dir: Path
     shifted_tiff: Path
@@ -95,6 +104,8 @@ class PreprocessResult:
     mean_image_path: Path
     n_frames: int
     shape_yx: tuple
+    raw_paths: list = field(default_factory=list)
+    shifted_paths: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Serialise to a plain JSON-friendly dict (every Path -> str).
@@ -110,6 +121,8 @@ class PreprocessResult:
         for k, v in d.items():
             if isinstance(v, Path):
                 d[k] = str(v)
+            elif isinstance(v, list):
+                d[k] = [str(x) if isinstance(x, Path) else x for x in v]
         return d
 
 
@@ -236,6 +249,233 @@ def _shift_tiff_streaming(
             tw.write(frame, contiguous=True)
             if (i + 1) % 2000 == 0:
                 _log(f"[shift]   write {i + 1}/{n_pages}")
+
+
+# ---------------------------------------------------------------------------
+# Raw TIFF compression (post-detection archive)
+# ---------------------------------------------------------------------------
+
+# Suffix used for the in-progress compressed TIFF before the atomic
+# rename. Easy to spot + clean up if a run was killed mid-write.
+_COMPRESS_TMP_SUFFIX = ".compressing"
+
+# Sidecar file recording the raw source paths for a recording. Written
+# by ``run_preprocess`` so the post-detection archive step can locate
+# the originals without needing PreprocessResult passed through to
+# detection_run.
+RAW_PATHS_SIDECAR = "_calliope_raw_paths.json"
+
+
+def write_raw_paths_sidecar(out_dir: Path, raw_paths: Sequence[Path]) -> Path:
+    """Write the recording's raw source paths to ``_calliope_raw_paths.json``.
+
+    Detection's archive step reads this back to know which originals
+    to compress into the recording folder. Stored as absolute strings
+    so the file is portable across CWDs but not across machines (the
+    archive step verifies existence before acting).
+    """
+    out_dir = Path(out_dir)
+    sidecar = out_dir / RAW_PATHS_SIDECAR
+    payload = {"raw_paths": [str(Path(p).resolve()) for p in raw_paths]}
+    sidecar.write_text(json.dumps(payload, indent=2))
+    return sidecar
+
+
+def read_raw_paths_sidecar(out_dir: Path) -> list[Path]:
+    """Return the recording's raw source paths, or an empty list if missing."""
+    out_dir = Path(out_dir)
+    sidecar = out_dir / RAW_PATHS_SIDECAR
+    if not sidecar.is_file():
+        return []
+    try:
+        data = json.loads(sidecar.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    raws = data.get("raw_paths", []) or []
+    return [Path(p) for p in raws]
+
+
+def compress_raw_tiff(
+    src: Path,
+    dst: Path,
+    *,
+    level: int = 19,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[int, int]:
+    """Rewrite a raw TIFF as Zstd-compressed (lossless) at ``dst``.
+
+    Verifies byte-equality of the decompressed payload against the
+    original array before swapping into place. If ``src == dst`` the
+    swap is in-place (write tmp, verify, ``os.replace``). If they
+    differ, ``src`` is left untouched and the compressed copy lands
+    at ``dst``.
+
+    Returns ``(original_bytes, compressed_bytes)``.
+
+    Raises on any verification failure -- ``dst`` is removed and
+    ``src`` is never overwritten.
+
+    Compression: ``tifffile.imwrite`` with ``compression=('zstd',
+    level)`` and ``predictor=2`` (horizontal differencing). The
+    predictor encodes pixel-to-pixel differences before zstd; for
+    spatially correlated fluorescence pixels this roughly doubles the
+    ratio over raw-bytes zstd.
+    """
+    def _log(msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(msg)
+
+    src = Path(src).resolve()
+    dst = Path(dst).resolve()
+    if not src.exists():
+        raise FileNotFoundError(src)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + _COMPRESS_TMP_SUFFIX)
+    # Defensive cleanup of stale tmp from a prior killed run.
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    original_bytes = src.stat().st_size
+
+    try:
+        _log(f"[compress] reading {src.name} (in-RAM)")
+        try:
+            data = tifffile.imread(str(src))
+        except MemoryError:
+            _log("[compress] MemoryError on in-RAM read; falling back to streaming")
+            return _compress_raw_tiff_streaming(
+                src, dst, level=level, progress_cb=progress_cb,
+            )
+
+        _log(
+            f"[compress] writing {dst.name} (zstd-{level}, predictor=2, "
+            f"shape={tuple(data.shape)}, dtype={data.dtype})"
+        )
+        # BigTIFF unconditionally -- raws over 4 GB are common and the
+        # overhead on small files is negligible.
+        tifffile.imwrite(
+            str(tmp),
+            data,
+            compression="zstd",
+            compressionargs={"level": int(level)},
+            predictor=2,
+            bigtiff=True,
+        )
+
+        _log("[compress] verifying byte-equality after decompression")
+        verify = tifffile.imread(str(tmp))
+        if not np.array_equal(verify, data):
+            raise RuntimeError(
+                f"compress_raw_tiff: verification failed for {src} "
+                f"(decompressed payload does not match original)"
+            )
+        # Free the verification buffer before the rename so we don't
+        # hold double the RAM during the swap.
+        del verify
+
+        compressed_bytes = tmp.stat().st_size
+        os.replace(str(tmp), str(dst))
+        _log(
+            f"[compress] done -> {dst.name}  "
+            f"{original_bytes / 1e9:.2f} GB -> "
+            f"{compressed_bytes / 1e9:.2f} GB "
+            f"({compressed_bytes / max(1, original_bytes) * 100:.1f}%)"
+        )
+        return original_bytes, compressed_bytes
+
+    except BaseException:
+        # Make best-effort to leave the original raw untouched.
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _compress_raw_tiff_streaming(
+    src: Path,
+    dst: Path,
+    *,
+    level: int,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[int, int]:
+    """Page-by-page compressed rewrite for raws too large to fit in RAM.
+
+    Two passes:
+        Pass 1 -- write each page through tifffile.TiffWriter with the
+                  zstd codec + predictor.
+        Pass 2 -- re-open both src and dst, byte-verify each page.
+    """
+    def _log(msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(msg)
+
+    src = Path(src).resolve()
+    dst = Path(dst).resolve()
+    tmp = dst.with_suffix(dst.suffix + _COMPRESS_TMP_SUFFIX)
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    original_bytes = src.stat().st_size
+
+    try:
+        _log(f"[compress] streaming write {src.name} -> {dst.name}")
+        with tifffile.TiffFile(str(src)) as tf, \
+                tifffile.TiffWriter(str(tmp), bigtiff=True) as tw:
+            n_pages = len(tf.pages)
+            for i, page in enumerate(tf.pages):
+                frame = page.asarray()
+                tw.write(
+                    frame,
+                    contiguous=False,
+                    compression="zstd",
+                    compressionargs={"level": int(level)},
+                    predictor=2,
+                )
+                if (i + 1) % 2000 == 0:
+                    _log(f"[compress]   write {i + 1}/{n_pages}")
+
+        _log("[compress] streaming verify (page-by-page)")
+        with tifffile.TiffFile(str(src)) as tf_src, \
+                tifffile.TiffFile(str(tmp)) as tf_dst:
+            if len(tf_src.pages) != len(tf_dst.pages):
+                raise RuntimeError(
+                    f"compress_raw_tiff: page count mismatch "
+                    f"{len(tf_src.pages)} != {len(tf_dst.pages)}"
+                )
+            for i, (sp, dp) in enumerate(zip(tf_src.pages, tf_dst.pages)):
+                if not np.array_equal(sp.asarray(), dp.asarray()):
+                    raise RuntimeError(
+                        f"compress_raw_tiff: verification failed at page {i}"
+                    )
+                if (i + 1) % 2000 == 0:
+                    _log(f"[compress]   verify {i + 1}/{len(tf_src.pages)}")
+
+        compressed_bytes = tmp.stat().st_size
+        os.replace(str(tmp), str(dst))
+        _log(
+            f"[compress] streaming done -> {dst.name}  "
+            f"{original_bytes / 1e9:.2f} GB -> "
+            f"{compressed_bytes / 1e9:.2f} GB "
+            f"({compressed_bytes / max(1, original_bytes) * 100:.1f}%)"
+        )
+        return original_bytes, compressed_bytes
+
+    except BaseException:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +633,8 @@ def preprocess_tiff(
         mean_image_path=mean_path,
         n_frames=int(T),
         shape_yx=(int(Y), int(X)),
+        raw_paths=[src],
+        shifted_paths=[shifted_path],
     )
 
 
@@ -526,6 +768,8 @@ def preprocess_tiff_group(
         mean_image_path=mean_path,
         n_frames=int(total_frames),
         shape_yx=(int(Y), int(X)),
+        raw_paths=list(srcs),
+        shifted_paths=list(shifted_paths),
     )
 
 
@@ -562,11 +806,22 @@ def list_tiffs(folder: str | Path, max_depth: int = 0) -> list[Path]:
     return sorted(found, key=lambda p: str(p).lower())
 
 
-def load_existing_preprocess(out_dir: str | Path) -> Optional[PreprocessResult]:
+def load_existing_preprocess(
+    out_dir: str | Path,
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Optional[PreprocessResult]:
     """If a recording folder already contains preprocessing outputs, load them.
 
     Recognises both single-TIFF (``shifted_<x>.tif``) and grouped
-    (``NNN_shifted_<x>.tif``) layouts."""
+    (``NNN_shifted_<x>.tif``) layouts.
+
+    Post-detection archive mode: if the shifted TIFFs have been
+    deleted by the archive step but compressed raws are present at
+    the top level (referenced by ``_calliope_raw_paths.json``), the
+    shifted is regenerated on demand by running
+    ``shift_tiff_to_uint16`` again so QC / re-detect can continue.
+    """
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return None
@@ -579,7 +834,72 @@ def load_existing_preprocess(out_dir: str | Path) -> Optional[PreprocessResult]:
     gif = out_dir / "qc.gif"
     mean_path = out_dir / "mean.npy"
 
-    if not (shifted_candidates and gif.exists() and mean_path.exists()):
+    if not (gif.exists() and mean_path.exists()):
+        return None
+
+    # Archived state: shifted gone but compressed raw sidecar exists.
+    # Regenerate the shifted TIFF(s) from the (compressed) raw before
+    # returning -- callers expect ``shifted_tiff`` to be a real file.
+    raw_sources = read_raw_paths_sidecar(out_dir)
+    if not shifted_candidates and raw_sources:
+        def _log(msg: str) -> None:
+            if progress_cb is not None:
+                progress_cb(msg)
+        _log(
+            f"[preprocess] shifted TIFFs missing; regenerating from "
+            f"{len(raw_sources)} archived raw(s) at {out_dir}"
+        )
+        regenerated: list[Path] = []
+        if len(raw_sources) == 1:
+            src = raw_sources[0]
+            if not src.exists():
+                # Maybe the original was deleted; check if the raw was
+                # archived into the recording folder under its own name.
+                in_folder = out_dir / src.name
+                if in_folder.is_file():
+                    src = in_folder
+                else:
+                    _log(
+                        f"[preprocess] cannot regenerate: raw missing at "
+                        f"{src} (and not in recording folder)"
+                    )
+                    return None
+            dst = out_dir / f"shifted_{src.name}"
+            shift_tiff_to_uint16(src, dst, progress_cb=_log)
+            regenerated = [dst]
+        else:
+            # Group case: re-run the grouped shift to keep one shared
+            # min across files (matches original Tab 1 behaviour).
+            srcs_resolved: list[Path] = []
+            for s in raw_sources:
+                if s.exists():
+                    srcs_resolved.append(s)
+                elif (out_dir / s.name).is_file():
+                    srcs_resolved.append(out_dir / s.name)
+                else:
+                    _log(
+                        f"[preprocess] cannot regenerate group: raw missing "
+                        f"at {s} (and not in recording folder)"
+                    )
+                    return None
+            # Re-run preprocess_tiff_group writing into the same folder.
+            # Cheaper would be a dedicated reshift, but this is correct
+            # and infrequent enough that the extra mean/gif rewrite cost
+            # is acceptable.
+            data_root = out_dir.parent
+            recording_name = out_dir.name
+            result = preprocess_tiff_group(
+                srcs_resolved,
+                data_root=str(data_root),
+                recording_name=recording_name,
+                progress_cb=_log,
+            )
+            shifted_folder = Path(result.shifted_tiff).parent
+            setattr(result, "shifted_folder", shifted_folder)
+            return result
+        shifted_candidates = regenerated
+
+    if not shifted_candidates:
         return None
 
     mean = np.load(str(mean_path))
@@ -591,6 +911,8 @@ def load_existing_preprocess(out_dir: str | Path) -> Optional[PreprocessResult]:
         mean_image_path=mean_path,
         n_frames=-1,
         shape_yx=tuple(mean.shape),
+        raw_paths=raw_sources,
+        shifted_paths=list(shifted_candidates),
     )
 
 
@@ -685,6 +1007,15 @@ def run_preprocess(
     # attribute pointing at it.
     shifted_folder = Path(result.shifted_tiff).parent
     setattr(result, "shifted_folder", shifted_folder)
+
+    # Persist raw source paths next to the recording outputs so the
+    # post-detection archive step can locate the originals without
+    # needing PreprocessResult threaded through detection_run.
+    try:
+        write_raw_paths_sidecar(result.out_dir, result.raw_paths)
+    except OSError as e:
+        if progress_cb is not None:
+            progress_cb(f"[preprocess] raw-paths sidecar write failed: {e}")
 
     if figures_dir is not None:
         figures_dir = Path(figures_dir)

@@ -64,6 +64,8 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
+
+import customtkinter as ctk
 # ``filedialog`` for the Browse... folder picker;
 # ``messagebox`` for error pop-ups; ``ttk`` for themed widgets.
 from tkinter import filedialog, messagebox, ttk
@@ -78,7 +80,11 @@ from .logic import PreprocessResult
 # Shared helpers from the top-level GUI common module: the state bus,
 # the advanced-dialog opener, and the "build a defaults dict from
 # PARAM_SPEC" helper.
-from ...gui_common import AppState, open_advanced, spec_defaults
+from ...gui_common import (
+    AppState, apply_dark_to_tk_widget, attach_resize_handle,
+    bind_mousewheel_to_scrollable, drain_queue, open_advanced,
+    spec_defaults,
+)
 
 
 class PreprocessTab(ttk.Frame):
@@ -136,29 +142,42 @@ class PreprocessTab(ttk.Frame):
 
         # Lay out the widgets.
         self._build_ui()
-        # ``after(ms, callback)`` schedules ``callback`` to run on
-        # the Tk main thread ``ms`` milliseconds from now. We use
-        # this to start the polling loop that drains the log queue
-        # without ever blocking the GUI.
-        self.after(self.POLL_MS, self._drain_log_queue)
+        # ``drain_queue`` polls ``self._log_queue`` from the Tk main
+        # thread every ``POLL_MS`` ms and dispatches each
+        # ``(kind, payload)`` to the matching handler -- the worker
+        # thread can ``print`` (via QueueWriter) without ever blocking
+        # the GUI.
+        drain_queue(self, self._log_queue,
+                    {"log": self._append_log,
+                     "done": self._on_done,
+                     "error": self._on_error},
+                    poll_ms=self.POLL_MS)
 
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        dir_frame = ttk.LabelFrame(self, text="1. Working directory (raw TIFFs)",
-                                   padding=8)
-        dir_frame.pack(fill="x", pady=(0, 8))
+        # Panels stack vertically at their natural heights. Only panels
+        # 2 (TIFF files) and 5 (Log) carry a draggable resize grip --
+        # dragging extends the panel downward and the surrounding
+        # scrollable wrapper lets the tab body grow as long as we want.
+        # Panels 1, 3, 4 stay fixed-height; resizing one of the variable
+        # panels never shrinks the others.
+        dir_frame = ttk.LabelFrame(self,
+                                   text="1. Working directory (raw TIFFs)",
+                                   padding=6)
+        dir_frame.pack(fill="x", padx=4, pady=(4, 2))
 
         self.dir_var = tk.StringVar()
-        ttk.Entry(dir_frame, textvariable=self.dir_var).grid(
+        ctk.CTkEntry(dir_frame, textvariable=self.dir_var).grid(
             row=0, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(dir_frame, text="Browse...", command=self._browse_dir).grid(
-            row=0, column=1)
+        ctk.CTkButton(dir_frame, text="Browse...", width=90,
+                      command=self._browse_dir).grid(row=0, column=1)
 
         # Subfolder search depth (BFS): 0 = only files in working_dir
         self.depth_var = tk.IntVar(value=0)
-        ttk.Label(dir_frame, text="Search depth (subfolders):").grid(
+        ctk.CTkLabel(dir_frame, text="Search depth (subfolders):").grid(
             row=1, column=0, sticky="w", pady=(6, 0))
+        # ttk.Spinbox kept -- customtkinter has no spinbox equivalent.
         depth_spin = ttk.Spinbox(
             dir_frame, from_=0, to=99, width=5,
             textvariable=self.depth_var, command=self._refresh_tiffs,
@@ -169,22 +188,28 @@ class PreprocessTab(ttk.Frame):
 
         dir_frame.columnconfigure(0, weight=1)
 
+        # tk.Frame wrap so configure(height=) is honoured -- ttk widgets
+        # recompute reqh from content after children land, which
+        # otherwise undoes the resize handle's height changes.
+        tiff_wrap = tk.Frame(self)
+        tiff_wrap.pack(fill="x", padx=4, pady=2)
         tiff_frame = ttk.LabelFrame(
-            self,
+            tiff_wrap,
             text="2. TIFF files  (select 1+; multi-selection -> one grouped "
                  "recording)",
-            padding=8,
+            padding=6,
         )
-        tiff_frame.pack(fill="x", pady=(0, 8))
+        tiff_frame.pack(fill="both", expand=True)
 
-        list_holder = ttk.Frame(tiff_frame)
-        list_holder.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        list_holder = ctk.CTkFrame(tiff_frame, fg_color="transparent")
+        list_holder.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         list_holder.columnconfigure(0, weight=1)
+        list_holder.rowconfigure(0, weight=1)
         self.tiff_listbox = tk.Listbox(
             list_holder, selectmode="extended", height=6,
             exportselection=False,
         )
-        self.tiff_listbox.grid(row=0, column=0, sticky="ew")
+        self.tiff_listbox.grid(row=0, column=0, sticky="nsew")
         list_sb = ttk.Scrollbar(list_holder, orient="vertical",
                                 command=self.tiff_listbox.yview)
         list_sb.grid(row=0, column=1, sticky="ns")
@@ -194,58 +219,83 @@ class PreprocessTab(ttk.Frame):
             lambda _e: self._update_existing_status(),
         )
 
-        ttk.Button(tiff_frame, text="Refresh",
-                   command=self._refresh_tiffs).grid(row=0, column=1, sticky="n")
+        ctk.CTkButton(tiff_frame, text="Refresh", width=80,
+                      command=self._refresh_tiffs).grid(
+                          row=0, column=1, sticky="n")
 
-        ttk.Label(
+        ctk.CTkLabel(
             tiff_frame,
             text="Identifier (optional, used as folder name; "
                  "default = '+'-joined stems for groups):",
+            anchor="w",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 2))
         self.identifier_var = tk.StringVar()
         self.identifier_var.trace_add(
             "write", lambda *_a: self._update_existing_status()
         )
-        ttk.Entry(tiff_frame, textvariable=self.identifier_var).grid(
+        ctk.CTkEntry(tiff_frame, textvariable=self.identifier_var).grid(
             row=2, column=0, columnspan=2, sticky="ew")
 
         tiff_frame.columnconfigure(0, weight=1)
+        # Only the list row expands when the panel is dragged taller --
+        # the Identifier label + entry (rows 1 and 2) stay anchored at
+        # the bottom with default weight=0, so growing the panel always
+        # gives more height to the TIFF listbox.
+        tiff_frame.rowconfigure(0, weight=1)
+
+        # Draggable grip extends tiff_wrap downward when the listbox
+        # needs more rows on screen.
+        attach_resize_handle(self, tiff_wrap, min_height=140)
 
         out_frame = ttk.LabelFrame(
-            self, text="3. Output root  (creates data/<recording>/ underneath)",
-            padding=8)
-        out_frame.pack(fill="x", pady=(0, 8))
+            self,
+            text="3. Output root  (creates data/<recording>/ underneath)",
+            padding=6)
+        out_frame.pack(fill="x", padx=4, pady=2)
 
         self.data_root_var = tk.StringVar()
-        ttk.Entry(out_frame, textvariable=self.data_root_var).grid(
+        ctk.CTkEntry(out_frame, textvariable=self.data_root_var).grid(
             row=0, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(out_frame, text="Browse...", command=self._browse_data_root).grid(
-            row=0, column=1)
+        ctk.CTkButton(out_frame, text="Browse...", width=90,
+                      command=self._browse_data_root).grid(row=0, column=1)
         out_frame.columnconfigure(0, weight=1)
 
-        action = ttk.Frame(self)
-        action.pack(fill="x", pady=(4, 8))
-        self.run_btn = ttk.Button(action, text="Run preprocessing",
-                                  command=self._on_run)
+        action = ttk.LabelFrame(self, text="4. Run", padding=6)
+        action.pack(fill="x", padx=4, pady=2)
+        self.run_btn = ctk.CTkButton(action, text="Run preprocessing",
+                                     command=self._on_run)
         self.run_btn.pack(side="left")
-        self.rerun_btn = ttk.Button(action, text="Force rerun",
-                                    command=self._on_force_rerun,
-                                    state="disabled")
+        self.rerun_btn = ctk.CTkButton(action, text="Force rerun",
+                                       command=self._on_force_rerun,
+                                       state="disabled")
         self.rerun_btn.pack(side="left", padx=(6, 0))
-        ttk.Button(action, text="Advanced...",
-                   command=self._on_advanced).pack(side="left", padx=(6, 0))
-        self.progress = ttk.Progressbar(action, mode="indeterminate", length=200)
+        ctk.CTkButton(action, text="Advanced...",
+                      command=self._on_advanced).pack(side="left", padx=(6, 0))
+        self.progress = ctk.CTkProgressBar(
+            action, mode="indeterminate", width=200)
         self.progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(value="Idle.")
         ttk.Label(action, textvariable=self.status_var).pack(side="left")
 
-        log_frame = ttk.LabelFrame(self, text="Log", padding=4)
+        log_wrap = tk.Frame(self)
+        log_wrap.pack(fill="x", padx=4, pady=(2, 0))
+        log_frame = ttk.LabelFrame(log_wrap, text="5. Log", padding=4)
         log_frame.pack(fill="both", expand=True)
         self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True, side="left")
-        sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        sb.pack(fill="y", side="right")
-        self.log.config(yscrollcommand=sb.set)
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
+                               command=self.log.yview)
+        log_sb.pack(fill="y", side="right")
+        self.log.config(yscrollcommand=log_sb.set)
+        apply_dark_to_tk_widget(self.log)
+        apply_dark_to_tk_widget(self.tiff_listbox)
+        # Scroll-on-hover: spin the wheel anywhere over the TIFF list
+        # holder, not just on the narrow scrollbar.
+        bind_mousewheel_to_scrollable(list_holder,
+                                      scroll_target=self.tiff_listbox)
+        # Resize grip below the log -- drag down to grow the log; the
+        # scrollable tab body absorbs the extra height.
+        attach_resize_handle(self, log_wrap, min_height=160, pad=(0, 0))
 
     # -- Handlers -----------------------------------------------------------
 
@@ -327,12 +377,12 @@ class PreprocessTab(ttk.Frame):
         existing = (preprocessing.load_existing_preprocess(out_dir)
                     if out_dir is not None else None)
         if existing is not None:
-            self.rerun_btn.config(state="normal")
+            self.rerun_btn.configure(state="normal")
             self.status_var.set(
                 f"Existing outputs at {out_dir} - Run will load them; "
                 f"use Force rerun to redo.")
         else:
-            self.rerun_btn.config(state="disabled")
+            self.rerun_btn.configure(state="disabled")
             if out_dir is not None:
                 n = len(self._selected_tiff_names())
                 suffix = f" ({n} TIFFs as one group)" if n > 1 else ""
@@ -389,9 +439,9 @@ class PreprocessTab(ttk.Frame):
                 self._on_done(existing)
                 return
 
-        self.run_btn.config(state="disabled")
-        self.rerun_btn.config(state="disabled")
-        self.progress.start(12)
+        self.run_btn.configure(state="disabled")
+        self.rerun_btn.configure(state="disabled")
+        self.progress.start()
         self.status_var.set("Running...")
         if len(srcs) == 1:
             self._append_log(f"--- Preprocessing {srcs[0].name} ---")
@@ -445,20 +495,6 @@ class PreprocessTab(ttk.Frame):
 
     # -- Logging / queue drain ---------------------------------------------
 
-    def _drain_log_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self._log_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "done":
-                    self._on_done(payload)
-                elif kind == "error":
-                    self._on_error(payload)
-        except queue.Empty:
-            pass
-        self.after(self.POLL_MS, self._drain_log_queue)
-
     def _append_log(self, text: str) -> None:
         self.log.config(state="normal")
         self.log.insert("end", text + "\n")
@@ -467,8 +503,8 @@ class PreprocessTab(ttk.Frame):
 
     def _on_done(self, result: PreprocessResult) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
-        self.rerun_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
+        self.rerun_btn.configure(state="normal")
         n_frames_str = (f"{result.n_frames} frames"
                         if result.n_frames > 0 else "n_frames=?")
         self.status_var.set(f"Done - {n_frames_str}.")
@@ -479,7 +515,7 @@ class PreprocessTab(ttk.Frame):
 
     def _on_error(self, msg: str) -> None:
         self.progress.stop()
-        self.run_btn.config(state="normal")
+        self.run_btn.configure(state="normal")
         self._update_existing_status()
         self.status_var.set("Error.")
         self._append_log(f"ERROR: {msg}")

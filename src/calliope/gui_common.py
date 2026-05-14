@@ -40,8 +40,13 @@ import io        # Provides the ``TextIOBase`` base class for QueueWriter.
 import queue     # Thread-safe FIFO queue used by QueueWriter.
 import tkinter as tk
 from pathlib import Path  # Modern object-oriented filesystem path API.
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+
+# ``customtkinter`` ships its own theme manager. The palette helpers
+# below pull the active dark-mode colors so raw ``tk`` widgets (Text,
+# Listbox, Canvas) -- which CTk does not skin -- can match.
+import customtkinter as ctk
 
 # matplotlib's Tk-Agg backend bundles two helper classes:
 # - ``FigureCanvasTkAgg``: turns a Figure into a Tk widget you can pack
@@ -54,6 +59,312 @@ from matplotlib.backends.backend_tkagg import (
 # Imported only so the type hint ``Optional[PreprocessResult]`` below
 # works -- this file never instantiates PreprocessResult itself.
 from .core.preprocessing import PreprocessResult
+
+
+# ---------------------------------------------------------------------------
+# Dark-palette helpers for raw tk widgets
+# ---------------------------------------------------------------------------
+#
+# ``customtkinter`` only restyles widgets you create as ``CTk*``
+# (CTkFrame, CTkButton, etc.). Raw ``tk`` widgets like ``tk.Text``,
+# ``tk.Listbox``, and ``tk.Canvas`` keep their default system colors
+# unless we hand-skin them. These two helpers grab the current CTk
+# theme's frame colors and apply them to a tk widget so the log
+# consoles and listboxes blend with the dark surround.
+
+def _resolve_color(spec) -> str:
+    """CTk theme entries are either a hex string or a 2-tuple
+    ``(light_mode_color, dark_mode_color)``. Return the entry that
+    matches the active appearance mode.
+    """
+    if isinstance(spec, (list, tuple)) and len(spec) == 2:
+        return spec[1] if ctk.get_appearance_mode() == "Dark" else spec[0]
+    return spec
+
+
+def tk_dark_palette() -> dict:
+    """Return a dict of colors keyed by role, sampled from the current
+    CTk theme. Use the entries (``bg``, ``fg``, ``select_bg``,
+    ``select_fg``, ``insert``) to skin raw tk widgets.
+    """
+    theme = ctk.ThemeManager.theme
+    frame_bg = _resolve_color(theme["CTkFrame"]["fg_color"])
+    text_fg = _resolve_color(theme["CTkLabel"]["text_color"])
+    border = _resolve_color(theme["CTkFrame"]["border_color"])
+    button_fg = _resolve_color(theme["CTkButton"]["fg_color"])
+    return {
+        "bg": frame_bg,
+        "fg": text_fg,
+        "select_bg": button_fg,
+        "select_fg": "#ffffff",
+        "insert": text_fg,
+        "border": border,
+        "trough": frame_bg,
+    }
+
+
+def apply_dark_to_tk_widget(widget) -> None:
+    """Recolor a raw ``tk.Text`` / ``tk.Listbox`` / ``tk.Canvas`` so it
+    matches the current CTk dark theme. Silently skips options the
+    widget doesn't accept (a ``tk.Canvas`` has no ``insertbackground``
+    etc.).
+    """
+    palette = tk_dark_palette()
+    options = {
+        "background": palette["bg"],
+        "foreground": palette["fg"],
+        "selectbackground": palette["select_bg"],
+        "selectforeground": palette["select_fg"],
+        "insertbackground": palette["insert"],
+        "highlightthickness": 0,
+        "borderwidth": 0,
+        "relief": "flat",
+    }
+    for opt, val in options.items():
+        try:
+            widget.configure({opt: val})
+        except tk.TclError:
+            # Widget doesn't support this option; skip.
+            pass
+
+
+def attach_resize_handle(parent, target, *, min_height: int = 60,
+                         initial_height: Optional[int] = None,
+                         pad: tuple = (0, 4)):
+    """Pack a thin draggable grip below ``target`` that lets the user
+    resize ``target``'s height by click-and-drag.
+
+    Unlike a ``PanedWindow`` sash, this grip does **not** redistribute
+    space between two siblings -- it just grows / shrinks ``target``,
+    and the surrounding scrollable wrapper handles overflow. Use it
+    when only one panel in a stack should be resizable while the
+    others stay at their natural height.
+
+    ``parent`` is the container the grip is packed into (typically the
+    same parent ``target`` was packed into, packed *after* ``target``).
+    ``min_height`` clamps the drag floor so the panel can't be
+    collapsed to invisibility.
+
+    After each drag we walk up to the nearest ``CTkScrollableFrame``
+    and bump its canvas-window height to match the new total content
+    requirement -- without that step the wrapper holds its old fixed
+    inner-frame height and the dragged panel just crushes its
+    neighbours instead of extending the tab.
+    """
+    target.pack_propagate(False)
+    target.update_idletasks()
+    natural_h = target.winfo_reqheight()
+    target.configure(height=initial_height
+                     if initial_height is not None
+                     else max(natural_h, min_height))
+
+    palette = tk_dark_palette()
+    handle = tk.Frame(parent, height=6, cursor="sb_v_double_arrow",
+                      bg=palette["border"], highlightthickness=0)
+    handle.pack(fill="x", pady=pad)
+
+    state = {"y0": None, "h0": None}
+
+    def _scrollable_ancestor(widget):
+        w = widget.master
+        while w is not None:
+            if isinstance(w, ctk.CTkScrollableFrame):
+                return w
+            w = w.master
+        return None
+
+    def _bump_scrollable(sf):
+        sf.update_idletasks()
+        canvas = sf._parent_canvas
+        window_id = sf._create_window_id
+        canvas_h = canvas.winfo_height()
+        natural = sf.winfo_reqheight()
+        canvas.itemconfigure(window_id, height=max(natural, canvas_h))
+
+    def _on_press(e):
+        state["y0"] = e.y_root
+        state["h0"] = target.winfo_height()
+
+    def _on_drag(e):
+        if state["y0"] is None:
+            return
+        dy = e.y_root - state["y0"]
+        new_h = max(min_height, int(state["h0"] + dy))
+        target.configure(height=new_h)
+        sf = _scrollable_ancestor(target)
+        if sf is not None:
+            _bump_scrollable(sf)
+
+    def _on_enter(_e):
+        handle.configure(bg=palette["select_bg"])
+
+    def _on_leave(_e):
+        handle.configure(bg=palette["border"])
+
+    handle.bind("<ButtonPress-1>", _on_press)
+    handle.bind("<B1-Motion>", _on_drag)
+    handle.bind("<Enter>", _on_enter)
+    handle.bind("<Leave>", _on_leave)
+    return handle
+
+
+def bind_mousewheel_to_scrollable(widget, scroll_target=None) -> None:
+    """Make mouse-wheel events scroll ``scroll_target`` while the cursor
+    is anywhere inside ``widget``.
+
+    Fixes the unintuitive default behaviour where a ``tk.Listbox`` /
+    ``tk.Canvas`` only scrolls when the cursor sits directly on the
+    scrollbar. We register a global ``<MouseWheel>`` handler on
+    ``<Enter>`` and remove it on ``<Leave>``, so the binding is scoped
+    to whenever the user is hovering the panel and doesn't fight other
+    scrollable regions elsewhere.
+
+    ``scroll_target`` defaults to ``widget`` itself; pass a separate
+    target when the scrollable rig wraps a Canvas in an outer frame
+    (e.g. Tab 0's queue body wraps the row canvas in a LabelFrame).
+    """
+    target = scroll_target if scroll_target is not None else widget
+
+    def _on_wheel(event):
+        # Windows fires <MouseWheel> with event.delta in steps of 120
+        # per notch; macOS / Linux fire +/-1. Normalise to scroll-units.
+        if abs(event.delta) >= 120:
+            delta = -int(event.delta / 120)
+        else:
+            delta = -1 if event.delta > 0 else 1
+        try:
+            target.yview_scroll(delta, "units")
+        except tk.TclError:
+            pass
+
+    def _on_enter(_e):
+        widget.bind_all("<MouseWheel>", _on_wheel)
+
+    def _on_leave(_e):
+        widget.unbind_all("<MouseWheel>")
+
+    widget.bind("<Enter>", _on_enter)
+    widget.bind("<Leave>", _on_leave)
+
+
+def drain_queue(widget, q: "queue.Queue", handlers: dict,
+                *, poll_ms: int = 100) -> None:
+    """Pull every ``(kind, payload)`` tuple off ``q`` and dispatch each
+    to ``handlers[kind]``, then re-arm via ``widget.after(poll_ms, ...)``.
+
+    Pre-Phase-6 every tab carried its own ``_drain_*_queue`` method
+    that duplicated the same loop:
+
+        while True:
+            kind, payload = self._queue.get_nowait()
+            if   kind == "log":   self._on_log(payload)
+            elif kind == "done":  self._on_done(payload)
+            ...
+        self.after(POLL_MS, self._drain_queue)
+
+    Each tab now collapses that loop to::
+
+        drain_queue(self, self._log_queue,
+                    {"log": self._append_log,
+                     "done": self._on_done,
+                     "error": self._on_error},
+                    poll_ms=self.POLL_MS)
+
+    Unknown kinds are silently ignored so a handler dict can lag the
+    producer without crashing. ``widget`` is any Tk widget that owns
+    an ``.after`` method (the tab itself works).
+    """
+
+    def _tick() -> None:
+        try:
+            while True:
+                kind, payload = q.get_nowait()
+                handler = handlers.get(kind)
+                if handler is not None:
+                    handler(payload)
+        except queue.Empty:
+            pass
+        widget.after(poll_ms, _tick)
+
+    widget.after(poll_ms, _tick)
+
+
+def apply_ttk_dark_theme(root) -> None:
+    """Restyle every ``ttk`` widget class to blend with the CTk dark
+    surround. Must be called once after the root window exists.
+
+    ``ttk`` widgets (Frame, LabelFrame, Button, Entry, Scrollbar,
+    Combobox, Checkbutton, Radiobutton, Progressbar, Separator,
+    PanedWindow) are not touched by customtkinter. Their default
+    system theme renders bright on a dark root. Switching the ttk
+    theme to ``clam`` and overriding common widget classes gives them
+    a passable dark look during the Phase-2/3 transition before each
+    tab is fully migrated to CTk widgets.
+    """
+    palette = tk_dark_palette()
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        # The clam theme is missing on some custom builds; fall back
+        # to whichever default the user has.
+        pass
+    fg = palette["fg"]
+    bg = palette["bg"]
+    # Hover / pressed shade: CTk's typical button hover.
+    hover = _resolve_color(
+        ctk.ThemeManager.theme["CTkButton"]["hover_color"])
+    accent = palette["select_bg"]
+
+    style.configure(".", background=bg, foreground=fg, fieldbackground=bg,
+                    bordercolor=palette["border"], lightcolor=bg,
+                    darkcolor=bg, troughcolor=bg)
+    style.configure("TFrame", background=bg)
+    style.configure("TLabel", background=bg, foreground=fg)
+    style.configure("TLabelframe", background=bg, foreground=fg,
+                    bordercolor=palette["border"])
+    style.configure("TLabelframe.Label", background=bg, foreground=fg)
+    style.configure("TButton", background=accent, foreground="#ffffff",
+                    bordercolor=accent, focusthickness=0, padding=4)
+    style.map("TButton",
+              background=[("active", hover), ("pressed", hover)])
+    style.configure("TEntry", fieldbackground=bg, foreground=fg,
+                    insertcolor=fg, bordercolor=palette["border"])
+    style.configure("TCombobox", fieldbackground=bg, background=bg,
+                    foreground=fg, arrowcolor=fg,
+                    bordercolor=palette["border"])
+    style.map("TCombobox",
+              fieldbackground=[("readonly", bg)],
+              foreground=[("readonly", fg)])
+    style.configure("TCheckbutton", background=bg, foreground=fg,
+                    indicatorbackground=bg, indicatorforeground=fg,
+                    focuscolor=bg)
+    style.map("TCheckbutton", background=[("active", bg)])
+    style.configure("TRadiobutton", background=bg, foreground=fg,
+                    indicatorbackground=bg, focuscolor=bg)
+    style.map("TRadiobutton", background=[("active", bg)])
+    style.configure("TProgressbar", background=accent, troughcolor=bg,
+                    bordercolor=palette["border"])
+    style.configure("TSeparator", background=palette["border"])
+    style.configure("TPanedwindow", background=bg)
+    style.configure("Sash", sashthickness=6, background=palette["border"])
+    style.configure("Vertical.TScrollbar", background=bg, troughcolor=bg,
+                    bordercolor=palette["border"], arrowcolor=fg)
+    style.configure("Horizontal.TScrollbar", background=bg, troughcolor=bg,
+                    bordercolor=palette["border"], arrowcolor=fg)
+    style.map("Vertical.TScrollbar",
+              background=[("active", hover), ("pressed", hover)])
+    style.map("Horizontal.TScrollbar",
+              background=[("active", hover), ("pressed", hover)])
+    style.configure("TSpinbox", fieldbackground=bg, background=bg,
+                    foreground=fg, arrowcolor=fg,
+                    bordercolor=palette["border"])
+    style.configure("TNotebook", background=bg, bordercolor=palette["border"])
+    style.configure("TNotebook.Tab", background=bg, foreground=fg,
+                    padding=(10, 4))
+    style.map("TNotebook.Tab",
+              background=[("selected", accent), ("active", hover)],
+              foreground=[("selected", "#ffffff")])
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +519,7 @@ class AppState:
 # Advanced parameters dialog
 # ---------------------------------------------------------------------------
 
-class AdvancedDialog(tk.Toplevel):
+class AdvancedDialog(ctk.CTkToplevel):
     """Modal Toplevel that auto-builds an Entry/Combobox form from a
     list of parameter specs and writes accepted values into ``current``.
 
@@ -248,6 +559,7 @@ class AdvancedDialog(tk.Toplevel):
         self.transient(master)
         self.resizable(True, True)
         self.geometry("560x600")
+        self.wm_minsize(440, 400)
         # Stash the inputs on the instance so the helper methods below
         # can read them. ``self._defaults`` is a dict comprehension --
         # the Python form of R's ``setNames(...)`` shortcut: build a
@@ -273,33 +585,18 @@ class AdvancedDialog(tk.Toplevel):
     def _build_ui(self) -> None:
         """Lay out the scrollable form, the per-group LabelFrames, and
         the OK / Cancel / Reset buttons. The actual fields are added by
-        ``_add_field`` per spec."""
-        # Outer frame holds the scroll canvas + scrollbar.
-        outer = ttk.Frame(self); outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        ``_add_field`` per spec.
 
-        # Tk's ``Canvas`` lets us host any widget by wrapping it in a
-        # window item. The fields go inside ``inner``; the canvas
-        # scrolls ``inner`` vertically.
-        inner = ttk.Frame(canvas, padding=8)
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        # Resize handler: keep the inner frame's width matching the
-        # canvas so the form fills horizontally, and update the
-        # scrollable region to match its full height.
-        def _resize(_e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(win, width=canvas.winfo_width())
-        inner.bind("<Configure>", _resize)
-        canvas.bind("<Configure>", _resize)
+        Uses ``CTkScrollableFrame`` for the form body so the dialog can
+        host long PARAM_SPECs without forcing a tall fixed window.
+        """
+        inner = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
         # Group fields by their ``group`` key. ``groups`` maps group
         # name -> (LabelFrame, current row). We add a new LabelFrame
-        # the first time each group is encountered.
+        # the first time each group is encountered. ttk.LabelFrame is
+        # kept (no CTk equivalent) and reads the dark ttk theme.
         groups: dict = {}
         for spec in self._specs:
             grp = spec.get("group", "Parameters")
@@ -313,20 +610,21 @@ class AdvancedDialog(tk.Toplevel):
             groups[grp] = (lf, row + 1)
 
         # Bottom button row: Reset / Cancel / OK.
-        btn_row = ttk.Frame(self, padding=(8, 4)); btn_row.pack(fill="x")
-        ttk.Button(btn_row, text="Reset to defaults",
-                   command=self._reset_defaults).pack(side="left")
-        ttk.Button(btn_row, text="Cancel",
-                   command=self._on_cancel).pack(side="right")
-        ttk.Button(btn_row, text="OK",
-                   command=self._on_ok).pack(side="right", padx=(0, 6))
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=6)
+        ctk.CTkButton(btn_row, text="Reset to defaults", width=160,
+                      command=self._reset_defaults).pack(side="left")
+        ctk.CTkButton(btn_row, text="Cancel", width=100,
+                      command=self._on_cancel).pack(side="right")
+        ctk.CTkButton(btn_row, text="OK", width=100,
+                      command=self._on_ok).pack(side="right", padx=(0, 6))
 
     def _add_field(self, parent, row, spec) -> None:
         """Create one row in the group's LabelFrame: label | widget |
         help text. The widget type depends on ``spec["type"]``."""
         name = spec["name"]
         label = spec.get("label", name)
-        ttk.Label(parent, text=label).grid(
+        ctk.CTkLabel(parent, text=label, anchor="w").grid(
             row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         # Pre-fill from the caller's ``current`` dict if a value is
         # already there, otherwise from the spec's default.
@@ -337,26 +635,27 @@ class AdvancedDialog(tk.Toplevel):
         # ``var.set(...)`` updates the widget; ``var.get()`` reads it.
         if spec["type"] == "bool":
             var = tk.BooleanVar(value=bool(cur))
-            ttk.Checkbutton(parent, variable=var).grid(
+            ctk.CTkCheckBox(parent, text="", variable=var).grid(
                 row=row, column=1, sticky="w", pady=2)
         elif spec["type"] == "choice":
             var = tk.StringVar(value=str(cur))
-            cb = ttk.Combobox(parent, textvariable=var, state="readonly",
-                              values=list(spec.get("choices", [])))
+            cb = ctk.CTkComboBox(parent, variable=var, state="readonly",
+                                 values=list(spec.get("choices", [])))
             cb.grid(row=row, column=1, sticky="ew", pady=2)
         else:
             # ints, floats and free-form strings all use a plain Entry.
             # We store the value as a string and coerce in ``_coerce``.
             var = tk.StringVar(value=str(cur))
-            ttk.Entry(parent, textvariable=var).grid(
+            ctk.CTkEntry(parent, textvariable=var).grid(
                 row=row, column=1, sticky="ew", pady=2)
 
         # Optional italic-grey help text shown to the right of the
         # input -- the cheapest possible tooltip.
         help_text = spec.get("help")
         if help_text:
-            ttk.Label(parent, text=help_text, foreground="gray",
-                      font=("", 8, "italic")).grid(
+            ctk.CTkLabel(parent, text=help_text, text_color="gray",
+                         font=ctk.CTkFont(size=10, slant="italic"),
+                         anchor="w").grid(
                 row=row, column=2, sticky="w", padx=(8, 0), pady=2)
 
         # Save (var, spec) so the OK handler can read the value back
@@ -438,6 +737,134 @@ def open_advanced(master, title: str, specs: list[dict],
     # dialog stays responsive.
     master.wait_window(dlg)
     return dlg._accepted
+
+
+def pick_tiffs_dialog(parent: tk.Misc, *, title: str,
+                      initial_dir: str = "",
+                      current_paths: Optional[list[str]] = None,
+                      initial_depth: int = 0) -> Optional[list[str]]:
+    """Modal Listbox-based TIFF picker (the same dialog Tab 1 and the
+    batch row "Browse..." buttons open).
+
+    Shows the TIFFs under ``initial_dir`` (recursing to
+    ``initial_depth`` sub-levels) in a multi-select Listbox. Returns
+    the list of absolute paths the user confirmed, or ``None`` if the
+    dialog was cancelled.
+
+    The user can change the search root + depth and hit "Refresh" to
+    re-populate the list. Items already in ``current_paths`` are
+    pre-selected.
+    """
+    from .core import preprocessing
+
+    win = ctk.CTkToplevel(parent)
+    win.title(title)
+    win.transient(parent.winfo_toplevel())
+    win.grab_set()
+    win.geometry("700x520")
+    win.wm_minsize(560, 380)
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=8, pady=8)
+
+    row = ctk.CTkFrame(body, fg_color="transparent")
+    row.pack(fill="x", pady=(0, 6))
+    ctk.CTkLabel(row, text="Folder:", width=70, anchor="w").pack(side="left")
+    dir_var = tk.StringVar(value=initial_dir or "")
+    ctk.CTkEntry(row, textvariable=dir_var).pack(
+        side="left", fill="x", expand=True, padx=(0, 4))
+    ctk.CTkButton(
+        row, text="Browse...", width=90,
+        command=lambda: dir_var.set(
+            filedialog.askdirectory(title="Pick search folder",
+                                    parent=win) or dir_var.get())
+    ).pack(side="left")
+
+    row = ctk.CTkFrame(body, fg_color="transparent")
+    row.pack(fill="x", pady=(0, 6))
+    ctk.CTkLabel(row, text="Depth:", width=70, anchor="w").pack(side="left")
+    depth_var = tk.IntVar(value=max(0, int(initial_depth)))
+    # ttk.Spinbox kept -- customtkinter has no spinbox equivalent.
+    ttk.Spinbox(row, from_=0, to=6, width=4,
+                textvariable=depth_var).pack(side="left")
+    refresh_btn = ctk.CTkButton(row, text="Refresh", width=90)
+    refresh_btn.pack(side="left", padx=(8, 0))
+    status_var = tk.StringVar(value="")
+    ttk.Label(row, textvariable=status_var,
+              font=("", 9, "italic")).pack(side="left", padx=(8, 0))
+
+    list_holder = ctk.CTkFrame(body, fg_color="transparent")
+    list_holder.pack(fill="both", expand=True)
+    list_holder.columnconfigure(0, weight=1)
+    list_holder.rowconfigure(0, weight=1)
+    listbox = tk.Listbox(list_holder, selectmode="extended",
+                         exportselection=False)
+    listbox.grid(row=0, column=0, sticky="nsew")
+    apply_dark_to_tk_widget(listbox)
+    sb = ttk.Scrollbar(list_holder, orient="vertical",
+                       command=listbox.yview)
+    sb.grid(row=0, column=1, sticky="ns")
+    listbox.configure(yscrollcommand=sb.set)
+
+    paths_state: list[str] = []  # mutated by _refresh; lives in closure
+    current_set = {str(Path(p).resolve()) for p in (current_paths or [])}
+
+    def _refresh():
+        d = dir_var.get().strip()
+        listbox.delete(0, "end")
+        paths_state.clear()
+        if not d:
+            status_var.set("Pick a folder.")
+            return
+        if not Path(d).is_dir():
+            status_var.set(f"Not a folder: {d}")
+            return
+        depth = max(0, int(depth_var.get()))
+        try:
+            paths = preprocessing.list_tiffs(d, max_depth=depth)
+        except Exception as e:
+            status_var.set(f"List error: {e}")
+            return
+        d_path = Path(d)
+        for p in paths:
+            try:
+                rel = Path(p).relative_to(d_path).as_posix()
+            except ValueError:
+                rel = str(p)
+            paths_state.append(str(p))
+            listbox.insert("end", rel)
+        # Pre-select rows whose absolute path matches current_paths.
+        for i, abs_p in enumerate(paths_state):
+            if str(Path(abs_p).resolve()) in current_set:
+                listbox.selection_set(i)
+        n_sel = len(listbox.curselection())
+        status_var.set(
+            f"{len(paths)} TIFFs"
+            + (f"  ({n_sel} pre-selected)" if n_sel else ""))
+
+    refresh_btn.configure(command=_refresh)
+
+    foot = ctk.CTkFrame(body, fg_color="transparent")
+    foot.pack(fill="x", pady=(8, 0))
+    result: dict = {"paths": None}
+
+    def _confirm():
+        sel = listbox.curselection()
+        result["paths"] = [paths_state[i] for i in sel]
+        win.destroy()
+
+    def _cancel():
+        result["paths"] = None
+        win.destroy()
+
+    ctk.CTkButton(foot, text="Cancel", width=90,
+                  command=_cancel).pack(side="right")
+    ctk.CTkButton(foot, text="Confirm", width=100,
+                  command=_confirm).pack(side="right", padx=(0, 6))
+
+    _refresh()
+    parent.wait_window(win)
+    return result["paths"]
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +982,10 @@ def attach_fig_toolbar(canvas: FigureCanvasTkAgg,
     tb = NavigationToolbar2Tk(canvas, tb_frame, pack_toolbar=False)
     tb.update()
     tb.pack(side="left", fill="x")
+    # matplotlib's toolbar ships as a raw ``tk.Frame`` with system-grey
+    # ``tk.Button``s and a coordinate ``tk.Label`` -- bright spots on
+    # the dark surround. Recolour every child to the dark palette here.
+    restyle_matplotlib_toolbar(tb)
     # ``lambda x=default: ...`` is Python's anonymous function (R: ``\(x)
     # ...`` or ``function(x) ...``). The ``c=canvas`` form captures the
     # current value of ``canvas`` at lambda creation time, dodging the
@@ -565,10 +996,58 @@ def attach_fig_toolbar(canvas: FigureCanvasTkAgg,
             plot_data_export.save_figure_data(c.figure, p, b)
     else:
         cmd = lambda p=tb_frame: data_provider(p)
-    ttk.Button(
-        tb_frame, text="Save data...", command=cmd,
+    ctk.CTkButton(
+        tb_frame, text="Save data...", command=cmd, width=110,
     ).pack(side="left", padx=(8, 0))
     return tb
+
+
+def restyle_matplotlib_toolbar(tb) -> None:
+    """Recolour every child of a matplotlib ``NavigationToolbar2Tk`` to
+    blend with the dark theme. The toolbar's internal buttons are raw
+    ``tk.Button`` widgets and its message Label is a ``tk.Label``; both
+    keep system colours unless we touch them.
+    """
+    palette = tk_dark_palette()
+    try:
+        tb.configure(background=palette["bg"])
+    except tk.TclError:
+        pass
+    hover = _resolve_color(
+        ctk.ThemeManager.theme["CTkButton"]["hover_color"])
+    for child in tb.winfo_children():
+        try:
+            cls = child.winfo_class()
+        except tk.TclError:
+            continue
+        if cls == "Button":
+            try:
+                child.configure(
+                    background=palette["bg"], foreground=palette["fg"],
+                    activebackground=hover, activeforeground=palette["fg"],
+                    relief="flat", borderwidth=0, highlightthickness=0,
+                )
+            except tk.TclError:
+                pass
+        elif cls in ("Label", "Frame"):
+            try:
+                child.configure(background=palette["bg"],
+                                foreground=palette["fg"])
+            except tk.TclError:
+                # tk.Frame has no ``foreground``.
+                try:
+                    child.configure(background=palette["bg"])
+                except tk.TclError:
+                    pass
+        elif cls == "Checkbutton":
+            try:
+                child.configure(background=palette["bg"],
+                                foreground=palette["fg"],
+                                activebackground=hover,
+                                selectcolor=palette["bg"],
+                                highlightthickness=0)
+            except tk.TclError:
+                pass
 
 
 # ---------------------------------------------------------------------------
