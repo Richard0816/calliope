@@ -121,8 +121,8 @@ from ...gui_common import (
 
 
 # ``DEFAULT_PREFIX``, ``DEFAULT_PALETTE``, ``ABOVE_CUT_COLOR`` are
-# imported from ``.logic`` above so ``ReclusterWindow`` (now in
-# ``logic.py``) and ``ClusteringTab`` share the same constants.
+# imported from ``.logic`` above so ``ReclusterWindow`` and
+# ``ClusteringTab`` share the same constants.
 # Cluster ROI .npy files are written directly into
 # ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster"
 # subfolder. Tab 7 + the headless ``crosscorrelation_run`` already
@@ -142,11 +142,11 @@ POLL_MS = 80
 # ---------------------------------------------------------------------------
 
 
-class ClusteringTab(ttk.Frame):
+class ClusteringTab(ctk.CTkFrame):
     """Cross-correlation hierarchical clustering tab."""
 
     def __init__(self, master, state=None) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
 
         self._plane0: Optional[Path] = None
@@ -214,14 +214,17 @@ class ClusteringTab(ttk.Frame):
     # -- UI ----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        head = ttk.LabelFrame(
-            self, text="Cross-correlation clustering "
-                       "(1 - Pearson r, hierarchical, average linkage)",
-            padding=8)
-        head.pack(fill="x", pady=(0, 6))
+        head = ctk.CTkFrame(self)
+        head.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            head,
+            text="Cross-correlation clustering "
+                 "(1 - Pearson r, hierarchical, average linkage)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         row1 = ctk.CTkFrame(head, fg_color="transparent")
-        row1.pack(fill="x", pady=2)
+        row1.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row1, text="plane0:").pack(side="left")
         self.path_var = tk.StringVar(value="")
         ctk.CTkEntry(row1, textvariable=self.path_var, width=560).pack(
@@ -230,7 +233,7 @@ class ClusteringTab(ttk.Frame):
                       command=self._on_browse).pack(side="left")
 
         row2 = ctk.CTkFrame(head, fg_color="transparent")
-        row2.pack(fill="x", pady=2)
+        row2.pack(fill="x", padx=8, pady=2)
         self.run_btn = ctk.CTkButton(
             row2, text="Run analysis", command=self._on_run, state="disabled")
         self.run_btn.pack(side="left")
@@ -242,13 +245,14 @@ class ClusteringTab(ttk.Frame):
                                            width=140)
         self.progress.pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="Pick a plane0 folder.")
-        ttk.Label(row2, textvariable=self.status_var,
-                  font=("", 9, "italic")).pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(row2, textvariable=self.status_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left", fill="x", expand=True)
 
         # Recluster controls: drill into one or more clusters (branches) at
         # the current cut and re-cluster only those ROIs at a finer threshold.
         row3 = ctk.CTkFrame(head, fg_color="transparent")
-        row3.pack(fill="x", pady=2)
+        row3.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row3, text="Recluster branch(es):").pack(side="left")
         self._cluster_vars: dict[int, tk.BooleanVar] = {}
         self.cluster_menu = tk.Menu(self, tearoff=False)
@@ -273,7 +277,7 @@ class ClusteringTab(ttk.Frame):
         # / Tab 5 manual-ROI entries or external scripts. Auto-refreshes on
         # every menu toggle and every threshold/palette change.
         row3b = ctk.CTkFrame(head, fg_color="transparent")
-        row3b.pack(fill="x", pady=2)
+        row3b.pack(fill="x", padx=8, pady=(2, 6))
         ctk.CTkLabel(row3b, text="ROIs in picked clusters (Suite2p ids):").pack(
             side="left")
         self.roi_list_var = tk.StringVar(value="")
@@ -290,30 +294,35 @@ class ClusteringTab(ttk.Frame):
         # slider) from the spatial canvas. Dragging redistributes width
         # between exactly two panes (matching Tab 7's behaviour) so the
         # slider stays tied to the dendrogram it controls.
+        # ttk.PanedWindow kept -- customtkinter has no equivalent.
         body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        left_pane = ttk.Frame(body)
+        left_pane = ctk.CTkFrame(body, fg_color="transparent")
         body.add(left_pane, weight=3)
         left_pane.columnconfigure(0, weight=1)
         left_pane.columnconfigure(1, weight=0)
         left_pane.rowconfigure(0, weight=1)
 
         # Dendrogram canvas.
-        dframe = ttk.LabelFrame(left_pane, text="Dendrogram", padding=4)
+        dframe = ctk.CTkFrame(left_pane)
         dframe.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(dframe, text="Dendrogram",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.d_fig = plt.Figure(figsize=(6.5, 4.5), tight_layout=True)
         self.d_ax = self.d_fig.add_subplot(111)
         self._placeholder(self.d_ax, "Run analysis to populate.")
         self.d_canvas = FigureCanvasTkAgg(self.d_fig, master=dframe)
         attach_fig_toolbar(self.d_canvas, dframe)
-        self.d_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.d_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                           padx=4, pady=(0, 4))
 
         # Vertical slider for the cut, glued to the right edge of the
         # dendrogram pane (not its own sash pane).
-        sframe = ttk.Frame(left_pane)
+        sframe = ctk.CTkFrame(left_pane, fg_color="transparent")
         sframe.grid(row=0, column=1, sticky="ns", padx=4)
-        ttk.Label(sframe, text="cut").pack(side="top", pady=(4, 0))
+        ctk.CTkLabel(sframe, text="cut").pack(side="top", pady=(4, 0))
         # tk.Scale (not ttk.Scale) kept here -- its ``resolution`` and
         # ``showvalue`` knobs have no clean CTkSlider equivalent, and the
         # apply_dark_to_tk_widget skin already matches the dark surround.
@@ -324,19 +333,22 @@ class ClusteringTab(ttk.Frame):
         self.threshold_scale.pack(side="top", fill="y", expand=True)
         apply_dark_to_tk_widget(self.threshold_scale)
         self.threshold_readout = tk.StringVar(value="-")
-        ttk.Label(sframe, textvariable=self.threshold_readout,
-                  width=8, anchor="center").pack(side="top")
+        ctk.CTkLabel(sframe, textvariable=self.threshold_readout,
+                     width=64, anchor="center").pack(side="top")
 
         # Spatial canvas.
-        sp_frame = ttk.LabelFrame(body, text="Spatial (cluster colors)",
-                                  padding=4)
+        sp_frame = ctk.CTkFrame(body)
         body.add(sp_frame, weight=2)
+        ctk.CTkLabel(sp_frame, text="Spatial (cluster colors)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.s_fig = plt.Figure(figsize=(5.5, 4.5), tight_layout=True)
         self.s_ax = self.s_fig.add_subplot(111)
         self._placeholder(self.s_ax, "Run analysis to populate.")
         self.s_canvas = FigureCanvasTkAgg(self.s_fig, master=sp_frame)
         attach_fig_toolbar(self.s_canvas, sp_frame)
-        self.s_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.s_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                           padx=4, pady=(0, 4))
         # Click an ROI on the spatial map to open a popout showing the
         # heatmap + raster for that ROI's cluster. Resolved via a
         # cached label image (built every render in _render_all) that
@@ -348,7 +360,7 @@ class ClusteringTab(ttk.Frame):
 
         # Bottom controls.
         ctl = ctk.CTkFrame(self, fg_color="transparent")
-        ctl.pack(fill="x", pady=(6, 0))
+        ctl.pack(fill="x", padx=10, pady=(6, 10))
 
         self.manual_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -404,6 +416,43 @@ class ClusteringTab(ttk.Frame):
             return
         self.path_var.set(path)
         self._set_plane0(Path(path))
+
+    def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
+        """BatchTab calls this after a row's scratch->HDD copy. Drop
+        any ``np.memmap`` we still hold against a file under
+        ``scratch`` so Windows releases the handle before the bulk
+        rmtree. The next Run analysis on the new recording reopens
+        against the HDD path.
+
+        Covers two holders the path-walking repoint can't reach:
+          - ``self._dff`` -- memmap returned by ``load_filtered_dff``
+            and stashed in ``_on_done``; never nulled by
+            ``_set_plane0`` so it would leak across recordings.
+          - The open ``ClusterPopout``'s ``_dff`` -- ``np.asarray``
+            on a memmap returns the memmap unchanged, so the popout
+            also retains the scratch handle.
+        """
+        def _under_scratch(arr) -> bool:
+            fname = getattr(arr, "filename", None)
+            if fname is None:
+                return False
+            try:
+                Path(fname).relative_to(scratch)
+            except (TypeError, ValueError, OSError):
+                return False
+            return True
+
+        if _under_scratch(self._dff):
+            self._dff = None
+
+        popout = self._cluster_popout
+        if popout is not None:
+            try:
+                if popout.winfo_exists() and _under_scratch(
+                        getattr(popout, "_dff", None)):
+                    popout._dff = None
+            except Exception:
+                pass
 
     def _set_plane0(self, plane0: Path) -> None:
         self._plane0 = plane0
@@ -1232,7 +1281,8 @@ class ClusteringTab(ttk.Frame):
         np.save(out_dir / "linkage.npy", self._Z)
         np.save(out_dir / "threshold_used.npy", np.array([T], dtype=float))
         # Marker so the xcorr runner knows the .npy files contain Suite2p
-        # ROI indices (post-2026-04-30 layout) and skips legacy translation.
+        # ROI indices directly and skips the filtered-position translation
+        # step it would otherwise apply.
         (out_dir / "_indices_are_suite2p").write_text("1")
         return out_dir
 

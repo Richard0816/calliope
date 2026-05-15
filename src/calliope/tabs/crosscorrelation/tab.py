@@ -84,7 +84,7 @@ from matplotlib.backends.backend_tkagg import (
 import customtkinter as ctk
 
 from ...gui_common import (
-    apply_dark_to_tk_widget, drain_queue, restyle_matplotlib_toolbar,
+    drain_queue, install_scroll_router, restyle_matplotlib_toolbar,
 )
 from .logic import xc
 from .logic import utils
@@ -346,13 +346,13 @@ class ViolinWindow(ctk.CTkToplevel):
         if not self._pair_data:
             # Theme-safe error red -- "red" on the dark theme reads too
             # dim; this hex pops against the gray17 surround.
-            ttk.Label(
-                self, padding=20, foreground="#ff6b6b",
+            ctk.CTkLabel(
+                self, text_color="#ff6b6b",
                 text=("No CAxCB/*_summary.csv files found in:\n"
                       f"{xcorr_root}\n\n"
                       "Run the full-recording cross-correlation first."),
                 wraplength=900,
-            ).pack(fill="both", expand=True)
+            ).pack(fill="both", expand=True, padx=20, pady=20)
             return
 
         # Cluster ids present in the pair names (e.g. {1, 2, 3, 4, 5}).
@@ -369,13 +369,17 @@ class ViolinWindow(ctk.CTkToplevel):
 
         self._build_ui()
         self._render()
+        # Consume wheel events so they don't leak through CTk's
+        # global bind_all and scroll the main app behind this popout.
+        install_scroll_router(self)
 
     def _build_ui(self) -> None:
         ctl = ctk.CTkFrame(self, fg_color="transparent")
         ctl.pack(fill="x", padx=6, pady=(6, 0))
         ctk.CTkLabel(ctl, text="Include clusters:").pack(side="left")
         self.cluster_menu = tk.Menu(self, tearoff=False)
-        # ttk.Menubutton kept -- customtkinter has no cascade-menu equiv.
+        # ttk.Menubutton because customtkinter has no cascade-menu widget --
+        # we need the checkbutton-list dropdown for "include cluster" toggles.
         self.cluster_menu_btn = ttk.Menubutton(ctl, text="all", width=24)
         self.cluster_menu_btn.config(menu=self.cluster_menu)
         self.cluster_menu_btn.pack(side="left", padx=(8, 0))
@@ -400,24 +404,23 @@ class ViolinWindow(ctk.CTkToplevel):
         self.apply_btn.pack(side="left", padx=(6, 0))
 
         self._pair_count_var = tk.StringVar(value="")
-        # ttk.Label retained for the textvariable binding.
-        ttk.Label(ctl, textvariable=self._pair_count_var
-                  ).pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(ctl, textvariable=self._pair_count_var
+                     ).pack(side="left", padx=(12, 0))
 
         self.fig = plt.Figure(figsize=(10, 7), constrained_layout=True)
         self.ax_corr = self.fig.add_subplot(2, 1, 1)
         self.ax_lag = self.fig.add_subplot(2, 1, 2)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
 
-        tb_frame = ttk.Frame(self)
+        tb_frame = ctk.CTkFrame(self, fg_color="transparent")
         tb_frame.pack(fill="x")
         self.toolbar = NavigationToolbar2Tk(
             self.canvas, tb_frame, pack_toolbar=False)
         self.toolbar.update()
         restyle_matplotlib_toolbar(self.toolbar)
         self.toolbar.pack(side="left", fill="x")
-        ttk.Button(
-            tb_frame, text="Save data...",
+        ctk.CTkButton(
+            tb_frame, text="Save data...", width=110,
             command=self._on_save_violin_data,
         ).pack(side="left", padx=(8, 0))
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -593,11 +596,11 @@ def _read_event_windows_from_summary(plane0: Path):
     return []
 
 
-class CrossCorrelationTab(ttk.Frame):
+class CrossCorrelationTab(ctk.CTkFrame):
     """Cluster x cluster cross-correlation, full recording + per-event."""
 
     def __init__(self, master, state=None) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
 
         self._plane0: Optional[Path] = None
@@ -643,13 +646,17 @@ class CrossCorrelationTab(ttk.Frame):
     # -- UI ----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        head = ttk.LabelFrame(
-            self, text="Cluster x cluster cross-correlation "
-                       "(batched matmul, best lag + zero lag)", padding=8)
-        head.pack(fill="x", pady=(0, 6))
+        head = ctk.CTkFrame(self)
+        head.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            head,
+            text="Cluster x cluster cross-correlation "
+                 "(batched matmul, best lag + zero lag)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         row1 = ctk.CTkFrame(head, fg_color="transparent")
-        row1.pack(fill="x", pady=2)
+        row1.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row1, text="plane0:").pack(side="left")
         self.path_var = tk.StringVar(value="")
         ctk.CTkEntry(row1, textvariable=self.path_var, width=560).pack(
@@ -658,7 +665,7 @@ class CrossCorrelationTab(ttk.Frame):
                       command=self._on_browse).pack(side="left")
 
         row2 = ctk.CTkFrame(head, fg_color="transparent")
-        row2.pack(fill="x", pady=2)
+        row2.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row2, text="prefix:").pack(side="left")
         self.prefix_var = tk.StringVar(value=DEFAULT_PREFIX)
         ctk.CTkEntry(row2, textvariable=self.prefix_var, width=140).pack(
@@ -674,98 +681,114 @@ class CrossCorrelationTab(ttk.Frame):
         ctk.CTkEntry(row2, textvariable=self.fps_var, width=70).pack(
             side="left", padx=(4, 0))
 
-        # Algorithm parameters -- ttk.LabelFrame kept for the bordered box.
-        row3 = ttk.LabelFrame(head, text="Search parameters", padding=6)
-        row3.pack(fill="x", pady=(6, 0))
+        # Algorithm parameters.
+        row3 = ctk.CTkFrame(head)
+        row3.pack(fill="x", padx=8, pady=(6, 6))
+        ctk.CTkLabel(row3, text="Search parameters",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
-        ctk.CTkLabel(row3, text="max_lag (s):").pack(side="left")
+        row3_inner = ctk.CTkFrame(row3, fg_color="transparent")
+        row3_inner.pack(fill="x", padx=8, pady=(0, 6))
+        ctk.CTkLabel(row3_inner, text="max_lag (s):").pack(side="left")
         self.maxlag_var = tk.StringVar(value=str(DEFAULT_MAX_LAG_S))
-        ctk.CTkEntry(row3, textvariable=self.maxlag_var, width=70).pack(
+        ctk.CTkEntry(row3_inner, textvariable=self.maxlag_var, width=70).pack(
             side="left", padx=(4, 12))
 
         self.zero_lag_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(row3, text="also output zero-lag corr",
+        ctk.CTkCheckBox(row3_inner, text="also output zero-lag corr",
                         variable=self.zero_lag_var).pack(
             side="left", padx=(4, 12))
 
         self.gpu_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(row3, text="use GPU if available",
+        ctk.CTkCheckBox(row3_inner, text="use GPU if available",
                         variable=self.gpu_var).pack(side="left")
 
         # Run buttons
-        run_frame = ttk.LabelFrame(self, text="Run", padding=8)
-        run_frame.pack(fill="x", pady=(0, 6))
+        run_frame = ctk.CTkFrame(self)
+        run_frame.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkLabel(run_frame, text="Run",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        run_inner = ctk.CTkFrame(run_frame, fg_color="transparent")
+        run_inner.pack(fill="x", padx=8, pady=(0, 6))
 
         self.full_btn = ctk.CTkButton(
-            run_frame, text="Run full-recording cross-correlation",
+            run_inner, text="Run full-recording cross-correlation",
             command=self._on_run_full, state="disabled")
         self.full_btn.pack(side="left")
 
         self.per_event_btn = ctk.CTkButton(
-            run_frame, text="Run per-event cross-correlation",
+            run_inner, text="Run per-event cross-correlation",
             command=self._on_run_per_event, state="disabled")
         self.per_event_btn.pack(side="left", padx=(8, 0))
 
         self.refresh_btn = ctk.CTkButton(
-            run_frame, text="Reload event windows", width=160,
+            run_inner, text="Reload event windows", width=160,
             command=self._on_refresh_events)
         self.refresh_btn.pack(side="left", padx=(8, 0))
 
         self.reload_btn = ctk.CTkButton(
-            run_frame, text="Reload dF/F & clusters", width=170,
+            run_inner, text="Reload dF/F & clusters", width=170,
             command=self._on_reload_inputs)
         self.reload_btn.pack(side="left", padx=(8, 0))
 
         self.violin_btn = ctk.CTkButton(
-            run_frame, text="Violin plot", width=100,
+            run_inner, text="Violin plot", width=100,
             command=self._on_violin, state="disabled")
         self.violin_btn.pack(side="left", padx=(8, 0))
 
         # Abort button: only enabled while a worker is alive.
         self.abort_btn = ctk.CTkButton(
-            run_frame, text="Abort", width=80,
+            run_inner, text="Abort", width=80,
             command=self._on_abort, state="disabled")
         self.abort_btn.pack(side="left", padx=(8, 0))
 
         self.event_count_var = tk.StringVar(value="events: -")
-        ttk.Label(run_frame, textvariable=self.event_count_var).pack(
+        ctk.CTkLabel(run_inner, textvariable=self.event_count_var).pack(
             side="left", padx=(12, 0))
 
-        # Progress + status. CTkProgressBar uses 0..1 scale; ``_set_progress``
-        # below normalises the legacy ``value=N, maximum=M`` call-site idiom.
+        # Progress + status. CTkProgressBar is always on a 0..1 scale;
+        # ``_set_progress`` below normalises ``done / total`` so callers
+        # can keep thinking in "step N of M" terms.
         prog = ctk.CTkFrame(self, fg_color="transparent")
-        prog.pack(fill="x", pady=(0, 6))
+        prog.pack(fill="x", padx=10, pady=(0, 6))
         self.progress = ctk.CTkProgressBar(prog, mode="determinate", width=320)
         self.progress.set(0)
         self.progress.pack(side="left")
         self.status_var = tk.StringVar(value="Pick a plane0 folder.")
-        ttk.Label(prog, textvariable=self.status_var,
-                  font=("", 9, "italic")).pack(
+        ctk.CTkLabel(prog, textvariable=self.status_var,
+                     anchor="w",
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
             side="left", padx=(8, 0), fill="x", expand=True)
 
         # Bottom: log on the left, single-pair preview on the right.
+        # ttk.PanedWindow because customtkinter has no resizable-pane
+        # widget -- the drag handle between the two panels is the whole
+        # reason this isn't a plain CTkFrame split.
         bottom = ttk.PanedWindow(self, orient="horizontal")
-        bottom.pack(fill="both", expand=True)
+        bottom.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         # -- Log pane
-        log_frame = ttk.LabelFrame(bottom, text="Log", padding=4)
+        log_frame = ctk.CTkFrame(bottom)
         bottom.add(log_frame, weight=1)
-        self.log_text = tk.Text(log_frame, height=12, wrap="word",
-                                font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True, side="left")
-        sb = ttk.Scrollbar(log_frame, orient="vertical",
-                           command=self.log_text.yview)
-        sb.pack(fill="y", side="right")
-        self.log_text.config(yscrollcommand=sb.set)
-        apply_dark_to_tk_widget(self.log_text)
+        ctk.CTkLabel(log_frame, text="Log",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        self.log_text = ctk.CTkTextbox(
+            log_frame, height=200, wrap="word",
+            font=ctk.CTkFont(family="Consolas", size=11))
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
         # -- Single-pair preview pane
-        sp_frame = ttk.LabelFrame(
-            bottom, text="Single-pair cross-correlation curve", padding=6)
+        sp_frame = ctk.CTkFrame(bottom)
         bottom.add(sp_frame, weight=2)
+        ctk.CTkLabel(sp_frame, text="Single-pair cross-correlation curve",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         ctrl = ctk.CTkFrame(sp_frame, fg_color="transparent")
-        ctrl.pack(fill="x", pady=(0, 4))
+        ctrl.pack(fill="x", padx=6, pady=(0, 4))
         ctk.CTkLabel(ctrl, text="ROI A:").pack(side="left")
         self.sp_roiA_var = tk.StringVar(value="0")
         ctk.CTkEntry(ctrl, textvariable=self.sp_roiA_var, width=70).pack(
@@ -940,6 +963,32 @@ class CrossCorrelationTab(ttk.Frame):
             return
         self.path_var.set(path)
         self._set_plane0(Path(path))
+
+    def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
+        """BatchTab calls this after a row's scratch->HDD copy. If
+        ``_dff_cache`` is holding a memmap whose file lives under
+        ``scratch``, drop it so Windows releases the handle before the
+        bulk rmtree fires. The cache is reopened lazily against the
+        HDD twin on the next ``_get_cached_dff`` call.
+
+        Without this hook, the open memmap kept the scratch
+        ``r0p7*dff.memmap.float32`` locked across recordings; on the
+        last row of a batch the janitor's rmtree never succeeded
+        until the user navigated away or closed the app.
+        """
+        cache = self._dff_cache
+        if cache is None:
+            return
+        dff = cache[0] if isinstance(cache, tuple) else cache
+        fname = getattr(dff, "filename", None)
+        if fname is None:
+            return
+        try:
+            Path(fname).relative_to(scratch)
+        except (TypeError, ValueError, OSError):
+            return
+        self._dff_cache = None
+        self._dff_cache_key = None
 
     def _set_plane0(self, plane0: Path) -> None:
         self._plane0 = plane0

@@ -175,7 +175,8 @@ def _roi_centroids_xy(stat_filtered):
 
 def event_frame_centroids(first_time_col: np.ndarray,
                           active_mask_col: np.ndarray,
-                          stat_filtered, fps: float) -> list[dict]:
+                          stat_filtered, fps: float,
+                          *, xs_all=None, ys_all=None) -> list[dict]:
     """Group the ROIs that fired during one event by their first-onset
     frame, and compute a centroid + 2-D spread per frame group.
 
@@ -197,6 +198,12 @@ def event_frame_centroids(first_time_col: np.ndarray,
         centroid.
     fps : float
         Frame rate; converts ``first_time`` (s) to frame index.
+    xs_all, ys_all : ndarray, optional
+        Precomputed per-ROI centroid arrays of shape ``(N_kept,)``.
+        Pass these in when calling per-event inside a render loop so
+        ``_roi_centroids_xy`` (a Python list-comp over N_kept np.median
+        calls) is not redone for every event. If None, computed
+        on the fly from ``stat_filtered``.
 
     Returns
     -------
@@ -230,7 +237,8 @@ def event_frame_centroids(first_time_col: np.ndarray,
     # Convert seconds to frame index by ``round(t * fps)``.
     frames = np.round(first_time_col[roi_idx] * float(fps)).astype(int)
 
-    xs_all, ys_all = _roi_centroids_xy(stat_filtered)
+    if xs_all is None or ys_all is None:
+        xs_all, ys_all = _roi_centroids_xy(stat_filtered)
     # Subset to only the active ROIs.
     xs = xs_all[roi_idx]
     ys = ys_all[roi_idx]
@@ -470,6 +478,10 @@ def render_spatial_event_figures(
 
     written: list[str] = []
     n_events = ev.shape[0]
+    # Per-ROI centroids are stable across events -- compute once here
+    # and pass into event_frame_centroids so the inner loop doesn't
+    # rebuild an N_kept-length list of np.median calls per event.
+    xs_all, ys_all = _roi_centroids_xy(stat_filtered)
     for ev_idx in range(n_events):
         first_col = first_time[:, ev_idx]
         active_col = A[:, ev_idx]
@@ -483,7 +495,8 @@ def render_spatial_event_figures(
         frame_groups = []
         if fps:
             frame_groups = event_frame_centroids(
-                first_col, active_col, stat_filtered, float(fps))
+                first_col, active_col, stat_filtered, float(fps),
+                xs_all=xs_all, ys_all=ys_all)
         cxs = np.array([g["cx"] * scale for g in frame_groups])
         cys = np.array([g["cy"] * scale for g in frame_groups])
 

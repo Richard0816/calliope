@@ -157,7 +157,7 @@ def prune_detection_intermediates(
 
 
 def archive_recording_post_detection(
-    save_folder,
+    rec_root,
     *,
     compress_raw: bool = True,
     delete_shifted: bool = True,
@@ -194,7 +194,7 @@ def archive_recording_post_detection(
     raw, the archive step aborts BEFORE any deletions so the
     recording stays in a re-runnable state.
     """
-    rec_root = Path(save_folder)
+    rec_root = Path(rec_root)
     summary = {
         "compressed": 0,
         "shifted_deleted": 0,
@@ -441,28 +441,58 @@ def compute_dff_memmaps(
     lp_mm = np.memmap(str(lp_path), mode="w+", dtype="float32", shape=shape)
     dt_mm = np.memmap(str(dt_path), mode="w+", dtype="float32", shape=shape)
 
+    # 2D-vectorized chunk size: caps transient memory at ~3 * CHUNK * T
+    # float32 buffers regardless of how generous the outer ``batch`` is.
+    DFF_CHUNK = 256
     batch = max(8, utils.change_batch_according_to_free_ram() * 20)
     sos = None
     t0 = time.time()
+    from scipy.signal import savgol_filter
     for i0 in range(0, N, batch):
         i1 = min(N, i0 + batch)
-        for i in range(i0, i1):
-            trace = (F[i, :] - r * Fneu[i, :]).astype(np.float32)
-            if baseline_mode == "first_n":
-                dff = utils.first_n_min_df_over_f_1d(
-                    trace, baseline_min=baseline_min,
-                    perc=perc, fps=fps)
+        for j0 in range(i0, i1, DFF_CHUNK):
+            j1 = min(i1, j0 + DFF_CHUNK)
+            # Batched neuropil subtraction (F / Fneu are already
+            # float32, so this stays float32 without an extra astype).
+            traces_chunk = F[j0:j1] - r * Fneu[j0:j1]
+            dff_chunk = np.empty_like(traces_chunk)
+            lp_chunk = np.empty_like(traces_chunk)
+            for k in range(j1 - j0):
+                trace = traces_chunk[k]
+                if baseline_mode == "first_n":
+                    dff = utils.first_n_min_df_over_f_1d(
+                        trace, baseline_min=baseline_min,
+                        perc=perc, fps=fps)
+                else:
+                    dff = utils.robust_df_over_f_1d(
+                        trace, win_sec=win_sec, perc=perc, fps=fps)
+                lp, _, sos = utils.lowpass_causal_1d(
+                    dff, fps=fps, cutoff_hz=cutoff_hz,
+                    order=2, zi=None, sos=sos)
+                dff_chunk[k] = dff
+                lp_chunk[k] = lp
+            # Batched Savitzky-Golay derivative along the time axis:
+            # one savgol_filter call per chunk replaces CHUNK per-ROI
+            # calls. ``savgol_filter`` with ``axis=1`` is mathematically
+            # identical to per-row, just amortizes the Python overhead.
+            T_len = lp_chunk.shape[1]
+            win = max(3, int((sg_win_ms / 1000.0) * fps) | 1)
+            if win >= T_len:
+                win = max(3, (T_len - (1 - T_len % 2)))
+            if win < 3 or T_len < 3:
+                dt_chunk = np.empty_like(lp_chunk)
+                dt_chunk[:, 0] = 0.0
+                dt_chunk[:, 1:] = (lp_chunk[:, 1:] - lp_chunk[:, :-1]) * fps
             else:
-                dff = utils.robust_df_over_f_1d(
-                    trace, win_sec=win_sec, perc=perc, fps=fps)
-            lp, _, sos = utils.lowpass_causal_1d(
-                dff, fps=fps, cutoff_hz=cutoff_hz,
-                order=2, zi=None, sos=sos)
-            dt = utils.sg_first_derivative_1d(
-                lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
-            dff_mm[:, i] = dff
-            lp_mm[:, i] = lp
-            dt_mm[:, i] = dt
+                dt_chunk = savgol_filter(
+                    lp_chunk, window_length=win, polyorder=sg_poly,
+                    deriv=1, delta=1.0 / fps, axis=1,
+                ).astype(np.float32)
+            # Slab writes (one contiguous transposed block per buffer
+            # per chunk) replace CHUNK column-by-column updates.
+            dff_mm[:, j0:j1] = dff_chunk.T
+            lp_mm[:, j0:j1] = lp_chunk.T
+            dt_mm[:, j0:j1] = dt_chunk.T
         dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
         if progress_cb is not None:
             progress_cb(
@@ -692,8 +722,13 @@ def run_detection(
     # key so Tab 3 / batch tab can override.
     if bool(params.get("archive_post_detection", True)):
         try:
+            # ``save_folder`` is the ``detection/`` subfolder, but the
+            # archive expects the recording root (one level up) -- the
+            # raw-paths sidecar lives there alongside the shifted
+            # TIFFs, and the function builds ``rec_root/detection/...``
+            # internally when reaching for the final data.bin.
             archive_recording_post_detection(
-                save_folder,
+                Path(save_folder).parent,
                 compress_raw=bool(
                     params.get("compress_raw_post_detection", True)),
                 delete_shifted=bool(

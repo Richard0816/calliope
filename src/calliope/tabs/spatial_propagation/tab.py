@@ -72,7 +72,7 @@ from ...core import utils as core_utils
 from ...gui_common import AppState, attach_fig_toolbar
 
 
-class SpatialPropagationTab(ttk.Frame):
+class SpatialPropagationTab(ctk.CTkFrame):
     """Tab 8: per-event spatial activation-order maps, driven by Tab 5.
 
     Instance attributes
@@ -99,7 +99,7 @@ class SpatialPropagationTab(ttk.Frame):
     """
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         self._data: Optional[dict] = None  # see _ingest_results
         self._event_index: int = 0
@@ -128,28 +128,32 @@ class SpatialPropagationTab(ttk.Frame):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        header = ttk.LabelFrame(
-            self, text="Spatial propagation (events from tab 5)",
-            padding=8)
-        header.pack(fill="x", pady=(0, 6))
+        header = ctk.CTkFrame(self)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            header, text="Spatial propagation (events from tab 5)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         # Persistent recording header so the user always knows which
         # plane0 the activation-order maps + monotonicity panels
         # come from. Updated by ``_ingest_results`` when Tab 5
         # publishes a new event_results dict.
         rec_row = ctk.CTkFrame(header, fg_color="transparent")
-        rec_row.pack(fill="x", pady=(0, 4))
+        rec_row.pack(fill="x", padx=8, pady=(0, 4))
         self.recording_var = tk.StringVar(value="No recording loaded.")
-        ttk.Label(rec_row, textvariable=self.recording_var,
-                  font=("", 10, "italic")).pack(side="left")
+        ctk.CTkLabel(rec_row, textvariable=self.recording_var,
+                     font=ctk.CTkFont(size=12, slant="italic")).pack(
+            side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         self.status_var = tk.StringVar(
             value="Run Tab 5 first; this tab will populate automatically "
                   "once events are detected.")
-        ttk.Label(row, textvariable=self.status_var,
-                  font=("", 9, "italic")).pack(side="left")
+        ctk.CTkLabel(row, textvariable=self.status_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
         ctk.CTkButton(row, text="Refresh from Tab 5",
                       command=self._refresh).pack(side="right")
 
@@ -162,7 +166,7 @@ class SpatialPropagationTab(ttk.Frame):
         # change. Mirrors the experimental ``spks`` signal kind in
         # ``Calcium_imaging_suite2p/lead_lag_prototype.py``.
         toggle_row = ctk.CTkFrame(header, fg_color="transparent")
-        toggle_row.pack(fill="x", pady=(2, 0))
+        toggle_row.pack(fill="x", padx=8, pady=(2, 0))
         self._use_spks_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             toggle_row,
@@ -180,13 +184,14 @@ class SpatialPropagationTab(ttk.Frame):
 
         # Event navigation row.
         nav = ctk.CTkFrame(header, fg_color="transparent")
-        nav.pack(fill="x", pady=(6, 0))
+        nav.pack(fill="x", padx=8, pady=(6, 6))
         self.prev_btn = ctk.CTkButton(
             nav, text="< Prev", command=self._on_prev, state="disabled",
             width=80)
         self.prev_btn.pack(side="left")
         self.event_var = tk.IntVar(value=1)
-        # ttk.Spinbox kept -- customtkinter has no equivalent spinbox widget.
+        # ttk.Spinbox: CTk doesn't ship its own spinbox primitive, so
+        # we use the ttk version here for event navigation.
         self.event_spin = ttk.Spinbox(
             nav, from_=1, to=1, width=6, textvariable=self.event_var,
             command=self._on_spin)
@@ -199,22 +204,26 @@ class SpatialPropagationTab(ttk.Frame):
             width=80)
         self.next_btn.pack(side="left")
         self.event_label_var = tk.StringVar(value="")
-        ttk.Label(nav, textvariable=self.event_label_var,
-                  font=("", 9, "italic")).pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(nav, textvariable=self.event_label_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left", padx=(12, 0))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
         # Top row, left: plain activation-order map (no arrows).
-        f_map_plain = ttk.LabelFrame(
-            body, text="Activation order  (cyan = earliest, red = latest)",
-            padding=4)
+        f_map_plain = ctk.CTkFrame(body)
         f_map_plain.grid(row=0, column=0, sticky="nsew",
                          padx=(0, 2), pady=(0, 4))
+        ctk.CTkLabel(
+            f_map_plain,
+            text="Activation order  (cyan = earliest, red = latest)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.fig_map_plain = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.ax_map_plain = self.fig_map_plain.add_subplot(111)
         self.ax_map_plain.set_axis_off()
@@ -228,14 +237,17 @@ class SpatialPropagationTab(ttk.Frame):
             self.canvas_map_plain, f_map_plain,
             data_basename="coact_order_map")
         self.canvas_map_plain.get_tk_widget().pack(
-            fill="both", expand=True)
+            fill="both", expand=True, padx=4, pady=(0, 4))
 
         # Top row, right: same map with frame-to-frame arrows overlaid.
-        f_map_arrows = ttk.LabelFrame(
-            body, text="Activation order + frame-to-frame propagation",
-            padding=4)
+        f_map_arrows = ctk.CTkFrame(body)
         f_map_arrows.grid(row=0, column=1, sticky="nsew",
                           padx=(2, 0), pady=(0, 4))
+        ctk.CTkLabel(
+            f_map_arrows,
+            text="Activation order + frame-to-frame propagation",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.fig_map_arrows = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.ax_map_arrows = self.fig_map_arrows.add_subplot(111)
         self.ax_map_arrows.set_axis_off()
@@ -249,36 +261,39 @@ class SpatialPropagationTab(ttk.Frame):
             self.canvas_map_arrows, f_map_arrows,
             data_basename="coact_order_map_arrows")
         self.canvas_map_arrows.get_tk_widget().pack(
-            fill="both", expand=True)
+            fill="both", expand=True, padx=4, pady=(0, 4))
 
-        # Bottom row: directional monotonicity test. Replaces the
-        # previous per-Δframe pairwise-distance violin (which described
-        # spread but not direction). The new panel asks "is there a
+        # Bottom row: directional monotonicity test. Asks "is there a
         # monotone propagation axis at all, and how strong is it?" via
         # Spearman ρ on a planar projection of ROI positions vs
         # activation times, with a shuffle null for significance.
         #
-        # The middle "vectors-only" panel (frame-centroid circles with
-        # 2D-std radii + arrows on a blank FOV) was dropped on
-        # 2026-05-10: its information is already conveyed by the
-        # white-arrow overlay on the top-right activation-order map,
-        # and the new monotonicity test below is the more useful
-        # quantitative companion than another spatial layout.
+        # Layout history (2026-05-10): a middle "vectors-only" panel
+        # (frame-centroid circles with 2D-std radii + arrows on a blank
+        # FOV) was dropped because its information was already conveyed
+        # by the white-arrow overlay on the top-right activation-order
+        # map, and a per-Δframe pairwise-distance violin was replaced
+        # with this monotonicity test -- spread alone didn't tell us
+        # about direction.
         body.rowconfigure(1, weight=1)
-        f_dist = ttk.LabelFrame(
-            body, text="Directional monotonicity  "
-                       "(Spearman ρ on projected position vs activation time, "
-                       "shuffle null for p-value)",
-            padding=4)
+        f_dist = ctk.CTkFrame(body)
         f_dist.grid(row=1, column=0, columnspan=2, sticky="nsew",
                     pady=(4, 0))
+        ctk.CTkLabel(
+            f_dist,
+            text="Directional monotonicity  "
+                 "(Spearman ρ on projected position vs activation time, "
+                 "shuffle null for p-value)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.fig_dist = plt.Figure(figsize=(8, 4.2), tight_layout=True)
         self.ax_dist = self.fig_dist.add_subplot(111)
         self.ax_dist.set_axis_off()
         self.canvas_dist = FigureCanvasTkAgg(self.fig_dist, master=f_dist)
         self.toolbar_dist = attach_fig_toolbar(
             self.canvas_dist, f_dist, data_basename="monotonicity")
-        self.canvas_dist.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas_dist.get_tk_widget().pack(fill="both", expand=True,
+                                              padx=4, pady=(0, 4))
 
     # -- Tab 5 ingestion ----------------------------------------------------
 
@@ -346,6 +361,10 @@ class SpatialPropagationTab(ttk.Frame):
             "fps": float(fps) if fps is not None else None,
         }
 
+        # Precompute per-ROI centroids once: _render_event is called per
+        # slider move and previously rebuilt these via an N_kept-length
+        # np.median loop on every render.
+        xs_all, ys_all = spatial_helpers._roi_centroids_xy(stat_filtered)
         self._data = {
             "stat_filtered": stat_filtered,
             "kept_idx": kept_idx_arr,
@@ -356,6 +375,8 @@ class SpatialPropagationTab(ttk.Frame):
             "first_time": np.asarray(first_time),
             "fps": float(fps) if fps is not None else None,
             "plane0": plane0,
+            "xs_all": xs_all,
+            "ys_all": ys_all,
         }
 
         # If the user has the spks override toggled on, swap in the
@@ -634,7 +655,8 @@ class SpatialPropagationTab(ttk.Frame):
         frame_groups = []
         if fps:
             frame_groups = spatial_helpers.event_frame_centroids(
-                first_col, active_col, data["stat_filtered"], float(fps))
+                first_col, active_col, data["stat_filtered"], float(fps),
+                xs_all=data.get("xs_all"), ys_all=data.get("ys_all"))
 
         title_top_left = (
             f"Event {ev_idx + 1} / {ev.shape[0]}  "
@@ -690,11 +712,9 @@ class SpatialPropagationTab(ttk.Frame):
                      title_top_right, with_arrows=True)
 
         # ---- Bottom panel: directional monotonicity test ----
-        # The pre-2026-05-10 layout had a middle "vectors-only" panel
-        # here (frame-centroid circles with 2D-std radii + arrows on a
-        # blank FOV). It was dropped because the top-right map already
-        # carries the same arrow trace overlaid on the actual cell
-        # layout — having a blank-canvas version below it was redundant.
+        # See the layout-history note in ``_build_ui`` for why this
+        # bottom panel is the monotonicity test rather than a
+        # vectors-only spatial layout.
         self._render_monotonicity_panel(
             first_col, active_col, data, ev_idx, fps, scale,
             xlabel_unit=("µm" if pix_to_um is not None else "px"))

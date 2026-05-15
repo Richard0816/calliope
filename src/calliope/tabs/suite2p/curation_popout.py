@@ -2,17 +2,18 @@
 
 What it shows
 -------------
-Modeled on ``Calcium_imaging_suite2p/roi_curation_app.py``: when the
-user clicks an ROI on Tab 3's "All detected ROIs" panel, this Toplevel
-opens with five panels for that ROI:
+When the user clicks an ROI on Tab 3's "All detected ROIs" panel,
+this Toplevel opens with one panel per available background image
+(mean / max / correlation / reference / channel 2, whichever the
+recording carries), plus a ROI-footprint panel along the top row
+and a ΔF/F trace spanning the bottom row.
 
-    [ Mean image ] [ Max projection ] [ Max + ROI overlay ]
-    [ ROI footprint ]                  [ ΔF/F trace ]
-
-Plus a status row (current iscell flag, model p(cell) if available),
-a **Cell** / **Not cell** flip pair, and a **Retrain cell filter**
-button that stays disabled until the user has flipped at least one
-classification this session.
+A status row beneath the figure shows the current iscell flag and
+the model's p(cell) when available. A **Cell** / **Not cell** flip
+pair persists the curator's verdict, and a **Retrain cell filter**
+button (disabled until the user has flipped at least one
+classification this session) re-trains the model on the updated
+labels CSV.
 
 Side effects of a flip
 ----------------------
@@ -40,7 +41,7 @@ import csv
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 from typing import Optional
 
 import customtkinter as ctk
@@ -51,6 +52,8 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 from matplotlib.patches import Rectangle
+
+from ...gui_common import install_scroll_router
 
 
 def _padded_max_image(ops: dict, mean_img: np.ndarray) -> np.ndarray:
@@ -284,25 +287,28 @@ class CurationPopout(ctk.CTkToplevel):
         # Forward Esc to a graceful close.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda _e: self._on_close())
-        # Keyboard shortcuts mirroring the reference curation app.
-        # Bound at the Toplevel level for the case where focus is
-        # on the Tk side of the window (status bar, button strip).
+        # Keyboard shortcuts: 1 = cell, 0 = not a cell. Bound at
+        # the Toplevel level for the case where focus is on the Tk
+        # side of the window (status bar, button strip).
         self.bind("1", lambda _e: self._set_label(1))
         self.bind("0", lambda _e: self._set_label(0))
         # And again via matplotlib's own key-event channel for the
         # case where focus is on the figure canvas or the toolbar.
-        # The NavigationToolbar (added 2026-05-12) consumes Tk
-        # keyboard events on its child buttons, so Tk-level digit
-        # bindings get dropped intermittently when the cursor hovers
-        # over the toolbar. ``FigureCanvasBase.mpl_connect`` is
-        # independent of Tk focus -- it fires whenever the mouse is
-        # over the figure -- so as long as the user is looking at
-        # the panels, the digit keys work reliably.
+        # The NavigationToolbar consumes Tk keyboard events on its
+        # child buttons, so Tk-level digit bindings get dropped
+        # intermittently when the cursor hovers over the toolbar.
+        # ``FigureCanvasBase.mpl_connect`` is independent of Tk
+        # focus -- it fires whenever the mouse is over the figure
+        # -- so as long as the user is looking at the panels, the
+        # digit keys work reliably.
         self._canvas.mpl_connect(
             "key_press_event", self._on_mpl_key)
         # Make the canvas focus-takeable so it actually receives key
         # events when clicked.
         self._canvas.get_tk_widget().configure(takefocus=True)
+        # Consume wheel events so they don't leak through CTk's
+        # global bind_all and scroll the main app behind this popout.
+        install_scroll_router(self)
 
     @classmethod
     def _collect_backgrounds(cls, ops: dict, mean_img: np.ndarray
@@ -340,10 +346,9 @@ class CurationPopout(ctk.CTkToplevel):
     def _build_ui(self) -> None:
         # Figure: top row = one panel per available background +
         # one panel for the ROI footprint; bottom row = ΔF/F trace
-        # spanning every column. Old layout was a fixed 4 panels
-        # (mean / max / max+ROI / footprint); the 2026-05-12 rework
-        # made the count dynamic so recordings with ``meanImgE`` /
-        # ``Vcorr`` / ``refImg`` get a dedicated panel for each.
+        # spanning every column. The panel count is dynamic so a
+        # recording carrying ``meanImgE`` / ``Vcorr`` / ``refImg``
+        # gets a dedicated panel for each background it actually has.
         n_bg = len(self._backgrounds)
         # Always reserve one column for the footprint panel; if no
         # backgrounds are available (unusual) we still want a 1-col
@@ -392,9 +397,8 @@ class CurationPopout(ctk.CTkToplevel):
         status_frame = ctk.CTkFrame(self, fg_color="transparent")
         status_frame.pack(side="top", fill="x", padx=6, pady=6)
         self._status_var = tk.StringVar(value="No ROI selected.")
-        # ttk.Label kept for the textvariable binding (CTkLabel has none).
-        ttk.Label(status_frame, textvariable=self._status_var,
-                  anchor="w").pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(status_frame, textvariable=self._status_var,
+                     anchor="w").pack(side="left", fill="x", expand=True)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(side="top", fill="x", padx=6, pady=(0, 6))
@@ -414,10 +418,8 @@ class CurationPopout(ctk.CTkToplevel):
         self._retrain_btn.pack(side="left", padx=(20, 0))
 
         self._train_status_var = tk.StringVar(value="")
-        # ttk.Label retained for the textvariable; dark ttk theme reads
-        # legible by default (no ``foreground=`` override).
-        ttk.Label(btn_frame, textvariable=self._train_status_var
-                  ).pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(btn_frame, textvariable=self._train_status_var
+                     ).pack(side="left", padx=(10, 0))
 
         ctk.CTkButton(btn_frame, text="Close (Esc)", width=110,
                       command=self._on_close).pack(side="right")
@@ -566,12 +568,12 @@ class CurationPopout(ctk.CTkToplevel):
         even when the value already matches ``iscell.npy``. The
         confirmation case ("model said cell, curator presses 1 to
         agree") is the most common in practice; an early-return on
-        "no change" used to silently swallow those presses, which
-        looked like a broken button AND skipped the auto-advance
-        the standalone curation app wires through
-        ``on_iscell_changed``. Explicit human labels also carry
-        more weight for retraining than the model's seed prediction,
-        so logging confirmations is what we want.
+        "no change" would silently swallow those presses, which
+        would look like a broken button AND skip the auto-advance
+        the parent tab wires through ``on_iscell_changed``.
+        Explicit human labels also carry more weight for
+        retraining than the model's seed prediction, so logging
+        confirmations is what we want.
         """
         if self._roi_idx is None:
             return

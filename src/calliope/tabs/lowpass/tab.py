@@ -73,7 +73,7 @@ import time
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from typing import Optional
 
 import customtkinter as ctk
@@ -90,7 +90,7 @@ from ...gui_common import (
 )
 
 
-class LowpassTab(ttk.Frame):
+class LowpassTab(ctk.CTkFrame):
     """Three panels:
         1. FFT power spectrum of the population-mean filtered dF/F.
         2. Population-mean dF/F (raw).
@@ -122,7 +122,7 @@ class LowpassTab(ttk.Frame):
     ]
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         self._plane0: Optional[Path] = None
         self._fps: float = 15.0
@@ -152,13 +152,16 @@ class LowpassTab(ttk.Frame):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        header = ttk.LabelFrame(
-            self, text="Low-pass filter (causal Butterworth, order 2)",
-            padding=8)
-        header.pack(fill="x", pady=(0, 6))
+        header = ctk.CTkFrame(self)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            header,
+            text="Low-pass filter (causal Butterworth, order 2)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="Cutoff (Hz):", width=90,
                      anchor="w").pack(side="left")
         self.cutoff_var = tk.DoubleVar(value=self.CUTOFF_DEFAULT)
@@ -180,7 +183,7 @@ class LowpassTab(ttk.Frame):
                       command=self._reload_from_folder).pack(side="right")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=(4, 0))
+        row.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(row, text="", width=90).pack(side="left")
         self.compute_btn = ctk.CTkButton(
             row, text="Compute low-pass + derivative (write memmaps)",
@@ -190,11 +193,12 @@ class LowpassTab(ttk.Frame):
             row, mode="indeterminate", width=160)
         self.compute_progress.pack(side="left", padx=12)
         self.compute_status_var = tk.StringVar(value="")
-        ttk.Label(row, textvariable=self.compute_status_var,
-                  font=("", 9, "italic")).pack(side="left")
+        ctk.CTkLabel(row, textvariable=self.compute_status_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=(4, 0))
+        row.pack(fill="x", padx=8, pady=(4, 6))
         ctk.CTkLabel(row, text="Trace source:", width=90,
                      anchor="w").pack(side="left")
         self.source_var = tk.StringVar(value="mean")
@@ -234,30 +238,35 @@ class LowpassTab(ttk.Frame):
 
         self.status_var = tk.StringVar(
             value="Run detection first (or reload from a finished folder).")
-        ttk.Label(self, textvariable=self.status_var,
-                  font=("", 9, "italic")).pack(anchor="w", pady=(0, 6))
+        ctk.CTkLabel(self, textvariable=self.status_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            anchor="w", padx=10, pady=(0, 6))
 
         # Persistent recording header so the user can always tell
         # which plane0 the FFT / raw / low-pass panels are showing.
         # Updated by ``_on_plane0`` once data has loaded.
         self.recording_var = tk.StringVar(value="No recording loaded.")
-        ttk.Label(self, textvariable=self.recording_var,
-                  font=("", 10, "italic")).pack(anchor="w", pady=(0, 6))
+        ctk.CTkLabel(self, textvariable=self.recording_var,
+                     font=ctk.CTkFont(size=12, slant="italic")).pack(
+            anchor="w", padx=10, pady=(0, 6))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         body.rowconfigure(0, weight=1, uniform="rows")
         body.rowconfigure(1, weight=1, uniform="rows")
         body.rowconfigure(2, weight=1, uniform="rows")
         body.columnconfigure(0, weight=1)
 
-        f1 = ttk.LabelFrame(body, text="1. FFT power spectrum", padding=4)
+        f1 = ctk.CTkFrame(body)
         f1.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        ctk.CTkLabel(f1, text="1. FFT power spectrum",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         # Y-axis scale toggle. Log is the default (better for visualising
         # power-law roll-off at higher frequencies); linear is useful for
         # sanity-checking a single dominant peak at e.g. line frequency.
         fft_top = ctk.CTkFrame(f1, fg_color="transparent")
-        fft_top.pack(fill="x")
+        fft_top.pack(fill="x", padx=4)
         ctk.CTkLabel(fft_top, text="y-axis:").pack(side="left", padx=(0, 4))
         self.fft_yscale_var = tk.StringVar(value="log")
         ctk.CTkRadioButton(
@@ -275,10 +284,14 @@ class LowpassTab(ttk.Frame):
                          transform=self.fft_ax.transAxes)
         self.fft_canvas = FigureCanvasTkAgg(self.fft_fig, master=f1)
         attach_fig_toolbar(self.fft_canvas, f1)
-        self.fft_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.fft_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                             padx=4, pady=(0, 4))
 
-        f2 = ttk.LabelFrame(body, text="2. Raw dF/F", padding=4)
+        f2 = ctk.CTkFrame(body)
         f2.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        ctk.CTkLabel(f2, text="2. Raw dF/F",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.raw_fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
         self.raw_ax = self.raw_fig.add_subplot(111)
         self.raw_ax.set_axis_off()
@@ -286,10 +299,14 @@ class LowpassTab(ttk.Frame):
                          transform=self.raw_ax.transAxes)
         self.raw_canvas = FigureCanvasTkAgg(self.raw_fig, master=f2)
         attach_fig_toolbar(self.raw_canvas, f2)
-        self.raw_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.raw_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                             padx=4, pady=(0, 4))
 
-        f3 = ttk.LabelFrame(body, text="3. Low-pass dF/F", padding=4)
+        f3 = ctk.CTkFrame(body)
         f3.grid(row=2, column=0, sticky="nsew")
+        ctk.CTkLabel(f3, text="3. Low-pass dF/F",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.lp_fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
         self.lp_ax = self.lp_fig.add_subplot(111)
         self.lp_ax.set_axis_off()
@@ -297,7 +314,8 @@ class LowpassTab(ttk.Frame):
                         transform=self.lp_ax.transAxes)
         self.lp_canvas = FigureCanvasTkAgg(self.lp_fig, master=f3)
         attach_fig_toolbar(self.lp_canvas, f3)
-        self.lp_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.lp_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                            padx=4, pady=(0, 4))
 
     # -- Plane0 handling ----------------------------------------------------
 
