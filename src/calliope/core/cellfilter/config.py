@@ -52,8 +52,8 @@ from pathlib import Path
 # Curation CSV: one row per (plane0_path, ROI_number) with a 0/1
 # label. The training pipeline reads this; the Tab 3 popout and the
 # standalone ``scripts/roi_curation_app.py`` append to it. Lives
-# inside the project (next to the suite2p ops .npy + AAV metadata
-# .csv) so a fresh clone of the repo has everything it needs to
+# inside the project (next to the bundled cell-filter checkpoint)
+# so a fresh clone of the repo has everything it needs to
 # retrain without any external drive present.
 #
 # Schema: ``plane0_path, recording_ID, ROI_number,

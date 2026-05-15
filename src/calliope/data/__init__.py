@@ -1,4 +1,5 @@
-"""Bundled resource files (Suite2p ``ops`` JSON, AAV metadata, etc.).
+"""Bundled resource files (Suite2p ``ops`` JSON, the cell-filter
+checkpoint, etc.).
 
 This sub-package isn't really code -- it's a folder full of static
 data files that ship alongside the Python source. The ``__init__.py``

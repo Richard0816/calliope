@@ -648,7 +648,6 @@ def run_detection(
     params: dict,
     *,
     path_to_ops: Optional[str] = None,
-    aav_info_csv: Optional[str] = None,
     tau_override: Optional[float] = None,
     ckpt_path: Optional[str] = None,
     rec_id: Optional[str] = None,
@@ -686,8 +685,6 @@ def run_detection(
         cellpose_cfg=cellpose_cfg,
         hard_cap=hard_cap,
         max_overlap=max_overlap,
-        aav_info_csv=aav_info_csv,
-        tau_vals=spc.DEFAULT_TAU_VALS,
         tau_override=tau_override,
         verbose=True,
     )

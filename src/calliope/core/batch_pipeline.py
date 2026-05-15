@@ -13,7 +13,7 @@ visual record without opening the GUI.
 Public surface
 --------------
 ``run_recording(tiff_folder, save_folder, params, *, ckpt_path=None,
-                aav_info_csv=None, baseline_mode='first_n',
+                tau_override=None, baseline_mode='first_n',
                 baseline_min=2.0, recording_id=None, progress_cb=None)``
     Run the full pipeline for one recording. Returns a dict whose
     ``status`` is ``"ok"`` (everything succeeded), ``"partial"``
@@ -52,7 +52,6 @@ def run_recording(
     *,
     path_to_ops: Optional[str] = None,
     ckpt_path: Optional[str] = None,
-    aav_info_csv: Optional[str] = None,
     tau_override: Optional[float] = None,
     baseline_mode: str = "first_n",
     baseline_min: float = 2.0,
@@ -152,7 +151,6 @@ def run_recording(
             save_folder=str(save_folder),
             params=params,
             path_to_ops=path_to_ops,
-            aav_info_csv=aav_info_csv,
             tau_override=tau_override,
             ckpt_path=ckpt_path,
             rec_id=rec_id,

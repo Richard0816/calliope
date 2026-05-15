@@ -139,9 +139,9 @@ HARD_CAP = 60000
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
-# Tau lookup table by GCaMP variant. Forwarded into Suite2pPipelineConfig so
-# load_base_ops can match a recording's tau via aav_info_csv. The GUI passes
-# this through `tau_vals=spc.DEFAULT_TAU_VALS`.
+# Tau lookup table by GCaMP variant. Kept here as a reference of the
+# values the lab uses; the GUI now passes a per-recording tau scalar
+# via ``tau_override`` and there is no automatic filename->AAV lookup.
 DEFAULT_TAU_VALS: dict = {"6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137}
 
 
@@ -425,8 +425,6 @@ def run(
     cellpose_cfg: dict | None = None,
     hard_cap: int | None = HARD_CAP,
     max_overlap: float = CELLPOSE_MERGE_MAX_OVERLAP,
-    aav_info_csv: str | None = None,
-    tau_vals: dict | None = None,
     tau_override: float | None = None,
     settings_override: dict | None = None,
     verbose: bool = True,
@@ -438,12 +436,12 @@ def run(
 
     1. Build a ``Suite2pPipelineConfig`` (input bundle for the
        suite2p invocation helpers in
-       :mod:`calliope.core.suite2p_pipeline` -- AAV/tau lookup,
+       :mod:`calliope.core.suite2p_pipeline` -- tau override,
        optional popout settings override, shared-registration cache).
     2. ``load_base_settings`` builds the base 2-photon ``(db, settings)``
        pair from :func:`calliope_settings.build_base_settings` (in source)
        and overlays any per-session ``settings_override`` (from Tab 3's
-       popout) plus the recording's tau looked up from the AAV CSV.
+       popout) plus the user-picked GCaMP-variant tau.
     3. ``_get_or_create_shared_registration`` runs Suite2p's motion-
        correction once and caches ``data.bin`` + ``ops.npy`` so both
        Sparsery and Cellpose can reuse it.
@@ -474,9 +472,10 @@ def run(
     max_overlap : float
         Cellpose ROIs whose pixels are >= this fraction inside an
         existing Sparsery ROI are dropped during merge.
-    aav_info_csv, tau_vals : optional
-        Forwarded to ``Suite2pPipelineConfig`` for the GCaMP-variant
-        tau lookup.
+    tau_override : float, optional
+        Per-recording tau scalar (seconds) used for Suite2p
+        deconvolution. The GUI resolves this from the GCaMP-variant
+        picker; ``None`` falls back to the in-source default tau.
     verbose : bool
         Print step-by-step progress.
 
@@ -504,12 +503,6 @@ def run(
         use_cache=False,
         verbose=verbose,
     )
-    if aav_info_csv:
-        cfg_kwargs["aav_info_csv"] = aav_info_csv
-    if tau_vals:
-        cfg_kwargs["tau_vals"] = dict(tau_vals)
-    # Explicit tau wins over the AAV CSV lookup. ``None`` (the
-    # default) lets the legacy filename-based resolver run.
     if tau_override is not None:
         cfg_kwargs["tau_override"] = float(tau_override)
     if settings_override:
@@ -615,7 +608,6 @@ def main():
         cellpose_cfg=CELLPOSE_CFG,
         hard_cap=HARD_CAP,
         max_overlap=CELLPOSE_MERGE_MAX_OVERLAP,
-        tau_vals=DEFAULT_TAU_VALS,
         verbose=True,
     )
 

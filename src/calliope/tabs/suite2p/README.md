@@ -15,9 +15,9 @@ This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computatio
 ## 1. Inputs
 
 - `result.shifted_tiff` (and its sibling shifted TIFFs in the same folder) from Tab 1.
-- A **base ops file** (`<calliope/data>/suite2p_2p_ops_240621.npy`) — the Suite2p ops dictionary that defines per-pixel size, registration knobs, etc. It's *base*; the user's Advanced parameters override individual fields at runtime.
-- A **cell-filter checkpoint** (`.pt`) for the trained `CellFilter` model. Default path is `F:\cellfilter_checkpoints\best.pt`. If absent, the third panel falls back to Suite2p's `iscell.npy`.
-- An **AAV-info CSV** mapping recording stems to AAV/expression metadata (`<calliope/data>/human_SLE_2p_meta.csv`).
+- The in-source **base settings** dict from `calliope.core.calliope_settings` (defines per-pixel size, registration knobs, etc.). The user's Advanced parameters and the "Edit suite2p settings..." popout override individual fields at runtime.
+- A **cell-filter checkpoint** (`.pt`) for the trained `CellFilter` model. Ships bundled at `<calliope/data>/cellfilter_best.pt` and is loaded by default. Users can point the Browse... field at their own retrained checkpoint; if the file is missing or unreadable, the third panel falls back to Suite2p's `iscell.npy`.
+- The **per-recording GCaMP variant**, picked from the dropdown in the Tab 3 header. Resolves to the Suite2p deconvolution `tau` (seconds). Default is GCaMP6m (`tau = 1.0 s`).
 
 ---
 
