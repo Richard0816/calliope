@@ -65,14 +65,14 @@ from .logic import PreprocessResult
 from ...gui_common import AppState, attach_fig_toolbar
 
 
-class QcTab(ttk.Frame):
+class QcTab(ctk.CTkFrame):
     """QC preview: GIF playback on the left, mean image on the right."""
 
     # Inter-frame delay in milliseconds. 66 ms ≈ 15 fps.
     FRAME_MS = 66
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         # Pre-materialised list of Tk PhotoImage frames; populated
         # when the GIF loads, cleared when the user pauses animation
@@ -107,29 +107,30 @@ class QcTab(ttk.Frame):
 
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 6))
+        header.pack(fill="x", padx=10, pady=(10, 6))
         self.header_var = tk.StringVar(
             value="No preprocessing result yet. Run it in the first tab.")
-        # ``ttk.Label`` retained where ``textvariable=`` is needed -- CTkLabel
-        # has no equivalent. The global dark ttk style keeps it on-theme.
-        ttk.Label(header, textvariable=self.header_var,
-                  font=("", 10, "italic")).pack(side="left")
+        ctk.CTkLabel(header, textvariable=self.header_var,
+                     font=ctk.CTkFont(size=12, slant="italic")).pack(side="left")
         ctk.CTkButton(header, text="Reload from folder...",
                       command=self._reload_from_folder).pack(side="right")
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         body.columnconfigure(0, weight=1, uniform="cols")
         body.columnconfigure(1, weight=1, uniform="cols")
         body.rowconfigure(0, weight=1)
 
-        gif_frame = ttk.LabelFrame(body, text="QC movie (GIF)", padding=6)
+        gif_frame = ctk.CTkFrame(body)
         gif_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        ctk.CTkLabel(gif_frame, text="QC movie (GIF)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         # Animate-toggle row at the top: unchecking drops the frame buffer
         # to a single still (saves ~1 MB per 512x512 frame); rechecking
         # reloads the GIF from disk and resumes playback.
         toggle_row = ctk.CTkFrame(gif_frame, fg_color="transparent")
-        toggle_row.pack(anchor="w", pady=(0, 4))
+        toggle_row.pack(anchor="w", padx=6, pady=(4, 4))
         ctk.CTkCheckBox(
             toggle_row,
             text="Animate (uncheck to free frame buffer; still image stays)",
@@ -139,13 +140,16 @@ class QcTab(ttk.Frame):
         # gif_label holds a Pillow ImageTk.PhotoImage -- keep ttk.Label.
         # CTkLabel only accepts CTkImage which can't wrap a Tk PhotoImage.
         self.gif_label = ttk.Label(gif_frame, anchor="center")
-        self.gif_label.pack(fill="both", expand=True)
+        self.gif_label.pack(fill="both", expand=True, padx=6)
         self.gif_status = tk.StringVar(value="")
-        ttk.Label(gif_frame, textvariable=self.gif_status).pack(anchor="w",
-                                                                pady=(4, 0))
+        ctk.CTkLabel(gif_frame, textvariable=self.gif_status).pack(
+            anchor="w", padx=6, pady=(4, 6))
 
-        mean_frame = ttk.LabelFrame(body, text="Mean image", padding=6)
+        mean_frame = ctk.CTkFrame(body)
         mean_frame.grid(row=0, column=1, sticky="nsew")
+        ctk.CTkLabel(mean_frame, text="Mean image",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         self.fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.ax = self.fig.add_subplot(111)
@@ -154,7 +158,8 @@ class QcTab(ttk.Frame):
                      transform=self.ax.transAxes)
         self.canvas = FigureCanvasTkAgg(self.fig, master=mean_frame)
         attach_fig_toolbar(self.canvas, mean_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True,
+                                         padx=6, pady=(4, 6))
 
     # -- Reload helper ------------------------------------------------------
 

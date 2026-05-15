@@ -8,8 +8,8 @@ Tab 1 finishes preprocessing, Tab 2 should pick up the result; when
 Tab 5 detects events, Tabs 7 and 8 should redraw with those events.
 Rather than wiring every tab to every other tab, all of them subscribe
 to a single ``AppState`` object and that object broadcasts state
-changes. This is the same idea as a Redux store in a JavaScript app or
-an event bus in a Shiny module.
+changes. Tabs publish via ``set_*`` methods and listen via
+``subscribe_*`` methods; nobody calls into a sibling tab directly.
 
 Three other reusable Tk helpers also live here:
 
@@ -30,9 +30,9 @@ Kept separate from ``pipeline_gui.py`` so each tab can be its own
 importable module without pulling in the rest of the GUI.
 """
 
-# See pipeline_gui.py for what ``from __future__ import annotations``
-# does. Short version: turns type hints into strings, lets us forward-
-# reference names that are defined later in the file.
+# Turns every type hint in this file into a string at parse time. Used
+# here so the ``Optional[PreprocessResult]`` annotation on AppState
+# stays cheap even if ``PreprocessResult`` import gets expensive later.
 from __future__ import annotations
 
 # Standard-library bits we'll need.
@@ -44,8 +44,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 # ``customtkinter`` ships its own theme manager. The palette helpers
-# below pull the active dark-mode colors so raw ``tk`` widgets (Text,
-# Listbox, Canvas) -- which CTk does not skin -- can match.
+# below pull whatever appearance is active so raw ``tk`` widgets
+# (Text, Listbox, Canvas) -- which CTk does not skin -- can match.
 import customtkinter as ctk
 
 # matplotlib's Tk-Agg backend bundles two helper classes:
@@ -208,43 +208,149 @@ def attach_resize_handle(parent, target, *, min_height: int = 60,
     return handle
 
 
-def bind_mousewheel_to_scrollable(widget, scroll_target=None) -> None:
-    """Make mouse-wheel events scroll ``scroll_target`` while the cursor
-    is anywhere inside ``widget``.
+def install_scroll_router(
+    toplevel,
+    *,
+    fallback_canvas=None,
+    fallback_units_per_notch: int = 25,
+    compact_canvas_units_per_notch: int = 3,
+) -> None:
+    """Route every ``<MouseWheel>`` event under ``toplevel`` to the
+    widget the cursor is actually over.
 
-    Fixes the unintuitive default behaviour where a ``tk.Listbox`` /
-    ``tk.Canvas`` only scrolls when the cursor sits directly on the
-    scrollbar. We register a global ``<MouseWheel>`` handler on
-    ``<Enter>`` and remove it on ``<Leave>``, so the binding is scoped
-    to whenever the user is hovering the panel and doesn't fight other
-    scrollable regions elsewhere.
+    Dispatch priority for each wheel tick:
 
-    ``scroll_target`` defaults to ``widget`` itself; pass a separate
-    target when the scrollable rig wraps a Canvas in an outer frame
-    (e.g. Tab 0's queue body wraps the row canvas in a LabelFrame).
+    1. Walk up from ``event.widget`` looking for the innermost
+       scrollable inner widget the cursor sits inside -- a console
+       (``CTkTextbox`` / ``tk.Text``), a listbox, a scrollable inner
+       ``tk.Canvas``, or a nested ``CTkScrollableFrame``. If one is
+       found, the wheel scrolls that widget. (For ``tk.Text`` /
+       ``tk.Listbox`` / ``CTkTextbox`` the widget's class binding has
+       already done the scroll by the time this handler runs -- the
+       class tag fires before the toplevel tag in the bindtag chain
+       -- so we just consume the event so the same notch doesn't
+       trigger a second scroll downstream.)
+    2. Otherwise -- and only when ``fallback_canvas`` is set -- the
+       wheel scrolls the fallback. The tab wrapper passes its inner
+       canvas here so the wheel falls through to scroll the whole tab
+       when the cursor isn't over any inner panel. Popouts pass
+       ``fallback_canvas=None`` since there's no outer scrollable to
+       absorb the leftover.
+    3. The handler always returns ``"break"`` so the global
+       ``CTkScrollableFrame`` ``bind_all`` (on the ``"all"`` bindtag
+       stage) is suppressed -- without that step the wheel would also
+       scroll whichever ``CTkScrollableFrame`` was most recently
+       constructed in the process, regardless of where the cursor is.
+
+    The binding is installed on ``toplevel`` itself; because the
+    toplevel's bindtag appears in every descendant's bindtag list
+    (widget, class, toplevel, all), the handler fires for events
+    anywhere inside the window -- no per-widget recursion needed.
+
+    ``fallback_canvas`` may be a callable returning the canvas
+    (used by the app root to point at whichever tab is currently
+    visible).
+
+    ``fallback_units_per_notch`` is the per-notch step for the
+    fallback and for any nested ``CTkScrollableFrame`` -- both are
+    "big region" scrolls that feel right when they move ~a fifth of
+    a viewport per notch. ``compact_canvas_units_per_notch`` is the
+    smaller step for raw ``tk.Canvas`` content (compact lists like
+    Tab 0's recordings rows) where a big jump would skip past
+    visible rows.
     """
-    target = scroll_target if scroll_target is not None else widget
 
-    def _on_wheel(event):
-        # Windows fires <MouseWheel> with event.delta in steps of 120
-        # per notch; macOS / Linux fire +/-1. Normalise to scroll-units.
-        if abs(event.delta) >= 120:
-            delta = -int(event.delta / 120)
-        else:
-            delta = -1 if event.delta > 0 else 1
+    def _resolve_fallback():
+        if fallback_canvas is None:
+            return None
+        if callable(fallback_canvas):
+            try:
+                return fallback_canvas()
+            except Exception:
+                return None
+        return fallback_canvas
+
+    def _is_canvas_scrollable(c) -> bool:
+        # A ``tk.Canvas`` whose content fits in its viewport reports
+        # ``yview() == (0.0, 1.0)`` -- nothing to scroll. Matplotlib's
+        # ``FigureCanvasTkAgg`` widget is a tk.Canvas in that state,
+        # so this check naturally keeps the wheel from doing anything
+        # silly over a plot.
         try:
-            target.yview_scroll(delta, "units")
+            return c.yview() != (0.0, 1.0)
+        except tk.TclError:
+            return False
+
+    def _find_target(widget, stop_at):
+        # Walk up from ``widget`` toward the toplevel looking for the
+        # innermost widget that owns the wheel. ``stop_at`` (the
+        # fallback canvas, when set) bounds the search so the wrapper
+        # canvas is only reached via the fallback path, not as an
+        # "inner" scrollable.
+        w = widget
+        while w is not None and w is not toplevel:
+            if stop_at is not None and w is stop_at:
+                return None
+            # tk.Text / tk.Listbox each have a class binding for
+            # <MouseWheel> that already scrolled the widget by the
+            # time the toplevel-tag stage runs. Same goes for
+            # CTkTextbox, which wraps a tk.Text. We flag those as
+            # "self-handled" -- still consume the event so it doesn't
+            # bubble to CTk's bind_all on the "all" stage.
+            if isinstance(w, (tk.Text, tk.Listbox)):
+                return ("self_handled", w)
+            if isinstance(w, ctk.CTkTextbox):
+                return ("self_handled", w)
+            if isinstance(w, ctk.CTkScrollableFrame):
+                return ("manual_big", w._parent_canvas)
+            if isinstance(w, tk.Canvas) and _is_canvas_scrollable(w):
+                return ("manual_compact", w)
+            w = getattr(w, "master", None)
+        return None
+
+    def _do_scroll(canvas, delta, units):
+        # Windows fires +/-120 per wheel notch; macOS / Linux fire
+        # +/-1. Normalise to scroll-units before applying the
+        # per-context multiplier (1 for inner scrollables, higher
+        # for the tab fallback so long-distance scrolls feel snappy).
+        if abs(delta) >= 120:
+            n = -int(delta / 120)
+        else:
+            n = -1 if delta > 0 else 1
+        try:
+            canvas.yview_scroll(n * units, "units")
         except tk.TclError:
             pass
 
-    def _on_enter(_e):
-        widget.bind_all("<MouseWheel>", _on_wheel)
+    def _handler(event):
+        widget = event.widget
+        if not isinstance(widget, tk.Misc):
+            return "break"
+        fallback = _resolve_fallback()
+        match = _find_target(widget, stop_at=fallback)
+        if match is not None:
+            kind, target = match
+            if kind == "manual_big":
+                # CTkScrollableFrame's inner canvas -- always a big
+                # scroll region (Advanced dialog form, future tab
+                # subareas). Use the same multiplier as the fallback
+                # so its feel matches the whole-tab scroll.
+                _do_scroll(target, event.delta, fallback_units_per_notch)
+            elif kind == "manual_compact":
+                # Raw tk.Canvas with content -- typically a compact
+                # list of widgets (the batch tab's recordings rows).
+                # A smaller per-notch step keeps single-line lists
+                # from blowing past the visible range.
+                _do_scroll(target, event.delta,
+                           compact_canvas_units_per_notch)
+            # ``self_handled`` -> the widget already scrolled itself
+            # via its class binding; nothing more to do here, just
+            # consume the event below.
+        elif fallback is not None and _is_canvas_scrollable(fallback):
+            _do_scroll(fallback, event.delta, fallback_units_per_notch)
+        return "break"
 
-    def _on_leave(_e):
-        widget.unbind_all("<MouseWheel>")
-
-    widget.bind("<Enter>", _on_enter)
-    widget.bind("<Leave>", _on_leave)
+    toplevel.bind("<MouseWheel>", _handler, add="+")
 
 
 def drain_queue(widget, q: "queue.Queue", handlers: dict,
@@ -252,17 +358,7 @@ def drain_queue(widget, q: "queue.Queue", handlers: dict,
     """Pull every ``(kind, payload)`` tuple off ``q`` and dispatch each
     to ``handlers[kind]``, then re-arm via ``widget.after(poll_ms, ...)``.
 
-    Pre-Phase-6 every tab carried its own ``_drain_*_queue`` method
-    that duplicated the same loop:
-
-        while True:
-            kind, payload = self._queue.get_nowait()
-            if   kind == "log":   self._on_log(payload)
-            elif kind == "done":  self._on_done(payload)
-            ...
-        self.after(POLL_MS, self._drain_queue)
-
-    Each tab now collapses that loop to::
+    Typical use from a tab::
 
         drain_queue(self, self._log_queue,
                     {"log": self._append_log,
@@ -270,9 +366,11 @@ def drain_queue(widget, q: "queue.Queue", handlers: dict,
                      "error": self._on_error},
                     poll_ms=self.POLL_MS)
 
-    Unknown kinds are silently ignored so a handler dict can lag the
-    producer without crashing. ``widget`` is any Tk widget that owns
-    an ``.after`` method (the tab itself works).
+    The dispatch dict centralises the (kind -> handler) wiring so every
+    tab doesn't reinvent a get_nowait/elif/elif loop. Unknown kinds are
+    silently ignored so a handler dict can lag the producer without
+    crashing. ``widget`` is any Tk widget that owns an ``.after`` method
+    (the tab itself works).
     """
 
     def _tick() -> None:
@@ -290,16 +388,17 @@ def drain_queue(widget, q: "queue.Queue", handlers: dict,
 
 
 def apply_ttk_dark_theme(root) -> None:
-    """Restyle every ``ttk`` widget class to blend with the CTk dark
+    """Restyle every ``ttk`` widget class to blend with the CTk
     surround. Must be called once after the root window exists.
 
     ``ttk`` widgets (Frame, LabelFrame, Button, Entry, Scrollbar,
     Combobox, Checkbutton, Radiobutton, Progressbar, Separator,
-    PanedWindow) are not touched by customtkinter. Their default
-    system theme renders bright on a dark root. Switching the ttk
-    theme to ``clam`` and overriding common widget classes gives them
-    a passable dark look during the Phase-2/3 transition before each
-    tab is fully migrated to CTk widgets.
+    PanedWindow, Spinbox, Treeview) are not touched by customtkinter
+    -- their default system theme renders bright on a dark root.
+    Switching the ttk theme to ``clam`` and overriding the common
+    widget classes here keeps the few ttk widgets we still rely on
+    (mostly PanedWindow sashes and Spinbox arrows, where CTk has no
+    equivalent) visually consistent with the CTk surround.
     """
     palette = tk_dark_palette()
     style = ttk.Style(root)
@@ -384,8 +483,9 @@ class AppState:
            value out to every subscriber.
 
     Tabs publish via ``set_*`` and listen via ``subscribe_*``. They
-    never call into each other directly. If you have a Shiny / R6
-    background, this is essentially a hand-rolled reactive value.
+    never call into each other directly -- this keeps the dependency
+    graph between tabs flat and lets new tabs join the bus without
+    every existing tab needing to know about them.
     """
 
     def __init__(self) -> None:
@@ -562,8 +662,8 @@ class AdvancedDialog(ctk.CTkToplevel):
         self.wm_minsize(440, 400)
         # Stash the inputs on the instance so the helper methods below
         # can read them. ``self._defaults`` is a dict comprehension --
-        # the Python form of R's ``setNames(...)`` shortcut: build a
-        # new dict by iterating over ``specs``.
+        # one entry per spec, keyed by spec name -- so the Reset
+        # button can snap fields back without re-walking ``specs``.
         self._specs = specs
         self._current = current
         self._defaults = {s["name"]: s["default"] for s in specs}
@@ -581,6 +681,9 @@ class AdvancedDialog(ctk.CTkToplevel):
         # Catch the OS "X" close button so it cancels rather than just
         # destroying the window.
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        # Route wheel events to the inner CTkScrollableFrame; no
+        # fallback since the dialog itself isn't scrollable.
+        install_scroll_router(self)
 
     def _build_ui(self) -> None:
         """Lay out the scrollable form, the per-group LabelFrames, and
@@ -594,17 +697,23 @@ class AdvancedDialog(ctk.CTkToplevel):
         inner.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
         # Group fields by their ``group`` key. ``groups`` maps group
-        # name -> (LabelFrame, current row). We add a new LabelFrame
-        # the first time each group is encountered. ttk.LabelFrame is
-        # kept (no CTk equivalent) and reads the dark ttk theme.
+        # name -> (frame, current row). We add a new CTkFrame the first
+        # time each group is encountered; the header label sits in row
+        # 0 and fields stack below it.
         groups: dict = {}
         for spec in self._specs:
             grp = spec.get("group", "Parameters")
             if grp not in groups:
-                lf = ttk.LabelFrame(inner, text=grp, padding=8)
+                lf = ctk.CTkFrame(inner)
                 lf.pack(fill="x", pady=(0, 8))
+                ctk.CTkLabel(lf, text=grp,
+                             font=ctk.CTkFont(weight="bold")).grid(
+                    row=0, column=0, columnspan=3, sticky="w",
+                    padx=8, pady=(6, 4))
                 lf.columnconfigure(1, weight=1)
-                groups[grp] = (lf, 0)
+                # Field rows start at index 1 so the header label at
+                # row 0 stays above them.
+                groups[grp] = (lf, 1)
             lf, row = groups[grp]
             self._add_field(lf, row, spec)
             groups[grp] = (lf, row + 1)
@@ -620,12 +729,12 @@ class AdvancedDialog(ctk.CTkToplevel):
                       command=self._on_ok).pack(side="right", padx=(0, 6))
 
     def _add_field(self, parent, row, spec) -> None:
-        """Create one row in the group's LabelFrame: label | widget |
+        """Create one row in the group's CTkFrame: label | widget |
         help text. The widget type depends on ``spec["type"]``."""
         name = spec["name"]
         label = spec.get("label", name)
         ctk.CTkLabel(parent, text=label, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            row=row, column=0, sticky="w", padx=(8, 8), pady=2)
         # Pre-fill from the caller's ``current`` dict if a value is
         # already there, otherwise from the spec's default.
         cur = self._current.get(name, spec["default"])
@@ -654,9 +763,9 @@ class AdvancedDialog(ctk.CTkToplevel):
         help_text = spec.get("help")
         if help_text:
             ctk.CTkLabel(parent, text=help_text, text_color="gray",
-                         font=ctk.CTkFont(size=10, slant="italic"),
+                         font=ctk.CTkFont(size=11, slant="italic"),
                          anchor="w").grid(
-                row=row, column=2, sticky="w", padx=(8, 0), pady=2)
+                row=row, column=2, sticky="w", padx=(8, 8), pady=2)
 
         # Save (var, spec) so the OK handler can read the value back
         # and coerce it to the right Python type.
@@ -664,9 +773,9 @@ class AdvancedDialog(ctk.CTkToplevel):
 
     def _reset_defaults(self) -> None:
         """Snap every field back to the value declared in its spec."""
-        # ``.items()`` iterates a dict as (key, value) pairs. The inner
-        # tuple ``(var, spec)`` is destructured directly in the for
-        # loop -- this is one of the niceties Python has over R.
+        # ``.items()`` iterates a dict as (key, value) pairs; the
+        # inner tuple ``(var, spec)`` is unpacked directly in the
+        # for-loop header so we get both back without a second lookup.
         for name, (var, spec) in self._vars.items():
             d = self._defaults[name]
             if spec["type"] == "bool":
@@ -784,14 +893,16 @@ def pick_tiffs_dialog(parent: tk.Misc, *, title: str,
     row.pack(fill="x", pady=(0, 6))
     ctk.CTkLabel(row, text="Depth:", width=70, anchor="w").pack(side="left")
     depth_var = tk.IntVar(value=max(0, int(initial_depth)))
-    # ttk.Spinbox kept -- customtkinter has no spinbox equivalent.
+    # ttk.Spinbox here because customtkinter has no spinbox widget;
+    # gets themed via apply_ttk_dark_theme.
     ttk.Spinbox(row, from_=0, to=6, width=4,
                 textvariable=depth_var).pack(side="left")
     refresh_btn = ctk.CTkButton(row, text="Refresh", width=90)
     refresh_btn.pack(side="left", padx=(8, 0))
     status_var = tk.StringVar(value="")
-    ttk.Label(row, textvariable=status_var,
-              font=("", 9, "italic")).pack(side="left", padx=(8, 0))
+    ctk.CTkLabel(row, textvariable=status_var,
+                 font=ctk.CTkFont(size=11, slant="italic")).pack(
+        side="left", padx=(8, 0))
 
     list_holder = ctk.CTkFrame(body, fg_color="transparent")
     list_holder.pack(fill="both", expand=True)
@@ -801,8 +912,8 @@ def pick_tiffs_dialog(parent: tk.Misc, *, title: str,
                          exportselection=False)
     listbox.grid(row=0, column=0, sticky="nsew")
     apply_dark_to_tk_widget(listbox)
-    sb = ttk.Scrollbar(list_holder, orient="vertical",
-                       command=listbox.yview)
+    sb = ctk.CTkScrollbar(list_holder, orientation="vertical",
+                          command=listbox.yview)
     sb.grid(row=0, column=1, sticky="ns")
     listbox.configure(yscrollcommand=sb.set)
 
@@ -861,6 +972,10 @@ def pick_tiffs_dialog(parent: tk.Misc, *, title: str,
                   command=_cancel).pack(side="right")
     ctk.CTkButton(foot, text="Confirm", width=100,
                   command=_confirm).pack(side="right", padx=(0, 6))
+
+    # Route wheel events: cursor over the Listbox scrolls it, cursor
+    # elsewhere in the dialog does nothing (no outer scrollable).
+    install_scroll_router(win)
 
     _refresh()
     parent.wait_window(win)
@@ -975,7 +1090,7 @@ def attach_fig_toolbar(canvas: FigureCanvasTkAgg,
     # Lazy-import: only loaded when the toolbar is actually built. This
     # avoids a small import cost for tabs that never call this helper.
     from . import plot_data_export
-    tb_frame = ttk.Frame(parent_frame)
+    tb_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
     tb_frame.pack(side="top", fill="x")
     # ``pack_toolbar=False`` lets us pack it ourselves instead of
     # NavigationToolbar2Tk auto-packing into the parent.
@@ -986,11 +1101,11 @@ def attach_fig_toolbar(canvas: FigureCanvasTkAgg,
     # ``tk.Button``s and a coordinate ``tk.Label`` -- bright spots on
     # the dark surround. Recolour every child to the dark palette here.
     restyle_matplotlib_toolbar(tb)
-    # ``lambda x=default: ...`` is Python's anonymous function (R: ``\(x)
-    # ...`` or ``function(x) ...``). The ``c=canvas`` form captures the
-    # current value of ``canvas`` at lambda creation time, dodging the
-    # classic late-binding gotcha where loop variables would all
-    # resolve to the last value.
+    # The ``c=canvas`` / ``p=tb_frame`` / ``b=data_basename`` default
+    # arguments on each lambda capture the *current* values at lambda
+    # creation time. Without them the closures would all share the
+    # same names from the enclosing scope, and a second call to
+    # ``attach_fig_toolbar`` would silently rebind them.
     if data_provider is None:
         cmd = lambda c=canvas, p=tb_frame, b=data_basename: \
             plot_data_export.save_figure_data(c.figure, p, b)

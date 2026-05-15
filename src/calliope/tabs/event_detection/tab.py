@@ -60,7 +60,7 @@ import traceback
 
 import customtkinter as ctk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from typing import Optional
 
 import matplotlib
@@ -78,7 +78,7 @@ from ...gui_common import (
 )
 
 
-class EventDetectionTab(ttk.Frame):
+class EventDetectionTab(ctk.CTkFrame):
     """Tab 5: per-ROI onsets + population events.
 
     Three panels:
@@ -259,7 +259,7 @@ class EventDetectionTab(ttk.Frame):
     ]
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         self._plane0: Optional[Path] = None
         self._render_queue: queue.Queue = queue.Queue()
@@ -290,23 +290,27 @@ class EventDetectionTab(ttk.Frame):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        header = ttk.LabelFrame(
-            self, text="Event detection (uses filtered lowpass + derivative)",
-            padding=8)
-        header.pack(fill="x", pady=(0, 6))
+        header = ctk.CTkFrame(self)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            header,
+            text="Event detection (uses filtered lowpass + derivative)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         # Persistent recording header. ``status_var`` below carries
         # transient state messages ("Loading...", "Ready", etc.);
         # this label keeps the recording id + plane0 visible at all
         # times so the user can tell which dataset the panels show.
         rec_row = ctk.CTkFrame(header, fg_color="transparent")
-        rec_row.pack(fill="x", pady=(0, 4))
+        rec_row.pack(fill="x", padx=8, pady=(0, 4))
         self.recording_var = tk.StringVar(value="No recording loaded.")
-        ttk.Label(rec_row, textvariable=self.recording_var,
-                  font=("", 10, "italic")).pack(side="left")
+        ctk.CTkLabel(rec_row, textvariable=self.recording_var,
+                     font=ctk.CTkFont(size=12, slant="italic")).pack(
+            side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         self.render_btn = ctk.CTkButton(
             row, text="Render", width=100,
             command=self._on_render, state="disabled")
@@ -316,8 +320,9 @@ class EventDetectionTab(ttk.Frame):
         self.render_progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(
             value="Compute lowpass + derivative on tab 4 first.")
-        ttk.Label(row, textvariable=self.status_var,
-                  font=("", 9, "italic")).pack(side="left")
+        ctk.CTkLabel(row, textvariable=self.status_var,
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
         ctk.CTkButton(row, text="Advanced...", width=100,
                       command=self._on_advanced).pack(side="right",
                                                       padx=(0, 6))
@@ -338,7 +343,7 @@ class EventDetectionTab(ttk.Frame):
         # The "spks" alternative loads Suite2p's deconvolved
         # ``spks.npy`` and runs the same MAD-z + hysteresis on it.
         src_row = ctk.CTkFrame(header, fg_color="transparent")
-        src_row.pack(fill="x", pady=(4, 0))
+        src_row.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(src_row, text="Onset source:").pack(side="left")
         ctk.CTkRadioButton(
             src_row, text="Derivative (default; MAD-z hysteresis on dt)",
@@ -359,7 +364,7 @@ class EventDetectionTab(ttk.Frame):
         # (intersected with the cell-filter keep mask) feed the heatmap,
         # raster, and population event detection.
         sub_row = ctk.CTkFrame(header, fg_color="transparent")
-        sub_row.pack(fill="x", pady=(4, 0))
+        sub_row.pack(fill="x", padx=8, pady=(4, 6))
         self.manual_subset_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             sub_row, text="Restrict to manual ROI subset (Suite2p ids):",
@@ -374,17 +379,20 @@ class EventDetectionTab(ttk.Frame):
             text_color="gray",
         ).pack(side="left")
 
-        # Three stacked matplotlib panels, each in its own ``tk.Frame``
+        # Three stacked matplotlib panels, each in its own CTkFrame
         # wrap so the height is controllable. A draggable grip below
         # each panel lets the user grow that panel independently --
         # without squeezing its neighbours -- and the scrollable wrapper
         # extends the tab body to absorb the new height.
-        f1_wrap = tk.Frame(self)
-        f1_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        f1 = ttk.LabelFrame(
-            f1_wrap, text="1. Filtered lowpass dF/F heatmap "
-                       "(sorted by event count)", padding=4)
+        f1_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        f1_wrap.pack(fill="x", padx=14, pady=(0, 0))
+        f1 = ctk.CTkFrame(f1_wrap)
         f1.pack(fill="both", expand=True)
+        ctk.CTkLabel(f1,
+                     text="1. Filtered lowpass dF/F heatmap "
+                          "(sorted by event count)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.hm_fig = plt.Figure(figsize=(8, 1.6), tight_layout=True)
         self.hm_ax = self.hm_fig.add_subplot(111)
         self.hm_ax.set_axis_off()
@@ -394,16 +402,19 @@ class EventDetectionTab(ttk.Frame):
         attach_fig_toolbar(
             self.hm_canvas, f1, data_basename="event_heatmap",
             data_provider=lambda p: self._save_panel_csv(p, "heatmap"))
-        self.hm_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.hm_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                            padx=4, pady=(0, 4))
         attach_resize_handle(self, f1_wrap, min_height=140,
                              initial_height=180)
 
-        f2_wrap = tk.Frame(self)
-        f2_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        f2 = ttk.LabelFrame(
-            f2_wrap, text="2. Filtered event raster (sorted by event count)",
-            padding=4)
+        f2_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        f2_wrap.pack(fill="x", padx=14, pady=(0, 0))
+        f2 = ctk.CTkFrame(f2_wrap)
         f2.pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            f2, text="2. Filtered event raster (sorted by event count)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.er_fig = plt.Figure(figsize=(8, 1.6), tight_layout=True)
         self.er_ax = self.er_fig.add_subplot(111)
         self.er_ax.set_axis_off()
@@ -413,16 +424,21 @@ class EventDetectionTab(ttk.Frame):
         attach_fig_toolbar(
             self.er_canvas, f2, data_basename="event_raster",
             data_provider=lambda p: self._save_panel_csv(p, "raster"))
-        self.er_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.er_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                            padx=4, pady=(0, 4))
         attach_resize_handle(self, f2_wrap, min_height=140,
                              initial_height=180)
 
-        f3_wrap = tk.Frame(self)
-        f3_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        f3 = ttk.LabelFrame(
-            f3_wrap, text="3. Population event detection "
-                       "(utils.plot_event_detection)", padding=4)
+        f3_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        f3_wrap.pack(fill="x", padx=14, pady=(0, 10))
+        f3 = ctk.CTkFrame(f3_wrap)
         f3.pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            f3,
+            text="3. Population event detection "
+                 "(utils.plot_event_detection)",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.ed_fig = plt.Figure(figsize=(8, 4.8), tight_layout=True)
         self.ed_ax = self.ed_fig.add_subplot(111)
         self.ed_ax.set_axis_off()
@@ -431,7 +447,8 @@ class EventDetectionTab(ttk.Frame):
         self.ed_canvas = FigureCanvasTkAgg(self.ed_fig, master=f3)
         self.ed_toolbar = attach_fig_toolbar(self.ed_canvas, f3)
         self.ed_canvas.get_tk_widget().pack(side="top", fill="both",
-                                            expand=True)
+                                            expand=True,
+                                            padx=4, pady=(0, 4))
         attach_resize_handle(self, f3_wrap, min_height=240,
                              initial_height=380)
 

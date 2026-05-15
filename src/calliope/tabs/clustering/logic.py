@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import colorchooser, ttk
+from tkinter import colorchooser
 from typing import Optional
 
 import customtkinter as ctk
@@ -48,7 +48,9 @@ from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from scipy.spatial.distance import pdist
 
 from ...core import clustering, summary_writer, utils
-from ...gui_common import apply_dark_to_tk_widget, attach_fig_toolbar
+from ...gui_common import (
+    apply_dark_to_tk_widget, attach_fig_toolbar, install_scroll_router,
+)
 
 # Backwards-compat alias for the pre-merge module name. The merged
 # module is now ``calliope.core.clustering``; the old name was
@@ -246,6 +248,9 @@ class CustomColorDialog(ctk.CTkToplevel):
         self._build_ui()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # Consume wheel events so they don't leak through CTk's
+        # global bind_all and scroll the main app behind this dialog.
+        install_scroll_router(self)
 
     def _build_ui(self) -> None:
         frm = ctk.CTkFrame(self, fg_color="transparent")
@@ -262,7 +267,7 @@ class CustomColorDialog(ctk.CTkToplevel):
                             command=lambda idx=i: self._pick(idx))
             btn.grid(row=i + 1, column=1, sticky="w", pady=2)
             self._swatches.append(btn)
-            ttk.Label(frm, textvariable=tk.StringVar(value=hex_color)).grid(
+            ctk.CTkLabel(frm, text=hex_color).grid(
                 row=i + 1, column=2, sticky="w", padx=(8, 0))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -321,6 +326,9 @@ class ReclusterWindow(ctk.CTkToplevel):
 
         self._build_ui()
         self._render()
+        # Consume wheel events so they don't leak through CTk's
+        # global bind_all and scroll the main app behind this popout.
+        install_scroll_router(self)
 
     def _build_ui(self) -> None:
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -331,13 +339,17 @@ class ReclusterWindow(ctk.CTkToplevel):
         body.rowconfigure(0, weight=1)
 
         # Dendrogram.
-        dframe = ttk.LabelFrame(body, text="Sub-dendrogram", padding=4)
+        dframe = ctk.CTkFrame(body)
         dframe.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(dframe, text="Sub-dendrogram",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.d_fig = plt.Figure(figsize=(6.5, 4.5), tight_layout=True)
         self.d_ax = self.d_fig.add_subplot(111)
         self.d_canvas = FigureCanvasTkAgg(self.d_fig, master=dframe)
         attach_fig_toolbar(self.d_canvas, dframe)
-        self.d_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.d_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                           padx=4, pady=(0, 4))
 
         # Slider.
         sframe = ctk.CTkFrame(body, fg_color="transparent")
@@ -356,19 +368,21 @@ class ReclusterWindow(ctk.CTkToplevel):
         self.threshold_scale.pack(side="top", fill="y", expand=True)
         apply_dark_to_tk_widget(self.threshold_scale)
         self.threshold_readout = tk.StringVar(value=f"{self._T:.3f}")
-        # ttk.Label retained for the textvariable readout.
-        ttk.Label(sframe, textvariable=self.threshold_readout,
-                  width=8, anchor="center").pack(side="top")
+        ctk.CTkLabel(sframe, textvariable=self.threshold_readout,
+                     width=64, anchor="center").pack(side="top")
 
         # Spatial.
-        sp_frame = ttk.LabelFrame(body, text="Sub-spatial (cluster colors)",
-                                  padding=4)
+        sp_frame = ctk.CTkFrame(body)
         sp_frame.grid(row=0, column=2, sticky="nsew")
+        ctk.CTkLabel(sp_frame, text="Sub-spatial (cluster colors)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.s_fig = plt.Figure(figsize=(5.5, 4.5), tight_layout=True)
         self.s_ax = self.s_fig.add_subplot(111)
         self.s_canvas = FigureCanvasTkAgg(self.s_fig, master=sp_frame)
         attach_fig_toolbar(self.s_canvas, sp_frame)
-        self.s_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.s_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                           padx=4, pady=(0, 4))
 
     def _on_slider(self, raw: str) -> None:
         if not self._slider_user_driven:

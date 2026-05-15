@@ -1,6 +1,6 @@
 """calliope - GUI package for the calcium imaging pipeline.
 
-A note for readers coming from R
+A note for readers
 --------------------------------
 Python packages are *folders containing an ``__init__.py`` file*. The
 file you are reading is the ``__init__.py`` for the top-level

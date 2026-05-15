@@ -67,7 +67,7 @@ import traceback
 from pathlib import Path
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from typing import Optional
 
 import matplotlib
@@ -84,8 +84,8 @@ from .logic import (
 from .curation_popout import CurationPopout
 
 from ...gui_common import (
-    AppState, QueueWriter, apply_dark_to_tk_widget, attach_fig_toolbar,
-    attach_resize_handle, drain_queue, open_advanced, spec_defaults,
+    AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
+    drain_queue, open_advanced, spec_defaults,
 )
 
 
@@ -96,7 +96,7 @@ from ...gui_common import (
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 
-class Suite2pTab(ttk.Frame):
+class Suite2pTab(ctk.CTkFrame):
     """Runs sparse_plus_cellpose -> dF/F -> cell filter on the preprocessed
     shifted TIFF and renders three panels: live console, raw detected ROIs,
     and ROIs surviving the cell-filter prediction mask.
@@ -125,8 +125,8 @@ class Suite2pTab(ttk.Frame):
 
     POLL_MS = 80
 
-    # Base settings now come from calliope.core.calliope_settings (in source)
-    # rather than a .npy file; the corresponding "Base ops" picker is gone.
+    # Base settings come from calliope.core.calliope_settings (in source);
+    # per-session edits go through the "Edit suite2p settings..." popout.
     DEFAULT_CKPT_PATH = Path(r"F:\cellfilter_checkpoints\best.pt")
     DEFAULT_AAV_CSV = _DATA_DIR / "human_SLE_2p_meta.csv"
 
@@ -135,8 +135,8 @@ class Suite2pTab(ttk.Frame):
     # constant in seconds) that matches the GECI variant in the
     # recording. Picking it wrong throws off the per-cell spike
     # estimate. The user can either pick a variant explicitly
-    # (skipping the AAV CSV lookup) or stay on "Auto" to let the
-    # legacy lookup run.
+    # (skipping the AAV CSV lookup) or stay on "Auto" to fall back
+    # to the AAV CSV lookup by recording filename.
     GCAMP_OPTIONS: list[tuple[str, Optional[float]]] = [
         ("Auto (from AAV CSV)", None),     # default
         ("GCaMP6f  (tau = 0.7 s)", 0.7),
@@ -227,7 +227,7 @@ class Suite2pTab(ttk.Frame):
     ]
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         self._log_queue: queue.Queue = queue.Queue()
         self._worker: Optional[threading.Thread] = None
@@ -253,19 +253,22 @@ class Suite2pTab(ttk.Frame):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        header = ttk.LabelFrame(
-            self, text="Suite2p detection (sparsery + cellpose) "
-                       "-> dF/F -> cell filter", padding=8)
-        header.pack(fill="x", pady=(0, 6))
+        header = ctk.CTkFrame(self)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            header,
+            text="Suite2p detection (sparsery + cellpose) "
+                 "-> dF/F -> cell filter",
+            font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
-        # The "Base ops" / "Base settings" file picker that used to live
-        # here is gone in the native (db, settings) refactor. Base settings
-        # come from calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS
-        # (in-source) and per-session edits go through the
-        # "Edit suite2p settings..." popout next to the Run button.
+        # No "Base ops" file picker here: base settings come from
+        # calliope.core.calliope_settings.CALLIOPE_BASE_SETTINGS (in-source)
+        # and per-session edits go through the "Edit suite2p settings..."
+        # popout next to the Run button.
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="Cell filter:", width=90,
                      anchor="w").pack(side="left")
         self.ckpt_var = tk.StringVar(value=str(self.DEFAULT_CKPT_PATH))
@@ -275,7 +278,7 @@ class Suite2pTab(ttk.Frame):
                       command=self._browse_ckpt).pack(side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="dF/F baseline:", width=90,
                      anchor="w").pack(side="left")
         # Default = first-N-minutes mode at 2 minutes. The lab's
@@ -299,7 +302,7 @@ class Suite2pTab(ttk.Frame):
 
         # ---- GCaMP variant picker (drives Suite2p's tau) ----
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="GCaMP variant:", width=110,
                      anchor="w").pack(side="left")
         self.gcamp_var = tk.StringVar(value=self.GCAMP_OPTIONS[0][0])
@@ -317,7 +320,7 @@ class Suite2pTab(ttk.Frame):
         ).pack(side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         self.csv_dff_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             row,
@@ -327,7 +330,7 @@ class Suite2pTab(ttk.Frame):
         ).pack(side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x", pady=(4, 0))
+        row.pack(fill="x", padx=8, pady=(4, 0))
         self.run_btn = ctk.CTkButton(
             row, text="Run detection + cell filter", width=220,
             command=self._on_run, state="disabled")
@@ -350,57 +353,61 @@ class Suite2pTab(ttk.Frame):
                                            width=200)
         self.progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(value="Run preprocessing first.")
-        ttk.Label(row, textvariable=self.status_var).pack(side="left")
+        ctk.CTkLabel(row, textvariable=self.status_var).pack(side="left")
 
         # Persistent header showing which recording the panels +
         # popout are currently pointing at. Updated by
         # ``_draw_panels`` whenever a plane0 finishes loading.
         rec_row = ctk.CTkFrame(header, fg_color="transparent")
-        rec_row.pack(fill="x", pady=(4, 0))
+        rec_row.pack(fill="x", padx=8, pady=(4, 6))
         self.recording_var = tk.StringVar(value="No recording loaded.")
-        ttk.Label(rec_row, textvariable=self.recording_var,
-                  font=("", 10, "italic")).pack(side="left")
+        ctk.CTkLabel(rec_row, textvariable=self.recording_var,
+                     font=ctk.CTkFont(size=12, slant="italic")).pack(
+            side="left")
 
         # Log on top with a draggable grip below it -- dragging extends
         # the log down without changing the size of the detection
         # panels beneath. The surrounding scrollable tab body absorbs
-        # the extra height. tk.Frame wrap so the height drag actually
-        # sticks (ttk widgets recompute reqh from content).
-        log_wrap = tk.Frame(self)
-        log_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        log_frame = ttk.LabelFrame(log_wrap, text="1. Suite2p console",
-                                   padding=4)
+        # the extra height. CTkFrame wrap so the height drag actually
+        # sticks.
+        log_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        log_wrap.pack(fill="x", padx=14, pady=(0, 0))
+        log_frame = ctk.CTkFrame(log_wrap)
         log_frame.pack(fill="both", expand=True)
-        self.log = tk.Text(log_frame, height=10, wrap="word",
-                           state="disabled", font=("Consolas", 9))
-        self.log.pack(fill="both", expand=True, side="left")
-        sb = ttk.Scrollbar(log_frame, orient="vertical",
-                           command=self.log.yview)
-        sb.pack(fill="y", side="right")
-        self.log.config(yscrollcommand=sb.set)
-        apply_dark_to_tk_widget(self.log)
+        ctk.CTkLabel(log_frame, text="1. Suite2p console",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        self.log = ctk.CTkTextbox(
+            log_frame, height=180, wrap="word", state="disabled",
+            font=ctk.CTkFont(family="Consolas", size=11))
+        self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         attach_resize_handle(self, log_wrap, min_height=160)
 
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=4)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 10))
         body.rowconfigure(0, weight=0)
         body.rowconfigure(1, weight=1)
         body.columnconfigure(0, weight=1, uniform="cols")
         body.columnconfigure(1, weight=1, uniform="cols")
 
-        bg_row = ttk.LabelFrame(
-            body, text="Background image (panels 2 & 3)", padding=4)
+        bg_row = ctk.CTkFrame(body)
         bg_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        self._bg_radio_holder = ttk.Frame(bg_row)
-        self._bg_radio_holder.pack(side="left", fill="x", expand=True)
-        ttk.Label(
+        ctk.CTkLabel(bg_row, text="Background image (panels 2 & 3)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        self._bg_radio_holder = ctk.CTkFrame(bg_row, fg_color="transparent")
+        self._bg_radio_holder.pack(side="left", fill="x", expand=True,
+                                   padx=8, pady=(0, 6))
+        ctk.CTkLabel(
             self._bg_radio_holder,
             text="Run detection (or load existing) to choose a background.",
         ).pack(side="left")
 
-        det_frame = ttk.LabelFrame(
-            body, text="2. Detected ROIs (raw suite2p output)", padding=6)
+        det_frame = ctk.CTkFrame(body)
         det_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 3))
+        ctk.CTkLabel(det_frame, text="2. Detected ROIs (raw suite2p output)",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.det_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.det_ax = self.det_fig.add_subplot(111)
         self.det_ax.set_axis_off()
@@ -408,7 +415,8 @@ class Suite2pTab(ttk.Frame):
                          va="center", transform=self.det_ax.transAxes)
         self.det_canvas = FigureCanvasTkAgg(self.det_fig, master=det_frame)
         attach_fig_toolbar(self.det_canvas, det_frame)
-        self.det_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.det_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                             padx=6, pady=(0, 6))
         # Click on the "All detected ROIs" panel to open the curation
         # popout. We resolve the clicked ROI via the cached label image
         # (built in ``_redraw_with_bg``) so the popout works on whichever
@@ -418,9 +426,11 @@ class Suite2pTab(ttk.Frame):
         self._det_label_img: Optional[np.ndarray] = None
         self._curation_popout: Optional[CurationPopout] = None
 
-        fil_frame = ttk.LabelFrame(
-            body, text="3. After cell-filter prediction mask", padding=6)
+        fil_frame = ctk.CTkFrame(body)
         fil_frame.grid(row=1, column=1, sticky="nsew", padx=(3, 0))
+        ctk.CTkLabel(fil_frame, text="3. After cell-filter prediction mask",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
         self.fil_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.fil_ax = self.fil_fig.add_subplot(111)
         self.fil_ax.set_axis_off()
@@ -428,7 +438,8 @@ class Suite2pTab(ttk.Frame):
                          va="center", transform=self.fil_ax.transAxes)
         self.fil_canvas = FigureCanvasTkAgg(self.fil_fig, master=fil_frame)
         attach_fig_toolbar(self.fil_canvas, fil_frame)
-        self.fil_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.fil_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                             padx=6, pady=(0, 6))
 
     # -- Handlers -----------------------------------------------------------
 
@@ -692,8 +703,11 @@ class Suite2pTab(ttk.Frame):
             return
         from ...core.detection_run import archive_recording_post_detection
         try:
+            # ``save_folder`` is the ``detection/`` subfolder; the
+            # archive expects the recording root (one level up), where
+            # the raw-paths sidecar and shifted TIFFs live.
             archive_recording_post_detection(
-                save_folder,
+                Path(save_folder).parent,
                 compress_raw=bool(
                     params.get("compress_raw_post_detection", True)),
                 delete_shifted=bool(
@@ -991,10 +1005,10 @@ class Suite2pTab(ttk.Frame):
         self._final_plane0 = Path(payload)
 
     def _append_log(self, text: str) -> None:
-        self.log.config(state="normal")
+        self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
-        self.log.config(state="disabled")
+        self.log.configure(state="disabled")
 
     def _on_done(self) -> None:
         self.progress.stop()
@@ -1213,6 +1227,25 @@ class Suite2pTab(ttk.Frame):
                     new_p = _rewrite(getattr(popout, "_plane0", None))
                     if new_p is not None:
                         popout._plane0 = new_p
+                    # ``popout._dff`` is an ``np.memmap`` opened
+                    # against scratch's ``r0p7_dff.memmap.float32``
+                    # for the trace strip. The path rewrite above
+                    # doesn't release the handle -- drop it so the
+                    # bulk rmtree can succeed. ``show_roi`` doesn't
+                    # reopen it, so this disables the trace strip on
+                    # the open popout; that's the right trade-off
+                    # for freeing scratch (user reopens the popout
+                    # if they need the trace).
+                    dff = getattr(popout, "_dff", None)
+                    fname = getattr(dff, "filename", None)
+                    if fname is not None:
+                        try:
+                            Path(fname).relative_to(scratch)
+                        except (TypeError, ValueError, OSError):
+                            pass
+                        else:
+                            popout._dff = None
+                            popout._T = 0
             except Exception:
                 pass
 

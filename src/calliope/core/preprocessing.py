@@ -130,23 +130,52 @@ class PreprocessResult:
 # Shift  (make minimum zero, save as uint16)
 # ---------------------------------------------------------------------------
 
+@dataclass
+class ShiftResult:
+    """Outputs of ``shift_tiff_to_uint16``.
+
+    Mean image and QC frame samples are accumulated *during* the same
+    read pass that produces the shifted output, so callers do not have
+    to re-read the shifted TIFF from disk. On spinning disks that's the
+    difference between three full stack reads and one.
+
+    Fields
+    ------
+    array       : full shifted stack if it fit in RAM, else ``None``.
+    mean        : (Y, X) float32 per-pixel time average of the shifted
+                  stack.
+    qc_frames   : (T // qc_downsample_t, Y, X) uint16 every-Nth shifted
+                  frame, ready to hand to ``make_qc_gif`` with
+                  ``downsample_t=1``.
+    n_frames    : exact T (number of pages in the shifted stack).
+    """
+    array: Optional[np.ndarray]
+    mean: np.ndarray
+    qc_frames: np.ndarray
+    n_frames: int
+
+
 def shift_tiff_to_uint16(
     src_tiff: Path,
     dst_tiff: Path,
     progress_cb: Optional[Callable[[str], None]] = None,
-) -> np.ndarray:
-    """Shift TIFF so min=0 and rewrite as uint16.
+    qc_downsample_t: int = 4,
+) -> ShiftResult:
+    """Shift TIFF so min=0 and rewrite as uint16; also return mean + QC samples.
 
     Tries the fast in-RAM path first (load whole stack as int32, shift,
     cast). On ``MemoryError`` falls back to the two-pass streaming
-    implementation modelled on ``run_full_pipeline.shift_tiff`` that
-    never holds more than a single page in RAM, then returns a
-    ``tifffile.memmap`` view of the output so downstream steps (mean
-    image, QC gif) keep working unchanged.
+    implementation that never holds more than a single page in RAM.
+
+    Both paths produce the per-pixel mean image and every-Nth QC frame
+    in the same read loop they were already running, so downstream
+    mean.npy / qc.gif steps don't have to re-read the shifted output.
     """
     def _log(msg: str) -> None:
         if progress_cb is not None:
             progress_cb(msg)
+
+    qc_step = max(1, int(qc_downsample_t))
 
     try:
         # Fast path: read the whole stack into RAM as int32 (so we
@@ -174,43 +203,63 @@ def shift_tiff_to_uint16(
                 f"raw dynamic range too wide."
             ) #todo create alternative solution for this case
         data = data.astype(np.uint16)
+        # Free: mean over already-in-RAM stack; ``data[::N]`` is a
+        # stride view (no copy) -- ``ascontiguousarray`` makes a small
+        # contiguous block that we can hand to Pillow later.
+        mean = data.mean(axis=0, dtype=np.float64).astype(np.float32)
+        qc_frames = np.ascontiguousarray(data[::qc_step])
         _log(f"[shift] writing {dst_tiff.name} ({data.shape[0]} pages)")
         tifffile.imwrite(str(dst_tiff), data)
         _log(f"[shift] done -> {dst_tiff.name}")
-        return data
+        return ShiftResult(
+            array=data, mean=mean, qc_frames=qc_frames,
+            n_frames=int(data.shape[0]),
+        )
     except MemoryError:
         # Slow path: very large recordings (10+ GB raw) won't fit in
         # RAM. Drop down to a two-pass streaming version that scans
         # for the global min in pass 1 and writes the shifted output
-        # one TIFF page at a time in pass 2.
+        # one TIFF page at a time in pass 2. Mean + QC samples are
+        # accumulated during pass 2 so we don't re-read the output.
         _log("[shift] MemoryError on in-RAM path; "
              "retrying with streaming shift")
-        _shift_tiff_streaming(src_tiff, dst_tiff, progress_cb=_log)
-        # Return a memmap of the freshly written output -- callers
-        # treat the return value as if it was the in-RAM array.
-        return tifffile.memmap(str(dst_tiff), mode="r")
+        mean, qc_frames, n_pages = _shift_tiff_streaming(
+            src_tiff, dst_tiff,
+            progress_cb=_log,
+            qc_downsample_t=qc_step,
+        )
+        return ShiftResult(
+            array=None, mean=mean, qc_frames=qc_frames,
+            n_frames=int(n_pages),
+        )
 
 
 def _shift_tiff_streaming(
     src_tiff: Path,
     dst_tiff: Path,
     progress_cb: Optional[Callable[[str], None]] = None,
-) -> None:
+    qc_downsample_t: int = 4,
+) -> tuple[np.ndarray, np.ndarray, int]:
     """Page-by-page shift + uint16 rewrite for memory-strapped runs.
 
     Two passes:
         Pass 1 - scan every TIFF page for global min/max without
                  keeping pages in memory.
         Pass 2 - re-open the source and the output, write each page
-                 shifted into the new file.
+                 shifted into the new file, AND on the same iteration
+                 accumulate a ``float64`` per-pixel sum (for the mean
+                 image) and copy every ``qc_downsample_t``-th shifted
+                 frame into a small list (for the QC gif).
 
-    Never holds more than one frame in RAM. Uses BigTIFF on the
-    output (>4 GB single-file support) since multi-hour recordings
-    blow past the standard 4 GB TIFF limit.
+    Returns ``(mean, qc_frames, n_pages)`` so the caller does not need
+    to read the shifted output back from disk. Never holds more than
+    one full frame plus the QC sample buffer in RAM.
     """
     def _log(msg: str) -> None:
         if progress_cb is not None:
             progress_cb(msg)
+
+    qc_step = max(1, int(qc_downsample_t))
 
     # Pass 1: scan for global min/max without materializing the stack.
     _log(f"[shift] streaming scan {src_tiff.name}")
@@ -236,8 +285,11 @@ def _shift_tiff_streaming(
             f"Shifted max {shifted_max} > 65535; uint16 overflow."
         )
 
-    # Pass 2: write page-by-page as uint16 (BigTIFF for >4 GB output).
+    # Pass 2: write page-by-page as uint16 (BigTIFF for >4 GB output),
+    # folding mean accumulator + QC frame sampling into the same loop.
     _log(f"[shift] streaming write {dst_tiff.name}")
+    sum_arr: Optional[np.ndarray] = None
+    qc_buf: list[np.ndarray] = []
     with tifffile.TiffFile(str(src_tiff)) as tf, \
             tifffile.TiffWriter(str(dst_tiff), bigtiff=True) as tw:
         for i, page in enumerate(tf.pages):
@@ -247,8 +299,24 @@ def _shift_tiff_streaming(
             elif frame.dtype != np.uint16:
                 frame = frame.astype(np.uint16)
             tw.write(frame, contiguous=True)
+            # Mean: ``float64`` sum; allocate lazily so we know (Y, X).
+            if sum_arr is None:
+                sum_arr = np.zeros(frame.shape, dtype=np.float64)
+            sum_arr += frame
+            # QC: ``.copy()`` because ``frame`` is reassigned next loop.
+            if i % qc_step == 0:
+                qc_buf.append(frame.copy())
             if (i + 1) % 2000 == 0:
                 _log(f"[shift]   write {i + 1}/{n_pages}")
+
+    if sum_arr is None:
+        raise ValueError(f"shift: source TIFF {src_tiff} has no pages")
+    mean = (sum_arr / max(1, n_pages)).astype(np.float32)
+    qc_frames = (
+        np.stack(qc_buf, axis=0) if qc_buf
+        else np.empty((0, *sum_arr.shape), dtype=np.uint16)
+    )
+    return mean, qc_frames, n_pages
 
 
 # ---------------------------------------------------------------------------
@@ -605,22 +673,26 @@ def preprocess_tiff(
             progress_cb(msg)
 
     # ---- Step 1: shift to non-negative + cast to uint16 ----
+    # Mean image + QC frame samples are accumulated inside the shift's
+    # read loop so we don't pay another full read of the shifted output.
+    qc_kwargs = dict(qc_params or {})
+    qc_downsample_t = max(1, int(qc_kwargs.pop("downsample_t", 4)))
     log(f"[1/3] Shifting {src.name} -> {shifted_path.name}")
-    shifted = shift_tiff_to_uint16(src, shifted_path, progress_cb=log)
-    # Tuple-unpack the shape: ``shifted`` is ``(T, Y, X)`` so we
-    # name those three.
-    T, Y, X = shifted.shape
+    shifted = shift_tiff_to_uint16(
+        src, shifted_path,
+        progress_cb=log,
+        qc_downsample_t=qc_downsample_t,
+    )
+    Y, X = shifted.mean.shape
+    T = int(shifted.n_frames)
 
-    # ---- Step 2: per-pixel mean image ----
-    # ``shifted.mean(axis=0)`` averages across the time axis (the
-    # first one) -> a (Y, X) image.
-    log(f"[2/3] Computing mean image ({T} frames, {Y}x{X})")
-    mean = shifted.mean(axis=0).astype(np.float32)
-    np.save(str(mean_path), mean)
+    # ---- Step 2: per-pixel mean image (no re-read; already accumulated) ----
+    log(f"[2/3] Saving mean image ({T} frames, {Y}x{X})")
+    np.save(str(mean_path), shifted.mean)
 
-    # ---- Step 3: animated QC GIF ----
+    # ---- Step 3: animated QC GIF (no re-read; frames already sampled) ----
     log("[3/3] Writing QC gif")
-    make_qc_gif(shifted, gif_path, **(qc_params or {}))
+    make_qc_gif(shifted.qc_frames, gif_path, downsample_t=1, **qc_kwargs)
 
     log(f"Done. Output -> {out_dir}")
 
@@ -684,7 +756,7 @@ def preprocess_tiff_group(
             progress_cb(msg)
 
     # ---- Pass 1: scan all files for one shared global min/max -------------
-    log(f"[1/4] Scanning {len(srcs)} TIFFs for shared global min/max")
+    log(f"[1/2] Scanning {len(srcs)} TIFFs for shared global min/max")
     gmin = np.iinfo(np.int64).max
     gmax = np.iinfo(np.int64).min
     page_counts: list[int] = []
@@ -697,26 +769,60 @@ def preprocess_tiff_group(
                 if pmin < gmin: gmin = pmin
                 if pmax > gmax: gmax = pmax
                 if (i + 1) % 2000 == 0:
-                    log(f"[1/4]   {src.name}  scan {i + 1}/{n_pages}  "
+                    log(f"[1/2]   {src.name}  scan {i + 1}/{n_pages}  "
                         f"min={gmin} max={gmax}")
             page_counts.append(n_pages)
-            log(f"[1/4]   {src.name}: {n_pages} pages")
+            log(f"[1/2]   {src.name}: {n_pages} pages")
     shift = -gmin if gmin < 0 else 0
     shifted_max = gmax + shift
-    log(f"[1/4] global min={gmin} max={gmax}  -> shift+={shift}  "
+    log(f"[1/2] global min={gmin} max={gmax}  -> shift+={shift}  "
         f"(shifted max={shifted_max})")
     if shifted_max > 65535:
         raise ValueError(
             f"Shifted max {shifted_max} > 65535; uint16 overflow."
         )
 
-    # ---- Pass 2: write each shifted file ----------------------------------
-    log(f"[2/4] Writing {len(srcs)} shifted TIFFs into {out_dir}")
+    # ---- Pass 2: write each shifted file + accumulate mean / QC samples ---
+    # Folding mean accumulation and QC frame sampling into the write
+    # loop avoids two extra full reads of the shifted output (passes 3
+    # and 4 in the old layout) -- on spinning disks that's the entire
+    # cost of the QC/mean step.
+    qc_kwargs = dict(qc_params or {})
+    downsample_t = max(1, int(qc_kwargs.pop("downsample_t", 4)))
+    log(f"[2/2] Writing {len(srcs)} shifted TIFFs into {out_dir} "
+        f"(+ mean + QC accumulation)")
+    sum_arr: Optional[np.ndarray] = None
+    qc_buf: list[np.ndarray] = []
+    total_frames = 0
+    # ``qc_index`` is the global frame counter across files so the
+    # ``i % downsample_t == 0`` sample pattern continues seamlessly
+    # over concatenated TIFFs (matches the old pass-4 behaviour where
+    # each file was sampled independently with stride ``downsample_t``;
+    # the global counter makes the result file-boundary-agnostic).
+    qc_index = 0
     for src, dst in zip(srcs, shifted_paths):
         if dst.exists():
-            log(f"[2/4]   exists, skipping: {dst.name}")
+            # Already shifted on a prior run -- read it through to
+            # update the accumulators so the mean/QC remain correct
+            # for the full concatenation.
+            log(f"[2/2]   exists, scanning for mean+QC: {dst.name}")
+            with tifffile.TiffFile(str(dst)) as tf:
+                n_pages = len(tf.pages)
+                for i, page in enumerate(tf.pages):
+                    frame = page.asarray()
+                    if frame.dtype != np.uint16:
+                        frame = frame.astype(np.uint16)
+                    if sum_arr is None:
+                        sum_arr = np.zeros(frame.shape, dtype=np.float64)
+                    sum_arr += frame
+                    if qc_index % downsample_t == 0:
+                        qc_buf.append(frame.copy())
+                    qc_index += 1
+                    if (i + 1) % 2000 == 0:
+                        log(f"[2/2]     scan {i + 1}/{n_pages}")
+                total_frames += n_pages
             continue
-        log(f"[2/4]   {src.name} -> {dst.name}")
+        log(f"[2/2]   {src.name} -> {dst.name}")
         with tifffile.TiffFile(str(src)) as tf, \
                 tifffile.TiffWriter(str(dst), bigtiff=True) as tw:
             n_pages = len(tf.pages)
@@ -727,36 +833,30 @@ def preprocess_tiff_group(
                 elif frame.dtype != np.uint16:
                     frame = frame.astype(np.uint16)
                 tw.write(frame, contiguous=True)
+                if sum_arr is None:
+                    sum_arr = np.zeros(frame.shape, dtype=np.float64)
+                sum_arr += frame
+                if qc_index % downsample_t == 0:
+                    qc_buf.append(frame.copy())
+                qc_index += 1
                 if (i + 1) % 2000 == 0:
-                    log(f"[2/4]     write {i + 1}/{n_pages}")
+                    log(f"[2/2]     write {i + 1}/{n_pages}")
+            total_frames += n_pages
 
-    # ---- Pass 3: mean image across the concatenated stack -----------------
-    log(f"[3/4] Mean image across {len(shifted_paths)} files")
-    sum_arr: Optional[np.ndarray] = None
-    total_frames = 0
-    Y = X = 0
-    for dst in shifted_paths:
-        m = tifffile.memmap(str(dst), mode="r")
-        if sum_arr is None:
-            Y, X = int(m.shape[1]), int(m.shape[2])
-            sum_arr = np.zeros((Y, X), dtype=np.float64)
-        sum_arr += m.sum(axis=0, dtype=np.float64)
-        total_frames += int(m.shape[0])
-        del m
+    if sum_arr is None:
+        raise ValueError(
+            f"preprocess_tiff_group: produced no frames for {out_dir}"
+        )
+    Y, X = int(sum_arr.shape[0]), int(sum_arr.shape[1])
     mean = (sum_arr / max(1, total_frames)).astype(np.float32)
     np.save(str(mean_path), mean)
-    log(f"[3/4]   mean over {total_frames} frames ({Y}x{X})")
+    log(f"[2/2]   mean over {total_frames} frames ({Y}x{X})")
 
-    # ---- Pass 4: QC gif from down-sampled concatenated frames -------------
-    log("[4/4] Writing QC gif")
-    qc_kwargs = dict(qc_params or {})
-    downsample_t = max(1, int(qc_kwargs.pop("downsample_t", 4)))
-    sampled: list[np.ndarray] = []
-    for dst in shifted_paths:
-        m = tifffile.memmap(str(dst), mode="r")
-        sampled.append(np.asarray(m[::downsample_t]))
-        del m
-    movie = np.concatenate(sampled, axis=0) if len(sampled) > 1 else sampled[0]
+    log("[2/2] Writing QC gif")
+    movie = (
+        np.stack(qc_buf, axis=0) if qc_buf
+        else np.empty((0, Y, X), dtype=np.uint16)
+    )
     make_qc_gif(movie, gif_path, downsample_t=1, **qc_kwargs)
 
     log(f"Done. Output -> {out_dir}")

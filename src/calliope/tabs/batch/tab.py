@@ -25,7 +25,7 @@ What the user sees
   identifier entry, a list of TIFFs (with Browse), an "Edit
   parameters..." button, and a per-row status / progress label.
 - Bottom: orchestration log -- per-stage start/done/timing for the
-  active row. The detailed suite2p / preprocess output now lives in
+  active row. The detailed suite2p / preprocess output is shown in
   each individual tab's own console (which the user can view by
   clicking that tab during the run).
 
@@ -60,8 +60,7 @@ from typing import Optional
 
 from ...gui_common import (
     AppState, apply_dark_to_tk_widget, attach_resize_handle,
-    bind_mousewheel_to_scrollable, drain_queue, open_advanced,
-    pick_tiffs_dialog, spec_defaults,
+    drain_queue, open_advanced, pick_tiffs_dialog, spec_defaults,
 )
 from .logic import (
     BATCH_JSON_NAME, BATCH_REPORT_NAME, SCRATCH_DETECTION_KEEP_DIRS,
@@ -78,7 +77,7 @@ class BatchRow:
     tiff list, parameter overrides, and status label.
     """
 
-    def __init__(self, parent: ttk.Frame, tab: "BatchTab",
+    def __init__(self, parent, tab: "BatchTab",
                  *, identifier: str = "",
                  tiffs: Optional[list[str]] = None,
                  params: Optional[dict] = None) -> None:
@@ -109,8 +108,8 @@ class BatchRow:
         ctk.CTkButton(self.frame, text="Edit params", width=110,
                       command=self._on_edit_params) \
             .grid(row=0, column=4, padx=(0, 4))
-        ttk.Label(self.frame, textvariable=self.status_var,
-                  width=18, anchor="w") \
+        ctk.CTkLabel(self.frame, textvariable=self.status_var,
+                     width=140, anchor="w") \
             .grid(row=0, column=5, padx=(0, 4))
         ctk.CTkButton(self.frame, text="x", width=28,
                       command=self._on_remove) \
@@ -171,7 +170,7 @@ class BatchRow:
         self.tab.remove_row(self)
 
 
-class BatchTab(ttk.Frame):
+class BatchTab(ctk.CTkFrame):
     """Tab 0: queue of recordings + run-all worker."""
 
     POLL_MS = 100
@@ -179,7 +178,7 @@ class BatchTab(ttk.Frame):
     PARAM_SPEC = build_batch_param_spec()
 
     def __init__(self, master, state: AppState) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, fg_color="transparent")
         self.state = state
         self._rows: list[BatchRow] = []
         self.default_params: dict = spec_defaults(self.PARAM_SPEC)
@@ -480,11 +479,14 @@ class BatchTab(ttk.Frame):
     # -- UI ----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        top = ttk.LabelFrame(self, text="Batch run setup", padding=8)
-        top.pack(fill="x", pady=(0, 6))
+        top = ctk.CTkFrame(self)
+        top.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(top, text="Batch run setup",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
 
         row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="Working dir:", width=110,
                      anchor="w").pack(side="left")
         self.workdir_var = tk.StringVar()
@@ -500,7 +502,7 @@ class BatchTab(ttk.Frame):
                       command=self._on_scan).pack(side="left", padx=(8, 0))
 
         row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="Output folder:", width=110,
                      anchor="w").pack(side="left")
         self.outdir_var = tk.StringVar()
@@ -524,7 +526,7 @@ class BatchTab(ttk.Frame):
         # recording's intermediate I/O lives on this scratch path during
         # the run, then bulk-copies to the slow output folder above.
         row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", padx=8, pady=2)
         ctk.CTkLabel(row, text="Scratch dir (SSD):", width=110,
                      anchor="w").pack(side="left")
         self.scratch_dir_var = tk.StringVar()
@@ -537,7 +539,7 @@ class BatchTab(ttk.Frame):
                      text_color="gray").pack(side="left", padx=(8, 0))
 
         row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack(fill="x", pady=(6, 2))
+        row.pack(fill="x", padx=8, pady=(6, 6))
         ctk.CTkButton(row, text="Apply defaults to all rows", width=200,
                       command=self._on_edit_defaults) \
             .pack(side="left")
@@ -560,30 +562,45 @@ class BatchTab(ttk.Frame):
         # Headers + scrollable rows -----------------------------------------
         # First column = the per-row selection checkbox (no header text);
         # the rest match BatchRow's grid order.
+        # Each header label width is in CTkLabel pixels (~7 per char) so
+        # it lines up with each column underneath.
         headers = ctk.CTkFrame(self, fg_color="transparent")
-        headers.pack(fill="x", padx=4)
-        for txt, w in (("", 3),
-                       ("Identifier", 22),
-                       ("TIFF file(s) (semicolon-sep)", 50),
-                       ("", 11), ("", 13), ("Status", 18), ("", 3)):
-            ttk.Label(headers, text=txt, width=w, anchor="w") \
+        headers.pack(fill="x", padx=14)
+        for txt, w in (("", 24),
+                       ("Identifier", 200),
+                       ("TIFF file(s) (semicolon-sep)", 360),
+                       ("", 90), ("", 110), ("Status", 140), ("", 28)):
+            ctk.CTkLabel(headers, text=txt, width=w, anchor="w") \
                 .pack(side="left", padx=(0, 4))
 
-        # Recordings list and Run log each live in their own ``tk.Frame``
+        # Recordings list and Run log each live in their own CTkFrame
         # wrap with a draggable grip below. Resizing one extends just
         # that panel and the surrounding scrollable wrapper grows the
         # tab body to absorb it -- no top-level PanedWindow so dragging
         # one panel never shrinks the other.
-        body_wrap = tk.Frame(self)
-        body_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        body = ttk.LabelFrame(body_wrap, text="Recordings", padding=4)
+        body_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        body_wrap.pack(fill="x", padx=14, pady=(0, 0))
+        body = ctk.CTkFrame(body_wrap)
         body.pack(fill="both", expand=True)
-        canvas = tk.Canvas(body, highlightthickness=0)
+        ctk.CTkLabel(body, text="Recordings",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        # tk.Canvas because CTk has no scrollable-canvas widget --
+        # we need a canvas-window so the inner rows frame can grow
+        # independently of the viewport. Dark-skin the canvas *before*
+        # we add the rows-frame window so CTkFrame's "transparent"
+        # mode resolves to the dark canvas bg (not the default white
+        # at construction time).
+        canvas_holder = ctk.CTkFrame(body, fg_color="transparent")
+        canvas_holder.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        canvas = tk.Canvas(canvas_holder, highlightthickness=0)
+        apply_dark_to_tk_widget(canvas)
         canvas.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        sb = ctk.CTkScrollbar(canvas_holder, orientation="vertical",
+                              command=canvas.yview)
         sb.pack(side="right", fill="y")
         canvas.configure(yscrollcommand=sb.set)
-        self._rows_frame = ttk.Frame(canvas)
+        self._rows_frame = ctk.CTkFrame(canvas, fg_color="transparent")
         self._rows_canvas_id = canvas.create_window(
             (0, 0), window=self._rows_frame, anchor="nw")
 
@@ -599,25 +616,21 @@ class BatchTab(ttk.Frame):
                              initial_height=260)
 
         # Console -----------------------------------------------------------
-        console_wrap = tk.Frame(self)
-        console_wrap.pack(fill="x", padx=4, pady=(0, 0))
-        console_frame = ttk.LabelFrame(console_wrap, text="Run log",
-                                       padding=4)
+        console_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        console_wrap.pack(fill="x", padx=14, pady=(0, 14))
+        console_frame = ctk.CTkFrame(console_wrap)
         console_frame.pack(fill="both", expand=True)
-        self.log = tk.Text(console_frame, height=10, wrap="word",
-                           state="disabled")
-        log_sb = ttk.Scrollbar(console_frame, orient="vertical",
-                               command=self.log.yview)
-        self.log.configure(yscrollcommand=log_sb.set)
-        log_sb.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
-        apply_dark_to_tk_widget(self.log)
-        # Also dark-skin the embedded rows canvas so the queue list
-        # doesn't render on a bright white background.
-        apply_dark_to_tk_widget(canvas)
-        # Scroll-on-hover: spin the wheel anywhere over the Recordings
-        # panel to scroll the row list, not just on its scrollbar.
-        bind_mousewheel_to_scrollable(body, scroll_target=canvas)
+        ctk.CTkLabel(console_frame, text="Run log",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        self.log = ctk.CTkTextbox(console_frame, height=180, wrap="word",
+                                  state="disabled")
+        self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        # Wheel routing is centralised in the app root's
+        # ``install_scroll_router``: when the cursor sits over the
+        # rows canvas the walk-up finds this scrollable tk.Canvas
+        # first and scrolls it; everywhere else in the tab falls
+        # through to scrolling the tab wrapper.
         attach_resize_handle(self, console_wrap, min_height=160,
                              initial_height=220)
 
@@ -1005,10 +1018,9 @@ class BatchTab(ttk.Frame):
     # ---------------------------------------------------------------------
     # Batch orchestration
     # ---------------------------------------------------------------------
-    # The batch runner now drives the GUI tabs in sequence rather than
-    # calling headless ``*_run.py`` modules. For each row it walks
-    # STAGES, sets the relevant tab's input fields the same way a user
-    # would, then calls that tab's ``_on_run`` (or equivalent) and
+    # The batch runner drives the GUI tabs in sequence. For each row it
+    # walks STAGES, sets the relevant tab's input fields the same way a
+    # user would, then calls that tab's ``_on_run`` (or equivalent) and
     # subscribes one-shot to the AppState publish channel that signals
     # the stage's completion (``set_result``, ``set_plane0``,
     # ``set_lowpass_ready``, ``set_event_results``,
@@ -1018,9 +1030,10 @@ class BatchTab(ttk.Frame):
     # ``set_event_results`` so the orchestrator just waits a beat for
     # it to draw and advances.
     #
-    # Why drive the GUI rather than call headless modules: lets the
-    # user click into any tab mid-run and see the live state (panels,
-    # progress, log) as the pipeline progresses through that recording.
+    # Why drive the GUI rather than call into headless backends: lets
+    # the user click into any tab mid-run and see the live state
+    # (panels, progress, log) as the pipeline progresses through that
+    # recording.
 
     STAGES = (
         "preprocess",
@@ -2056,20 +2069,19 @@ class BatchTab(ttk.Frame):
             # this is safe regardless of whether the mirror drained
             # cleanly or timed out.
             #
-            # First attempt: standard rmtree. On Windows this can
-            # fail silently when a file handle is still open
-            # (suite2p memmap not yet GC'd, Explorer window in
-            # scratch, antivirus scanning, or downstream tabs --
-            # Tab 4 / 5 / 6 / ... -- holding ``np.memmap`` objects
-            # on the just-finished recording's scratch files). One
-            # retry after a 2-s pause covers transient locks.
-            # Anything still locked after that gets handed off to
-            # the long-lived scratch janitor (see
+            # First attempt: standard rmtree. The repoint hooks
+            # above already nulled known long-lived memmap caches
+            # (Tab 3 popout, Tab 6, Tab 7) so the common case is
+            # that ``gc.collect`` releases the file handles and
+            # rmtree succeeds on the first pass. Residual failures
+            # come from transient locks (antivirus scanning, an
+            # Explorer window in scratch, a popout reopened between
+            # the drop and the rmtree). One retry after a 2-s pause
+            # covers those. Anything still locked after that gets
+            # handed off to the long-lived scratch janitor (see
             # ``_scratch_janitor_loop``) which retries every ~30 s
-            # until the handles release -- typically when the next
-            # recording's repoint causes the tabs to reopen their
-            # memmaps elsewhere, or when the user navigates away
-            # from a stale view. No manual cleanup is ever needed.
+            # until the handles release. No manual cleanup is ever
+            # needed.
             gc.collect()
             shutil.rmtree(str(scratch_rec), ignore_errors=True)
             if scratch_rec.exists():
@@ -2231,18 +2243,23 @@ class BatchTab(ttk.Frame):
                 except Exception:
                     continue
 
-        # Memmap-handle release. We deliberately do NOT explicitly
-        # null tab-level ``np.memmap`` caches here (Tab 7's
-        # ``_dff_cache`` is the only one that exists today): the
-        # next row's pipeline naturally publishes a new plane0
-        # which fires ``_set_plane0`` on Tab 7 and drops the cache;
-        # the long-lived scratch janitor picks up the released
-        # handle on its next 30 s pass and rmtree succeeds. For
-        # the LAST row of a batch the orphan sweep at the next
-        # batch start catches anything still locked. Keeping the
-        # repoint stage decoupled from tab-internal cache field
-        # names means new tab-level memmap caches don't need a
-        # corresponding entry in this function.
+        # Memmap-handle release. Path rewrites above don't close
+        # any open ``np.memmap`` -- so tabs that cache a memmap as
+        # instance state (Tab 6 ``_dff``, Tab 7 ``_dff_cache``, the
+        # Tab 3 curation popout's ``_dff``, the Tab 6 cluster
+        # popout's ``_dff``) implement their own ``_repoint_after_copy``
+        # hook that nulls the cache when its backing file lives
+        # under ``scratch``. The hook ran in the loop above; the
+        # ``gc.collect`` here forces the released ``np.memmap``
+        # objects to drop their Windows file handles before the
+        # caller's bulk ``rmtree`` fires.
+        #
+        # Why this matters: without the explicit drop, the LAST row
+        # of a batch + any open popout would keep the scratch dF/F
+        # memmap locked indefinitely (no next-row publish to fire
+        # ``_set_plane0``, no orphan sweep until the next batch
+        # starts). The janitor would spin every 30 s and never
+        # succeed until app exit.
         gc.collect()
 
     def _batch_finish(self) -> None:
@@ -2409,10 +2426,10 @@ class BatchTab(ttk.Frame):
     def _append_log(self, text: str) -> None:
         if not text:
             return
-        self.log.config(state="normal")
+        self.log.configure(state="normal")
         self.log.insert("end", text.rstrip() + "\n")
         self.log.see("end")
-        self.log.config(state="disabled")
+        self.log.configure(state="disabled")
 
     def _log(self, msg: str) -> None:
         self._log_queue.put(("log", msg))

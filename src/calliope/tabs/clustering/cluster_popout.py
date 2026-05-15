@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
 from typing import Optional
 
 import customtkinter as ctk
@@ -45,6 +44,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import to_rgba
+
+from ...gui_common import install_scroll_router
 
 
 def _normalise_rows(arr: np.ndarray) -> np.ndarray:
@@ -137,13 +138,16 @@ class ClusterPopout(ctk.CTkToplevel):
         status_frame = ctk.CTkFrame(self, fg_color="transparent")
         status_frame.pack(side="top", fill="x", padx=6, pady=6)
         self._status_var = tk.StringVar(value="No cluster selected.")
-        ttk.Label(status_frame, textvariable=self._status_var,
-                  anchor="w").pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(status_frame, textvariable=self._status_var,
+                     anchor="w").pack(side="left", fill="x", expand=True)
         ctk.CTkButton(status_frame, text="Close (Esc)", width=110,
                       command=self._on_close).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda _e: self._on_close())
+        # Consume wheel events so they don't leak through CTk's
+        # global bind_all and scroll the main app behind this popout.
+        install_scroll_router(self)
 
     # -- Public ------------------------------------------------------------
 

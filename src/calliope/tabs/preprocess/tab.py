@@ -26,16 +26,12 @@ shows up in every "long-running" tab in CalLIOPE:
        queue, and writes lines into the log panel. When it sees the
        "done" sentinel it publishes the result on ``AppState``.
 
-For an R user: same idea as launching a ``future`` in the
-``promises`` package and polling it from Shiny's reactive event
-loop.
-
 Module layout
 -------------
-``PreprocessTab`` (subclass of ``ttk.Frame``)
-    The actual tab widget. ``ttk.Frame`` is just "a container for
-    other widgets" -- subclassing it gives us a Tk widget that *is*
-    a frame and adds our own state + methods on top.
+``PreprocessTab`` (subclass of ``ctk.CTkFrame``)
+    The actual tab widget. Subclassing the frame gives us a Tk
+    widget that *is* a frame and adds our own state + methods on
+    top.
 
 ``PARAM_SPEC`` (class attribute)
     A list of dicts describing every Advanced... knob. Used to
@@ -54,7 +50,8 @@ Lifecycle
     _drain_log_queue-- main-thread polling loop draining the log queue.
 """
 
-# Type-hint forward-reference shim (see pipeline_gui.py).
+# ``from __future__ import annotations`` keeps type hints as strings
+# at parse time (see pipeline_gui.py for the full rationale).
 from __future__ import annotations
 
 # Threading + queue: the long-running preprocess step runs on a
@@ -67,12 +64,13 @@ from pathlib import Path
 
 import customtkinter as ctk
 # ``filedialog`` for the Browse... folder picker;
-# ``messagebox`` for error pop-ups; ``ttk`` for themed widgets.
+# ``messagebox`` for error pop-ups; ``ttk`` only for the Spinbox
+# widget CTk doesn't ship.
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-# Re-export shim (see logic.py for what this is). We rename it to
-# ``preprocessing`` so the call sites read like normal code:
+# ``logic`` is the per-tab worker module; aliasing it as
+# ``preprocessing`` lets the call sites read like
 # ``preprocessing.preprocess_tiff(...)``.
 from . import logic as preprocessing
 from .logic import PreprocessResult
@@ -82,22 +80,20 @@ from .logic import PreprocessResult
 # PARAM_SPEC" helper.
 from ...gui_common import (
     AppState, apply_dark_to_tk_widget, attach_resize_handle,
-    bind_mousewheel_to_scrollable, drain_queue, open_advanced,
-    spec_defaults,
+    drain_queue, open_advanced, spec_defaults,
 )
 
 
-class PreprocessTab(ttk.Frame):
+class PreprocessTab(ctk.CTkFrame):
     """Tab 1: pick TIFFs and run the shift + QC preprocess.
 
-    Inherits from ``ttk.Frame`` so an instance is usable as a Tk
-    widget that holds children and can be packed/gridded into the
-    parent notebook.
+    Subclasses ``ctk.CTkFrame`` so the instance is itself a Tk widget
+    that the content host can pack/grid directly.
     """
 
-    # ``POLL_MS`` is how often (ms) the main-thread log-drain runs.
-    # 80ms ≈ 12 Hz, fast enough to look smooth, slow enough not to
-    # eat CPU.
+    # Class attribute (lives on the class, shared by every instance).
+    # ``POLL_MS`` is how often (ms) the main-thread log-drain runs --
+    # 80 ms is fast enough to look smooth, slow enough not to eat CPU.
     POLL_MS = 80
 
     PARAM_SPEC: list = [
@@ -123,10 +119,10 @@ class PreprocessTab(ttk.Frame):
         ``state`` is the shared ``AppState`` event bus -- we'll
         publish the ``PreprocessResult`` onto it when Run finishes.
         """
-        # Initialise the parent ``ttk.Frame`` with 10 px of internal
-        # padding. ``super().__init__`` is the standard way to call
-        # the parent class's constructor.
-        super().__init__(master, padding=10)
+        # ``super().__init__`` runs the CTkFrame constructor; CTk frames
+        # don't accept a ``padding=`` kwarg, so the children below use
+        # padx/pady for inset spacing.
+        super().__init__(master, fg_color="transparent")
         # Stash the state bus so the worker callback can publish onto
         # it later.
         self.state = state
@@ -162,47 +158,55 @@ class PreprocessTab(ttk.Frame):
         # scrollable wrapper lets the tab body grow as long as we want.
         # Panels 1, 3, 4 stay fixed-height; resizing one of the variable
         # panels never shrinks the others.
-        dir_frame = ttk.LabelFrame(self,
-                                   text="1. Working directory (raw TIFFs)",
-                                   padding=6)
-        dir_frame.pack(fill="x", padx=4, pady=(4, 2))
+        dir_frame = ctk.CTkFrame(self)
+        dir_frame.pack(fill="x", padx=14, pady=(14, 2))
+        ctk.CTkLabel(dir_frame, text="1. Working directory (raw TIFFs)",
+                     font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w",
+            padx=8, pady=(6, 4))
 
         self.dir_var = tk.StringVar()
         ctk.CTkEntry(dir_frame, textvariable=self.dir_var).grid(
-            row=0, column=0, sticky="ew", padx=(0, 6))
+            row=1, column=0, sticky="ew", padx=(8, 6), pady=(0, 4))
         ctk.CTkButton(dir_frame, text="Browse...", width=90,
-                      command=self._browse_dir).grid(row=0, column=1)
+                      command=self._browse_dir).grid(
+            row=1, column=1, padx=(0, 8), pady=(0, 4))
 
         # Subfolder search depth (BFS): 0 = only files in working_dir
         self.depth_var = tk.IntVar(value=0)
         ctk.CTkLabel(dir_frame, text="Search depth (subfolders):").grid(
-            row=1, column=0, sticky="w", pady=(6, 0))
-        # ttk.Spinbox kept -- customtkinter has no spinbox equivalent.
+            row=2, column=0, sticky="w", padx=(8, 0), pady=(0, 6))
+        # ttk.Spinbox: CTk doesn't ship its own spinbox primitive, so
+        # we fall back to ttk here and let apply_ttk_dark_theme blend it.
         depth_spin = ttk.Spinbox(
             dir_frame, from_=0, to=99, width=5,
             textvariable=self.depth_var, command=self._refresh_tiffs,
         )
-        depth_spin.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        depth_spin.grid(row=2, column=1, sticky="w", padx=(0, 8),
+                        pady=(0, 6))
         depth_spin.bind("<Return>", lambda _e: self._refresh_tiffs())
         depth_spin.bind("<FocusOut>", lambda _e: self._refresh_tiffs())
 
         dir_frame.columnconfigure(0, weight=1)
 
-        # tk.Frame wrap so configure(height=) is honoured -- ttk widgets
-        # recompute reqh from content after children land, which
-        # otherwise undoes the resize handle's height changes.
-        tiff_wrap = tk.Frame(self)
-        tiff_wrap.pack(fill="x", padx=4, pady=2)
-        tiff_frame = ttk.LabelFrame(
-            tiff_wrap,
-            text="2. TIFF files  (select 1+; multi-selection -> one grouped "
-                 "recording)",
-            padding=6,
-        )
+        # CTkFrame wrap so configure(height=) is honoured -- the
+        # resize handle re-sizes this wrapper without ttk widgets
+        # recomputing reqh and undoing the change.
+        tiff_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        tiff_wrap.pack(fill="x", padx=14, pady=2)
+        tiff_frame = ctk.CTkFrame(tiff_wrap)
         tiff_frame.pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            tiff_frame,
+            text="2. TIFF files  (select 1+; multi-selection -> "
+                 "one grouped recording)",
+            font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w",
+            padx=8, pady=(6, 4))
 
         list_holder = ctk.CTkFrame(tiff_frame, fg_color="transparent")
-        list_holder.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        list_holder.grid(row=1, column=0, sticky="nsew",
+                         padx=(8, 6), pady=(0, 4))
         list_holder.columnconfigure(0, weight=1)
         list_holder.rowconfigure(0, weight=1)
         self.tiff_listbox = tk.Listbox(
@@ -210,8 +214,8 @@ class PreprocessTab(ttk.Frame):
             exportselection=False,
         )
         self.tiff_listbox.grid(row=0, column=0, sticky="nsew")
-        list_sb = ttk.Scrollbar(list_holder, orient="vertical",
-                                command=self.tiff_listbox.yview)
+        list_sb = ctk.CTkScrollbar(list_holder, orientation="vertical",
+                                   command=self.tiff_listbox.yview)
         list_sb.grid(row=0, column=1, sticky="ns")
         self.tiff_listbox.config(yscrollcommand=list_sb.set)
         self.tiff_listbox.bind(
@@ -221,78 +225,91 @@ class PreprocessTab(ttk.Frame):
 
         ctk.CTkButton(tiff_frame, text="Refresh", width=80,
                       command=self._refresh_tiffs).grid(
-                          row=0, column=1, sticky="n")
+                          row=1, column=1, sticky="n", padx=(0, 8),
+                          pady=(0, 4))
 
         ctk.CTkLabel(
             tiff_frame,
             text="Identifier (optional, used as folder name; "
                  "default = '+'-joined stems for groups):",
             anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ).grid(row=2, column=0, columnspan=2, sticky="w",
+               padx=8, pady=(8, 2))
         self.identifier_var = tk.StringVar()
         self.identifier_var.trace_add(
             "write", lambda *_a: self._update_existing_status()
         )
         ctk.CTkEntry(tiff_frame, textvariable=self.identifier_var).grid(
-            row=2, column=0, columnspan=2, sticky="ew")
+            row=3, column=0, columnspan=2, sticky="ew",
+            padx=8, pady=(0, 8))
 
         tiff_frame.columnconfigure(0, weight=1)
         # Only the list row expands when the panel is dragged taller --
-        # the Identifier label + entry (rows 1 and 2) stay anchored at
+        # the Identifier label + entry (rows 2 and 3) stay anchored at
         # the bottom with default weight=0, so growing the panel always
         # gives more height to the TIFF listbox.
-        tiff_frame.rowconfigure(0, weight=1)
+        tiff_frame.rowconfigure(1, weight=1)
 
         # Draggable grip extends tiff_wrap downward when the listbox
         # needs more rows on screen.
         attach_resize_handle(self, tiff_wrap, min_height=140)
 
-        out_frame = ttk.LabelFrame(
-            self,
+        out_frame = ctk.CTkFrame(self)
+        out_frame.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(
+            out_frame,
             text="3. Output root  (creates data/<recording>/ underneath)",
-            padding=6)
-        out_frame.pack(fill="x", padx=4, pady=2)
+            font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w",
+            padx=8, pady=(6, 4))
 
         self.data_root_var = tk.StringVar()
         ctk.CTkEntry(out_frame, textvariable=self.data_root_var).grid(
-            row=0, column=0, sticky="ew", padx=(0, 6))
+            row=1, column=0, sticky="ew", padx=(8, 6), pady=(0, 8))
         ctk.CTkButton(out_frame, text="Browse...", width=90,
-                      command=self._browse_data_root).grid(row=0, column=1)
+                      command=self._browse_data_root).grid(
+            row=1, column=1, padx=(0, 8), pady=(0, 8))
         out_frame.columnconfigure(0, weight=1)
 
-        action = ttk.LabelFrame(self, text="4. Run", padding=6)
-        action.pack(fill="x", padx=4, pady=2)
-        self.run_btn = ctk.CTkButton(action, text="Run preprocessing",
+        action = ctk.CTkFrame(self)
+        action.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(action, text="4. Run",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 4))
+        action_row = ctk.CTkFrame(action, fg_color="transparent")
+        action_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.run_btn = ctk.CTkButton(action_row, text="Run preprocessing",
                                      command=self._on_run)
         self.run_btn.pack(side="left")
-        self.rerun_btn = ctk.CTkButton(action, text="Force rerun",
+        self.rerun_btn = ctk.CTkButton(action_row, text="Force rerun",
                                        command=self._on_force_rerun,
                                        state="disabled")
         self.rerun_btn.pack(side="left", padx=(6, 0))
-        ctk.CTkButton(action, text="Advanced...",
+        ctk.CTkButton(action_row, text="Advanced...",
                       command=self._on_advanced).pack(side="left", padx=(6, 0))
         self.progress = ctk.CTkProgressBar(
-            action, mode="indeterminate", width=200)
+            action_row, mode="indeterminate", width=200)
         self.progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(value="Idle.")
-        ttk.Label(action, textvariable=self.status_var).pack(side="left")
+        ctk.CTkLabel(action_row, textvariable=self.status_var).pack(
+            side="left")
 
-        log_wrap = tk.Frame(self)
-        log_wrap.pack(fill="x", padx=4, pady=(2, 0))
-        log_frame = ttk.LabelFrame(log_wrap, text="5. Log", padding=4)
+        log_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        log_wrap.pack(fill="x", padx=14, pady=(2, 14))
+        log_frame = ctk.CTkFrame(log_wrap)
         log_frame.pack(fill="both", expand=True)
-        self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log.pack(fill="both", expand=True, side="left")
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
-                               command=self.log.yview)
-        log_sb.pack(fill="y", side="right")
-        self.log.config(yscrollcommand=log_sb.set)
-        apply_dark_to_tk_widget(self.log)
+        ctk.CTkLabel(log_frame, text="5. Log",
+                     font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        self.log = ctk.CTkTextbox(log_frame, height=200, wrap="word",
+                                  state="disabled")
+        self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         apply_dark_to_tk_widget(self.tiff_listbox)
-        # Scroll-on-hover: spin the wheel anywhere over the TIFF list
-        # holder, not just on the narrow scrollbar.
-        bind_mousewheel_to_scrollable(list_holder,
-                                      scroll_target=self.tiff_listbox)
+        # Wheel routing is centralised in the app root's
+        # ``install_scroll_router``: when the cursor is over the
+        # listbox the walk-up finds the tk.Listbox and lets its
+        # class binding scroll; everywhere else falls through to
+        # the tab wrapper.
         # Resize grip below the log -- drag down to grow the log; the
         # scrollable tab body absorbs the extra height.
         attach_resize_handle(self, log_wrap, min_height=160, pad=(0, 0))
@@ -496,10 +513,10 @@ class PreprocessTab(ttk.Frame):
     # -- Logging / queue drain ---------------------------------------------
 
     def _append_log(self, text: str) -> None:
-        self.log.config(state="normal")
+        self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
-        self.log.config(state="disabled")
+        self.log.configure(state="disabled")
 
     def _on_done(self, result: PreprocessResult) -> None:
         self.progress.stop()

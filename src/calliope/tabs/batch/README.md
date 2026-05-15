@@ -249,31 +249,44 @@ mirror's copy operations are bandwidth-throttled:
       things that matter for the rmtree: (1) rewrite path-string
       attributes (`_plane0`, `_lowpass_plane0`, etc.) on every tab
       so future reloads land on HDD, and (2) invoke each tab's
-      opt-in `_repoint_after_copy(scratch, final)` hook so tabs
-      can rewrite path data stored inside dict-valued attributes
-      that the attribute walker can't reach. Tab 3 implements the
-      hook to rewrite `_panel_cache["plane0"]` (the path its
-      curation popout reads `iscell.npy` / `stat.npy` from) plus
-      any open `CurationPopout`'s `_plane0`. Tabs without the
-      hook are unaffected.
+      opt-in `_repoint_after_copy(scratch, final)` hook. The hook
+      handles two responsibilities the attribute walker can't:
+      rewriting path data stored inside dict-valued attributes,
+      and **explicitly nulling any `np.memmap` whose backing file
+      lives under `scratch`** so Windows releases the file handle
+      before the bulk rmtree fires.
 
-      We DON'T explicitly null tab-level `np.memmap` caches
-      (Tab 7's `_dff_cache` is the only one that exists today):
-      the next row's pipeline naturally publishes a new plane0
-      which fires Tab 7's `_set_plane0` and drops the cache; the
-      janitor's next 30 s pass picks up the released handle and
-      rmtree succeeds. Keeping the repoint stage decoupled from
-      tab-internal cache field names means new tab-level memmap
-      caches don't need a corresponding entry here.
+      Tabs that hold long-lived memmap state implement the hook:
+      - **Tab 3 (suite2p)** — rewrites `_panel_cache["plane0"]`
+        (the path its curation popout reads `iscell.npy` /
+        `stat.npy` from), rewrites any open `CurationPopout`'s
+        `_plane0`, and drops `CurationPopout._dff` (the trace-strip
+        memmap opened from `r0p7_dff.memmap.float32`).
+      - **Tab 6 (clustering)** — drops `self._dff` (the filtered
+        dF/F memmap stashed in `_on_done`) and the open
+        `ClusterPopout._dff`. `_set_plane0` doesn't reset
+        `self._dff` so without this hook the scratch handle would
+        leak across recordings.
+      - **Tab 7 (cross-correlation)** — drops `_dff_cache` if its
+        memmap points under scratch. Next preview reopens lazily
+        against the HDD twin.
 
-      If rmtree still fails on the first try (e.g., the user has
-      the curation popout open and its `_open_dff` cached memmap
-      pins the handle, or antivirus is scanning), a second attempt
-      fires after a 2 s wait + another `gc.collect`. Anything
-      still locked is enqueued to the long-lived **scratch
-      janitor** (a daemon thread started in `__init__`) which
-      retries every 30 s until the handles release. The user is
-      never asked to clean up manually.
+      Without these explicit drops, the LAST row of a batch + any
+      open popout would keep the scratch dF/F memmap locked
+      indefinitely (no next-row publish to fire `_set_plane0`, no
+      orphan sweep until the next batch starts), and the janitor
+      would spin every 30 s with no progress until app exit. New
+      tab-level memmap caches need a corresponding `_repoint_after_copy`
+      entry on their tab — the batch tab stays decoupled from
+      tab internals.
+
+      If rmtree still fails on the first try (e.g., antivirus is
+      scanning, or a popout reopened the memmap between the drop
+      and the rmtree), a second attempt fires after a 2 s wait +
+      another `gc.collect`. Anything still locked is enqueued to
+      the long-lived **scratch janitor** (a daemon thread started
+      in `__init__`) which retries every 30 s until the handles
+      release. The user is never asked to clean up manually.
 5. Row status flips from `"<status> (transferring)"` to
    `"<status> (done)"` once the finalize worker finishes.
 
