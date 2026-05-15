@@ -26,7 +26,8 @@ Layout
                                 cellpose-based detection, the
                                 cell-filter PyTorch model)
 - ``calliope.data``          - bundled resource files (Suite2p ``ops``
-                                JSON, AAV metadata, etc.)
+                                JSON, the pretrained cell-filter
+                                checkpoint, etc.)
 
 Run the GUI with::
 

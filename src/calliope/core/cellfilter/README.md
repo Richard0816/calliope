@@ -343,7 +343,7 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 |---|---|---|
 | `LABELS_CSV` | `src/calliope/data/cellfilter_labels.csv` (in-project) | Hand-labelled training data. Created lazily on the first curation flip. Gitignored so per-curator labels don't conflict. |
 | `LABELS_CSV_COLUMNS` | `(plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso)` | Canonical CSV schema. `plane0_path` is the trainer's source of truth -- no more `DATA_ROOT` resolution. |
-| `CHECKPOINT_DIR` | `~/.calliope/cellfilter_checkpoints/` | Where `best.pt`, `last.pt`, `train_log.csv` live. Outside the repo so big binary weights don't get committed. |
+| `CHECKPOINT_DIR` | `~/.calliope/cellfilter_checkpoints/` | Where retrained `best.pt`, `last.pt`, `train_log.csv` from `cellfilter.train` land. The default ckpt Tab 3 loads is the bundled `src/calliope/data/cellfilter_best.pt` (small enough to ship in the wheel); users who retrain point Tab 3's Browse... field at their new file here. |
 | `DFF_PREFIX` | `r0p7_` | Memmap prefix the cache reads from `plane0`. |
 | `PATCH_SIZE` | 32 | Spatial patch edge in pixels. |
 | `TRACE_CROP_LEN` | 2000 | Random crop length for training. |

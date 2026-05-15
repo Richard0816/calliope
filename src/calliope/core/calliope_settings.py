@@ -29,8 +29,9 @@ from typing import Any
 # the correct nested location matching suite2p 1.0's settings schema.
 #
 # Notes on the chosen values:
-#     * ``tau`` defaults to GCaMP6f (0.137 s); per-recording AAV lookup
-#       overrides this when the recording is in the AAV CSV.
+#     * ``tau`` defaults to GCaMP8m (0.137 s) as a fallback. Tab 3's
+#       GCaMP-variant dropdown sets the per-recording tau via the
+#       suite2p_pipeline ``tau_override`` field, which wins over this.
 #     * ``fs`` is the lab's 2-photon scope's nominal frame rate; the tab
 #       overrides per recording from the notes.txt sidecar when present.
 #     * ``registration.batch_size`` is much larger than suite2p's default

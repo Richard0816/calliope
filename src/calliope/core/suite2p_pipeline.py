@@ -11,8 +11,8 @@ The pipeline has three layers:
    :func:`calliope.core.calliope_settings.build_base_settings` (the
    in-source defaults), then deep-merges any per-session
    ``settings_override`` from Tab 3's "Edit suite2p settings..."
-   popout. Per-recording dynamics (``tau`` from the AAV CSV,
-   RAM-tuned ``batch_size`` / ``nbins``) are layered on top.
+   popout. Per-recording dynamics (``tau`` from Tab 3's GCaMP-variant
+   picker, RAM-tuned ``batch_size`` / ``nbins``) are layered on top.
 
 2. **Suite2p invocation** -- :func:`_invoke_run_s2p` and
    :func:`_invoke_run_plane` are the only call sites for
@@ -47,7 +47,7 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -649,15 +649,10 @@ class Suite2pPipelineConfig:
     # constructs this from the user's edits and stuffs it on the cfg.
     settings_override: Optional[dict] = None
 
-    # ---- Sample metadata (used for tau lookup) ----
-    aav_info_csv: str = "human_SLE_2p_meta.csv"
-    tau_vals: dict = field(default_factory=lambda: {
-        "6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137,
-    })
-    # If set, ``load_base_settings`` uses this tau directly and skips the
-    # AAV CSV lookup. Tab 3 sets this when the user picks an explicit
-    # GCaMP variant from the dropdown ("Auto (from AAV CSV)" leaves it
-    # ``None`` so the legacy lookup runs).
+    # ---- Per-recording tau (GCaMP-variant decay constant in seconds) ----
+    # Tab 3's GCaMP-variant dropdown resolves to a scalar and passes it
+    # in here. ``None`` falls back to whatever tau is already in the base
+    # settings dict from ``calliope.core.calliope_settings``.
     tau_override: Optional[float] = None
 
     # ---- Caching ----
@@ -729,10 +724,9 @@ def load_base_settings(config: Suite2pPipelineConfig):
 
     The pipeline then overlays per-recording dynamics:
 
-    * **tau** : the GCaMP-variant decay constant. Looked up via
-      ``utils.file_name_to_aav_to_dictionary_lookup`` from the AAV
-      metadata CSV in ``config.aav_info_csv`` and the dict in
-      ``config.tau_vals`` (or ``config.tau_override`` wins outright).
+    * **tau** : the GCaMP-variant decay constant. Taken from
+      ``config.tau_override`` when set (Tab 3's GCaMP-variant picker
+      supplies it); otherwise the base settings' default tau is kept.
     * **batch_size** : picked by ``utils.get_adaptive_sizer().pick()``
       -- frame-size aware initial estimate for the first recording in
       a queue, closed-loop scaling against the previous run's observed
@@ -795,29 +789,12 @@ def load_base_settings(config: Suite2pPipelineConfig):
     })
 
     # --- Sample-specific tau ---
-    # Priority order:
-    #   1. Explicit tau_override on the config.
-    #   2. AAV CSV lookup keyed by recording filename.
-    #   3. Whatever tau was already in settings.
+    # If the caller (Tab 3's GCaMP-variant picker) supplied a tau,
+    # apply it; otherwise keep whatever tau the base settings carry.
     if config.tau_override is not None:
         settings['tau'] = float(config.tau_override)
         if config.verbose:
-            print(f"Set tau={settings['tau']} from explicit override "
-                  f"(skipping AAV lookup)")
-    else:
-        file_name = os.path.basename(os.path.normpath(config.tiff_folder))
-        if os.path.exists(config.aav_info_csv):
-            try:
-                tau = utils.file_name_to_aav_to_dictionary_lookup(
-                    file_name, config.aav_info_csv, config.tau_vals
-                )
-                settings['tau'] = tau
-                if config.verbose:
-                    print(f"Set tau={tau} based on AAV lookup for {file_name}")
-            except Exception as e:
-                if config.verbose:
-                    print(f"tau lookup failed ({e}); keeping existing "
-                          f"tau={settings.get('tau')}")
+            print(f"Set tau={settings['tau']} from GCaMP-variant picker")
 
     # --- Dynamic batch size (frame-size aware + closed-loop in batch mode) ---
     # First recording in a queue: frame-size-aware initial estimate.

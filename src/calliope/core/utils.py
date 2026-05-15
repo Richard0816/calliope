@@ -62,10 +62,6 @@ Recording metadata
     get_fps_from_notes
         Locate the lab's ``notes.csv`` and read the frame rate for a
         given recording. Falls back to a default if missing.
-    aav_cleanup_and_dictionary_lookup, get_row_number_csv_module,
-    file_name_to_aav_to_dictionary_lookup
-        Cross-reference a recording filename against a CSV of AAV
-        metadata.
 """
 
 # Type-hint forward-reference shim. See pipeline_gui.py for full
@@ -2619,90 +2615,3 @@ def first_n_min_df_over_f_1d(F, baseline_min=2.0, perc=10, fps=30.0):
     return ((F - F0_scalar) / eps).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# AAV / notes-CSV lookups (used by suite2p_pipeline.load_base_settings)
-# ---------------------------------------------------------------------------
-#
-# Why these helpers exist:
-#   - The lab's AAV metadata sits in a CSV with one row per recording.
-#   - Each row's "AAV" column carries a string like "GCaMP6f-rg",
-#     "8m+CC", or "6s_GR" describing the GECI variant injected.
-#   - Suite2p's deconvolution needs a numeric ``tau`` constant for the
-#     calcium transient decay; that constant differs between 6f, 6m,
-#     6s, 8m... so we look it up from a small in-code dictionary.
-# These three functions wire the lookup together.
-
-
-def aav_cleanup_and_dictionary_lookup(aav: str, dic: dict) -> float:
-    """Find which dictionary key appears in the AAV string and return
-    the matching value.
-
-    Example
-    -------
-        dic = {"6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137}
-        aav_cleanup_and_dictionary_lookup("GCaMP6f-rg", dic)  # -> 0.7
-    """
-    # The "rg" suffix is a lab convention indicating "rabies-G"
-    # delivery; strip it so it doesn't trip up the lookup.
-    aav = aav.replace("rg", "")
-    # Split on any of ``-``, ``_``, ``+``.
-    components = re.split(r"[-_+]", aav)
-    # Lower-case both sides so "6F" and "6f" match.
-    dict_lower = {k.lower(): v for k, v in dic.items()}
-    list_lower = {item.lower() for item in components}
-    # ``set & set`` intersection. ``next(iter(...))`` grabs an
-    # arbitrary element from the intersection -- we assume there's
-    # at most one match.
-    common = dict_lower.keys() & list_lower
-    return dict_lower[next(iter(common))]
-
-
-def get_row_number_csv_module(csv_filename: str, header_name: str, target_element: str) -> int:
-    """Find the row number in ``csv_filename`` whose ``header_name``
-    column matches ``target_element`` after splitting on ``-``/``_``
-    and casting to ints.
-
-    Why the int-list comparison: filenames in the lab look like
-    ``2024-07-01_00018``; the metadata CSV's ``video`` column may
-    have the same recording typed as ``20240701-00018`` or
-    ``2024-07-01-00018``. By extracting the integer fragments we
-    match across all those punctuation variants.
-
-    Returns 1-based row number (so callers can use it as
-    ``df.iloc[row_num - 1]``), or None if no row matches.
-    """
-    try:
-        col = pd.read_csv(csv_filename, usecols=[header_name])
-    except ValueError:
-        print(f"Error: Header '{header_name}' not found in the CSV file.")
-        return None
-
-    # Local helper closure: turn a string into a list of ints
-    # extracted from its hyphen / underscore-separated fragments.
-    def to_int_list(s: str):
-        return [int(x) for x in re.split(r"[-_]", str(s)) if x.isdigit()]
-
-    target_list = to_int_list(target_element)
-    # ``col[header_name]`` is a pandas Series; ``.items()`` iterates
-    # (index, value) pairs.
-    for idx, val in col[header_name].items():
-        if to_int_list(val) == target_list:
-            return idx + 1
-    return None
-
-
-def file_name_to_aav_to_dictionary_lookup(file_name, aav_info_csv, dic):
-    """Compose the two helpers above: take a recording filename, find
-    its row in the AAV CSV, read the ``AAV`` column, and resolve the
-    matching dictionary value (e.g. tau).
-
-    Used by ``suite2p_pipeline.load_base_settings`` to set the
-    recording-specific tau in the suite2p settings dict before
-    detection.
-    """
-    row_num = get_row_number_csv_module(aav_info_csv, 'video', file_name)
-    col = pd.read_csv(aav_info_csv, usecols=["AAV"])
-    # ``iloc[row_num - 1]`` is positional indexing: 1-based -> 0-based.
-    element = col["AAV"].iloc[row_num - 1]
-    element = str(element)
-    return aav_cleanup_and_dictionary_lookup(element, dic)

@@ -33,8 +33,9 @@ without re-running anything.
 
 What the user sees
 ------------------
-- An ops profile dropdown + paths to the suite2p ops .npy file, the
-  cell-filter checkpoint, and the AAV metadata CSV.
+- A path picker for the cell-filter checkpoint (defaults to the
+  bundled ``calliope/data/cellfilter_best.pt``) and a GCaMP-variant
+  dropdown that resolves to the Suite2p deconvolution tau.
 - An Advanced... dialog with every Sparsery, Cellpose, dF/F and
   classifier knob.
 - A "Run detection" button that kicks off the worker thread.
@@ -89,8 +90,8 @@ from ...gui_common import (
 )
 
 
-# Bundled resource files: suite2p ops .npy + AAV metadata .csv ship inside
-# calliope/data/. The detection worker also lazy-imports the heavyweight
+# Bundled resource files: the pretrained cell-filter checkpoint ships
+# inside calliope/data/. The detection worker also lazy-imports the heavyweight
 # detection modules from calliope.core (sparse_plus_cellpose, utils,
 # cellfilter) — see the worker bodies below.
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
@@ -103,11 +104,10 @@ class Suite2pTab(ctk.CTkFrame):
 
     Class-attribute layout
     ----------------------
-    ``DEFAULT_OPS_PATH`` / ``DEFAULT_CKPT_PATH`` / ``DEFAULT_AAV_CSV``
+    ``DEFAULT_OPS_PATH`` / ``DEFAULT_CKPT_PATH``
         File paths the form is pre-populated with on startup. Users
-        can override via the Browse... buttons. The ops file ships
-        bundled in ``calliope/data``; the checkpoint and AAV CSV
-        live on the lab F: drive.
+        can override via the Browse... buttons. Both the ops file and
+        the cell-filter checkpoint ship bundled in ``calliope/data``.
 
     ``KNOWN_BG_IMAGES``
         Background-image options shown in the dropdown above the
@@ -127,20 +127,18 @@ class Suite2pTab(ctk.CTkFrame):
 
     # Base settings come from calliope.core.calliope_settings (in source);
     # per-session edits go through the "Edit suite2p settings..." popout.
-    DEFAULT_CKPT_PATH = Path(r"F:\cellfilter_checkpoints\best.pt")
-    DEFAULT_AAV_CSV = _DATA_DIR / "human_SLE_2p_meta.csv"
+    DEFAULT_CKPT_PATH = _DATA_DIR / "cellfilter_best.pt"
 
     # ---- GCaMP variant -> tau lookup table ----
     # The Suite2p deconvolution step needs a tau (calcium decay
     # constant in seconds) that matches the GECI variant in the
     # recording. Picking it wrong throws off the per-cell spike
-    # estimate. The user can either pick a variant explicitly
-    # (skipping the AAV CSV lookup) or stay on "Auto" to fall back
-    # to the AAV CSV lookup by recording filename.
-    GCAMP_OPTIONS: list[tuple[str, Optional[float]]] = [
-        ("Auto (from AAV CSV)", None),     # default
+    # estimate, so the user must pick the variant that matches their
+    # injection. GCaMP6m is the default since it's the most common
+    # variant in the lab's standing recordings.
+    GCAMP_OPTIONS: list[tuple[str, float]] = [
+        ("GCaMP6m  (tau = 1.0 s)", 1.0),   # default
         ("GCaMP6f  (tau = 0.7 s)", 0.7),
-        ("GCaMP6m  (tau = 1.0 s)", 1.0),
         ("GCaMP6s  (tau = 1.3 s)", 1.3),
         ("GCaMP8m  (tau = 0.137 s)", 0.137),
     ]
@@ -566,18 +564,18 @@ class Suite2pTab(ctk.CTkFrame):
                     f"(got {self.baseline_min_var.get()!r}): {e}")
                 return
 
-        # Resolve the GCaMP picker into a tau scalar (or ``None`` to
-        # let the AAV-CSV lookup run as before). Picker rows are
+        # Resolve the GCaMP picker into a tau scalar. Picker rows are
         # ``(label, tau)`` pairs; we look up the user-chosen label.
-        tau_override: Optional[float] = None
+        # Falls back to the first option's tau if the label somehow
+        # doesn't match (shouldn't happen with a readonly combobox).
+        tau_override: float = self.GCAMP_OPTIONS[0][1]
         gcamp_label = self.gcamp_var.get()
         for label, tau in self.GCAMP_OPTIONS:
             if label == gcamp_label:
                 tau_override = tau
                 break
-        if tau_override is not None:
-            self._append_log(
-                f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
+        self._append_log(
+            f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
 
         tiff_folder = result.shifted_tiff.parent
         save_folder = result.out_dir / "detection"
@@ -620,7 +618,7 @@ class Suite2pTab(ctk.CTkFrame):
         rec_id: str,
         baseline_mode: str,
         baseline_min: float,
-        tau_override: Optional[float] = None,
+        tau_override: float = 1.0,
     ) -> None:
         writer = QueueWriter(self._log_queue)
         params = dict(self._params)
@@ -651,8 +649,6 @@ class Suite2pTab(ctk.CTkFrame):
                 contextlib.redirect_stderr(writer):
             print("[GUI] running sparse_plus_cellpose...")
             from ...core import sparse_plus_cellpose as spc
-            aav_csv = (str(self.DEFAULT_AAV_CSV)
-                       if self.DEFAULT_AAV_CSV.exists() else None)
             final_plane0 = spc.run(
                 tiff_folder=str(tiff_folder),
                 save_folder=str(save_folder),
@@ -663,8 +659,6 @@ class Suite2pTab(ctk.CTkFrame):
                 cellpose_cfg=cellpose_cfg,
                 hard_cap=hard_cap,
                 max_overlap=max_overlap,
-                aav_info_csv=aav_csv,
-                tau_vals=spc.DEFAULT_TAU_VALS,
                 tau_override=tau_override,
                 # Per-session overrides from the "Edit suite2p settings..."
                 # popout. Empty dict means no overrides.
