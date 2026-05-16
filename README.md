@@ -2,42 +2,36 @@
 
 **Cal**cium **L**ive-imaging **O**utput **P**ipeline for **E**piletiform-recordings.
 
-A self-contained **customtkinter** dark-mode GUI for the Suite2p-based
-2-photon calcium imaging analysis pipeline. Each pipeline stage lives
-on its own tab; shared backend modules (preprocessing, signal
-processing, hierarchical clustering, cross-correlation, cellpose-based
-detection, the cell-filter PyTorch model) ship inside the package.
+A self-contained GUI for the Suite2p-based 2-photon calcium imaging
+analysis pipeline. Each pipeline stage lives on its own tab; shared
+backend modules (preprocessing, signal processing, hierarchical
+clustering, cross-correlation, cellpose-based detection, the
+cell-filter PyTorch model) ship inside the package.
 
-## UI / Look & feel
+## Pipeline stages
 
-- **Dark mode** via [customtkinter](https://customtkinter.tomschimansky.com/).
-  Matplotlib figures keep their white facecolor (dark frame, light
-  plots) so plot contrast stays maximised.
-- **Sidebar navigation** — left-hand vertical bar with one button per
-  tab. Click to swap content; the active tab is highlighted with the
-  CTk accent colour. Replaces the old top tab-bar.
-- **Drag-resizable panels.** Every tab that hosts a log console
-  (Tabs 0 / 1 / 3 / 7) and every multi-panel layout exposes draggable
-  resize grips so the user can give one panel more room without
-  squeezing its neighbours. The tab body grows; the scrollable wrapper
-  absorbs the extra height.
-- **Hover-scroll** — spin the mouse wheel anywhere on a tab to scroll
-  it (no need to aim at the scrollbar).
-- **Resizable popouts** — the prominence, curation, cluster, recluster,
-  and violin popout windows all open at a sensible initial size with a
-  `minsize` floor; drag any corner to resize.
+Raw two-photon TIFFs flow through:
 
-## Screenshots
+1. **Preprocess** — rigid registration + intensity normalization;
+   writes a shifted TIFF, mean image, and QC GIF in one pass.
+2. **QC preview** — inspect the shifted recording and mean image
+   before committing compute.
+3. **Detection** — Suite2p sparsery + Cellpose ROI extraction, dF/F
+   computation, and a PyTorch cell-filter that prunes non-neuronal ROIs.
+4. **Low-pass filter** — Butterworth low-pass + Savitzky-Golay
+   derivative; writes filtered + derivative memmaps per recording.
+5. **Event detection** — per-ROI hysteresis onsets and population-level
+   event windows from the dF/F density.
+6. **Clustering** — hierarchical clustering of the filtered traces with
+   an auto-threshold or user-pinned cut height.
+7. **Cross-correlation** — full-recording and per-event ROI×ROI xcorr,
+   with optional GPU acceleration via CuPy.
+8. **Spatial propagation** — per-event spatial figures over the
+   recording's mean image.
 
-Drop screenshots into `docs/screenshots/` matching the filenames
-referenced below; the README will render them inline once they exist.
-
-| | |
-|---|---|
-| Sidebar navigation + dark theme | ![sidebar](docs/screenshots/sidebar.png) |
-| Tab 0 — Batch runner with resize grips | ![tab0-batch](docs/screenshots/tab0-batch.png) |
-| Tab 3 — Suite2p detection with curation popout | ![tab3-curation](docs/screenshots/tab3-curation.png) |
-| Tab 6 — Clustering dendrogram + spatial map | ![tab6-clustering](docs/screenshots/tab6-clustering.png) |
+The **Batch runner** (Tab 0) queues recordings and chains all eight
+stages per row, with per-recording parameter overrides persisted to a
+JSON sidecar and round-tripped through CSV.
 
 ## Layout
 
@@ -52,13 +46,12 @@ calliope/                           # repo root (where you run pip install)
 ├── .gitignore
 ├── .gitattributes                  # LF line endings cross-platform
 ├── docs/
-│   └── screenshots/                # README screenshots land here
 ├── tests/
 │   └── test_imports.py             # pytest smoke test (imports + headless GUI walk)
 └── src/
     └── calliope/                   # the actual Python package
-        ├── pipeline_gui.py         # PipelineApp coordinator (sidebar + content host)
-        ├── gui_common.py           # AppState, AdvancedDialog, palette + Tk helpers
+        ├── pipeline_gui.py         # GUI entry point
+        ├── gui_common.py           # shared GUI helpers (AppState, AdvancedDialog)
         ├── plot_data_export.py     # "Save data..." button writer
         ├── core/                   # backend modules used by the tabs
         │   ├── preprocessing.py        # raw TIFF -> shifted TIFF + QC gif + mean
@@ -84,11 +77,11 @@ calliope/                           # repo root (where you run pip install)
         └── data/                   # bundled resource files (.npy / .csv)
 ```
 
-Each tab subfolder has a `tab.py` (the customtkinter widget tree) and a
-`logic.py` for pure compute / I/O helpers + a re-export shim into
+Each tab subfolder has a `tab.py` (the widget tree) and a `logic.py`
+for pure compute / I/O helpers + a re-export shim into
 `calliope.core`. Tabs 3, 6, and 7 also have one or more `*_popout.py`
-files for resizable detail windows (curation, cluster heatmap+raster,
-recluster sub-tree, violin plots).
+files for detail windows (curation, cluster heatmap+raster, recluster
+sub-tree, violin plots).
 
 ## Installing
 
@@ -178,7 +171,7 @@ python -m calliope
 
 ## Dependencies
 
-- `customtkinter` (dark-mode GUI framework)
+- `customtkinter` (GUI framework)
 - `numpy`, `pandas`, `scipy`, `matplotlib`, `seaborn`
 - `scikit-image`, `openpyxl`, `Pillow`, `psutil`, `tifffile`, `imagecodecs`
 - `torch` (cell-filter model)
