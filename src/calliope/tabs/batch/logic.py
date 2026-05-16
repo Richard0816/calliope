@@ -525,6 +525,23 @@ def build_batch_param_spec() -> list:
     try:
         from ..suite2p.tab import Suite2pTab
         _extend(Suite2pTab.PARAM_SPEC)
+        # GCaMP variant lives as a Tk var on Tab 3, not in its PARAM_SPEC;
+        # surface it here so the per-row Edit params dialog can override
+        # the tau passed to suite2p deconvolution. The label strings are
+        # the single source of truth in Suite2pTab.GCAMP_OPTIONS, so we
+        # import them rather than re-listing.
+        _gcamp_labels = [lbl for lbl, _tau in Suite2pTab.GCAMP_OPTIONS]
+        spec.append({
+            "name": "gcamp_variant",
+            "label": "GCaMP variant (sets suite2p tau)",
+            "type": "choice",
+            "choices": _gcamp_labels,
+            "default": _gcamp_labels[0],
+            "group": "2. Detection - dF/F",
+            "help": "drives the calcium-decay tau passed to suite2p "
+                    "deconvolution; pick the GECI you injected",
+        })
+        seen.add("gcamp_variant")
     except Exception:
         pass
 

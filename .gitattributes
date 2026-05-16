@@ -1,0 +1,15 @@
+# Normalise line endings across Windows/macOS/Linux so collaborators
+# don't churn the diff log on commit. Text files use LF in the repo;
+# Git transparently converts to the platform's native EOL on checkout
+# when ``core.autocrlf`` is set (the default on Windows).
+* text=auto eol=lf
+
+# Binary assets -- don't try to normalise these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.tif binary
+*.tiff binary
+*.npy binary

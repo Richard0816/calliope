@@ -312,8 +312,8 @@ class Suite2pTab(ctk.CTkFrame):
         gcamp_combo.pack(side="left", padx=(0, 8))
         ctk.CTkLabel(
             row,
-            text=("Pick the GECI you injected; \"Auto\" reads the AAV "
-                  "metadata CSV by recording filename."),
+            text=("Pick the GECI you injected; the chosen variant sets "
+                  "the suite2p tau."),
             text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left")
 
