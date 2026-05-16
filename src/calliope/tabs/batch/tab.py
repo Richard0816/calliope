@@ -887,18 +887,21 @@ class BatchTab(ctk.CTkFrame):
 
     # -- CSV import / export ----------------------------------------------
     #
-    # Schema: a flat two-column CSV that Excel / pandas can edit
+    # Schema: a flat three-column CSV that Excel / pandas can edit
     # without ceremony. Columns:
     #   identifier  -- the row's name (drives the output folder)
     #   tiffs       -- semicolon-separated absolute paths to TIFFs
-    # Header row required. Extra columns are ignored on read (for
-    # future-proofing -- e.g. someone could add a 'notes' column and
-    # share the CSV with a collaborator). Per-row params are not in
-    # the CSV; use the JSON sidecar (Reload queue) for full state
-    # roundtrip, or "Apply defaults to all rows" to push uniform
-    # params after a CSV load.
+    #   params      -- JSON-encoded dict of per-row overrides
+    #                  (e.g. {"gcamp_variant": "GCaMP6f  (tau = 0.7 s)",
+    #                         "cutoff_hz": 0.5}); empty string == no
+    #                  overrides (the tab's current defaults apply at
+    #                  run time via the existing merge order).
+    # Header row required. The ``params`` column is OPTIONAL on read:
+    # a CSV exported by an older Calliope (only identifier / tiffs)
+    # still loads cleanly -- missing column == empty dict per row.
+    # Extra columns are ignored on read.
 
-    _CSV_HEADERS = ("identifier", "tiffs")
+    _CSV_HEADERS = ("identifier", "tiffs", "params")
 
     def _on_export_queue_csv(self) -> None:
         """Write the current queue to a CSV the user picks. One row
@@ -935,7 +938,13 @@ class BatchTab(ctk.CTkFrame):
                     # Re-join with "; " (space after semicolon) to
                     # match the GUI's display format. CSV's own
                     # quoting handles any commas inside paths.
-                    w.writerow([ident, "; ".join(tiffs)])
+                    # Params serialize as a compact JSON blob so the
+                    # entire override dict round-trips in one column;
+                    # empty dict writes as "" to keep the CSV readable
+                    # for the common no-overrides case.
+                    params_blob = (json.dumps(r.params, sort_keys=True)
+                                   if r.params else "")
+                    w.writerow([ident, "; ".join(tiffs), params_blob])
                     n_written += 1
             self._log(f"Exported {n_written} rows to {path}")
         except OSError as e:
@@ -943,9 +952,12 @@ class BatchTab(ctk.CTkFrame):
 
     def _on_load_queue_csv(self) -> None:
         """Pick a CSV (with the same schema ``_on_export_queue_csv``
-        writes) and replace the queue with its contents. Per-row
-        params default to empty -- the tab's current defaults apply
-        at run time via the existing merge order.
+        writes) and replace the queue with its contents.
+
+        The ``params`` column is optional: CSVs exported by older
+        Calliope versions (identifier / tiffs only) still load, with
+        each row's params defaulting to ``{}`` so the tab's current
+        defaults apply at run time via the existing merge order.
         """
         initial_dir = (self.outdir_var.get().strip()
                        or self.workdir_var.get().strip())
@@ -957,6 +969,7 @@ class BatchTab(ctk.CTkFrame):
         )
         if not path:
             return
+        bad_params_rows = 0
         try:
             with open(path, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -966,9 +979,11 @@ class BatchTab(ctk.CTkFrame):
                         "Bad CSV",
                         f"{path} doesn't have a 'tiffs' column. "
                         f"Expected headers: "
-                        f"{', '.join(self._CSV_HEADERS)}")
+                        f"{', '.join(self._CSV_HEADERS)} "
+                        f"(params is optional)")
                     return
-                rows: list[tuple[str, list[str]]] = []
+                has_params_col = "params" in reader.fieldnames
+                rows: list[tuple[str, list[str], dict]] = []
                 for entry in reader:
                     ident = (entry.get("identifier") or "").strip()
                     raw_tiffs = (entry.get("tiffs") or "").strip()
@@ -979,7 +994,19 @@ class BatchTab(ctk.CTkFrame):
                     # kept the GUI's trailing space.
                     tiffs = [s.strip() for s in raw_tiffs.split(";")
                              if s.strip()]
-                    rows.append((ident, tiffs))
+                    params: dict = {}
+                    if has_params_col:
+                        raw_params = (entry.get("params") or "").strip()
+                        if raw_params:
+                            try:
+                                parsed = json.loads(raw_params)
+                                if isinstance(parsed, dict):
+                                    params = parsed
+                                else:
+                                    bad_params_rows += 1
+                            except (ValueError, TypeError):
+                                bad_params_rows += 1
+                    rows.append((ident, tiffs, params))
         except OSError as e:
             messagebox.showerror("Load failed", str(e))
             return
@@ -991,11 +1018,15 @@ class BatchTab(ctk.CTkFrame):
                                 f"{path} had no rows to load.")
             return
         self._clear_rows()
-        for ident, tiffs in rows:
-            # ``params={}`` falls through to the tab's current defaults
-            # at run time via the existing merge order.
-            self.add_row(identifier=ident, tiffs=tiffs, params={})
+        for ident, tiffs, params in rows:
+            # Empty params dict falls through to the tab's current
+            # defaults at run time via the existing merge order.
+            self.add_row(identifier=ident, tiffs=tiffs, params=params)
         self._log(f"Loaded {len(rows)} rows from {path}")
+        if bad_params_rows:
+            self._log(
+                f"  WARNING: {bad_params_rows} row(s) had unparseable "
+                f"'params' JSON; those rows loaded with empty overrides.")
 
     # -- Persistence ------------------------------------------------------
 
@@ -1495,6 +1526,116 @@ class BatchTab(ctk.CTkFrame):
 
         self._begin_stage("preprocess")
 
+    def _apply_row_params_to_tabs(self, row: "BatchRow") -> None:
+        """Push ``row.params`` into each pipeline tab BEFORE its run
+        method fires.
+
+        The orchestrator drives each tab via its native ``_on_run`` /
+        ``_on_compute`` / ``_on_render`` / ``_start_run``, every one of
+        which reads from the tab's own ``_params`` dict and/or Tk vars.
+        Without this push, the per-row "Edit params..." dialog has no
+        runtime effect -- it just round-trips through
+        ``calliope_batch.json``.
+
+        For each key the row defines, we copy it into the matching tab's
+        ``_params`` dict (for PARAM_SPEC-style fields) and/or set the
+        matching Tk variable (for UI-only knobs like Tab 3's GCaMP
+        variant, Tab 4's cutoff slider, Tab 5's manual subset toggles,
+        Tab 6's prefix/palette/threshold, and Tab 7's xcorr knobs).
+        Keys the row didn't override leave the tab state untouched.
+        """
+        p = row.params or {}
+        if not p:
+            return
+        app = self._app
+
+        # Tab 1: preprocess -- 5 QC-gif knobs read from self._params
+        prep = getattr(app, "preprocess_tab", None)
+        if prep is not None:
+            for k in ("downsample_t", "max_size_px", "playback_fps",
+                      "clip_low", "clip_high"):
+                if k in p:
+                    prep._params[k] = p[k]
+
+        # Tab 3: detection -- PARAM_SPEC fields go through _params; the
+        # baseline + GCaMP knobs live as Tk vars and are read directly
+        # in _on_run.
+        det = getattr(app, "detection_tab", None)
+        if det is not None:
+            for entry in det.PARAM_SPEC:
+                name = entry["name"]
+                if name in p:
+                    det._params[name] = p[name]
+            if "baseline_mode" in p:
+                det.baseline_var.set(str(p["baseline_mode"]))
+            if "baseline_min" in p:
+                det.baseline_min_var.set(str(p["baseline_min"]))
+            if "gcamp_variant" in p:
+                # Label round-trips verbatim; _on_run resolves the
+                # label -> tau scalar via Suite2pTab.GCAMP_OPTIONS.
+                det.gcamp_var.set(str(p["gcamp_variant"]))
+
+        # Tab 4: lowpass -- PARAM_SPEC fields + the live cutoff slider.
+        lp = getattr(app, "lowpass_tab", None)
+        if lp is not None:
+            for entry in lp.PARAM_SPEC:
+                name = entry["name"]
+                if name in p:
+                    lp._params[name] = p[name]
+            if "cutoff_hz" in p:
+                try:
+                    lp.cutoff_var.set(float(p["cutoff_hz"]))
+                except (TypeError, ValueError):
+                    pass
+
+        # Tab 5: event detection -- PARAM_SPEC fields + the three Tk
+        # vars _on_render snapshots into _params on the main thread.
+        ev = getattr(app, "event_tab", None)
+        if ev is not None:
+            for entry in ev.PARAM_SPEC:
+                name = entry["name"]
+                if name in p:
+                    ev._params[name] = p[name]
+            if "manual_subset_enabled" in p:
+                ev.manual_subset_var.set(bool(p["manual_subset_enabled"]))
+            if "manual_roi_spec" in p:
+                ev.manual_roi_var.set(str(p["manual_roi_spec"]))
+            if "onset_source" in p:
+                ev.onset_source_var.set(str(p["onset_source"]))
+
+        # Tab 6: clustering -- no PARAM_SPEC; Tk vars + internal state.
+        cl = getattr(app, "clustering_tab", None)
+        if cl is not None:
+            if "prefix" in p:
+                cl.prefix_var.set(str(p["prefix"]))
+            if "palette" in p:
+                cl.palette_var.set(str(p["palette"]))
+                cl._palette_name = str(p["palette"])
+            if "threshold" in p:
+                try:
+                    t = float(p["threshold"])
+                    # threshold == 0 means "auto"; leave the tab alone
+                    # so its auto_choose_threshold path runs.
+                    if t > 0.0:
+                        cl._manual_T = t
+                        try:
+                            cl.threshold_scale.set(t)
+                        except Exception:
+                            pass
+                except (TypeError, ValueError):
+                    pass
+
+        # Tab 7: xcorr -- no PARAM_SPEC; everything flows through
+        # _gather_params reading Tk vars.
+        xc = getattr(app, "xcorr_tab", None)
+        if xc is not None:
+            if "max_lag_seconds" in p:
+                xc.maxlag_var.set(str(p["max_lag_seconds"]))
+            if "zero_lag" in p:
+                xc.zero_lag_var.set(bool(p["zero_lag"]))
+            if "use_gpu" in p:
+                xc.gpu_var.set(bool(p["use_gpu"]))
+
     def _begin_stage(self, stage: str) -> None:
         """Trigger ``stage`` for the current row + arm the one-shot
         completion listener.
@@ -1503,6 +1644,19 @@ class BatchTab(ctk.CTkFrame):
             self._row_results["status"] = "aborted"
             self._on_row_done()
             return
+
+        # Push row-level overrides into each tab so the Edit params
+        # dialog actually controls the batch run. Idempotent per stage
+        # (cheap dict / Tk var writes); re-applied on every transition
+        # to defend against intermediate mutations.
+        try:
+            self._apply_row_params_to_tabs(self._current_row)
+        except Exception as e:
+            ident = (self._current_row.identifier
+                     if getattr(self, "_current_row", None) is not None
+                     else "?")
+            self._append_log(
+                f"[{ident}] WARN: failed to apply per-row params: {e}")
 
         self._current_stage = stage
         self._stage_t0 = time.time()
