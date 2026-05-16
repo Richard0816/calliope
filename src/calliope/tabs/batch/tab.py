@@ -1566,10 +1566,13 @@ class BatchTab(ctk.CTkFrame):
                 name = entry["name"]
                 if name in p:
                     det._params[name] = p[name]
-            if "baseline_mode" in p:
-                det.baseline_var.set(str(p["baseline_mode"]))
-            if "baseline_min" in p:
-                det.baseline_min_var.set(str(p["baseline_min"]))
+            # Tab 3 dF/F baseline lives under dff_baseline_mode /
+            # dff_baseline_min in the batch spec (renamed to avoid
+            # colliding with Tab 5's PARAM_SPEC ``baseline_mode``).
+            if "dff_baseline_mode" in p:
+                det.baseline_var.set(str(p["dff_baseline_mode"]))
+            if "dff_baseline_min" in p:
+                det.baseline_min_var.set(str(p["dff_baseline_min"]))
             if "gcamp_variant" in p:
                 # Label round-trips verbatim; _on_run resolves the
                 # label -> tau scalar via Suite2pTab.GCAMP_OPTIONS.
