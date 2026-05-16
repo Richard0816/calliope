@@ -567,8 +567,28 @@ def build_batch_param_spec() -> list:
     except Exception:
         pass
 
+    # Helper for the remaining synthesized-entry blocks: append() each
+    # entry through the same dedup gate ``_extend`` uses so we don't
+    # silently duplicate a name that an earlier PARAM_SPEC already
+    # contributed. (Background: pre-2026-05-16 this block used raw
+    # ``spec.extend([...])``, which bypassed ``seen`` and produced two
+    # ``baseline_mode`` entries -- Tab 5's choice [rolling, global] and
+    # the synthesized Tab 3 choice [first_n, rolling]. AdvancedDialog
+    # built two form rows that both wrote to the same key, and the
+    # last-seen default ('first_n') leaked into Tab 5's row where it
+    # wasn't a valid choice. The fix here renames the Tab 3 synthesized
+    # entries to dff_baseline_mode / dff_baseline_min and routes all
+    # new appends through the dedup gate so the bug can't recur.)
+    def _add_synthesized(entries):
+        for entry in entries:
+            name = entry.get("name")
+            if not name or name in seen:
+                continue
+            spec.append(entry)
+            seen.add(name)
+
     # 5. Clustering (no source PARAM_SPEC)
-    spec.extend([
+    _add_synthesized([
         {"name": "prefix", "label": "dF/F prefix",
          "type": "str", "default": "r0p7_filtered_",
          "group": "5. Clustering",
@@ -582,7 +602,7 @@ def build_batch_param_spec() -> list:
     ])
 
     # 6. Cross-correlation (no source PARAM_SPEC)
-    spec.extend([
+    _add_synthesized([
         {"name": "max_lag_seconds", "label": "xcorr max lag (s)",
          "type": "float", "default": 2.0,
          "group": "6. Cross-correlation"},
@@ -594,14 +614,19 @@ def build_batch_param_spec() -> list:
          "group": "6. Cross-correlation"},
     ])
 
-    # 7. Pipeline-wide
-    spec.extend([
-        {"name": "baseline_mode", "label": "dF/F baseline mode",
+    # 7. Pipeline-wide -- Tab 3's dF/F baseline (suite2p detection).
+    # Distinct name from Tab 5's Population events ``baseline_mode``
+    # (choices ["rolling", "global"]) so the two never collide in the
+    # row.params dict or the AdvancedDialog form.
+    _add_synthesized([
+        {"name": "dff_baseline_mode", "label": "dF/F baseline mode",
          "type": "choice", "choices": ["first_n", "rolling"],
-         "default": "first_n", "group": "7. Pipeline-wide"},
-        {"name": "baseline_min", "label": "Baseline duration (min)",
+         "default": "first_n", "group": "7. Pipeline-wide",
+         "help": "suite2p dF/F baseline: first_n = first-N-minute mean; "
+                 "rolling = 45 s window, 10th percentile"},
+        {"name": "dff_baseline_min", "label": "Baseline duration (min)",
          "type": "float", "default": 2.0, "group": "7. Pipeline-wide",
-         "help": "first-N-min baseline length when baseline_mode=first_n"},
+         "help": "first-N-min baseline length when dff_baseline_mode=first_n"},
     ])
 
     return spec
