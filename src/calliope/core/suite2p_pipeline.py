@@ -567,10 +567,19 @@ def _invoke_run_s2p(db: dict, settings: dict):
 def _invoke_run_plane(db: dict, settings: dict):
     """Dispatch to suite2p.run_plane with logger setup and patches in place.
 
-    Same peak-RAM monitor + adaptive feedback wrapping as
-    :func:`_invoke_run_s2p`. ``run_plane`` skips registration so its
-    batch_size doesn't matter for memory, but the detection phase still
-    benefits from the closed loop on subsequent recordings.
+    Same peak-RAM monitor wrapping as :func:`_invoke_run_s2p` but the
+    GPU peak does **not** get fed back to the adaptive sizer.
+    ``run_plane`` skips registration (the only batch_size-sensitive GPU
+    stage in suite2p), so its GPU footprint is essentially a fixed
+    cost regardless of ``batch_size``. Recording the low detection-only
+    peak as if it were a function of the registration ``batch_size``
+    wipes out the high registration peak that ``_invoke_run_s2p`` just
+    learned -- the closed loop then thinks GPU is barely used and
+    happily scales ``batch_size`` up on the next recording. That's the
+    bug behind the climbing-then-OOM pattern across queued recordings.
+
+    CPU peak is still reported because detection's CPU work IS a
+    meaningful signal for next-recording sizing.
     """
     _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
@@ -581,13 +590,15 @@ def _invoke_run_plane(db: dict, settings: dict):
         try:
             return suite2p.run_plane(db, settings)
         finally:
+            # gpu_peak deliberately omitted -- see docstring.
             sizer.update_from_peak(
                 cpu_peak=mon.cpu_peak_fraction,
-                gpu_peak=mon.gpu_peak_fraction,
                 batch_size=used_bs)
             print(f"[adaptive] suite2p run_plane: "
                   f"cpu peak={mon.cpu_peak_fraction:.1%} "
                   f"gpu peak={mon.gpu_peak_fraction:.1%} "
+                  f"(gpu peak not fed back: run_plane is "
+                  f"batch_size-insensitive) "
                   f"batch_size_used={used_bs}")
             # Release this run's GPU residue before the next call
             # so VRAM doesn't creep up across queued recordings.
