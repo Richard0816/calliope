@@ -390,19 +390,56 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 
 def _clear_cuda_arena() -> None:
-    """Best-effort empty the torch CUDA allocator's free-list so the
-    OOM retry sees a clean memory map.
+    """Best-effort release of every GPU resource torch is willing to
+    let go of.
 
-    Useful between attempts because the allocator holds onto freed
-    blocks for reuse -- without an explicit reset, a retry can hit
-    the same fragmentation that caused the first OOM even when the
-    smaller batch_size would have fit in a fresh allocator.
+    Called both between OOM retries (so a halved-batch retry sees a
+    clean memory map instead of the same fragmentation) and between
+    successive recordings (so recording N+1 doesn't inherit
+    recording N's residue -- cuFFT plan workspaces and suite2p
+    module-level tensors are the prime suspects).
+
+    Steps, in order:
+
+    1. ``gc.collect()`` -- drop cyclic Python references that may be
+       keeping GPU tensors alive past their last named use.
+    2. ``torch.cuda.empty_cache()`` -- return the torch allocator's
+       cached free blocks to the driver.
+    3. ``torch.cuda.synchronize()`` -- wait for in-flight kernels so
+       subsequent memory measurements (and the next run's allocations)
+       see a stable state.
+    4. ``cufft_plan_cache.clear()`` per device -- release cuFFT plan
+       workspaces, which are *not* covered by ``empty_cache`` and which
+       suite2p's nonrigid phasecorr builds up across calls.
+    5. ``torch.cuda.ipc_collect()`` -- best-effort IPC cleanup.
+
+    All steps are individually guarded; this function never raises.
     """
     try:
         import torch, gc
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            cache = torch.backends.cuda.cufft_plan_cache
+            # cufft_plan_cache is indexable per-device; iterate to clear
+            # workspaces on every CUDA device the process has touched.
+            for i in range(torch.cuda.device_count()):
+                try:
+                    cache[i].clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -416,16 +453,24 @@ def _invoke_run_s2p(db: dict, settings: dict):
 
     CUDA OOM safety net: if registration blows the GPU, halve
     ``settings['registration']['batch_size']``, clear the CUDA arena,
-    and retry once. The closed loop's recording-2 update then has
-    real feedback to converge from. Up to two retries (8x reduction
-    from the initial estimate) before giving up -- past that the
-    user has a deeper problem than batch_size tuning.
+    and retry. First OOM uses a gentle //2 halve (marginal miss).
+    Subsequent OOMs use //4 (we're badly mis-estimated, accelerate
+    convergence rather than burn retries inching down).
+
+    Pre- and post-call ``_clear_cuda_arena()`` ensures recording N+1
+    doesn't inherit recording N's GPU residue (cuFFT plans, stale
+    suite2p tensors). Without this, VRAM creeps up across a queue
+    until the 5th recording or so OOMs even with a small batch_size.
     """
     _ensure_s2p_logger(db.get('save_path0'))
     _patch_suite2p_estimate_spatial_scale()
     sizer = utils.get_adaptive_sizer()
     used_bs = get_setting(settings, 'batch_size')
-    max_oom_retries = 2
+    max_oom_retries = 4
+
+    # Reclaim whatever the prior run left pinned before we start
+    # estimating against the current free-VRAM picture.
+    _clear_cuda_arena()
 
     for attempt in range(max_oom_retries + 1):
         mon = utils.PeakMemoryMonitor()
@@ -435,15 +480,18 @@ def _invoke_run_s2p(db: dict, settings: dict):
         except BaseException as exc:
             mon.__exit__(type(exc), exc, exc.__traceback__)
             if _is_cuda_oom(exc) and attempt < max_oom_retries:
-                new_bs = max(64, used_bs // 2)
+                # First OOM: gentle halve. After that: quartering --
+                # halving alone wasn't enough, so converge faster.
+                divisor = 2 if attempt == 0 else 4
+                new_bs = max(64, used_bs // divisor)
                 print(f"[adaptive] CUDA OOM at batch_size={used_bs} "
                       f"(attempt {attempt + 1}/{max_oom_retries + 1}); "
-                      f"halving to {new_bs} and retrying")
+                      f"cutting to {new_bs} (/{divisor}) and retrying")
                 set_setting(settings, 'batch_size', new_bs)
                 # Record the OOM as a "100% GPU peak" data point so
                 # the closed loop knows this batch_size was too big
                 # even though we recover via retry. Use the just-
-                # halved value as the batch_size we'll actually run
+                # cut value as the batch_size we'll actually run
                 # at on the retry.
                 sizer.update_from_peak(
                     cpu_peak=mon.cpu_peak_fraction,
@@ -464,6 +512,9 @@ def _invoke_run_s2p(db: dict, settings: dict):
                   f"batch_size_used={used_bs}"
                   + (f" (after {attempt} OOM retries)"
                      if attempt > 0 else ""))
+            # Still clean up so the next recording in the queue
+            # (if any) starts fresh.
+            _clear_cuda_arena()
             raise
         # Success path.
         mon.__exit__(None, None, None)
@@ -477,6 +528,11 @@ def _invoke_run_s2p(db: dict, settings: dict):
               f"batch_size_used={used_bs}"
               + (f" (after {attempt} OOM retries)"
                  if attempt > 0 else ""))
+        # Release this run's GPU residue before the next recording
+        # in the queue starts. The closed-loop sizer's next-recording
+        # estimate is more honest when peak measurements reflect
+        # actual working set rather than accumulated leak.
+        _clear_cuda_arena()
         return result
 
 
@@ -492,6 +548,7 @@ def _invoke_run_plane(db: dict, settings: dict):
     _patch_suite2p_estimate_spatial_scale()
     sizer = utils.get_adaptive_sizer()
     used_bs = get_setting(settings, 'batch_size')
+    _clear_cuda_arena()
     with utils.PeakMemoryMonitor() as mon:
         try:
             return suite2p.run_plane(db, settings)
@@ -504,6 +561,9 @@ def _invoke_run_plane(db: dict, settings: dict):
                   f"cpu peak={mon.cpu_peak_fraction:.1%} "
                   f"gpu peak={mon.gpu_peak_fraction:.1%} "
                   f"batch_size_used={used_bs}")
+            # Release this run's GPU residue before the next call
+            # so VRAM doesn't creep up across queued recordings.
+            _clear_cuda_arena()
 
 
 # ============================================================================

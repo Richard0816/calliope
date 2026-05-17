@@ -1564,12 +1564,16 @@ RAM_OVERHEAD_MULTIPLIER = 8.0
 # Fraction of total GPU memory available to suite2p's registration
 # buffer. Lower than the CPU target because the CUDA allocator
 # fragments badly above ~80% and there's no OS-level buffering to
-# absorb spikes.
-RAM_TARGET_FRACTION_GPU = 0.70
+# absorb spikes. Closed loop can ratchet up on subsequent recordings
+# if observed peak comes in well under target.
+RAM_TARGET_FRACTION_GPU = 0.60
 
 # Reserved off-the-top GPU memory for cellpose model weights, other
-# CUDA processes, and the torch arena's own bookkeeping.
-RAM_HEADROOM_GIB_GPU = 1.0
+# CUDA processes, and the torch arena's own bookkeeping. Absolute
+# (not fractional) so the cost lands disproportionately on small GPUs
+# -- which is the asymmetry we want (6 GiB cards need more headroom,
+# 24 GiB cards barely notice).
+RAM_HEADROOM_GIB_GPU = 1.5
 
 # complex64 (8 bytes per pixel) + FFT working buffers + mask copies
 # that scale with batch_size. Calibrated against the observed OOM
