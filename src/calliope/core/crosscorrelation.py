@@ -68,26 +68,82 @@ def _release_gpu_pools() -> None:
     its locals go out of scope. Returning the pool blocks to the
     driver is what makes Task Manager / nvidia-smi reflect the drop.
 
-    Also issues a CUDA stream sync so any in-flight kernels finish
-    before the caller proceeds (otherwise a follow-up pool query
-    might see stale state).
+    Order matters: GC first (drops any Python refs the caller hasn't
+    explicitly cleared), then full device sync (catches all streams,
+    not just the null one), then pool free, then a final sync so the
+    diagnostic print sees the post-release state. ``free_all_blocks``
+    is run twice because CuPy occasionally needs a second pass to
+    release segments that were "in use" at the moment of the first
+    call but became free during the sync between calls.
+
+    Logs ``used_bytes`` and ``total_bytes`` from the default pool so
+    the operator can verify the release actually happened. If
+    ``used_bytes`` stays high after this returns, something is
+    still holding a CuPy reference -- look upstream for an
+    unreleased ``cluster_*``, dict entry, or cached scratch tensor.
 
     No-op if CuPy isn't installed; never raises.
     """
     if cp is None:
         return
+    import gc
     try:
-        cp.cuda.Stream.null.synchronize()
+        gc.collect()
     except Exception:
         pass
     try:
-        cp.get_default_memory_pool().free_all_blocks()
+        # Sync the WHOLE device (every stream), not just the null
+        # stream. CuPy kernels can live on non-default streams in
+        # newer versions and these would otherwise leave allocations
+        # in flight when free_all_blocks runs.
+        cp.cuda.Device().synchronize()
+    except Exception:
+        pass
+    mempool = None
+    pinned = None
+    try:
+        mempool = cp.get_default_memory_pool()
     except Exception:
         pass
     try:
-        cp.get_default_pinned_memory_pool().free_all_blocks()
+        pinned = cp.get_default_pinned_memory_pool()
     except Exception:
         pass
+    used_before = total_before = -1
+    if mempool is not None:
+        try:
+            used_before = int(mempool.used_bytes())
+            total_before = int(mempool.total_bytes())
+        except Exception:
+            pass
+    if mempool is not None:
+        for _ in range(2):
+            try:
+                mempool.free_all_blocks()
+            except Exception:
+                pass
+            try:
+                cp.cuda.Device().synchronize()
+            except Exception:
+                pass
+    if pinned is not None:
+        try:
+            pinned.free_all_blocks()
+        except Exception:
+            pass
+    used_after = total_after = -1
+    if mempool is not None:
+        try:
+            used_after = int(mempool.used_bytes())
+            total_after = int(mempool.total_bytes())
+        except Exception:
+            pass
+    if used_before >= 0 and used_after >= 0:
+        print(
+            f"[xcorr-cleanup] CuPy pool: "
+            f"used {used_before / 1e6:.1f}->{used_after / 1e6:.1f} MB, "
+            f"total {total_before / 1e6:.1f}->{total_after / 1e6:.1f} MB"
+        )
 
 
 def _zscore_cols_xp(X, xp, eps=1e-12):
