@@ -219,11 +219,34 @@ def archive_recording_post_detection(
     if compress_raw:
         raw_sources = _pre.read_raw_paths_sidecar(rec_root)
         if not raw_sources:
-            _log(
-                "[archive] no _calliope_raw_paths.json found; skipping "
-                "raw compression"
-            )
-        else:
+            # Sidecar absent. This is expected when detection runs on a
+            # recording that wasn't preprocessed via CalLIOPE (e.g., the
+            # user placed shifted TIFFs in the folder manually, or it
+            # was preprocessed by an older version before the sidecar
+            # was added). Fall back to: any *.tif/*.tiff in the
+            # recording folder that doesn't have ``shifted_`` in its
+            # name is a candidate raw to compress in place.
+            fallback = [
+                p for p in sorted(rec_root.iterdir())
+                if p.is_file()
+                and p.suffix.lower() in (".tif", ".tiff")
+                and "shifted_" not in p.name
+            ]
+            if fallback:
+                _log(
+                    f"[archive] no raw-paths sidecar; using "
+                    f"{len(fallback)} TIFF(s) found in the recording "
+                    f"folder as raw sources"
+                )
+                raw_sources = fallback
+            else:
+                _log(
+                    "[archive] raw compression skipped (no sidecar and "
+                    "no raw TIFFs in recording folder -- run preprocess "
+                    "via Tab 0/Batch to enable). Shifted TIFFs and "
+                    "data.bin will still be cleaned up."
+                )
+        if raw_sources:
             for src in raw_sources:
                 src = Path(src)
                 if not src.exists():
