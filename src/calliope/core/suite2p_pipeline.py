@@ -399,6 +399,13 @@ def _clear_cuda_arena() -> None:
     recording N's residue -- cuFFT plan workspaces and suite2p
     module-level tensors are the prime suspects).
 
+    Covers both PyTorch and CuPy because CalLIOPE uses both in
+    different tabs (suite2p / cellfilter use torch; lowpass dF/F and
+    cross-correlation use CuPy) and they hold *separate* device memory
+    pools. Clearing one leaves the other pinned -- which is exactly
+    why VRAM appears to "never get cleared" after a cross-correlation
+    run when the user then triggers suite2p detection.
+
     Steps, in order:
 
     1. ``gc.collect()`` -- drop cyclic Python references that may be
@@ -412,32 +419,53 @@ def _clear_cuda_arena() -> None:
        workspaces, which are *not* covered by ``empty_cache`` and which
        suite2p's nonrigid phasecorr builds up across calls.
     5. ``torch.cuda.ipc_collect()`` -- best-effort IPC cleanup.
+    6. ``cupy.get_default_memory_pool().free_all_blocks()`` and
+       ``get_default_pinned_memory_pool().free_all_blocks()`` -- return
+       CuPy's device + pinned-host pools to the driver.
 
     All steps are individually guarded; this function never raises.
     """
     try:
-        import torch, gc
+        import gc
         gc.collect()
-        if not torch.cuda.is_available():
-            return
-        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                cache = torch.backends.cuda.cufft_plan_cache
+                # cufft_plan_cache is indexable per-device; iterate to clear
+                # workspaces on every CUDA device the process has touched.
+                for i in range(torch.cuda.device_count()):
+                    try:
+                        cache[i].clear()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        # CuPy's pool is independent of torch's allocator -- clearing one
+        # doesn't touch the other. Skip silently if CuPy isn't installed
+        # or the device isn't reachable.
+        import cupy as _cp
         try:
-            torch.cuda.synchronize()
+            _cp.get_default_memory_pool().free_all_blocks()
         except Exception:
             pass
         try:
-            cache = torch.backends.cuda.cufft_plan_cache
-            # cufft_plan_cache is indexable per-device; iterate to clear
-            # workspaces on every CUDA device the process has touched.
-            for i in range(torch.cuda.device_count()):
-                try:
-                    cache[i].clear()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            torch.cuda.ipc_collect()
+            _cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:
             pass
     except Exception:

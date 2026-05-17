@@ -113,6 +113,29 @@ def _gpu_process_all(
         del Fc, Fn, F_corr, F0, F0_safe, dff, pad_block, dff_pad, lp, deriv
         cp.get_default_memory_pool().free_all_blocks()
 
+    # End-of-function cleanup: drop the SOS coefficients still on
+    # device, sync the stream so the per-chunk pool frees have
+    # actually run, then return both pools to the driver. Without
+    # this, ``dedicated GPU memory`` in Task Manager stays elevated
+    # after the function returns because CuPy's pool keeps the blocks
+    # cached for reuse.
+    try:
+        del sos_gpu
+    except Exception:
+        pass
+    try:
+        cp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
     return dff_out, lp_out, dt_out
 
 

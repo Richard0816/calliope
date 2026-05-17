@@ -60,6 +60,36 @@ except ImportError:
     print("[warn] CuPy not available; GPU cross-correlation will fall back to CPU.")
 
 
+def _release_gpu_pools() -> None:
+    """Return CuPy's device + pinned-host memory pools to the driver.
+
+    CuPy holds onto freed allocations in its pool by default, which
+    means dedicated VRAM stays high even after the run finishes and
+    its locals go out of scope. Returning the pool blocks to the
+    driver is what makes Task Manager / nvidia-smi reflect the drop.
+
+    Also issues a CUDA stream sync so any in-flight kernels finish
+    before the caller proceeds (otherwise a follow-up pool query
+    might see stale state).
+
+    No-op if CuPy isn't installed; never raises.
+    """
+    if cp is None:
+        return
+    try:
+        cp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
 def _zscore_cols_xp(X, xp, eps=1e-12):
     """Z-score each column independently using either NumPy or CuPy.
 
@@ -532,13 +562,13 @@ def run_cluster_xcorr_full_fast(
                 except Exception:
                     pass
 
-    # Free GPU memory if used
+    # Free GPU memory if used. Drop references first so the pool free
+    # actually reclaims those blocks rather than leaving them as live
+    # allocations from CuPy's POV.
     if gpu_ok:
+        cluster_X.clear()
         cluster_Z.clear()
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        _release_gpu_pools()
 
     return out_root
 
@@ -673,6 +703,7 @@ def run_cluster_xcorr_per_event_fast(
                 )
 
         if gpu_ok:
+            cluster_X_ev.clear()
             cluster_Z_ev.clear()
 
         if progress_cb is not None:
@@ -682,10 +713,7 @@ def run_cluster_xcorr_per_event_fast(
                 pass
 
     if gpu_ok:
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        _release_gpu_pools()
 
     return out_root
 
