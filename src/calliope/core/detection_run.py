@@ -506,6 +506,7 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
+    import gc
     import torch
     from .cellfilter.model import CellFilter
     from .cellfilter.predict import predict_recording
@@ -515,7 +516,20 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
     model = CellFilter().to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    predict_recording(rec_id, model, device, plane0=plane0)
+    try:
+        predict_recording(rec_id, model, device, plane0=plane0)
+    finally:
+        # Drop model + checkpoint before flushing the allocator so the
+        # weights actually return to the driver. Without this, every
+        # recording's predict step adds another model copy worth of
+        # VRAM to torch's cache, which suite2p's next run inherits.
+        del model, ckpt
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
