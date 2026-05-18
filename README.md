@@ -100,7 +100,7 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-For GPU cross-correlation, install the CuPy extra that matches your
+For GPU support, install the CuPy extra that matches your
 CUDA toolkit (`nvcc --version` or check `CUDA_PATH`):
 
 ```bash
@@ -140,7 +140,7 @@ conda install -c conda-forge numpy pandas scipy matplotlib seaborn \
 pip install -e .
 ```
 
-For GPU cross-correlation inside a conda env, install the matching CuPy
+For GPU support inside a conda env, install the matching CuPy
 build from conda-forge instead of the pip extra:
 
 ```bash
@@ -178,14 +178,3 @@ python -m calliope
 - `suite2p`, `cellpose` (detection)
 - `cupy` (optional, GPU cross-correlation — see CUDA note above)
 - `pytest` (optional, `[dev]` extra)
-
-## Publishing
-
-This repo is already in the standard src layout, so PyPI publishing
-is straightforward:
-
-```bash
-pip install build twine
-python -m build               # builds sdist + wheel into dist/
-twine upload dist/*           # upload to PyPI (or ``--repository testpypi``)
-```
