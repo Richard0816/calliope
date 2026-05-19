@@ -249,6 +249,9 @@ class CurationApp:
         btn_row = ttk.Frame(top); btn_row.pack(fill="x", pady=(0, 6))
         ttk.Button(btn_row, text="Add plane0...",
                    command=self._on_add).pack(side="left")
+        ttk.Button(btn_row, text="Paste paths...",
+                   command=self._on_paste_paths).pack(side="left",
+                                                       padx=(6, 0))
         ttk.Button(btn_row, text="Remove",
                    command=self._on_remove).pack(side="left",
                                                   padx=(6, 0))
@@ -287,30 +290,102 @@ class CurationApp:
 
     # ---- Actions ----
 
+    def _add_plane0_path(self, raw) -> tuple[str, str]:
+        # Tolerate quoted Windows paths from copy-paste; an empty
+        # string after stripping signals "skip this line silently".
+        s = str(raw).strip().strip('"').strip("'")
+        if not s:
+            return ("empty", "")
+        try:
+            p = Path(s).resolve()
+        except (OSError, ValueError) as e:
+            return ("invalid", f"{s} ({e})")
+        if not (p / "stat.npy").exists():
+            return ("invalid", f"{p} (no stat.npy)")
+        key = str(p)
+        if key in self._states:
+            return ("duplicate", key)
+        self._states[key] = _Plane0State(p)
+        return ("added", key)
+
     def _on_add(self) -> None:
         path = filedialog.askdirectory(
             title="Select a suite2p plane0 folder")
         if not path:
             return
-        p = Path(path).resolve()
-        if not (p / "stat.npy").exists():
+        status, info = self._add_plane0_path(path)
+        if status == "added":
+            self._refresh_listbox()
+            # Select the just-added entry so a quick Enter / double-
+            # click opens it without scrolling.
+            self._listbox.selection_clear(0, "end")
+            self._listbox.selection_set("end")
+            self._listbox.see("end")
+            self._status_var.set(f"Added: {info}")
+        elif status == "duplicate":
+            self._status_var.set(f"Already in list: {info}")
+        elif status == "invalid":
             messagebox.showerror(
                 "Not a plane0 folder",
-                f"{p} has no stat.npy. Pick the recording's "
+                f"{info}\n\nPick the recording's "
                 f"<...>/detection/final/suite2p/plane0/ directory.")
-            return
-        key = str(p)
-        if key in self._states:
-            self._status_var.set(f"Already in list: {key}")
-            return
-        self._states[key] = _Plane0State(p)
-        self._refresh_listbox()
-        # Select the just-added entry so a quick Enter / double-
-        # click opens it without scrolling.
-        self._listbox.selection_clear(0, "end")
-        self._listbox.selection_set("end")
-        self._listbox.see("end")
-        self._status_var.set(f"Added: {key}")
+        # ``empty`` only happens if the picker returned a blank
+        # string, which the early return above already handled.
+
+    def _on_paste_paths(self) -> None:
+        # Modal text dialog: paste one plane0 path per line and the
+        # app validates + dedupes each in a single tally instead of
+        # firing 80 individual messagebox popups.
+        win = tk.Toplevel(self._root)
+        win.title("Paste plane0 paths (one per line)")
+        win.geometry("720x420")
+        win.transient(self._root)
+        win.grab_set()
+
+        ttk.Label(
+            win,
+            text="Paste one plane0 path per line, then click Add paths.",
+            padding=6,
+        ).pack(anchor="w")
+
+        txt_row = ttk.Frame(win, padding=6)
+        txt_row.pack(fill="both", expand=True)
+        txt = tk.Text(txt_row, wrap="none", undo=True)
+        txt.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(txt_row, orient="vertical",
+                           command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.configure(yscrollcommand=sb.set)
+        txt.focus_set()
+
+        def _do_add() -> None:
+            raw = txt.get("1.0", "end")
+            tallies = {"added": 0, "duplicate": 0,
+                       "invalid": 0, "empty": 0}
+            invalid_examples: list[str] = []
+            for line in raw.splitlines():
+                status, info = self._add_plane0_path(line)
+                tallies[status] += 1
+                if status == "invalid" and len(invalid_examples) < 3:
+                    invalid_examples.append(info)
+            if tallies["added"]:
+                self._refresh_listbox()
+            msg = (f"Added {tallies['added']}, "
+                   f"skipped {tallies['duplicate']} (duplicate), "
+                   f"skipped {tallies['invalid']} (invalid)")
+            if invalid_examples:
+                msg += " — e.g. " + "; ".join(invalid_examples)
+            self._status_var.set(msg)
+            win.destroy()
+
+        btn_row = ttk.Frame(win, padding=(6, 0, 6, 6))
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Add paths",
+                   command=_do_add).pack(side="left")
+        ttk.Button(btn_row, text="Cancel",
+                   command=win.destroy).pack(side="left", padx=(6, 0))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._root.wait_window(win)
 
     def _on_remove(self) -> None:
         sel = self._listbox.curselection()

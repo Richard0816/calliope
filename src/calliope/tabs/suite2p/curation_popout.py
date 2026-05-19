@@ -53,6 +53,7 @@ from matplotlib.backends.backend_tkagg import (
 )
 from matplotlib.patches import Rectangle
 
+from ...core.utils import lowpass_causal_1d
 from ...gui_common import install_scroll_router
 
 
@@ -283,6 +284,10 @@ class CurationPopout(ctk.CTkToplevel):
         self._train_state_after_id: Optional[str] = None
 
         self._roi_idx: Optional[int] = None
+        # Persists across show_roi() calls so a curator sweeping a
+        # queue can enable the 1 Hz overlay once and see it on every
+        # subsequent ROI without re-clicking.
+        self._show_lowpass: bool = False
         self._build_ui()
         # Forward Esc to a graceful close.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -416,6 +421,13 @@ class CurationPopout(ctk.CTkToplevel):
             btn_frame, text="Retrain cell filter", width=180,
             state="disabled", command=self._on_retrain)
         self._retrain_btn.pack(side="left", padx=(20, 0))
+        # Promote stays disabled until the user has flipped at least
+        # one ROI; it overlays those flips onto predicted_cell_mask.npy
+        # so downstream tabs honour them without a full retrain.
+        self._promote_btn = ctk.CTkButton(
+            btn_frame, text="Promote to filter mask", width=200,
+            state="disabled", command=self._on_promote)
+        self._promote_btn.pack(side="left", padx=(6, 0))
 
         self._train_status_var = tk.StringVar(value="")
         ctk.CTkLabel(btn_frame, textvariable=self._train_status_var
@@ -423,6 +435,12 @@ class CurationPopout(ctk.CTkToplevel):
 
         ctk.CTkButton(btn_frame, text="Close (Esc)", width=110,
                       command=self._on_close).pack(side="right")
+        # Packed AFTER Close with side="right" so it lands left-of-
+        # Close (right-side packs build right-to-left).
+        self._lowpass_btn = ctk.CTkButton(
+            btn_frame, text="Show 1 Hz lowpass", width=170,
+            command=self._on_toggle_lowpass)
+        self._lowpass_btn.pack(side="right", padx=(0, 6))
 
     # -- Public ------------------------------------------------------------
 
@@ -497,7 +515,17 @@ class CurationPopout(ctk.CTkToplevel):
         if self._dff is not None and self._T > 0:
             trace = np.asarray(self._dff[:, self._roi_idx])
             time = np.arange(self._T) / max(self._fps, 1e-6)
-            self._trace_ax.plot(time, trace, lw=0.8)
+            self._trace_ax.plot(time, trace, lw=0.8, label="ΔF/F")
+            # ``sosfilt`` is IIR — a single NaN poisons the rest of
+            # the output, so skip the overlay (raw still renders) when
+            # the trace isn't fully finite.
+            if self._show_lowpass and np.isfinite(trace).all():
+                y_lp, _, _ = lowpass_causal_1d(
+                    trace, self._fps, cutoff_hz=1.0, order=2)
+                self._trace_ax.plot(time, y_lp, lw=1.2, color="C1",
+                                    label="1 Hz lowpass")
+                self._trace_ax.legend(loc="upper right", fontsize=8,
+                                      frameon=False)
             self._trace_ax.set_xlabel("Time (s)")
         else:
             self._trace_ax.text(0.5, 0.5,
@@ -610,12 +638,82 @@ class CurationPopout(ctk.CTkToplevel):
 
         self._flipped.add(self._roi_idx)
         self._retrain_btn.configure(state="normal")
+        self._promote_btn.configure(state="normal")
         if self._on_iscell_changed is not None:
             try:
                 self._on_iscell_changed(self._roi_idx, value)
             except Exception:
                 pass
         self._refresh_status()
+
+    def _on_promote(self) -> None:
+        """Overlay this session's manual flips onto
+        ``predicted_cell_mask.npy`` so downstream stages (Tab 5/6/7,
+        cross-correlation) honour the curator's labels without a
+        full cell-filter retrain.
+
+        Reads the current ``predicted_cell_mask.npy`` if it exists
+        (CNN output), otherwise seeds from ``iscell.npy[:, 0]`` so
+        the file is created even when the cell-filter has never run.
+        For each ROI in ``self._flipped`` the mask cell is replaced
+        with ``self._iscell[idx, 0]`` -- which already reflects every
+        flip and flip-back the curator made this session. CNN
+        predictions for un-touched ROIs are preserved.
+        """
+        if not self._flipped:
+            return
+        if self._iscell is None:
+            messagebox.showwarning(
+                "iscell.npy missing",
+                f"No iscell.npy in {self._plane0}; cannot promote.")
+            return
+        n_flipped = len(self._flipped)
+        from ...core.cellfilter import config as _cf_cfg
+        mask_path = self._plane0 / _cf_cfg.PREDICTED_MASK_NAME
+        plural = "s" if n_flipped != 1 else ""
+        if not messagebox.askyesno(
+                "Promote to filter mask",
+                f"Promote {n_flipped} flipped ROI{plural} to "
+                f"{_cf_cfg.PREDICTED_MASK_NAME}?\n\n"
+                f"Downstream stages (Tab 5/6/7, cross-correlation) "
+                f"will see the new labels on next load. CNN "
+                f"predictions for the other ROIs are preserved."):
+            return
+        try:
+            if mask_path.exists():
+                mask = np.load(mask_path).astype(bool)
+                if mask.shape[0] != self._n_total:
+                    messagebox.showerror(
+                        "Shape mismatch",
+                        f"{mask_path.name} has length "
+                        f"{mask.shape[0]} but this recording has "
+                        f"{self._n_total} ROIs. The popout is stale "
+                        f"-- close it and reopen Tab 3.")
+                    return
+            else:
+                # No CNN run yet -- seed from iscell, which already
+                # carries the session's flips. The result is
+                # "Suite2p classifier + manual flips".
+                mask = (np.asarray(self._iscell[:, 0]) > 0)
+            for idx in self._flipped:
+                mask[int(idx)] = bool(
+                    int(self._iscell[int(idx), 0]) == 1)
+            np.save(mask_path, mask.astype(bool))
+        except Exception as e:
+            messagebox.showerror(
+                "Promote failed",
+                f"Could not write {mask_path}:\n{e}")
+            return
+        self._train_status_var.set(
+            f"Promoted {n_flipped} label{plural} to "
+            f"{_cf_cfg.PREDICTED_MASK_NAME}")
+        # Sentinel (-1, -1) tells the parent tab to reload the keep
+        # mask broadly rather than refresh a single ROI's panels.
+        if self._on_iscell_changed is not None:
+            try:
+                self._on_iscell_changed(-1, -1)
+            except Exception:
+                pass
 
     def _on_retrain(self) -> None:
         if self._train_thread is not None and self._train_thread.is_alive():
@@ -729,6 +827,15 @@ class CurationPopout(ctk.CTkToplevel):
                 except Exception:
                     pass
         self._train_thread = None
+
+    # -- Lowpass overlay ----------------------------------------------------
+
+    def _on_toggle_lowpass(self) -> None:
+        self._show_lowpass = not self._show_lowpass
+        self._lowpass_btn.configure(
+            text="Hide lowpass" if self._show_lowpass
+            else "Show 1 Hz lowpass")
+        self._render_panels()
 
     # -- Close --------------------------------------------------------------
 
