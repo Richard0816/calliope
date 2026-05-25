@@ -159,8 +159,9 @@ def attach_resize_handle(parent, target, *, min_height: int = 60,
                      else max(natural_h, min_height))
 
     palette = tk_dark_palette()
-    handle = tk.Frame(parent, height=6, cursor="sb_v_double_arrow",
-                      bg=palette["border"], highlightthickness=0)
+    handle = ctk.CTkFrame(parent, height=6, corner_radius=0,
+                          fg_color=palette["border"],
+                          cursor="sb_v_double_arrow")
     handle.pack(fill="x", pady=pad)
 
     state = {"y0": None, "h0": None}
@@ -196,10 +197,10 @@ def attach_resize_handle(parent, target, *, min_height: int = 60,
             _bump_scrollable(sf)
 
     def _on_enter(_e):
-        handle.configure(bg=palette["select_bg"])
+        handle.configure(fg_color=palette["select_bg"])
 
     def _on_leave(_e):
-        handle.configure(bg=palette["border"])
+        handle.configure(fg_color=palette["border"])
 
     handle.bind("<ButtonPress-1>", _on_press)
     handle.bind("<B1-Motion>", _on_drag)

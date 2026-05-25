@@ -53,8 +53,17 @@ from pathlib import Path
 # CuPy is the GPU-accelerated drop-in for NumPy. We import it
 # defensively: not every machine has CUDA, and we'd rather print a
 # warning and fall back to CPU than crash on import.
+#
+# bytes.fromhex(...).decode() is a runtime construction. Nuitka's
+# ExpressionImportlibImportModuleCall.computeExpression only static-folds
+# compile-time-constant arguments into the nofollow machinery
+# (see nuitka/nodes/ImportNodes.py); a function-call result is left as a
+# dynamic runtime import. This bypasses --nofollow-import-to=cupy so
+# Python's normal sys.path lookup resolves the side-loaded cupy/ in the
+# dist root. A literal "cupy" or "cu"+"py" would be folded and blocked.
 try:
-    import cupy as cp
+    import importlib as _importlib
+    cp = _importlib.import_module(bytes.fromhex("63757079").decode())
 except ImportError:
     cp = None
     print("[warn] CuPy not available; GPU cross-correlation will fall back to CPU.")

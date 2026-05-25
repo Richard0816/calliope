@@ -458,8 +458,11 @@ def _clear_cuda_arena() -> None:
     try:
         # CuPy's pool is independent of torch's allocator -- clearing one
         # doesn't touch the other. Skip silently if CuPy isn't installed
-        # or the device isn't reachable.
-        import cupy as _cp
+        # or the device isn't reachable. Runtime-constructed name avoids
+        # Nuitka's static-fold on --nofollow-import-to=cupy
+        # (see crosscorrelation.py for the long explanation).
+        import importlib as _importlib
+        _cp = _importlib.import_module(bytes.fromhex("63757079").decode())
         try:
             _cp.get_default_memory_pool().free_all_blocks()
         except Exception:

@@ -1295,7 +1295,7 @@ class Suite2pTab(ctk.CTkFrame):
             score_img = build_score_image(stat, keep, probs, Ly, Lx)
             title = (f"After filter (n = {kept_n} / {n_total})  "
                      f"[bg: {bg_label}, coloured by predicted_cell_prob]")
-            render_score_panel(
+            self.fil_ax = render_score_panel(
                 self.fil_ax, self.fil_canvas, bg, score_img,
                 vmin, vmax, title)
         else:

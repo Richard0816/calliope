@@ -16,9 +16,15 @@ from pathlib import Path
 
 import numpy as np
 
+# Runtime-constructed module names avoid Nuitka's static-fold on
+# --nofollow-import-to=cupy* (see crosscorrelation.py for the long story).
+# "cupy" = 63757079; "cupyx.scipy.signal" = 63757079782e7363697079 + 2e7369676e616c.
 try:
-    import cupy as cp
-    from cupyx.scipy import signal as cp_signal
+    import importlib as _importlib
+    cp = _importlib.import_module(bytes.fromhex("63757079").decode())
+    cp_signal = _importlib.import_module(
+        bytes.fromhex("63757079782e73636970792e7369676e616c").decode()
+    )
     cp.zeros(1)          # trigger device init; raises if no CUDA device
     _CUPY_OK = True
 except Exception:

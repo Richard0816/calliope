@@ -116,17 +116,18 @@ def render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:
 
 
 def render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
-                       title) -> None:
+                       title):
     """Same overlay style as :func:`render_panel` but coloured by score
     across ``[0.5, 1.0]`` (the cell-filter pass range). Adds a
-    colourbar to the right of the panel; existing colourbars on the
-    figure are removed first so re-renders don't stack them.
+    colourbar to the right of the panel. The figure is wiped and the
+    axes recreated each call so the colourbar can never accumulate
+    shrinkage on the host axes across re-renders. Returns the freshly
+    created axes so the caller can update its handle.
     """
     fig = ax.figure
-    for old_ax in list(fig.axes):
-        if old_ax is not ax:
-            fig.delaxes(old_ax)
-    ax.clear(); ax.set_axis_off()
+    fig.clear()
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
     ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
     overlay = np.ma.masked_invalid(score_img)
     if overlay.count() > 0:
@@ -138,3 +139,4 @@ def render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
         cb.ax.tick_params(labelsize=7)
     ax.set_title(title, fontsize=9)
     canvas.draw_idle()
+    return ax

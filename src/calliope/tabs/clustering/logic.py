@@ -242,9 +242,7 @@ class CustomColorDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self._colors = list(initial_colors)
         self.result: Optional[list[str]] = None
-        # Swatches stay as raw ``tk.Button`` because we need ``bg=`` to
-        # render the color preview, which ``CTkButton`` doesn't expose.
-        self._swatches: list[tk.Button] = []
+        self._swatches: list[ctk.CTkButton] = []
         self._build_ui()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -262,9 +260,10 @@ class CustomColorDialog(ctk.CTkToplevel):
         for i, hex_color in enumerate(self._colors):
             ctk.CTkLabel(frm, text=f"Cluster {i + 1}").grid(
                 row=i + 1, column=0, sticky="w", padx=(0, 8), pady=2)
-            btn = tk.Button(frm, width=6, bg=hex_color,
-                            relief="ridge",
-                            command=lambda idx=i: self._pick(idx))
+            btn = ctk.CTkButton(frm, text="", width=48, height=24,
+                                fg_color=hex_color, hover_color=hex_color,
+                                border_width=1, border_color="gray40",
+                                command=lambda idx=i: self._pick(idx))
             btn.grid(row=i + 1, column=1, sticky="w", pady=2)
             self._swatches.append(btn)
             ctk.CTkLabel(frm, text=hex_color).grid(
@@ -283,7 +282,8 @@ class CustomColorDialog(ctk.CTkToplevel):
             title=f"Pick color for cluster {idx + 1}")
         if hex_color:
             self._colors[idx] = hex_color
-            self._swatches[idx].configure(bg=hex_color)
+            self._swatches[idx].configure(fg_color=hex_color,
+                                          hover_color=hex_color)
 
     def _ok(self) -> None:
         self.result = list(self._colors)
