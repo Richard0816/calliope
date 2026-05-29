@@ -389,29 +389,43 @@ class LowpassTab(ctk.CTkFrame):
         N_total, T = F.shape
         self._T = int(T)
 
-        mask_path = plane0 / "predicted_cell_mask.npy"
         prob_path = plane0 / "predicted_cell_prob.npy"
-        if mask_path.exists():
-            mask = np.load(mask_path).astype(bool)
-        else:
-            iscell_path = plane0 / "iscell.npy"
-            if iscell_path.exists():
-                ic = np.load(iscell_path)
-                mask = ((ic[:, 0] > 0) if ic.ndim == 2
-                        else (ic > 0)).astype(bool)
-            else:
-                mask = np.ones(N_total, dtype=bool)
-        N_kept = int(mask.sum())
-        self._n_kept = N_kept
-        if N_kept == 0:
-            raise RuntimeError("No ROIs survive the cell-filter mask.")
-
         filtered_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+
         if filtered_path.exists():
+            # Resolve the keep mask against the filtered memmap's on-disk
+            # size, NOT the live predicted_cell_mask/iscell. Curation or a
+            # "Promote to filter mask" after the memmap was written drifts
+            # those files, so mask.sum() no longer matches the file's column
+            # count and the np.memmap request below fails on Windows with
+            # [WinError 8] Not enough memory resources. See
+            # utils.resolve_filtered_mask.
+            mask, N_kept = utils.resolve_filtered_mask(
+                plane0, N_total, memmap_path=filtered_path, T=T)
+            self._n_kept = N_kept
+            if N_kept == 0:
+                raise RuntimeError("No ROIs survive the cell-filter mask.")
             dff = np.memmap(str(filtered_path), dtype="float32", mode="r",
                             shape=(T, N_kept))
             kept_idx = np.flatnonzero(mask)
         else:
+            # No filtered memmap to size against: fall back to the full
+            # (T, N_total) memmap sliced by the live mask.
+            mask_path = plane0 / "predicted_cell_mask.npy"
+            if mask_path.exists():
+                mask = np.load(mask_path).astype(bool)
+            else:
+                iscell_path = plane0 / "iscell.npy"
+                if iscell_path.exists():
+                    ic = np.load(iscell_path)
+                    mask = ((ic[:, 0] > 0) if ic.ndim == 2
+                            else (ic > 0)).astype(bool)
+                else:
+                    mask = np.ones(N_total, dtype=bool)
+            N_kept = int(mask.sum())
+            self._n_kept = N_kept
+            if N_kept == 0:
+                raise RuntimeError("No ROIs survive the cell-filter mask.")
             dff_path = plane0 / "r0p7_dff.memmap.float32"
             if not dff_path.exists():
                 raise FileNotFoundError(

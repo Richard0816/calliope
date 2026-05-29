@@ -419,31 +419,69 @@ def compress_raw_tiff(
                 src, dst, level=level, progress_cb=progress_cb,
             )
 
-        _log(
-            f"[compress] writing {dst.name} (zstd-{level}, predictor=2, "
-            f"shape={tuple(data.shape)}, dtype={data.dtype})"
-        )
-        # BigTIFF unconditionally -- raws over 4 GB are common and the
-        # overhead on small files is negligible.
-        tifffile.imwrite(
-            str(tmp),
-            data,
-            compression="zstd",
-            compressionargs={"level": int(level)},
-            predictor=2,
-            bigtiff=True,
-        )
+        # Try predictor=2 (horizontal differencing -- ~2x better ratio on
+        # spatially correlated integer fluorescence) first, then fall back
+        # to predictor=1 (no prefilter). zstd is lossless either way; the
+        # predictor is only a pre-filter. predictor=2 RAISES on float dtypes
+        # (tifffile only defines HORIZONTAL for integers) and, very rarely,
+        # can round-trip wrong -- in both cases predictor=1 still gives a
+        # byte-exact lossless rewrite, so we recover instead of aborting the
+        # whole archive. Only if predictor=1 ALSO fails do we raise, and then
+        # with a diagnostic so a genuine structural mismatch is visible.
+        last_detail = ""
+        ok = False
+        for predictor in (2, 1):
+            _log(
+                f"[compress] writing {dst.name} (zstd-{level}, "
+                f"predictor={predictor}, shape={tuple(data.shape)}, "
+                f"dtype={data.dtype})"
+            )
+            try:
+                # BigTIFF unconditionally -- raws over 4 GB are common and
+                # the overhead on small files is negligible.
+                tifffile.imwrite(
+                    str(tmp),
+                    data,
+                    compression="zstd",
+                    compressionargs={"level": int(level)},
+                    predictor=predictor,
+                    bigtiff=True,
+                )
+            except ValueError as e:
+                # e.g. "cannot use PREDICTOR.HORIZONTAL with dtype('<f4')".
+                last_detail = f"predictor={predictor} imwrite: {e}"
+                _log(f"[compress] {last_detail}; trying next predictor")
+                if tmp.exists():
+                    tmp.unlink()
+                continue
 
-        _log("[compress] verifying byte-equality after decompression")
-        verify = tifffile.imread(str(tmp))
-        if not np.array_equal(verify, data):
+            _log("[compress] verifying byte-equality after decompression")
+            verify = tifffile.imread(str(tmp))
+            if (verify.shape == data.shape
+                    and verify.dtype == data.dtype
+                    and np.array_equal(verify, data)):
+                # Free the verification buffer before the rename so we don't
+                # hold double the RAM during the swap.
+                del verify
+                ok = True
+                break
+            last_detail = (
+                f"predictor={predictor}: decompressed "
+                f"shape={verify.shape} dtype={verify.dtype} != original "
+                f"shape={data.shape} dtype={data.dtype}"
+            )
+            _log(f"[compress] verify mismatch ({last_detail}); "
+                 f"trying next predictor")
+            del verify
+            if tmp.exists():
+                tmp.unlink()
+
+        if not ok:
             raise RuntimeError(
                 f"compress_raw_tiff: verification failed for {src} "
-                f"(decompressed payload does not match original)"
+                f"(decompressed payload does not match original). "
+                f"Last attempt: {last_detail}"
             )
-        # Free the verification buffer before the rename so we don't
-        # hold double the RAM during the swap.
-        del verify
 
         compressed_bytes = tmp.stat().st_size
         os.replace(str(tmp), str(dst))
@@ -495,37 +533,69 @@ def _compress_raw_tiff_streaming(
     original_bytes = src.stat().st_size
 
     try:
-        _log(f"[compress] streaming write {src.name} -> {dst.name}")
-        with tifffile.TiffFile(str(src)) as tf, \
-                tifffile.TiffWriter(str(tmp), bigtiff=True) as tw:
-            n_pages = len(tf.pages)
-            for i, page in enumerate(tf.pages):
-                frame = page.asarray()
-                tw.write(
-                    frame,
-                    contiguous=False,
-                    compression="zstd",
-                    compressionargs={"level": int(level)},
-                    predictor=2,
-                )
-                if (i + 1) % 2000 == 0:
-                    _log(f"[compress]   write {i + 1}/{n_pages}")
+        # predictor=2 (best ratio for integer raws) then predictor=1
+        # (lossless fallback for float dtypes / rare round-trip mismatches);
+        # see compress_raw_tiff for the rationale.
+        last_detail = ""
+        ok = False
+        for predictor in (2, 1):
+            _log(
+                f"[compress] streaming write {src.name} -> {dst.name} "
+                f"(predictor={predictor})"
+            )
+            try:
+                with tifffile.TiffFile(str(src)) as tf, \
+                        tifffile.TiffWriter(str(tmp), bigtiff=True) as tw:
+                    n_pages = len(tf.pages)
+                    for i, page in enumerate(tf.pages):
+                        frame = page.asarray()
+                        tw.write(
+                            frame,
+                            contiguous=False,
+                            compression="zstd",
+                            compressionargs={"level": int(level)},
+                            predictor=predictor,
+                        )
+                        if (i + 1) % 2000 == 0:
+                            _log(f"[compress]   write {i + 1}/{n_pages}")
+            except ValueError as e:
+                last_detail = f"predictor={predictor} write: {e}"
+                _log(f"[compress] {last_detail}; trying next predictor")
+                if tmp.exists():
+                    tmp.unlink()
+                continue
 
-        _log("[compress] streaming verify (page-by-page)")
-        with tifffile.TiffFile(str(src)) as tf_src, \
-                tifffile.TiffFile(str(tmp)) as tf_dst:
-            if len(tf_src.pages) != len(tf_dst.pages):
-                raise RuntimeError(
-                    f"compress_raw_tiff: page count mismatch "
-                    f"{len(tf_src.pages)} != {len(tf_dst.pages)}"
-                )
-            for i, (sp, dp) in enumerate(zip(tf_src.pages, tf_dst.pages)):
-                if not np.array_equal(sp.asarray(), dp.asarray()):
-                    raise RuntimeError(
-                        f"compress_raw_tiff: verification failed at page {i}"
-                    )
-                if (i + 1) % 2000 == 0:
-                    _log(f"[compress]   verify {i + 1}/{len(tf_src.pages)}")
+            _log(f"[compress] streaming verify (page-by-page, "
+                 f"predictor={predictor})")
+            mismatch = None
+            with tifffile.TiffFile(str(src)) as tf_src, \
+                    tifffile.TiffFile(str(tmp)) as tf_dst:
+                if len(tf_src.pages) != len(tf_dst.pages):
+                    mismatch = (f"page count {len(tf_src.pages)} != "
+                                f"{len(tf_dst.pages)}")
+                else:
+                    for i, (sp, dp) in enumerate(
+                            zip(tf_src.pages, tf_dst.pages)):
+                        if not np.array_equal(sp.asarray(), dp.asarray()):
+                            mismatch = f"page {i} differs"
+                            break
+                        if (i + 1) % 2000 == 0:
+                            _log(f"[compress]   verify {i + 1}/"
+                                 f"{len(tf_src.pages)}")
+            if mismatch is None:
+                ok = True
+                break
+            last_detail = f"predictor={predictor}: {mismatch}"
+            _log(f"[compress] verify mismatch ({last_detail}); "
+                 f"trying next predictor")
+            if tmp.exists():
+                tmp.unlink()
+
+        if not ok:
+            raise RuntimeError(
+                f"compress_raw_tiff: streaming verification failed for "
+                f"{src}. Last attempt: {last_detail}"
+            )
 
         compressed_bytes = tmp.stat().st_size
         os.replace(str(tmp), str(dst))
