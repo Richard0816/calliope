@@ -100,7 +100,7 @@ from scipy.special import erfinv  # inverse error function for Gaussian quantile
 from pathlib import Path
 # Type-hint utilities. ``Optional[X]`` == ``X | None``;
 # ``Sequence[X]`` is "any list-like of Xs"; ``Union[A, B]`` == ``A | B``.
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 # Dataclasses give us cheap "record" types -- a class whose
 # ``__init__`` is auto-generated from the field annotations. Roughly
 # the same idea as R's ``setClass`` for S4 records, but lighter.
@@ -1166,6 +1166,116 @@ def compute_candidate_prominences(
     _peaks, props = find_peaks(smoothed, **kw)
     proms = np.asarray(props.get("prominences", []), dtype=np.float64)
     return proms
+
+
+def _circular_shift_onsets(onsets_by_roi, duration_s, rng):
+    """Independently circular-shift each ROI's onset times (seconds).
+
+    Preserves each ROI's onset COUNT but destroys cross-cell timing
+    coincidence -- the null hypothesis "the same cells fire the same
+    number of times, but their timing is independent across cells".
+    """
+    shifted = []
+    for onsets in onsets_by_roi:
+        o = np.asarray(onsets, dtype=np.float64)
+        if o.size == 0:
+            shifted.append(o)
+            continue
+        offset = rng.uniform(0.0, duration_s)
+        shifted.append((o + offset) % duration_s)
+    return shifted
+
+
+def circular_shift_null_prominences(
+        onsets_by_roi: Sequence[np.ndarray],
+        T: int,
+        fps: float,
+        params: Optional["EventDetectionParams"] = None,
+        *,
+        n_shuffles: int = 200,
+        seed: int = 0,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+):
+    """Pooled candidate-peak prominences under a circular-shift null.
+
+    For each of ``n_shuffles`` shuffles, independently circular-shifts
+    every ROI's onset train (preserving per-ROI onset count, destroying
+    cross-cell coincidence), rebuilds the smoothed onset density with the
+    SAME pipeline detection uses (:func:`_build_density`), and collects
+    every candidate peak's prominence
+    (:func:`compute_candidate_prominences`). The pooled distribution is
+    the noise floor a real population event must clear.
+
+    This is the shared engine behind both the
+    ``scripts/null_prominence_audit.py`` experiment and Tab 5's
+    prominence-popout null-floor overlay, so the GUI and the audit see
+    the exact same null.
+
+    ``progress_cb(done, total)`` is invoked after each shuffle when
+    given (the CLI audit uses it for a rate/ETA readout).
+
+    Returns ``(pooled_prominences, n_peaks_per_shuffle)`` where
+    ``pooled_prominences`` is a 1-D float array (all candidate peaks
+    across all shuffles) and ``n_peaks_per_shuffle`` is an int array of
+    length ``n_shuffles``.
+    """
+    if params is None:
+        params = EventDetectionParams()
+    if not (fps and float(fps) > 0):
+        raise ValueError(
+            f"circular_shift_null_prominences: fps must be > 0, got {fps!r}")
+
+    duration_s = float(T) / float(fps)
+    n_rois = len(onsets_by_roi)
+    rng = np.random.default_rng(seed)
+
+    pooled: list[np.ndarray] = []
+    n_peaks = np.zeros(int(n_shuffles), dtype=np.int64)
+    for k in range(int(n_shuffles)):
+        shifted = _circular_shift_onsets(onsets_by_roi, duration_s, rng)
+        _centers, _counts, smooth = _build_density(
+            onsets_by_roi=shifted,
+            duration_s=duration_s,
+            bin_sec=params.bin_sec,
+            smooth_sigma_bins=params.smooth_sigma_bins,
+            n_rois=n_rois,
+            normalize_by_num_rois=params.normalize_by_num_rois,
+        )
+        proms = compute_candidate_prominences(smooth, params=params)
+        pooled.append(proms)
+        n_peaks[k] = proms.size
+        if progress_cb is not None:
+            progress_cb(k + 1, int(n_shuffles))
+
+    flat = (np.concatenate(pooled) if pooled
+            else np.empty(0, dtype=np.float64))
+    return flat, n_peaks
+
+
+def null_prominence_percentiles(
+        onsets_by_roi: Sequence[np.ndarray],
+        T: int,
+        fps: float,
+        params: Optional["EventDetectionParams"] = None,
+        *,
+        percentiles: Sequence[float] = (95.0, 99.0),
+        n_shuffles: int = 200,
+        seed: int = 0,
+) -> dict:
+    """Convenience wrapper: circular-shift null prominence percentiles.
+
+    Returns ``{percentile: value}`` (e.g. ``{95.0: ..., 99.0: ...}``).
+    Values are ``nan`` when the null produced no candidate peaks. See
+    :func:`circular_shift_null_prominences` for the null construction.
+    """
+    pooled, _ = circular_shift_null_prominences(
+        onsets_by_roi, T, fps, params,
+        n_shuffles=n_shuffles, seed=seed,
+    )
+    if pooled.size == 0:
+        return {float(p): float("nan") for p in percentiles}
+    vals = np.percentile(pooled, list(percentiles))
+    return {float(p): float(v) for p, v in zip(percentiles, np.atleast_1d(vals))}
 
 
 def _detect_density_peaks(

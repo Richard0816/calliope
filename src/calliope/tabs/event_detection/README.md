@@ -229,7 +229,7 @@ Defaults are tuned for **<0.5 s epileptiform events**. Every entry below is edit
 | `bin_sec` | 0.025 | Density histogram bin width. |
 | `smooth_sigma_bins` | 1.5 | Gaussian smoothing of the density. |
 | `normalize_by_num_rois` | True | Normalise to onsets/ROI/bin. |
-| `min_prominence` | 0.002 | `find_peaks` prominence floor. Also editable visually via the *Prominence distribution...* popout. |
+| `min_prominence` | 0.002 | `find_peaks` prominence floor. Also editable visually via the *Prominence distribution...* popout, which overlays the circular-shift null p95/p99 as a reference floor (not auto-applied — see Popouts below). |
 | `min_width_bins` | 1.0 | Peak min width. |
 | `min_distance_bins` | 4.0 | Min separation between peaks (~100 ms). |
 | `prominence_wlen_s` | 1.0 | Local window for prominence. |
@@ -289,5 +289,5 @@ Tab 5 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Per-panel resize grips.** All three stacked matplotlib panels (1. heatmap, 2. event raster, 3. population event detection) carry a draggable handle below them. Drag any grip to grow that panel — the scrollable tab body absorbs the extra height. The other panels stay at their current size (no PanedWindow sash redistribution).
 - **Popouts.**
-  - **Prominence distribution** (`ProminencePopout`) — opens from the "Prominence distribution..." button after a render completes; resizable Toplevel with a histogram of candidate-peak prominences and a slider for picking `min_prominence` interactively.
+  - **Prominence distribution** (`ProminencePopout`) — opens from the "Prominence distribution..." button after a render completes; resizable Toplevel with a histogram of candidate-peak prominences and a slider for picking `min_prominence` interactively. It also overlays the **circular-shift null floor** (p95 dotted, p99 dash-dot vertical reference lines): the null independently time-shifts each ROI's onset train so any cross-cell coincidence is pure chance, and `min_prominence` should sit at/above that floor. The null is computed off-thread (`utils.circular_shift_null_prominences`, 200 shuffles) so the popout opens instantly and the lines fill in a few seconds later (a "null floor: computing…" note shows meanwhile); the count label then reports the threshold as a `×` multiple of null p99. Per the 2026-05-29 council verdict the null is a **floor reference only — never auto-applied** as the default (the user's hand-tuned value consistently sits above it, well above on event-rich recordings). Same null engine as `scripts/null_prominence_audit.py`.
 - **Onset source** + **Manual ROI subset** rows let you pick between derivative / Suite2p `spks` and optionally restrict the heatmap + raster to a user-supplied ROI list.

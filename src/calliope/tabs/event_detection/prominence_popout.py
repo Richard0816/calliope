@@ -16,6 +16,21 @@ sit at a clearly higher prominence. Picking ``min_prominence`` by
 hand from the Advanced dialog is guesswork — this popout shows the
 valley between the two modes so the user can place the cut there.
 
+Null-floor overlay
+------------------
+The popout also draws the circular-shift NULL prominence floor (its
+p95 and p99) as vertical reference lines, when available. The null is
+built by ``utils.circular_shift_null_prominences`` — independently
+time-shifting each ROI's onset train so any cross-cell coincidence is
+pure chance — and answers "how tall does a density bump get from
+random coincidence alone?". A real population event must clear that
+floor. Per the 2026-05-29 council verdict, the null is shown as a
+*floor reference*, NOT auto-applied as the threshold: the user's
+hand-tuned ``min_prominence`` consistently sits at or above the null
+floor (well above it on event-rich recordings), so the human stays in
+the loop and just gains a principled lower bound. The null is computed
+off-thread by Tab 5 and pushed in via :meth:`ProminencePopout.set_null_percentiles`.
+
 Wiring
 ------
 * Tab 5 holds a single-instance reference (``self._prominence_popout``);
@@ -64,6 +79,8 @@ class ProminencePopout(ctk.CTkToplevel):
         prominences: np.ndarray,
         current_value: float,
         on_apply: Callable[[float], None],
+        null_percentiles: Optional[dict] = None,
+        null_pending: bool = False,
         title: str = "Prominence distribution",
     ) -> None:
         super().__init__(parent)
@@ -76,6 +93,13 @@ class ProminencePopout(ctk.CTkToplevel):
         self._prominences = np.asarray(prominences, dtype=np.float64).ravel()
         self._initial_value = float(current_value)
         self._on_apply = on_apply
+        # Circular-shift null floor: {percentile: value}, or None until the
+        # off-thread computation in Tab 5 finishes. ``null_pending`` toggles
+        # a "computing..." annotation so the user knows it's on the way.
+        self._null_percentiles = dict(null_percentiles or {})
+        self._null_pending = bool(null_pending)
+        self._null_lines: list = []
+        self._null_note = None
 
         slider_lo, slider_hi = _slider_range(self._prominences, current_value)
         self._slider_lo = slider_lo
@@ -172,11 +196,12 @@ class ProminencePopout(ctk.CTkToplevel):
                 color="crimson", linewidth=1.6, linestyle="--",
                 label="min_prominence",
             )
-            self.ax.legend(loc="upper right", fontsize=9)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self._canvas_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True,
                                          padx=4, pady=(0, 4))
+        # Null-floor reference lines (+ legend) on top of the histogram.
+        self._draw_null_lines()
 
     # ---- Event handlers ----------------------------------------------------
 
@@ -229,6 +254,74 @@ class ProminencePopout(ctk.CTkToplevel):
         self._threshold_line.set_xdata([v, v])
         self.canvas.draw_idle()
 
+    # ---- Null-floor overlay ------------------------------------------------
+
+    # p95 lighter, p99 darker; both clearly distinct from the crimson
+    # threshold line.
+    _NULL_STYLE = {
+        95.0: dict(color="#7f8c8d", linestyle=":", linewidth=1.4),
+        99.0: dict(color="#34495e", linestyle="-.", linewidth=1.4),
+    }
+
+    def set_null_percentiles(self, null_percentiles: Optional[dict]) -> None:
+        """Push the circular-shift null floor in after off-thread compute.
+
+        ``null_percentiles`` maps percentile -> prominence (e.g.
+        ``{95.0: 0.0022, 99.0: 0.0028}``). Passing ``None`` / empty marks
+        the null as unavailable (e.g. the null produced no peaks). Safe to
+        call from the Tk main thread after the window is built.
+        """
+        self._null_pending = False
+        self._null_percentiles = dict(null_percentiles or {})
+        if self.winfo_exists():
+            self._draw_null_lines()
+            self._refresh_count_label()
+
+    def _draw_null_lines(self) -> None:
+        """(Re)draw the null p95/p99 vertical lines, note, and legend."""
+        if getattr(self, "_threshold_line", None) is None:
+            # Empty-distribution placeholder figure -- nothing to overlay.
+            return
+        # Clear any prior null artists so repeated calls don't stack lines.
+        for ln in self._null_lines:
+            try:
+                ln.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._null_lines = []
+        if self._null_note is not None:
+            try:
+                self._null_note.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._null_note = None
+
+        finite = {p: v for p, v in self._null_percentiles.items()
+                  if v is not None and np.isfinite(v)}
+        if finite:
+            for p in sorted(finite):
+                style = self._NULL_STYLE.get(
+                    float(p),
+                    dict(color="#7f8c8d", linestyle=":", linewidth=1.4))
+                self._null_lines.append(self.ax.axvline(
+                    float(finite[p]),
+                    label=f"null p{int(p)} (floor)", **style))
+        elif self._null_pending:
+            self._null_note = self.ax.text(
+                0.99, 0.80, "null floor: computing…",
+                ha="right", va="top", transform=self.ax.transAxes,
+                fontsize=8, color="gray", style="italic")
+        elif self._null_percentiles == {} and not self._null_pending:
+            # Computation finished but yielded nothing usable.
+            pass
+
+        # Rebuild the legend so it picks up whatever lines now exist.
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            self.ax.legend(handles, labels, loc="upper right", fontsize=9)
+        if getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
+
     def _refresh_count_label(self) -> None:
         N = int(self._prominences.size)
         v = float(self.value_var.get())
@@ -236,7 +329,9 @@ class ProminencePopout(ctk.CTkToplevel):
             self.count_var.set("No candidate peaks available.")
             return
         kept = int(np.sum(self._prominences >= v))
-        self.count_var.set(
-            f"keeping {kept} / {N} candidate peaks at "
-            f"min_prominence = {v:.4f}"
-        )
+        msg = (f"keeping {kept} / {N} candidate peaks at "
+               f"min_prominence = {v:.4f}")
+        p99 = self._null_percentiles.get(99.0)
+        if p99 is not None and np.isfinite(p99) and p99 > 0:
+            msg += f"  ({v / p99:.2f}× null p99 floor)"
+        self.count_var.set(msg)

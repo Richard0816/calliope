@@ -119,11 +119,23 @@ target_lbls  = [_visual_to_label[v] for v in picked_visual_ids]   # raw labels
 local_idx    = where(isin(labels, target_lbls))[0]                # filtered-list positions
 
 if 'filtered' in prefix.split('_'):
-    keep_mask  = _load_filter_mask(plane0)
-    translator = where(keep_mask)[0]            # filtered-pos -> Suite2p id
-    return sorted(translator[local_idx].tolist())
+    translator = filtered_to_suite2p_indices(plane0, prefix)   # filtered-pos -> Suite2p id
+    if translator is not None and translator.size == len(labels):
+        return sorted(translator[local_idx].tolist())
 return sorted(local_idx.tolist())
 ```
+
+> **Keep-mask anchoring.** The filtered-position → Suite2p translator comes from
+> `filtered_to_suite2p_indices(plane0, prefix)`, which resolves the keep mask via
+> `utils.resolve_filtered_mask` **anchored to the `<prefix>dff.memmap.float32` file
+> size** — the same resolver `load_filtered_dff` and `stat_for_prefix` use. The old
+> `_load_filter_mask` read the *live* `predicted_cell_mask`/`iscell`; once curation
+> drifted those after the memmap was written, its `sum()` no longer matched the
+> linkage's leaf count, so the spatial map failed the `len(stat) != N` guard with
+> **"Spatial unavailable (stat / dF/F mismatch)"** and the export/ROI-id paths
+> silently fell back to emitting filtered-list positions instead of Suite2p ids.
+> Anchoring to file size keeps `stat`, the dF/F columns, and the translator the
+> exact same length.
 
 Refresh hooks:
 - `_update_cluster_pick_label` (fires on every menu toggle) → calls `_refresh_roi_list_var`.
@@ -192,7 +204,7 @@ The button is enabled only when both files exist for the active prefix:
 
 Cluster numbering matches the dendrogram's left-to-right visual order (C1, C2, … = leftmost branch, second branch, …). The `_indices_are_suite2p` marker tells Tab 7 that the indices in `C*_rois.npy` are positions in `stat.npy` / `F.npy` (Suite2p indices), not positions in the kept-only memmap.
 
-For the filtered prefix, the export translates from filtered-position to Suite2p index using `np.where(keep_mask)[0]`. For an unfiltered prefix it's a no-op.
+For the filtered prefix, the export translates from filtered-position to Suite2p index using `filtered_to_suite2p_indices(plane0, prefix)` (the file-size-anchored translator — see Step 4's keep-mask note). For an unfiltered prefix it's a no-op.
 
 Stale `C*_rois.npy` files are deleted before writing, so re-export with fewer clusters doesn't leave ghost files behind.
 

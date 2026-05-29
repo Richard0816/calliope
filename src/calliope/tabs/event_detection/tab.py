@@ -555,6 +555,16 @@ class EventDetectionTab(ctk.CTkFrame):
         proms = compute_candidate_prominences(np.asarray(smoothed),
                                               params=params)
 
+        # Circular-shift null floor: computed off-thread (a few seconds at
+        # 200 shuffles) so the popout opens instantly with the observed
+        # histogram and the null p95/p99 reference lines fill in when ready.
+        # Per the 2026-05-29 council verdict the null is a *floor reference*,
+        # not an auto-applied default.
+        onsets_by_roi = self._last_data.get("onsets_by_roi")
+        T = self._last_data.get("T")
+        fps = self._last_data.get("fps")
+        null_ready = bool(onsets_by_roi) and bool(T) and bool(fps and fps > 0)
+
         from .prominence_popout import ProminencePopout
         self._prominence_popout = ProminencePopout(
             self,
@@ -562,7 +572,40 @@ class EventDetectionTab(ctk.CTkFrame):
             current_value=float(self._params.get("min_prominence",
                                                  params.min_prominence)),
             on_apply=self._on_prominence_apply,
+            null_pending=null_ready,
         )
+
+        if null_ready:
+            self._spawn_null_floor_worker(
+                self._prominence_popout, list(onsets_by_roi),
+                int(T), float(fps), params)
+
+    def _spawn_null_floor_worker(self, popout, onsets_by_roi, T, fps,
+                                 params) -> None:
+        """Compute the circular-shift null prominence floor in a daemon
+        thread and push p95/p99 back into ``popout`` on the Tk main thread.
+
+        Errors are swallowed to a "null unavailable" state -- the floor is
+        an optional reference, never a blocker on tuning.
+        """
+        from ...core.utils import null_prominence_percentiles
+
+        def worker():
+            try:
+                pcts = null_prominence_percentiles(
+                    onsets_by_roi, T, fps, params,
+                    percentiles=(95.0, 99.0), n_shuffles=200, seed=0)
+            except Exception as e:
+                print(f"[GUI] null-floor computation failed: {e}")
+                pcts = None
+            # Marshal back to the Tk thread; the popout may have been
+            # closed in the meantime (set_null_percentiles guards that).
+            try:
+                self.after(0, lambda: popout.set_null_percentiles(pcts))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_prominence_apply(self, new_value: float) -> None:
         """Callback from the popout's Apply button: update
