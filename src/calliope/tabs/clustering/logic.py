@@ -77,6 +77,7 @@ __all__ = [
     "load_filter_mask",
     "load_filtered_dff",
     "stat_for_prefix",
+    "filtered_to_suite2p_indices",
     "build_label_image",
     "spatial_image",
     "CustomColorDialog",
@@ -181,14 +182,50 @@ def stat_for_prefix(plane0: Path, prefix: str):
     For filtered prefixes, restrict ``stat`` to the cell-filter keep mask so
     the i-th stat entry matches the i-th column of dF/F. Returns
     ``(stat_list, original_indices_or_None)``.
+
+    The mask MUST be resolved the same way ``load_filtered_dff`` resolves it
+    -- anchored to the filtered memmap's on-disk column count via
+    ``utils.resolve_filtered_mask`` -- not from the live
+    ``predicted_cell_mask``/``iscell``. Otherwise, when curation drifts those
+    files after the memmap was written, the stat list is sliced to a different
+    count than the dF/F columns and the spatial map fails the
+    ``len(stat) != N`` guard with "Spatial unavailable (stat / dF/F mismatch)".
     """
     full_stat = list(np.load(plane0 / "stat.npy", allow_pickle=True))
     if "filtered" in prefix.split("_"):
-        mask = load_filter_mask(plane0)
-        if mask is not None:
-            return ([s for s, keep in zip(full_stat, mask) if keep],
-                    np.where(mask)[0])
+        dff_path = plane0 / f"{prefix}dff.memmap.float32"
+        F = np.load(plane0 / "F.npy", mmap_mode="r")
+        N_total, T = F.shape
+        mask, _ = utils.resolve_filtered_mask(
+            plane0, N_total, memmap_path=dff_path, T=T)
+        return ([s for s, keep in zip(full_stat, mask) if keep],
+                np.where(mask)[0])
     return full_stat, None
+
+
+def filtered_to_suite2p_indices(plane0: Path, prefix: str) -> Optional[np.ndarray]:
+    """Translator from kept-ROI (dF/F column) position to Suite2p ROI index.
+
+    Returns ``np.where(mask)[0]`` for a filtered prefix and ``None`` for an
+    unfiltered one (where column position already *is* the Suite2p index).
+
+    Like :func:`stat_for_prefix`, the mask is resolved against the filtered
+    memmap's on-disk column count via ``utils.resolve_filtered_mask`` so the
+    translator stays the exact length of the linkage's leaves even after
+    curation drifts ``predicted_cell_mask``/``iscell``. Export / ROI-id
+    callsites previously read the live mask and silently fell back to emitting
+    filtered-list positions (not Suite2p ids) whenever ``mask.sum()`` no
+    longer matched the leaf count.
+    """
+    if "filtered" not in prefix.split("_"):
+        return None
+    plane0 = Path(plane0)
+    dff_path = plane0 / f"{prefix}dff.memmap.float32"
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+    mask, _ = utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=dff_path, T=T)
+    return np.where(np.asarray(mask, dtype=bool))[0].astype(int)
 
 
 def build_label_image(stat, Ly: int, Lx: int) -> np.ndarray:

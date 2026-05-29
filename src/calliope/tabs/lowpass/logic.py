@@ -18,6 +18,7 @@ from ...core.utils import (
     get_fps_from_notes,
     lowpass_causal_1d,
     lowpass_zero_phase_1d,
+    resolve_filtered_mask,
     sg_first_derivative_1d,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "get_fps_from_notes",
     "lowpass_causal_1d",
     "lowpass_zero_phase_1d",
+    "resolve_filtered_mask",
     "sg_first_derivative_1d",
 ]

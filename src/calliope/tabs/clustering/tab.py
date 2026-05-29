@@ -107,9 +107,9 @@ from scipy.spatial.distance import pdist
 
 from .logic import (
     ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
-    ReclusterWindow, build_label_image, load_filter_mask,
-    load_filtered_dff, spatial_image, stat_for_prefix, summary_writer,
-    utils, ward_linkage,
+    ReclusterWindow, build_label_image, filtered_to_suite2p_indices,
+    load_filtered_dff, spatial_image, stat_for_prefix,
+    summary_writer, utils, ward_linkage,
 )
 from .logic import clustering as cmap_mod
 from .cluster_popout import ClusterPopout
@@ -1016,10 +1016,9 @@ class ClusteringTab(ctk.CTkFrame):
         # active prefix is filtered (mirrors _export_clusters).
         if ("filtered" in self._prefix.split("_")
                 and self._plane0 is not None):
-            mask = load_filter_mask(self._plane0)
-            if mask is not None and int(mask.sum()) == len(labels):
-                translator = np.where(
-                    np.asarray(mask, dtype=bool))[0].astype(int)
+            translator = filtered_to_suite2p_indices(
+                self._plane0, self._prefix)
+            if translator is not None and translator.size == len(labels):
                 return sorted(int(i) for i in translator[local_idx])
         return sorted(int(i) for i in local_idx)
 
@@ -1265,10 +1264,10 @@ class ClusteringTab(ctk.CTkFrame):
         # mask the loaders use.
         filtered_to_suite2p: Optional[np.ndarray] = None
         if "filtered" in self._prefix.split("_"):
-            mask = load_filter_mask(self._plane0)
-            if mask is not None and int(mask.sum()) == len(labels):
-                filtered_to_suite2p = np.where(
-                    np.asarray(mask, dtype=bool))[0].astype(int)
+            translator = filtered_to_suite2p_indices(
+                self._plane0, self._prefix)
+            if translator is not None and translator.size == len(labels):
+                filtered_to_suite2p = translator
 
         out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1356,9 +1355,10 @@ class ClusteringTab(ctk.CTkFrame):
         # Suite2p ROI indices so the Clusters sheet's `roi` column lines
         # up with the ROIs sheet (where `roi` is the Suite2p index).
         if "filtered" in self._prefix.split("_"):
-            mask = load_filter_mask(self._plane0)
-            if mask is not None and int(mask.sum()) == len(labels):
-                roi_indices = np.where(mask)[0].astype(int).tolist()
+            translator = filtered_to_suite2p_indices(
+                self._plane0, self._prefix)
+            if translator is not None and translator.size == len(labels):
+                roi_indices = translator.tolist()
             else:
                 roi_indices = None
         else:
