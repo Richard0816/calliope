@@ -724,6 +724,7 @@ class Suite2pTab(ctk.CTkFrame):
                     baseline_mode=baseline_mode,
                     baseline_min=baseline_min,
                     tau_override=tau_override,
+                    raw_paths=getattr(result, "raw_paths", None),
                 )
                 self._log_queue.put(("done", None))
             except Exception as e:
@@ -744,6 +745,7 @@ class Suite2pTab(ctk.CTkFrame):
         baseline_mode: str,
         baseline_min: float,
         tau_override: float = 1.0,
+        raw_paths=None,
     ) -> None:
         writer = QueueWriter(self._log_queue)
         params = dict(self._params)
@@ -830,7 +832,7 @@ class Suite2pTab(ctk.CTkFrame):
             self._prune_detection_intermediates(save_folder)
             self._archive_recording(
                 save_folder, params,
-                raw_paths=getattr(result, "raw_paths", None),
+                raw_paths=raw_paths,
                 plane0=final_plane0)
 
     def _prune_detection_intermediates(self, save_folder: Path) -> None:
