@@ -9,10 +9,10 @@ This tab is interactive: a slider drives the cutoff, three panels (FFT, raw dF/F
 ## 1. Inputs
 
 From `plane0/`:
-- `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)` — preferred.
-- Falls back to `r0p7_dff.memmap.float32` of shape `(T, N_total)` masked by `predicted_cell_mask.npy` / `iscell.npy` if the filtered memmap is missing.
+- `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)` — preferred. The keep mask / `N_kept` is resolved via `utils.resolve_filtered_mask(plane0, N_total, memmap_path=<filtered memmap>, T=T)` — **anchored to the memmap's on-disk column count**, not the live `predicted_cell_mask`/`iscell`. This prevents `[WinError 8] Not enough memory resources` when curation has drifted the cell mask since Tab 3 wrote the memmap (a wrong-shaped mapping request, not real memory pressure).
+- Falls back to `r0p7_dff.memmap.float32` of shape `(T, N_total)` masked by the live `predicted_cell_mask.npy` / `iscell.npy` **only when the filtered memmap is missing** (no fixed file size to anchor against).
 - `F.npy` for `(N_total, T)` shape lookup.
-- `predicted_cell_mask.npy` (preferred) or `iscell.npy` for the keep mask.
+- `r0p7_cell_mask_bool.npy` — the authoritative keep mask persisted by Tab 3 alongside the memmap; `resolve_filtered_mask` prefers it, then `predicted_cell_mask.npy`, then `iscell.npy`.
 - `predicted_cell_prob.npy` (only used by the "best-scoring ROI" trace source).
 
 The tab subscribes to the AppState `plane0` broadcast so it auto-loads when Tab 3 finishes; "Reload from folder…" lets the user point at any `plane0`.
