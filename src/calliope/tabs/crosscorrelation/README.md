@@ -129,10 +129,21 @@ The output layout is:
 The summary CSV has columns:
 
 ```
-roi_A, roi_B, best_lag_sec, max_corr, zero_lag_corr
+roi_A, roi_B, best_lag_sec, max_corr, zero_lag_corr [, p_value, p_value_fdr, partial_corr_zero_lag]
 ```
 
-`roi_A` and `roi_B` are **Suite2p ROI indices**.
+`roi_A` and `roi_B` are **Suite2p ROI indices**. When the "shuffles" GUI field is > 0 (default 500), the per-pair circular-shift null adds two more columns:
+
+- `p_value` — fraction of circular-shift draws (jittered alignment, preserving each ROI's autocorrelation) whose max-correlation ≥ the observed max, with the Phipson-Smyth +1/+1 correction so a pair that beats every shuffle still gets a non-zero p capped at `1/(n_shuffles+1)`.
+- `p_value_fdr` — Benjamini-Hochberg-adjusted q-value across the (nA × nB) matrix. Compare against your target FDR (typically 0.05) to flag significant pairs.
+
+The circular-shift null is the field-standard fix for the autocorrelation-inflated false-positive rate that parametric tests (Marčenko-Pastur) suffer on calcium imaging data — see Cheng et al. eLife 2023 ([doi:10.7554/eLife.81279](https://doi.org/10.7554/eLife.81279)). The per-event variant accepts the same kwarg for API symmetry but does not currently compute per-window shuffles; the Tab 7 GUI strips it before calling the per-event runner and logs a note.
+
+When the "+ partial corr" checkbox is on (default off), an additional column appears:
+
+- `partial_corr_zero_lag` — partial correlation between `roi_A` and `roi_B` conditioning on every other ROI in the union of all clusters. Computed once via `core/crosscorrelation.py::compute_partial_correlation` on the full population's z-scored dF/F (ridge `1e-6`), then sliced per cluster pair. The motivating use case: disambiguate "A and B drive each other" from "A and B are both driven by some other ROI C" — Pearson can't tell those apart but partial correlation can (Sutera et al. [arXiv:1406.7865](https://arxiv.org/abs/1406.7865); Stevenson [arXiv:1708.01888](https://arxiv.org/abs/1708.01888)). Requires `N_union < 0.5 * T` (precision-matrix conditioning); the run automatically skips and warns above that threshold. Entries are `nan` when a cluster ROI isn't in the keep mask.
+
+> **Indicator-kinetics caveat.** Pearson r on filtered dF/F is biased by GCaMP rise + decay: every spike is convolved with a ~tens-to-hundreds-of-ms exponential, so the visible CCG peak is blurred by the indicator's autocorrelation. The apparent lag resolution is **indicator-limited, not frame-rate-limited**, and correlation magnitudes are inflated relative to spike-time correlations (Yatsenko/Mishne, eLife 2021, [doi:10.7554/eLife.68046](https://doi.org/10.7554/eLife.68046)). To get an indicator-independent CCG, compute on deconvolved/binned spike rates (Berens et al. 2018, 40 ms bins). Currently the input is `r0p7_filtered_dff.memmap.float32`; an "input signal" GUI dropdown is a planned upgrade (audit Tier 2 #10).
 
 ### Step 4 — Per-event mode (`run_cluster_xcorr_per_event_fast`)
 
@@ -245,6 +256,8 @@ A long full-recording run on a large cluster set can take minutes. The Abort but
 | `max_lag_seconds` | 2.0 | Search range ±L = ±round(max_lag · fps). |
 | `also output zero-lag corr` | True | Track the lag-0 matrix during the per-lag loop. |
 | `use GPU if available` | True | Falls back to NumPy if CuPy is missing. |
+| `shuffles (0=off)` | 500 | Circular-shift null + BH-FDR. Adds `p_value` / `p_value_fdr` CSV columns; cost scales linearly with the value (each shuffle is one extra batched-matmul sweep). |
+| `+ partial corr (requires N < T/2)` | unchecked | Compute population-wide partial correlation across the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`), conditioning each pair on every other ROI. Adds `partial_corr_zero_lag` to each cluster pair's summary CSV. Automatically skipped when `N_union >= 0.5 * T` (precision matrix ill-conditioned). Only meaningful on the full-recording run — Tab 7 strips the flag on per-event runs and logs a notice. |
 
 For the violin permutation test: `n_perm=10000`, `chunk=256`, `seed=0`.
 

@@ -389,6 +389,10 @@ class ClusteringTab(ctk.CTkFrame):
             ctl, text="Export *_rois.npy", width=150,
             command=self._on_export, state="disabled")
         self.export_btn.pack(side="right")
+        self.export_figs_btn = ctk.CTkButton(
+            ctl, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_figs_btn.pack(side="right", padx=(0, 6))
         self.summary_btn = ctk.CTkButton(
             ctl, text="Save summary", width=120,
             command=self._on_save_summary, state="disabled")
@@ -629,6 +633,7 @@ class ClusteringTab(ctk.CTkFrame):
 
         self._custom_colors = None  # palette resets to dropdown choice
         self.export_btn.configure(state="normal")
+        self.export_figs_btn.configure(state="normal")
         self.summary_btn.configure(state="normal")
         self.recluster_btn.configure(state="normal")
         self.cluster_menu_btn.config(state="normal")
@@ -1377,6 +1382,65 @@ class ClusteringTab(ctk.CTkFrame):
             threshold=float(T),
             method="average", metric="correlation",
             roi_indices=roi_indices)
+
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Save the live dendrogram + spatial-cluster panels as PNG +
+        SVG into ``<save_folder>/calliope_figures/clustering/`` and
+        refresh the recording's ``manifest.json``. Dumps whatever the
+        user is currently looking at (active palette, manual threshold,
+        custom colors) -- the export captures the interactive state,
+        not a recomputed default.
+
+        ``quiet=True`` (Tab 0 batch toggle) suppresses messageboxes.
+        """
+        if self._Z is None or self._plane0 is None:
+            if not quiet:
+                messagebox.showinfo(
+                    "Run first",
+                    "Run analysis (or 'Reload clusters') before "
+                    "exporting figures.")
+            return
+        save_folder = self._plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        cluster_dir = figures_root / "clustering"
+        try:
+            cluster_dir.mkdir(parents=True, exist_ok=True)
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(self._plane0)
+            except Exception:
+                rec_id = save_folder.name
+            d_png = cluster_dir / "dendrogram.png"
+            s_png = cluster_dir / "spatial_clusters.png"
+            self.d_fig.savefig(d_png, dpi=200)
+            self.d_fig.savefig(d_png.with_suffix(".svg"))
+            self.s_fig.savefig(s_png, dpi=200)
+            self.s_fig.savefig(s_png.with_suffix(".svg"))
+            params = {
+                "prefix": self.prefix_var.get(),
+                "palette": ("custom" if self._custom_colors
+                            else self._palette_name),
+                "threshold": float(self._current_threshold()),
+                "manual_threshold": bool(self.manual_var.get()),
+            }
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params=params,
+                plane0=self._plane0, ckpt_path=None,
+            )
+            self.status_var.set(
+                f"Exported cluster figures -> {cluster_dir}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote dendrogram + spatial_clusters (PNG + SVG) "
+                    f"to:\n  {cluster_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}")
+        except Exception as e:
+            self.status_var.set(f"Export failed: {e}")
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
 
     def _on_save_summary(self) -> None:
         if self._Z is None or self._plane0 is None:

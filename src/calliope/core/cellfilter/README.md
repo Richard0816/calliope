@@ -210,6 +210,21 @@ Per-ROI z-scoring removes any DC offset and amplitude differences between cells,
 
 This augments the dataset (different temporal contexts each epoch) and ensures the model handles arbitrary recording lengths at inference.
 
+### 3.7b Spatial + trace augmentation (training only)
+
+When `ROIDataset(...)` is constructed with `augment=True` (`train.py` passes this for the train set; val + inference keep `augment=False`), each fetched sample is randomly transformed before the tensors are returned:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `AUG_FLIP_H_PROB` | 0.5 | per-sample probability of horizontal mirror of the 3-channel spatial patch. |
+| `AUG_FLIP_V_PROB` | 0.5 | per-sample probability of vertical mirror. |
+| `AUG_ROTATE_90_PROB` | 0.75 | per-sample probability of rotating by a uniformly-random k ∈ {1, 2, 3} quarter-turns. |
+| `AUG_TRACE_NOISE_STD` | 0.05 | additive Gaussian noise (z-score units) on the trace. |
+
+Setting any value to 0 disables that augmentation. A cell soma is roughly isotropic, so the 8 dihedral-group transforms (flip × flip × 0/90/180/270) are label-preserving — exactly the augmentation pattern Cellpose uses (Stringer & Pachitariu, Cellpose 2.0, Nat Methods 2022, [doi:10.1038/s41592-022-01663-4](https://doi.org/10.1038/s41592-022-01663-4)). Trace noise stays mild (≈ 5% of a z-score unit) so labels survive.
+
+The augmentation is applied **after** the random temporal crop so it never crosses the crop boundary, and **inside** `__getitem__` rather than at the `DataLoader` level — that means re-running an epoch reshuffles the augmentation seed for free (no need to swap a `torch.Generator` per epoch).
+
 ### 3.8 Splits
 
 Two split helpers — choose based on dataset size:

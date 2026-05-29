@@ -77,6 +77,20 @@ TRACE_CROP_LEN = 2000        # random crop length for training (frames).
 VAL_FRAC = 0.20              # fraction of recordings held out for validation.
 RANDOM_SEED = 0              # reproducible split between train / val.
 
+# --- Augmentation (training only; validation and inference pass through) ---
+# A cell soma is a roughly isotropic blob, so the dihedral group of the
+# square (8 transforms: horizontal flip + vertical flip + 0/90/180/270
+# rotations) is label-preserving for the spatial branch -- exactly the
+# augmentation pattern Cellpose uses. The trace branch gets light
+# additive Gaussian noise in z-score units (the trace is z-scored at
+# load time in ``_RecordingCache.get_trace``). Set any of these to 0
+# to disable that augmentation. Defaults pulled from Cellpose 2.0
+# guidance + the cellfilter audit recommendation (2026-05-25).
+AUG_FLIP_H_PROB = 0.5        # horizontal mirror of spatial patch.
+AUG_FLIP_V_PROB = 0.5        # vertical mirror of spatial patch.
+AUG_ROTATE_90_PROB = 0.75    # uniform draw from {90, 180, 270} when fired.
+AUG_TRACE_NOISE_STD = 0.05   # std-dev (z-score units) of additive trace noise.
+
 # --- Model ---
 # Channel widths for each conv block in the temporal branch
 # (1D ResNet-style on the dF/F trace). Powers of 2 for GPU

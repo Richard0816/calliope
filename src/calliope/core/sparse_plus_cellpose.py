@@ -142,7 +142,26 @@ CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 # Tau lookup table by GCaMP variant. Kept here as a reference of the
 # values the lab uses; the GUI now passes a per-recording tau scalar
 # via ``tau_override`` and there is no automatic filename->AAV lookup.
-DEFAULT_TAU_VALS: dict = {"6f": 0.7, "6m": 1.0, "6s": 1.3, "8m": 0.137}
+# Mirrors ``tabs/suite2p/tab.py::GCAMP_OPTIONS`` -- keep the two in sync
+# when adding indicators. Sources:
+#   - 6f/6m/6s: Chen et al., Nature 2013 (doi:10.1038/nature12354), with
+#     6s widened to 1.5 s per the Suite2p / Pachitariu 2018 slow bin
+#     (doi:10.1523/JNEUROSCI.3339-17.2018).
+#   - 7f: Dana et al., Nat Methods 2019 (doi:10.1038/s41592-019-0435-6).
+#   - 8f/8m/8s: Zhang et al., Nature 2023 (doi:10.1038/s41586-023-05828-9)
+#     base kinetics, with in-vivo OASIS-optimum tau from Rupprecht et al.
+#     bioRxiv 2025 (doi:10.1101/2025.03.03.641129). The 8m value was
+#     0.137 s pre-2026-05-26 -- that matches the cultured-neuron half-
+#     decay, not the in-vivo OASIS optimum (~0.25 s).
+DEFAULT_TAU_VALS: dict = {
+    "6f": 0.7,
+    "6m": 1.0,
+    "6s": 1.5,
+    "7f": 0.7,
+    "8f": 0.15,
+    "8m": 0.25,
+    "8s": 0.5,
+}
 
 
 # ============================================================================
@@ -215,7 +234,8 @@ def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
 def merge_and_extract(sparsery_stat, cellpose_stat,
                       shared_plane0: Path, base_settings: dict,
                       final_dir: Path, max_overlap: float,
-                      verbose: bool = True):
+                      verbose: bool = True,
+                      extra_cellpose_passes: "list[tuple[str, list]] | None" = None):
     """Combine sparsery + non-overlapping cellpose ROIs, then extract
     fluorescence → dcnv → classify → save into ``final_dir/suite2p/plane0/``.
 
@@ -227,9 +247,14 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
        Sparsery folder. Symlink (or copy) ``data.bin`` over to the
        final folder so we don't have to re-register the movie.
     2. **Drop overlapping Cellpose ROIs** with
-       ``filter_non_overlapping_cellpose``.
-    3. **Concatenate** the two stat lists into ``combined_raw``,
-       tagging each entry with ``_source`` so we can audit later.
+       ``filter_non_overlapping_cellpose``. Each Cellpose pass is
+       filtered *independently* against the Sparsery mask (i.e. we
+       don't filter the SAM pass against the cyto2 pass). The audit
+       (Tier 2 #13) calls this out: SAM is meant to recover silent
+       cells Sparsery missed, and we want both detectors to have a
+       full shot at those even if they happen to agree on some.
+    3. **Concatenate** all stat lists into ``combined_raw``, tagging
+       each entry with ``_source`` so we can audit later.
     4. **Build the final ops dict** by copying registration-time ops
        and overlaying the trace-extraction knobs from ``base_ops``
        (tau, fs, neucoeff, baseline window, etc.).
@@ -241,6 +266,23 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     8. **Classify** cell vs not-cell into ``iscell.npy``.
     9. **Save** every output (F, Fneu, spks, stat, ops, iscell) into
        ``final_dir/suite2p/plane0`` -- the same layout Tabs 4-8 expect.
+
+    Parameters
+    ----------
+    sparsery_stat : list of dict
+        ROIs found by Suite2p's Sparsery detector. ``_source`` will
+        be set to ``"sparsery"``.
+    cellpose_stat : list of dict
+        ROIs from the primary Cellpose pass (cyto2 on meanImg in 3.x
+        / SAM on meanImg in 4.x). ``_source`` will be set to
+        ``"cellpose_cyto2"`` -- the name is historical; in cellpose
+        4.x it's actually SAM-on-meanImg, but downstream consumers
+        already key off this string.
+    extra_cellpose_passes : list of (source_tag, stat) tuples, optional
+        Additional Cellpose passes to merge in. The Tier 2 #13
+        Cellpose-SAM-on-Vcorr pass arrives here with
+        ``source_tag="cellpose_sam"``. Each pass is filtered
+        independently against the Sparsery mask before concatenation.
 
     Returns the path to the populated plane0 folder so callers can
     publish it on ``AppState.plane0``.
@@ -261,6 +303,23 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
         max_overlap=max_overlap, verbose=verbose,
     )
 
+    # Filter each extra cellpose pass independently against the same
+    # Sparsery mask. Doing it independently (instead of chaining each
+    # against the previous cumulative mask) is deliberate: the audit
+    # plan for Tier 2 #13 explicitly says "Filter each Cellpose output
+    # against Sparsery independently (not against each other)" so the
+    # SAM pass can recover silent cells the cyto2 pass also flagged.
+    # The follow-up de-dup happens implicitly via Suite2p's
+    # extract/classify pipeline downstream.
+    extra_kept: list[tuple[str, list]] = []
+    if extra_cellpose_passes:
+        for tag, stat_list in extra_cellpose_passes:
+            kept = filter_non_overlapping_cellpose(
+                sparsery_stat, stat_list, Ly, Lx,
+                max_overlap=max_overlap, verbose=verbose,
+            )
+            extra_kept.append((str(tag), kept))
+
     combined_raw = []
     for s in sparsery_stat:
         combined_raw.append({
@@ -278,13 +337,27 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
             'lam':  np.asarray(s['lam']).astype(np.float32),
             'med':  list(s.get('med', [int(np.median(s['ypix'])),
                                         int(np.median(s['xpix']))])),
-            '_source': 'cellpose',
+            '_source': 'cellpose_cyto2',
         })
+    for tag, kept in extra_kept:
+        for s in kept:
+            combined_raw.append({
+                'ypix': np.asarray(s['ypix']).astype(np.int32),
+                'xpix': np.asarray(s['xpix']).astype(np.int32),
+                'lam':  np.asarray(s['lam']).astype(np.float32),
+                'med':  list(s.get('med', [int(np.median(s['ypix'])),
+                                            int(np.median(s['xpix']))])),
+                '_source': tag,
+            })
 
     n_sp = len(sparsery_stat)
     n_cp = len(cellpose_kept)
     if verbose:
-        print(f"    merged stat: {n_sp} sparsery + {n_cp} cellpose = "
+        parts = [f"{n_sp} sparsery", f"{n_cp} cellpose_cyto2"]
+        for tag, kept in extra_kept:
+            parts.append(f"{len(kept)} {tag}")
+        parts_str = " + ".join(parts)
+        print(f"    merged stat: {parts_str} = "
               f"{len(combined_raw)} total ROIs")
 
     if not combined_raw:
@@ -427,6 +500,8 @@ def run(
     max_overlap: float = CELLPOSE_MERGE_MAX_OVERLAP,
     tau_override: float | None = None,
     settings_override: dict | None = None,
+    enable_sam_vcorr_pass: bool = False,
+    sam_vcorr_cfg: dict | None = None,
     verbose: bool = True,
 ) -> Path:
     """Sparsery + cellpose detection. Returns the final ``suite2p/plane0`` path.
@@ -555,9 +630,9 @@ def run(
         print(f'[s+cp] sparsery: {len(sp_stat)} ROIs '
               f'({time.time() - t_sp:.1f}s)')
 
-    # ---- cellpose ----
+    # ---- cellpose (primary pass on meanImg) ----
     if verbose:
-        print(f'[s+cp] cellpose pass')
+        print(f'[s+cp] cellpose pass (meanImg)')
     cp_dir = save_root / 'cellpose_pass'
     t_cp = time.time()
     cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
@@ -567,6 +642,85 @@ def run(
         print(f'[s+cp] cellpose: {len(cp_stat)} ROIs '
               f'({time.time() - t_cp:.1f}s)')
 
+    # ---- cellpose-SAM second pass on the correlation image (Vcorr) ----
+    # The audit (Tier 2 #13) recommends this as a recovery pass for
+    # cells Sparsery misses: Vcorr lights up pixels whose timecourse
+    # correlates with their neighbours, which is exactly what a soma
+    # looks like even if the cell happens to fire infrequently.
+    # Cellpose-SAM is the unified model in cellpose 4.x; in 3.x the
+    # check below gates the pass off with a clear warning.
+    extra_passes: list[tuple[str, list]] = []
+    if enable_sam_vcorr_pass:
+        from .suite2p_pipeline import cellpose_sam_available
+        if not cellpose_sam_available():
+            if verbose:
+                print('[s+cp] SAM-on-Vcorr requested but cellpose>=4.0 '
+                      'not available; skipping second pass.')
+        else:
+            # Resolve a Vcorr image and persist it next to shared_plane0
+            # so run_cellpose_pass's filesystem fallback can find it.
+            # The Sparsery pass we just ran wrote detect_outputs.npy
+            # into ``sparsery_dir / suite2p / plane0``; pull from there
+            # if available, otherwise stream-compute from data.bin.
+            from .correlation_image import load_or_compute_vcorr
+            sparsery_plane0 = sparsery_dir / 'suite2p' / 'plane0'
+            try:
+                vcorr_src = (sparsery_plane0
+                             if sparsery_plane0.exists()
+                             else shared_plane0)
+                # Pull Ly/Lx/nframes from the shared registration view
+                # so the compute_vcorr fallback path can do its sums
+                # without re-parsing the binary header.
+                reg_view = utils.load_plane_view(shared_plane0)
+                Ly_v = int(reg_view.get('Ly') or 0)
+                Lx_v = int(reg_view.get('Lx') or 0)
+                nframes_v = int(reg_view.get('nframes') or 0)
+                data_bin_path = Path(shared_plane0) / 'data.bin'
+                vcorr = load_or_compute_vcorr(
+                    vcorr_src,
+                    data_bin_path=data_bin_path,
+                    Ly=Ly_v, Lx=Lx_v, nframes=nframes_v,
+                )
+                # Persist in shared_plane0 so run_cellpose_pass's
+                # ``<plane0>/<key>.npy`` filesystem fallback picks it up.
+                np.save(Path(shared_plane0) / 'Vcorr.npy', vcorr)
+                if verbose:
+                    print(f'[s+cp] Vcorr persisted '
+                          f'({vcorr.shape}, range '
+                          f'[{vcorr.min():.3f}, {vcorr.max():.3f}])')
+
+                sam_cfg = dict(sam_vcorr_cfg) if sam_vcorr_cfg else {}
+                # Fill in sensible defaults for the SAM-on-Vcorr pass.
+                # ``cellpose_channel_input='Vcorr'`` is what triggers
+                # the filesystem-fallback lookup in run_cellpose_pass.
+                # ``model_type='cpsam'`` is an audit-tracked label;
+                # cellpose 4.x ignores it (only one model exists).
+                sam_cfg.setdefault('cellpose_model_type', 'cpsam')
+                sam_cfg.setdefault('cellpose_channel_input', 'Vcorr')
+                sam_cfg.setdefault('cellpose_diameter',
+                                   cp_cfg.get('cellpose_diameter', 0))
+                sam_cfg.setdefault('cellpose_flow_threshold',
+                                   cp_cfg.get('cellpose_flow_threshold', 0.8))
+                sam_cfg.setdefault('cellpose_cellprob_threshold',
+                                   cp_cfg.get('cellpose_cellprob_threshold',
+                                              -1.0))
+
+                if verbose:
+                    print(f'[s+cp] cellpose-SAM pass (Vcorr)')
+                t_sam = time.time()
+                sam_dir = save_root / 'cellpose_sam_pass'
+                sam_stat, _sam_ops, _sam_plane0 = run_cellpose_pass(
+                    sam_dir, shared_plane0, sam_cfg, verbose=verbose,
+                )
+                if verbose:
+                    print(f'[s+cp] cellpose-SAM: {len(sam_stat)} ROIs '
+                          f'({time.time() - t_sam:.1f}s)')
+                extra_passes.append(('cellpose_sam', sam_stat))
+            except Exception as e:
+                if verbose:
+                    print(f'[s+cp] SAM-on-Vcorr failed ({e}); '
+                          'continuing with primary cellpose only.')
+
     # ---- merge + extract ----
     if verbose:
         print(f'[s+cp] merging + extracting')
@@ -574,6 +728,7 @@ def run(
     stat_arr, _final_ops, final_plane0 = merge_and_extract(
         sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
         max_overlap=max_overlap, verbose=verbose,
+        extra_cellpose_passes=extra_passes or None,
     )
 
     if verbose:

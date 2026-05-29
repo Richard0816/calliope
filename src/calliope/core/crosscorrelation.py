@@ -26,9 +26,14 @@ Public surface
 ``batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, ...)``
     The matmul-per-lag routine. Returns three (nA, nB) matrices:
     ``best_lag_sec``, ``max_corr``, ``zero_lag_corr``.
+``circular_shift_null_pvalues(X_A, X_B, observed_max_corr, ...)``
+    Per-pair p-values from a circular-shift null distribution plus
+    Benjamini-Hochberg FDR-corrected p-values. Use to flag which
+    pair-correlations from ``batch_xcorr_clusters`` are significantly
+    above the autocorrelation-preserving null.
 ``run_cluster_xcorr_full(plane0, ..., progress_cb, abort_cb)``
     Walk every cluster pair on disk and emit a CSV per pair, one row
-    per cell pair.
+    per cell pair. Accepts ``n_shuffles`` to enable the shuffle null.
 ``run_cluster_xcorr_per_event_fast(plane0, event_windows, ...)``
     Same but cropped to each detected event window from Tab 5.
 ``zscore_pair_traces`` and the ``xcorr_*`` helpers are used by the
@@ -325,6 +330,147 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
             np.asarray(zero_lag_corr))
 
 
+def _bh_fdr(pvals):
+    """Benjamini-Hochberg FDR-corrected p-values (a.k.a. q-values).
+
+    Pure-NumPy reimplementation of
+    ``statsmodels.stats.multitest.multipletests(..., method='fdr_bh')``
+    so we don't add statsmodels as a dependency for one function.
+
+    Algorithm:
+    1. Sort p-values ascending. Let m = number of tests.
+    2. Provisional adjusted p_k = sorted_p_k * m / (k + 1).
+    3. Walk from largest to smallest enforcing monotone non-decreasing
+       order so the adjusted curve never dips below a later value:
+       p_adj_k = min(p_adj_k, p_adj_{k+1}).
+    4. Clip to 1.0 and unsort back to the original positions.
+
+    Returns an array shaped like ``pvals`` (small values => significant
+    after multiple-comparison correction).
+    """
+    p = np.asarray(pvals, dtype=np.float64)
+    shape = p.shape
+    flat = p.ravel()
+    m = flat.size
+    if m == 0:
+        return flat.reshape(shape).copy()
+    order = np.argsort(flat, kind="stable")
+    sorted_p = flat[order]
+    ranks = np.arange(1, m + 1, dtype=np.float64)
+    adj_sorted = sorted_p * m / ranks
+    # Enforce monotone non-decreasing from the top down: a later
+    # p-value should not undercut an earlier one. ``minimum.accumulate``
+    # on the reversed array gives a running min from the right.
+    adj_sorted = np.minimum.accumulate(adj_sorted[::-1])[::-1]
+    np.clip(adj_sorted, 0.0, 1.0, out=adj_sorted)
+    out = np.empty_like(flat)
+    out[order] = adj_sorted
+    return out.reshape(shape)
+
+
+def circular_shift_null_pvalues(X_A, X_B, observed_max_corr, fps,
+                                 max_lag_seconds, *,
+                                 use_gpu=True, ZA_pre=None, ZB_pre=None,
+                                 dtype=np.float32, n_shuffles=200, seed=0):
+    """Per-pair p-values from a circular-shift null + BH-FDR correction.
+
+    Why circular shifts instead of a parametric test
+    ------------------------------------------------
+    Calcium traces have heavy temporal autocorrelation (a few hundred
+    ms of indicator decay glued to slow brain-state drift), which makes
+    a Marcenko-Pastur / white-noise null wrong. Circular shifts preserve
+    each ROI's autocorrelation exactly while breaking inter-cluster
+    synchrony, so the null distribution captures "what max-corr would
+    you expect if cluster A and cluster B were temporally unrelated but
+    each kept its own autocorrelation structure". See Cheng et al.
+    eLife 2023 (doi:10.7554/eLife.81279) for the convention.
+
+    Null draw
+    ---------
+    Each shuffle picks ONE random offset in ``[L+1, T-L-1]`` (so the
+    shifted window never overlaps the unshifted band that the original
+    search already covered) and rolls EVERY column of ``X_A`` by that
+    shared offset. Within-A correlations are preserved; the A-vs-B
+    alignment is jittered. Then the (nA, nB) shuffled max-correlation
+    matrix is recomputed via the same matmul-per-lag routine and
+    compared element-wise against ``observed_max_corr``.
+
+    P-value convention
+    ------------------
+    ``p_value = (1 + #{k : shuffled_max_corr_k >= observed}) /
+                (n_shuffles + 1)``
+
+    The ``+1`` numerator follows Phipson & Smyth 2010 ("Permutation
+    P-values should never be zero") so a pair that beats every
+    shuffle still gets a non-zero p, capped at ``1/(n_shuffles+1)``.
+
+    Returns
+    -------
+    p_value : (nA, nB) float64 ndarray in (0, 1]
+    p_value_fdr : (nA, nB) float64 ndarray in [0, 1]
+        Benjamini-Hochberg FDR-corrected version. Compare against your
+        target FDR (typically 0.05) to flag significant pairs.
+
+    Edge case: when the trace is too short for the offset band to be
+    non-empty, both matrices are filled with 1.0 (no significance).
+    """
+    use_gpu = bool(use_gpu and cp is not None)
+    xp = cp if use_gpu else np
+
+    XA = xp.asarray(X_A, dtype=dtype)
+    XB = xp.asarray(X_B, dtype=dtype)
+    T, nA = XA.shape
+    nB = XB.shape[1]
+
+    if ZA_pre is None:
+        ZA = _zscore_cols_xp(XA, xp)
+    else:
+        ZA = xp.asarray(ZA_pre, dtype=dtype)
+    if ZB_pre is None:
+        ZB = _zscore_cols_xp(XB, xp)
+    else:
+        ZB = xp.asarray(ZB_pre, dtype=dtype)
+
+    L = int(np.floor(max_lag_seconds * float(fps)))
+    L = max(0, min(L, T - 1))
+    inv_T = dtype(1.0 / float(T))
+
+    obs = xp.asarray(observed_max_corr, dtype=ZA.dtype)
+
+    # Avoid offsets near 0 / T so the shifted alignment doesn't
+    # accidentally fall inside the observed search window.
+    lo = max(1, L + 1)
+    hi = max(lo + 1, T - L - 1)
+    if hi <= lo or n_shuffles <= 0:
+        ones = np.ones((int(nA), int(nB)), dtype=np.float64)
+        return ones, ones.copy()
+
+    rng = np.random.default_rng(seed)
+    n_hits = xp.zeros((nA, nB), dtype=xp.int32)
+
+    for _k in range(int(n_shuffles)):
+        offset = int(rng.integers(lo, hi))
+        # ``xp.roll`` along axis=0 rotates rows; column structure of
+        # ZA stays intact, so each ROI keeps its autocorrelation.
+        ZA_shuf = xp.roll(ZA, offset, axis=0)
+        pad = xp.zeros((L, nA), dtype=ZA.dtype)
+        ZA_pad = xp.concatenate([pad, ZA_shuf, pad], axis=0)
+        shuf_max = xp.full((nA, nB), -np.inf, dtype=ZA.dtype)
+        for j in range(2 * L + 1):
+            Zs = ZA_pad[j:j + T]
+            C = (Zs.T @ ZB) * inv_T
+            shuf_max = xp.maximum(shuf_max, C)
+        n_hits += (shuf_max >= obs).astype(xp.int32)
+
+    if use_gpu:
+        n_hits_np = cp.asnumpy(n_hits)
+    else:
+        n_hits_np = np.asarray(n_hits)
+    p_value = (n_hits_np.astype(np.float64) + 1.0) / (float(n_shuffles) + 1.0)
+    p_value_fdr = _bh_fdr(p_value)
+    return p_value, p_value_fdr
+
+
 def single_pair_xcorr_curve(sigA, sigB, fps, max_lag_seconds):
     """Full cross-correlation curve (Pearson r at every lag) for ONE pair.
 
@@ -469,9 +615,92 @@ def _load_keep_mask(plane0: Path, prefix: str) -> Optional[np.ndarray]:
     return None
 
 
+def compute_partial_correlation(Z, ridge: float = 1e-6):
+    """Partial-correlation matrix from a z-scored ``(T, N)`` data matrix.
+
+    Partial correlation ``P[i,j]`` is the correlation between variables
+    ``i`` and ``j`` *after removing the linear effect of every other
+    variable in ``Z``*. Computed via the precision matrix:
+
+    .. math::
+
+        C       &= Z^\\top Z / T \\\\
+        C^{-1}  &= \\text{pinv}(C + \\rho I) \\\\
+        P[i,j]  &= -C^{-1}[i,j] / \\sqrt{C^{-1}[i,i] \\, C^{-1}[j,j]}
+
+    The ridge term ``ρ`` (default ``1e-6``) keeps the pseudo-inverse
+    well-defined when ``C`` is near-singular (which happens whenever
+    columns of ``Z`` are nearly linearly dependent). Well-conditioned
+    ``C`` is essentially unchanged.
+
+    **Why this matters for calcium imaging.** Pearson correlation cannot
+    distinguish "A and B drive each other" from "A and B are both driven
+    by some other ROI C in the dataset" — slow drifts and shared
+    brain-state inflate pairwise correlations across the entire
+    population. Partial correlation conditions on every other ROI,
+    isolating the direct pairwise structure. See Sutera et al. arXiv:
+    `1406.7865 <https://arxiv.org/abs/1406.7865>`_ for the connectome-
+    inference application; Stevenson arXiv:`1708.01888
+    <https://arxiv.org/abs/1708.01888>`_ for the broader connectivity-
+    inference review.
+
+    **Conditioning requirement.** Partial correlation needs ``N << T``;
+    when ``N`` approaches ``T`` (or exceeds it), ``C`` becomes rank-
+    deficient and the precision matrix is essentially noise. Callers
+    should refuse to compute ``P`` when ``N >= 0.5 * T`` (see the Tab 7
+    wiring for the user-facing guard).
+
+    Parameters
+    ----------
+    Z : array_like, shape (T, N)
+        Already z-scored (per column) data matrix. Caller is responsible
+        for the z-scoring -- this function does NOT re-standardise.
+    ridge : float
+        Ridge regularisation added to ``C`` before inversion. Default
+        ``1e-6`` works for typical dF/F z-scored traces; increase if
+        ``np.linalg.pinv`` warns about ill-conditioning.
+
+    Returns
+    -------
+    P : ndarray, shape (N, N), float64
+        Partial-correlation matrix. Diagonal is exactly 1. Off-diagonal
+        entries are in approximately ``[-1, 1]`` (small numerical
+        excursion possible with aggressive ridge).
+    """
+    Z = np.asarray(Z, dtype=np.float64)  # float64 for pinv stability
+    T, N = Z.shape
+    if T <= 1 or N <= 1:
+        return np.eye(N, dtype=np.float64)
+    # Biased covariance: matches the biased-Pearson convention the
+    # batch_xcorr_clusters routine already uses (factor of T vs T-1 is
+    # constant across pairs, so it doesn't affect ranking / argmax).
+    C = (Z.T @ Z) / float(T)
+    # Ridge-regularised pseudo-inverse: adds a tiny diagonal so even a
+    # rank-deficient C has a well-defined inverse.
+    Cinv = np.linalg.pinv(C + ridge * np.eye(N, dtype=C.dtype))
+    # Off-diagonal partial corr from the precision matrix; standard
+    # graphical-model derivation. ``np.maximum`` clamps tiny negative
+    # diagonal entries (which would otherwise produce NaN under sqrt).
+    d = np.sqrt(np.maximum(np.diag(Cinv), 1e-12))
+    P = -Cinv / np.outer(d, d)
+    np.fill_diagonal(P, 1.0)
+    return P
+
+
 def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
-                            zero_lag_corr=None, extra_cols=None):
+                            zero_lag_corr=None, p_value=None,
+                            p_value_fdr=None, partial_corr=None,
+                            extra_cols=None):
     """Write a CAxCB summary CSV from batched (nA, nB) result matrices.
+
+    p_value / p_value_fdr (optional): per-pair p-values from
+    ``circular_shift_null_pvalues`` and the BH-FDR-corrected version.
+    Written as ``p_value`` / ``p_value_fdr`` columns when supplied.
+
+    partial_corr (optional): per-pair partial correlation, sliced from
+    the population-wide partial-correlation matrix computed by
+    ``compute_partial_correlation`` on the full keep-mask dF/F. Written
+    as ``partial_corr_zero_lag`` when supplied.
 
     extra_cols: optional list of (header_name, scalar_or_array) pairs that
     are appended to every row (e.g. event metadata).
@@ -487,6 +716,15 @@ def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
     if zero_lag_corr is not None:
         cols.append(zero_lag_corr.reshape(-1))
         header.append("zero_lag_corr")
+    if p_value is not None:
+        cols.append(np.asarray(p_value).reshape(-1))
+        header.append("p_value")
+    if p_value_fdr is not None:
+        cols.append(np.asarray(p_value_fdr).reshape(-1))
+        header.append("p_value_fdr")
+    if partial_corr is not None:
+        cols.append(np.asarray(partial_corr).reshape(-1))
+        header.append("partial_corr_zero_lag")
     if extra_cols is not None:
         for name, val in extra_cols:
             arr = np.broadcast_to(np.asarray(val), (nA * nB,))
@@ -495,6 +733,12 @@ def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
 
     fmts = ["%d", "%d", "%.6g", "%.6g"]
     if zero_lag_corr is not None:
+        fmts.append("%.6g")
+    if p_value is not None:
+        fmts.append("%.6g")
+    if p_value_fdr is not None:
+        fmts.append("%.6g")
+    if partial_corr is not None:
         fmts.append("%.6g")
     if extra_cols is not None:
         for name, val in extra_cols:
@@ -516,6 +760,9 @@ def run_cluster_xcorr_full_fast(
     zero_lag: bool = True,
     use_gpu: bool = True,
     output_subdir: str = "cross_correlation_full",
+    n_shuffles: int = 500,
+    shuffle_seed: int = 0,
+    compute_partial: bool = False,
     progress_cb=None,
 ):
     """Run cluster x cluster cross-correlation on the FULL recording.
@@ -523,6 +770,25 @@ def run_cluster_xcorr_full_fast(
     Uses the batched matmul implementation (one matmul per lag, all ROI
     pairs in the cluster pair at once). Each cluster's z-scored trace
     matrix is built once and reused across cluster-pair combinations.
+
+    When ``n_shuffles > 0`` (default 500) the per-pair circular-shift null is
+    also computed and ``p_value`` / ``p_value_fdr`` columns are added to the
+    summary CSV. See ``circular_shift_null_pvalues`` for the null semantics.
+    Cost scales linearly with ``n_shuffles`` (each draw is one additional
+    batched-matmul sweep), so 100-500 is a reasonable range; 500 gives
+    sub-1% p-value resolution. Set to 0 to disable. The null distribution
+    is the field-standard fix for the autocorrelation-inflated false-positive
+    rate that parametric tests (Marcenko-Pastur) suffer on calcium imaging
+    data -- see Cheng et al. eLife 2023 (doi:10.7554/eLife.81279).
+
+    When ``compute_partial`` is True, the population-wide partial-correlation
+    matrix is computed once across every ROI in the union of all clusters
+    (conditioning on every other ROI), then sliced for each cluster pair and
+    added to the summary CSV as ``partial_corr_zero_lag``. Partial correlation
+    isolates direct pairwise structure from shared-driver inflation -- see
+    Sutera et al. arXiv:1406.7865. Requires N_kept < 0.5 * T (otherwise the
+    precision matrix is ill-conditioned); the call falls back to "skip and
+    warn" when that condition fails.
 
     Output:
       plane0 / {prefix}cluster_results / {cluster_folder} / {output_subdir} /
@@ -594,6 +860,45 @@ def run_cluster_xcorr_full_fast(
         else:
             cluster_Z[name] = _zscore_cols_xp(X, np)
 
+    # Optional one-shot partial-correlation precompute. Partial corr
+    # conditions on every other ROI, so it has to be computed over the
+    # full union of cluster ROIs (not pair-by-pair) -- otherwise we'd
+    # be conditioning only on the two clusters' cells and missing the
+    # rest of the population. Cost: O((N_union)^3) pseudo-inverse, done
+    # once; the per-cluster-pair extraction is a (nA, nB) numpy slice.
+    partial_full: "np.ndarray | None" = None
+    partial_index: "dict[int, int]" = {}
+    if compute_partial:
+        # Union of every cluster's filtered positions (the index space
+        # the dF/F memmap actually has columns for). Sort + unique gives
+        # us a deterministic ordering for the slice maps below.
+        all_filt_pos: list[int] = []
+        for name in cluster_names:
+            s2p_rois = cluster_rois_s2p[name]
+            if s2p_to_filtered is not None:
+                fp = s2p_to_filtered[s2p_rois]
+                all_filt_pos.extend(int(p) for p in fp if p >= 0)
+            else:
+                all_filt_pos.extend(int(p) for p in s2p_rois)
+        union_pos = np.array(sorted(set(all_filt_pos)), dtype=np.int64)
+        n_union = int(union_pos.size)
+        # Conditioning requirement: N << T. The audit's cutoff is N <
+        # 0.5*T; above that the precision matrix is essentially noise.
+        if n_union >= 2 and n_union < 0.5 * int(n_frames):
+            X_union = np.asarray(dff[:, union_pos], dtype=np.float32,
+                                 order="C")
+            Z_union = _zscore_cols_xp(X_union, np)
+            partial_full = compute_partial_correlation(Z_union)
+            partial_index = {int(p): int(i)
+                             for i, p in enumerate(union_pos)}
+            print(f"[xcorr] partial-correlation precomputed: "
+                  f"N_union={n_union}, T={int(n_frames)} -> "
+                  f"P shape {partial_full.shape}")
+        else:
+            print(f"[xcorr] partial-correlation skipped: "
+                  f"N_union={n_union} not < 0.5*T={int(0.5 * n_frames)}; "
+                  f"precision matrix would be ill-conditioned.")
+
     total_pairs_groups = sum(
         1 for i, _ in enumerate(cluster_names) for _ in cluster_names[i:]
     )
@@ -615,9 +920,56 @@ def run_cluster_xcorr_full_fast(
                 use_gpu=gpu_ok,
                 ZA_pre=cluster_Z[cA], ZB_pre=cluster_Z[cB],
             )
+            p_val = p_val_fdr = None
+            if int(n_shuffles) > 0:
+                # Distinct seed per cluster pair so the shuffles aren't
+                # identical across pairs but still reproducible.
+                pair_seed = int(shuffle_seed) + done_groups
+                p_val, p_val_fdr = circular_shift_null_pvalues(
+                    cluster_X[cA], cluster_X[cB], max_c,
+                    fps, max_lag_seconds,
+                    use_gpu=gpu_ok,
+                    ZA_pre=cluster_Z[cA], ZB_pre=cluster_Z[cB],
+                    n_shuffles=int(n_shuffles), seed=pair_seed,
+                )
+
+            # Slice the population-wide partial-correlation matrix down
+            # to this cluster pair. Map Suite2p ROI ids -> filtered
+            # positions -> indices within the union; ROIs not in the
+            # keep mask get NaN so the CSV reader knows the value is
+            # missing rather than zero.
+            partial_block = None
+            if partial_full is not None:
+                if s2p_to_filtered is not None:
+                    fpA = s2p_to_filtered[roisA]
+                    fpB = s2p_to_filtered[roisB]
+                else:
+                    fpA = np.asarray(roisA, dtype=np.int64)
+                    fpB = np.asarray(roisB, dtype=np.int64)
+                idxA = np.array(
+                    [partial_index.get(int(p), -1) for p in fpA],
+                    dtype=np.int64)
+                idxB = np.array(
+                    [partial_index.get(int(p), -1) for p in fpB],
+                    dtype=np.int64)
+                block = np.full((idxA.size, idxB.size), np.nan,
+                                dtype=np.float64)
+                validA = idxA >= 0
+                validB = idxB >= 0
+                if validA.any() and validB.any():
+                    block_valid = partial_full[
+                        np.ix_(idxA[validA], idxB[validB])]
+                    # Scatter back into the (nA, nB) layout.
+                    rowmap = np.flatnonzero(validA)
+                    colmap = np.flatnonzero(validB)
+                    block[np.ix_(rowmap, colmap)] = block_valid
+                partial_block = block
+
             _write_pair_summary_csv(
                 summary_path, roisA, roisB, best_lag, max_c,
                 zero_lag_corr=z0 if zero_lag else None,
+                p_value=p_val, p_value_fdr=p_val_fdr,
+                partial_corr=partial_block,
             )
 
             done_groups += 1
@@ -650,6 +1002,8 @@ def run_cluster_xcorr_per_event_fast(
     use_gpu: bool = True,
     output_subdir: str = "cross_correlation_per_event",
     min_event_frames: int = 8,
+    n_shuffles: int = 0,
+    shuffle_seed: int = 0,
     progress_cb=None,
 ):
     """Run cluster x cluster cross-correlation per event window using the
@@ -834,7 +1188,9 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
         ax_lag.text(0.5, 0.5, "No pair data", ha="center", va="center",
                     transform=ax_lag.transAxes)
 
+    save_path = Path(save_path)
     fig.savefig(save_path, dpi=150)
+    fig.savefig(save_path.with_suffix(".svg"))
     plt.close(fig)
 
 
@@ -862,7 +1218,14 @@ def run_crosscorrelation(
         upstream stages),
         ``max_lag_seconds`` (default 2.0),
         ``zero_lag`` (default True),
-        ``use_gpu`` (default True).
+        ``use_gpu`` (default True),
+        ``n_shuffles`` (default 500 -- circular-shift null + BH-FDR
+        for per-pair p-values; set 0 to disable; per-event path
+        does not use this),
+        ``compute_partial`` (default False -- population-wide
+        partial-correlation matrix sliced into a
+        ``partial_corr_zero_lag`` CSV column; skipped if
+        N_kept >= 0.5 * T; per-event path does not use this).
     event_windows : iterable of (start_s, end_s) or None
         If supplied, also run the per-event xcorr.
     figures_dir : Path or None
@@ -883,12 +1246,16 @@ def run_crosscorrelation(
     max_lag = float(params.get("max_lag_seconds", 2.0))
     zero_lag = bool(params.get("zero_lag", True))
     use_gpu = bool(params.get("use_gpu", True))
+    n_shuffles = max(0, int(params.get("n_shuffles", 500)))
+    compute_partial = bool(params.get("compute_partial", False))
 
     full_subdir = "cross_correlation_full"
     run_cluster_xcorr_full_fast(
         plane0, prefix=prefix, fps=fps, cluster_folder=cluster_folder,
         max_lag_seconds=max_lag, zero_lag=zero_lag, use_gpu=use_gpu,
-        output_subdir=full_subdir, progress_cb=progress_cb,
+        output_subdir=full_subdir, n_shuffles=n_shuffles,
+        compute_partial=compute_partial,
+        progress_cb=progress_cb,
     )
     full_outdir = (plane0 / f"{prefix}cluster_results" / cluster_folder
                    / full_subdir)

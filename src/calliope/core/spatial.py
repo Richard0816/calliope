@@ -536,6 +536,7 @@ def render_spatial_event_figures(
 
         out = figures_dir / f"event_{ev_idx + 1:03d}.png"
         fig.savefig(out, dpi=150)
+        fig.savefig(out.with_suffix(".svg"))
         plt.close(fig)
         written.append(str(out))
 

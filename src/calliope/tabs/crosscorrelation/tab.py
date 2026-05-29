@@ -704,6 +704,29 @@ class CrossCorrelationTab(ctk.CTkFrame):
         ctk.CTkCheckBox(row3_inner, text="use GPU if available",
                         variable=self.gpu_var).pack(side="left")
 
+        # Circular-shift null for per-pair p-values. 500 is the audit-
+        # recommended default for sub-1% p-value resolution; set to 0 to
+        # disable (faster, no significance test). Adds an extra
+        # ``p_value`` / ``p_value_fdr`` column to the summary CSV.
+        # Reference: Cheng et al. eLife 2023, doi:10.7554/eLife.81279.
+        ctk.CTkLabel(row3_inner, text="    shuffles (0=off):").pack(side="left")
+        self.n_shuffles_var = tk.StringVar(value="500")
+        ctk.CTkEntry(row3_inner, textvariable=self.n_shuffles_var,
+                     width=70).pack(side="left", padx=(4, 0))
+
+        # Partial correlation. When checked, the population-wide partial-
+        # correlation matrix is computed once over the union of all
+        # cluster ROIs (conditioning on every other ROI), then sliced
+        # into a ``partial_corr_zero_lag`` column on each cluster pair's
+        # summary CSV. Skipped automatically if N_union >= 0.5 * T
+        # (precision matrix would be ill-conditioned). Reference: Sutera
+        # et al. arXiv:1406.7865.
+        self.partial_corr_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            row3_inner, text="+ partial corr (requires N < T/2)",
+            variable=self.partial_corr_var,
+        ).pack(side="left", padx=(12, 0))
+
         # Run buttons
         run_frame = ctk.CTkFrame(self)
         run_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -737,6 +760,11 @@ class CrossCorrelationTab(ctk.CTkFrame):
             run_inner, text="Violin plot", width=100,
             command=self._on_violin, state="disabled")
         self.violin_btn.pack(side="left", padx=(8, 0))
+
+        self.export_figs_btn = ctk.CTkButton(
+            run_inner, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_figs_btn.pack(side="left", padx=(8, 0))
 
         # Abort button: only enabled while a worker is alive.
         self.abort_btn = ctk.CTkButton(
@@ -933,7 +961,18 @@ class CrossCorrelationTab(ctk.CTkFrame):
         ax.scatter([0.0], [zero_r], color="tab:green", zorder=5,
                    label=f"lag=0:  r={zero_r:.3f}")
         ax.set_xlabel("lag (s)  [+ = ROI A leads]")
-        ax.set_ylabel("Pearson r (biased)")
+        # NOTE: This is Pearson r on filtered dF/F. Indicator kinetics
+        # (GCaMP rise + decay) convolve every spike with a ~tens-to-
+        # hundreds-of-ms exponential, so the visible CCG peak is
+        # blurred by the indicator's autocorrelation -- the apparent
+        # lag resolution is indicator-limited, not frame-rate-limited.
+        # Pearson on raw fluorescence also inflates correlation
+        # magnitudes via this temporal blur (Yatsenko/Mishne, eLife
+        # 2021, doi:10.7554/eLife.68046). To get an indicator-
+        # independent CCG, compute on deconvolved/binned spike rates.
+        ax.set_ylabel("Pearson r on filtered dF/F\n"
+                      "(indicator kinetics blur peak; lag resolution\n"
+                      "is indicator- not frame-rate-limited)")
         ax.set_title(f"ROI {iA}  vs  ROI {iB}  -  {ev_title}",
                      fontsize=10)
         ax.legend(fontsize=8, loc="best", frameon=True)
@@ -1017,6 +1056,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
         # the actual files at click time.
         self.violin_btn.configure(
             state="normal" if plane0 is not None else "disabled")
+        self.export_figs_btn.configure(
+            state="normal" if plane0 is not None else "disabled")
         if ok:
             self.status_var.set(f"Ready. ({plane0})")
         else:
@@ -1091,6 +1132,78 @@ class CrossCorrelationTab(ctk.CTkFrame):
         evts = ([(float(t0), float(t1)) for t0, t1 in ev]
                 if ev is not None else [])
         self._apply_event_windows(evts)
+
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Re-render Tab 7's violin pair plots into
+        ``<save_folder>/calliope_figures/crosscorrelation/`` as PNG +
+        SVG, plus update the manifest. Pulls per-pair data from the
+        on-disk ``cross_correlation_full`` (and optionally
+        ``cross_correlation_per_event``) outputs, so this is fast --
+        no recompute of the pairwise sweep.
+
+        ``quiet=True`` (Tab 0 batch toggle) suppresses messageboxes.
+        """
+        if self._plane0 is None:
+            if not quiet:
+                messagebox.showinfo(
+                    "No plane0", "Pick a plane0 folder first.")
+            return
+        prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
+        cfolder = self.cfolder_var.get().strip() or DEFAULT_CLUSTER_FOLDER
+        cluster_root = (self._plane0 / f"{prefix}cluster_results" / cfolder)
+        full_dir = cluster_root / DEFAULT_FULL_OUTPUT_SUBDIR
+        per_event_dir = cluster_root / "cross_correlation_per_event"
+        if not full_dir.is_dir():
+            if not quiet:
+                messagebox.showerror(
+                    "No outputs",
+                    f"Run the full-recording cross-correlation first.\n\n"
+                    f"Expected:\n{full_dir}")
+            return
+        save_folder = self._plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        xc_dir = figures_root / "crosscorrelation"
+        try:
+            xc_dir.mkdir(parents=True, exist_ok=True)
+            from ...core.crosscorrelation import _save_violin_pair
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(self._plane0)
+            except Exception:
+                rec_id = save_folder.name
+            n_files = 0
+            full_pair = _load_pair_data(full_dir)
+            _save_violin_pair(
+                full_pair, save_path=xc_dir / "full.png",
+                title_suffix="full recording")
+            n_files += 2  # png + svg
+            if per_event_dir.is_dir():
+                pe_pair = _load_pair_data(per_event_dir)
+                _save_violin_pair(
+                    pe_pair, save_path=xc_dir / "per_event.png",
+                    title_suffix="per event")
+                n_files += 2
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params={
+                    "prefix": prefix,
+                    "cluster_folder": cfolder,
+                },
+                plane0=self._plane0, ckpt_path=None,
+            )
+            self.status_var.set(
+                f"Exported xcorr figures -> {xc_dir}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote {n_files} violin-plot files (PNG + SVG) "
+                    f"to:\n  {xc_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}")
+        except Exception as e:
+            self.status_var.set(f"Export failed: {e}")
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
 
     def _on_violin(self) -> None:
         """Open a violin-plot window over the per-pair summary CSVs from the
@@ -1168,11 +1281,17 @@ class CrossCorrelationTab(ctk.CTkFrame):
             max_lag = float(self.maxlag_var.get())
         except ValueError:
             max_lag = DEFAULT_MAX_LAG_S
+        try:
+            n_shuffles = max(0, int(self.n_shuffles_var.get()))
+        except (TypeError, ValueError):
+            n_shuffles = 500
         return {
             "prefix": prefix, "cluster_folder": cfolder, "fps": fps,
             "max_lag_seconds": max_lag,
             "zero_lag": bool(self.zero_lag_var.get()),
             "use_gpu": bool(self.gpu_var.get()),
+            "n_shuffles": n_shuffles,
+            "compute_partial": bool(self.partial_corr_var.get()),
         }
 
     def _disable_run(self) -> None:
@@ -1249,6 +1368,22 @@ class CrossCorrelationTab(ctk.CTkFrame):
             messagebox.showinfo("Busy", "A run is already in progress.")
             return
         params = self._gather_params()
+        # Per-event runner accepts n_shuffles for API symmetry but the
+        # current implementation does not compute the shuffle null per
+        # event (would require per-window jitter). Strip it to make the
+        # no-op explicit and avoid a misleading n_shuffles= in the log.
+        n_shuf = params.pop("n_shuffles", 0)
+        if n_shuf:
+            self._log(f"[per-event] note: n_shuffles={n_shuf} ignored "
+                      "(per-event circular-shift null not implemented).")
+        # Partial correlation is only meaningful on the full recording
+        # (per-event windows are usually too short for a conditioned
+        # precision matrix). Strip the flag so the per-event call site
+        # doesn't see an unknown kwarg.
+        partial_flag = params.pop("compute_partial", False)
+        if partial_flag:
+            self._log("[per-event] note: partial correlation only supported "
+                      "for full-recording runs; ignoring for per-event.")
         plane0 = self._plane0
         evts = list(self._event_windows)
         self._disable_run()

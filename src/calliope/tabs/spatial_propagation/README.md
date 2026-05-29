@@ -56,10 +56,14 @@ maps with a three-subplot directional-monotonicity analysis underneath:
    The same scalars are stamped into the workbook's
    `EventMonotonicity` sheet (one row per event:
    `event_id, n_active, theta_star_deg, rho_obs, p_value,
-   n_shuffles, u_x, u_y`) by `core.event_detection_run` whenever
-   Tab 5 (or the headless runner / Tab 0 batch) finishes, so
-   cross-recording analyses can stack monotonicity stats next to
+   p_value_fdr, n_shuffles, u_x, u_y`) by `core.event_detection_run`
+   whenever Tab 5 (or the headless runner / Tab 0 batch) finishes,
+   so cross-recording analyses can stack monotonicity stats next to
    the existing `EventWindows` / `EventOnsets` tables.
+   `p_value_fdr` is the Benjamini-Hochberg-adjusted q-value across
+   the per-event tests in this recording — use this column (not the
+   raw `p_value`) when calling significance across the recording's
+   event ensemble.
 
 ## Where the data comes from
 

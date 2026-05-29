@@ -115,6 +115,7 @@ def _compute_event_monotonicity(
             "theta_star_deg": None,
             "rho_obs": None,
             "p_value": None,
+            "p_value_fdr": None,
             "n_shuffles": None,
             "u_x": None,
             "u_y": None,
@@ -150,10 +151,28 @@ def _compute_event_monotonicity(
             "theta_star_deg": float(np.degrees(theta)),
             "rho_obs": rho,
             "p_value": float(result["p_value"]),
+            "p_value_fdr": None,  # filled in below
             "n_shuffles": int(result["null_rho"].size),
             "u_x": float(np.cos(theta)),
             "u_y": float(np.sin(theta)),
         })
+
+    # Multiple-comparison correction across the per-event Spearman tests.
+    # With ~tens-to-hundreds of events per recording and many recordings
+    # per dataset, the uncorrected p-values inflate false positives. BH-FDR
+    # (Benjamini & Hochberg 1995) is the field-standard control for the
+    # expected false-discovery rate; ``_bh_fdr`` is the same pure-NumPy
+    # implementation used for the CCG significance matrix.
+    valid_idx = [
+        i for i, r in enumerate(rows) if r.get("p_value") is not None]
+    if valid_idx:
+        from .crosscorrelation import _bh_fdr
+        p_raw = np.array([rows[i]["p_value"] for i in valid_idx],
+                         dtype=np.float64)
+        p_fdr = _bh_fdr(p_raw)
+        for i, q in zip(valid_idx, p_fdr):
+            rows[i]["p_value_fdr"] = float(q)
+
     if progress_cb is not None and rows:
         n_valid = sum(1 for r in rows if r.get("rho_obs") is not None)
         progress_cb(
@@ -439,6 +458,7 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
     ax.set_title("Low-pass dF/F heatmap")
     p = figures_dir / "heatmap.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 
@@ -450,6 +470,7 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
     ax.set_title("Onset raster")
     p = figures_dir / "raster.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 
@@ -457,17 +478,29 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
     ax = fig.add_subplot(111)
     duration_s = float(T) / float(fps) if fps > 0 else 1.0
     try:
-        ed_utils.plot_event_detection(data["diagnostics"], ax=ax)
+        diagnostics = data["diagnostics"]
+        ed_utils.plot_event_detection(diagnostics, ax=ax)
         ev = data["event_windows"]
         if ev is not None and len(ev) > 0:
             ed_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
         ax.set_xlim(0.0, duration_s)
-        ax.relim(); ax.autoscale_view(scalex=False, scaley=True)
+        # Mirror the Tab 5 GUI fit: anchor ymin=0 and put ymax at the
+        # tallest detected peak + 10% headroom. ``peak_height`` is the
+        # smoothed-density value at each picked peak, so it's by
+        # construction the highest point the user cares about.
+        peak_h = np.asarray(
+            diagnostics.get("peak_height", []), dtype=float)
+        finite = peak_h[np.isfinite(peak_h)] if peak_h.size else peak_h
+        ymax = float(finite.max()) if finite.size else 1.0
+        if ymax <= 0:
+            ymax = 1.0
+        ax.set_ylim(0.0, ymax * 1.10)
     except Exception as e:
         ax.text(0.5, 0.5, f"plot_event_detection error:\n{e}",
                 ha="center", va="center", transform=ax.transAxes)
     p = figures_dir / "event_detection.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 

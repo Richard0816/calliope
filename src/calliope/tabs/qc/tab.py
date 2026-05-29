@@ -4,8 +4,7 @@ What the user sees
 ------------------
 Two side-by-side panels: an animated GIF of the shifted movie on the
 left, and the per-pixel mean image on the right. There's a checkbox
-to pause the animation (which also frees the frame buffer for
-memory-strapped machines) and a "Reload from folder..." button to
+to pause/resume the animation and a "Reload from folder..." button to
 re-load an already-preprocessed recording from disk.
 
 How this tab is driven
@@ -13,30 +12,39 @@ How this tab is driven
 Tab 1 publishes a ``PreprocessResult`` on the shared
 ``AppState`` whenever it finishes a preprocess run. Tab 2 subscribes
 to that channel in ``__init__`` -- ``state.subscribe(self._on_result)``
-registers ``_on_result`` as a callback that will be invoked from
-Tab 1's worker. ``_on_result`` then materialises the GIF frames into
-``ImageTk.PhotoImage`` objects and displays the mean image.
+registers ``_on_result`` as a callback that runs on the Tk main thread
+(Tab 1's worker hands the result back through a queue drained by an
+``after`` poll). ``_on_result`` opens the GIF and displays the mean
+image.
 
-Memory note
------------
-A 5-minute GIF can occupy ~50 MB once each frame has been turned
-into a Tk PhotoImage. The "Animate" checkbox flips between
-"playing animation" (frame buffer in RAM) and "still image only"
-(buffer freed); the ``on_tab_hidden`` hook also unloads the buffer
-when the user switches away.
+Playback model
+--------------
+The movie is *streamed* one frame at a time straight from an open
+``PIL.Image`` handle: each tick seeks to the next frame and builds a
+single ``ImageTk.PhotoImage`` for it. Only one frame is ever in memory,
+so playback costs the same whether the clip is 5 seconds or 5 minutes --
+there is no multi-megabyte frame buffer to build, free, or rebuild.
+
+That single decision removes a whole class of bugs the old buffered
+design suffered from: pausing only stops the clock (it never frees a
+buffer), resuming never re-reads the file, and there is no bulk decode
+to freeze the UI. The ``on_tab_hidden`` hook closes the file handle to
+drop the OS file lock; ``on_tab_shown`` reopens it lazily.
 
 Class layout
 ------------
-``QcTab(ttk.Frame)``
+``QcTab(ctk.CTkFrame)``
     The whole tab. Lifecycle:
         __init__               build widgets, subscribe to AppState.
-        _on_result             callback: arrange the GIF + mean panels.
-        _start_animation       schedule successive ``self.after`` calls
-                                that flip frames in the Label widget.
+        _on_result             callback: open the GIF + draw the mean.
+        _load_gif              open the handle and arm/start playback.
+        _advance_gif           one frame tick; re-arms via ``self.after``.
+        _start_playback /      guarded scheduling -- only ever one clock.
+        _stop_playback
+        _on_animate_toggle     play/pause checkbox handler.
         _reload_from_folder    "Reload..." button handler.
-        on_tab_hidden / on_tab_shown
-                                free / re-materialise the frame buffer
-                                when the user navigates between tabs.
+        on_tab_hidden /        stop the clock + release / reopen the
+        on_tab_shown           file handle as the user navigates tabs.
 """
 
 from __future__ import annotations
@@ -74,25 +82,30 @@ class QcTab(ctk.CTkFrame):
     def __init__(self, master, state: AppState) -> None:
         super().__init__(master, fg_color="transparent")
         self.state = state
-        # Pre-materialised list of Tk PhotoImage frames; populated
-        # when the GIF loads, cleared when the user pauses animation
-        # or hides the tab. List is cheap; PhotoImage objects are
-        # not.
-        self._gif_frames: list[ImageTk.PhotoImage] = []
-        # Index of the next frame to display.
+        # The movie is streamed straight from this open Pillow handle:
+        # we hold exactly one decoded frame on screen at a time and seek
+        # to the next one on each tick. Keeping memory flat at ~one frame
+        # means pausing never has to free a buffer and resuming never has
+        # to re-read the file. ``None`` when no GIF is open.
+        self._gif_im: Optional[Image.Image] = None
+        # The PhotoImage currently shown. Held as an attribute so Tk does
+        # not garbage-collect the image out from under the label.
+        self._gif_photo: Optional[ImageTk.PhotoImage] = None
+        # Index of the frame currently on screen.
         self._gif_index = 0
-        # Handle returned by ``self.after(...)`` for the next frame
-        # tick. We hold onto it so we can cancel the pending tick if
-        # the user pauses or hides the tab.
+        # Total frame count, learned lazily the first time playback wraps
+        # past the end (0 = not known yet).
+        self._gif_n_frames = 0
+        # Handle returned by ``self.after(...)`` for the next frame tick.
+        # Held so we can cancel a pending tick when the user pauses, hides
+        # the tab, or loads a different recording. All scheduling goes
+        # through _start_playback / _stop_playback so two clocks can never
+        # run at once.
         self._gif_job: Optional[str] = None
-        # Remember the GIF source so we can re-materialise frames after
-        # the user switches away from this tab and comes back, or after
-        # they manually toggle the "Animate" checkbox back on. Also tracks
-        # whether we're currently in "frozen" (single-frame) mode.
+        # Remember the GIF source so we can reopen it after the handle is
+        # released on tab-hide, or after the user re-checks Animate.
         self._gif_path: Optional[Path] = None
-        self._gif_frozen = False
-        # User-driven master switch. Default ON; flipping OFF drops the
-        # frame buffer to a single still image, flipping back ON reloads.
+        # User-driven play/pause switch. Default ON (playing).
         self._gif_animate_var = tk.BooleanVar(value=True)
 
         # Build the widgets...
@@ -126,14 +139,15 @@ class QcTab(ctk.CTkFrame):
         ctk.CTkLabel(gif_frame, text="QC movie (GIF)",
                      font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
-        # Animate-toggle row at the top: unchecking drops the frame buffer
-        # to a single still (saves ~1 MB per 512x512 frame); rechecking
-        # reloads the GIF from disk and resumes playback.
+        # Play/pause row. Playback streams one frame at a time from an
+        # open handle, so unchecking only stops the clock (the current
+        # frame stays on screen) and rechecking resumes instantly --
+        # neither touches the disk.
         toggle_row = ctk.CTkFrame(gif_frame, fg_color="transparent")
         toggle_row.pack(anchor="w", padx=6, pady=(4, 4))
         ctk.CTkCheckBox(
             toggle_row,
-            text="Animate (uncheck to free frame buffer; still image stays)",
+            text="Animate (uncheck to pause playback)",
             variable=self._gif_animate_var,
             command=self._on_animate_toggle,
         ).pack(side="left")
@@ -189,122 +203,160 @@ class QcTab(ctk.CTkFrame):
     # -- GIF playback -------------------------------------------------------
 
     def _load_gif(self, gif_path: Path) -> None:
-        if self._gif_job is not None:
-            self.after_cancel(self._gif_job)
-            self._gif_job = None
-        self._gif_frames = []
+        """Open ``gif_path`` and show its first frame, then start playback
+        if Animate is on. Streams frames from the open handle -- nothing
+        is bulk-decoded, so this returns immediately even for a long clip.
+        """
+        self._stop_playback()
+        self._close_gif()
         self._gif_index = 0
+        self._gif_n_frames = 0
         self._gif_path = gif_path
-        self._gif_frozen = False
 
         if not gif_path.exists():
             self.gif_status.set("GIF missing.")
             return
 
-        # If the user has the Animate toggle off, only decode the first
-        # frame -- enough to display a still without paying the full
-        # PhotoImage frame-buffer cost.
-        animate = self._gif_animate_var.get()
         try:
-            im = Image.open(str(gif_path))
-            if not animate:
-                self._gif_frames.append(ImageTk.PhotoImage(im.copy()))
-            else:
-                while True:
-                    self._gif_frames.append(ImageTk.PhotoImage(im.copy()))
-                    im.seek(im.tell() + 1)
-        except EOFError:
-            pass
+            self._gif_im = Image.open(str(gif_path))
         except Exception as e:
+            self._gif_im = None
             self.gif_status.set(f"GIF load error: {e}")
             return
 
-        if not self._gif_frames:
+        # Paint frame 0 up front so something is visible even while paused.
+        if not self._show_frame(0):
             self.gif_status.set("GIF has no frames.")
+            self._close_gif()
             return
 
-        if not animate:
-            # Show the single still and stay frozen; toggling Animate on
-            # later will reload the full GIF.
-            self._gif_frozen = True
-            frame = self._gif_frames[0]
-            self.gif_label.configure(image=frame)
-            self.gif_label.image = frame
-            self.gif_status.set("Animate off (single frame)")
-            return
+        if self._gif_animate_var.get():
+            self._start_playback()
+        else:
+            self.gif_status.set("Paused (frame 1)")
 
-        self.gif_status.set(f"{len(self._gif_frames)} frames")
-        self._advance_gif()
+    def _close_gif(self) -> None:
+        """Release the open Pillow handle so the OS file lock is dropped.
+        The last painted frame stays on screen via ``self._gif_photo``."""
+        if self._gif_im is not None:
+            try:
+                self._gif_im.close()
+            except Exception:
+                pass
+            self._gif_im = None
+
+    def _show_frame(self, index: int) -> bool:
+        """Seek to ``index`` and paint it into the label.
+
+        Seeks only ever advance by one or wrap to 0, so Pillow composites
+        palette/disposal frames correctly. Returns ``False`` if the frame
+        can't be decoded (e.g. an empty GIF). Updates ``self._gif_index``
+        and learns ``self._gif_n_frames`` the first time we run off the end.
+        """
+        if self._gif_im is None:
+            return False
+        try:
+            self._gif_im.seek(index)
+        except EOFError:
+            # Ran past the last frame: remember the length and wrap to 0.
+            if index == 0:
+                return False
+            self._gif_n_frames = index
+            index = 0
+            try:
+                self._gif_im.seek(0)
+            except (EOFError, OSError):
+                return False
+        except OSError as e:
+            self.gif_status.set(f"GIF decode error: {e}")
+            return False
+        try:
+            photo = ImageTk.PhotoImage(self._gif_im.copy())
+        except Exception as e:
+            self.gif_status.set(f"GIF render error: {e}")
+            return False
+        self._gif_index = index
+        self._gif_photo = photo
+        self.gif_label.configure(image=photo)
+        # The .image assignment is required so Python doesn't garbage-
+        # collect the PhotoImage while it's still on screen.
+        self.gif_label.image = photo
+        return True
 
     def _advance_gif(self) -> None:
-        if not self._gif_frames:
+        # One playback tick: show the next frame and re-arm the clock.
+        if self._gif_im is None:
+            self._gif_job = None
             return
-        frame = self._gif_frames[self._gif_index]
-        self.gif_label.configure(image=frame)
-        self.gif_label.image = frame
-        self._gif_index = (self._gif_index + 1) % len(self._gif_frames)
+        self._show_frame(self._gif_index + 1)
+        total = self._gif_n_frames or "?"
+        self.gif_status.set(f"Playing - frame {self._gif_index + 1}/{total}")
         self._gif_job = self.after(self.FRAME_MS, self._advance_gif)
 
-    # -- Animate toggle + tab visibility hooks -----------------------------
+    # -- Playback scheduling + toggle + tab visibility hooks ---------------
 
-    def _freeze_to_still(self, status: str) -> None:
-        """Stop the animation and drop every cached frame except the one
-        currently on screen. ``self.gif_label.image`` holds the kept
-        frame, so the still stays visible without a full frame buffer.
-        """
+    def _start_playback(self) -> None:
+        """Arm the frame clock. Idempotent -- cancels any pending tick
+        first, so on_tab_shown + a toggle can never spawn two loops."""
+        if self._gif_im is None:
+            return
+        self._stop_playback()
+        total = self._gif_n_frames or "?"
+        self.gif_status.set(f"Playing - frame {self._gif_index + 1}/{total}")
+        self._gif_job = self.after(self.FRAME_MS, self._advance_gif)
+
+    def _stop_playback(self) -> None:
+        """Cancel any pending frame tick. Safe to call repeatedly."""
         if self._gif_job is not None:
             self.after_cancel(self._gif_job)
             self._gif_job = None
-        if len(self._gif_frames) <= 1:
-            return
-        kept = self._gif_frames[self._gif_index]
-        self._gif_frames = [kept]
-        self._gif_index = 0
-        self._gif_frozen = True
-        import gc
-        gc.collect()
-        self.gif_status.set(status)
 
     def _on_animate_toggle(self) -> None:
-        """Master switch driven by the ``Animate`` checkbox.
+        """Play/pause switch driven by the ``Animate`` checkbox.
 
-        OFF -> freeze to a single still image and free the frame buffer.
-        ON  -> reload the GIF from disk (if we know its path) and resume
-        playback.
+        ON  -> resume playback; reopen the file only if the handle was
+               released (e.g. after the tab was hidden).
+        OFF -> stop the clock; the current frame stays on screen.
+
+        Never a silent no-op: every branch either plays or says why it
+        can't.
         """
         if self._gif_animate_var.get():
-            if self._gif_path is not None and self._gif_path.exists():
+            if self._gif_im is not None:
+                self._start_playback()
+            elif self._gif_path is not None and self._gif_path.exists():
                 self._load_gif(self._gif_path)
-            elif len(self._gif_frames) > 1 and self._gif_job is None:
-                self._advance_gif()
+            else:
+                self._stop_playback()
+                self.gif_status.set(
+                    "Can't play - no QC movie loaded. Run or reload a "
+                    "recording first.")
         else:
-            self._freeze_to_still(
-                "Paused by user (single frame held to save memory)")
+            self._stop_playback()
+            self.gif_status.set(f"Paused (frame {self._gif_index + 1})")
 
     def on_tab_hidden(self) -> None:
         """Called by ``PipelineApp`` when the user switches off this tab.
 
-        Always freezes the animation so PhotoImage memory is released;
-        if the user has the ``Animate`` toggle on, the next ``on_tab_shown``
-        re-materialises the buffer.
+        Stops the clock and releases the file handle (drops the OS lock).
+        The last frame stays on screen; ``on_tab_shown`` reopens lazily.
         """
-        self._freeze_to_still(
-            "Paused (single frame held to save memory)")
+        self._stop_playback()
+        self._close_gif()
 
     def on_tab_shown(self) -> None:
         """Called when the user switches back to this tab.
 
-        Honours the user's ``Animate`` toggle: if it's off, we leave the
-        still image in place. If it's on and we previously dropped the
-        frame buffer, re-materialise it from ``self._gif_path``.
+        Honours the ``Animate`` toggle: if it's off, leave the still in
+        place; if it's on, reopen the GIF from ``self._gif_path`` and
+        resume playback.
         """
         if not self._gif_animate_var.get():
             return
-        if self._gif_frozen and self._gif_path is not None and self._gif_path.exists():
+        if self._gif_im is not None:
+            self._start_playback()
+        elif self._gif_path is not None and self._gif_path.exists():
             self._load_gif(self._gif_path)
-            return
-        if len(self._gif_frames) > 1 and self._gif_job is None:
-            self._advance_gif()
 
     # -- Mean image plot ----------------------------------------------------
 

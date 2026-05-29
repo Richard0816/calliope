@@ -53,7 +53,7 @@ from matplotlib.backends.backend_tkagg import (
 )
 from matplotlib.patches import Rectangle
 
-from ...core.utils import lowpass_causal_1d
+from ...core.utils import lowpass_zero_phase_1d
 from ...gui_common import install_scroll_router
 
 
@@ -516,11 +516,15 @@ class CurationPopout(ctk.CTkToplevel):
             trace = np.asarray(self._dff[:, self._roi_idx])
             time = np.arange(self._T) / max(self._fps, 1e-6)
             self._trace_ax.plot(time, trace, lw=0.8, label="ΔF/F")
-            # ``sosfilt`` is IIR — a single NaN poisons the rest of
-            # the output, so skip the overlay (raw still renders) when
-            # the trace isn't fully finite.
+            # ``sosfiltfilt`` is IIR — a single NaN poisons the rest
+            # of the output, so skip the overlay (raw still renders)
+            # when the trace isn't fully finite. The overlay is a
+            # zero-phase preview so the lowpass line sits on top of
+            # the same peaks visible in the raw trace; the on-disk
+            # lowpass memmap that feeds event detection still uses the
+            # causal filter to preserve real-time interpretation.
             if self._show_lowpass and np.isfinite(trace).all():
-                y_lp, _, _ = lowpass_causal_1d(
+                y_lp, _ = lowpass_zero_phase_1d(
                     trace, self._fps, cutoff_hz=1.0, order=2)
                 self._trace_ax.plot(time, y_lp, lw=1.2, color="C1",
                                     label="1 Hz lowpass")
@@ -704,6 +708,10 @@ class CurationPopout(ctk.CTkToplevel):
                 "Promote failed",
                 f"Could not write {mask_path}:\n{e}")
             return
+        # Mask on disk now reflects every flip in this session; clear
+        # the pending set so external guards (Tab 3 export button) can
+        # tell a clean state from a dirty one.
+        self._flipped.clear()
         self._train_status_var.set(
             f"Promoted {n_flipped} label{plural} to "
             f"{_cf_cfg.PREDICTED_MASK_NAME}")
@@ -714,6 +722,14 @@ class CurationPopout(ctk.CTkToplevel):
                 self._on_iscell_changed(-1, -1)
             except Exception:
                 pass
+
+    def has_pending_promotion(self) -> bool:
+        """True when ROI labels have been flipped in this session but
+        not yet promoted to ``predicted_cell_mask.npy``. Used by the
+        Tab 3 figure-export button to refuse exporting figures that
+        wouldn't match what the curator is looking at.
+        """
+        return bool(self._flipped)
 
     def _on_retrain(self) -> None:
         if self._train_thread is not None and self._train_thread.is_alive():

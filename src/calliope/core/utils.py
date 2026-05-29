@@ -13,6 +13,11 @@ Per-trace signal processing
         Smooth a 1-D trace with a Butterworth low-pass that runs
         forward only (causal -- no peeking at the future). Used by
         Tab 4 to clean up shot noise before event detection.
+    lowpass_zero_phase_1d
+        Same Butterworth low-pass run forward + backward
+        (``sosfiltfilt``) so the filtered trace lines up with the raw
+        in time. Visualization-only; never feed its output into the
+        event detector because it peeks at future samples.
     sg_first_derivative_1d
         Estimate a 1-D trace's first time-derivative with a
         Savitzky-Golay polynomial fit. Lets us threshold on
@@ -88,7 +93,7 @@ import pandas as pd
 import psutil
 # SciPy is broken into many sub-modules; we import only what we need.
 from scipy.ndimage import gaussian_filter1d, percentile_filter
-from scipy.signal import butter, find_peaks, savgol_filter, sosfilt
+from scipy.signal import butter, find_peaks, savgol_filter, sosfilt, sosfiltfilt
 from scipy.special import erfinv  # inverse error function for Gaussian quantile
 # pathlib provides ``Path`` -- a path object. Use ``Path("a") / "b"``
 # instead of ``os.path.join``.
@@ -143,6 +148,22 @@ def lowpass_causal_1d(x, fps, cutoff_hz=5.0, order=2, zi=None, sos=None):
     output -- no peeking forward. That matters for event detection
     because we don't want a filter to introduce artificial pre-event
     activity.
+
+    Why causal even though zero-phase (`lowpass_zero_phase_1d`) is "more
+    accurate"? Because applying the *same* LTI filter to every ROI trace
+    preserves the location of the cross-correlation peak between any two
+    traces. The filtered-CCG equals the raw-CCG convolved with the
+    autocorrelation of the impulse response, which is even (symmetric)
+    regardless of whether the filter itself is causal. So relative
+    timing between neurons survives identical filtering even when
+    individual onset times get shifted by the filter's group delay.
+    The trade-off is that absolute onset times are shifted by roughly
+    half the impulse-response duration -- subtract this offset if
+    aligning to external events (stimulus, behavior, etc.). For sharp
+    GCaMP8 transients the IIR's frequency-dependent group delay also
+    starts to matter; the planned future upgrade is a linear-phase FIR
+    so the constant-group-delay assumption holds exactly across all
+    frequencies (see ``docs/pipeline_audit_2026-05-25.md`` §2.8).
 
     "SOS" = second-order sections, the numerically stable
     representation of an IIR filter. SciPy's ``sosfilt`` runs the
@@ -206,6 +227,42 @@ def lowpass_causal_1d(x, fps, cutoff_hz=5.0, order=2, zi=None, sos=None):
     # ``y.astype(np.float32)`` is essentially a copy with type
     # conversion -- needed because sosfilt returns float64.
     return y.astype(np.float32), zf.astype(np.float32), sos
+
+
+def lowpass_zero_phase_1d(x, fps, cutoff_hz=1.0, order=2, sos=None):
+    """Zero-phase SOS low-pass for VISUALIZATION ONLY.
+
+    Runs the Butterworth filter forward and then backward (``sosfiltfilt``)
+    so the net group delay is zero — the filtered trace lines up with the
+    raw trace in time, which is what we want when the user is comparing
+    them in an overlay. The trade-off is that the filter peeks into the
+    future, so this is not appropriate upstream of event detection where
+    causal interpretation matters.
+
+    Use ``lowpass_causal_1d`` instead when the output feeds the
+    Savitzky-Golay derivative / event detector — the half-window time
+    lag of a causal IIR is unavoidable but at least *real* in the sense
+    that no future samples were used to compute each output.
+
+    Parameters mirror ``lowpass_causal_1d``; the streaming ``zi``
+    argument is intentionally absent because filtfilt is a two-pass
+    operation and can't be chunked.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    n = x.size
+    if n < 9:
+        # sosfiltfilt's default padding requires roughly 3 * filter
+        # length samples; bail safely for very short traces.
+        return x.copy(), sos
+    nyq = fps / 2.0
+    cutoff = min(max(1e-4, cutoff_hz), 0.95 * nyq)
+    if sos is None:
+        sos = butter(order, cutoff / nyq, btype='low', output='sos')
+    # ``padlen`` defaults are usually fine, but on very short traces we
+    # cap it so sosfiltfilt doesn't raise ValueError.
+    padlen = min(3 * (2 * order) * 4, n - 1)
+    y = sosfiltfilt(sos, x, padlen=max(0, padlen))
+    return y.astype(np.float32), sos
 
 
 def sg_first_derivative_1d(x, fps, win_ms=333, poly=3):
@@ -677,6 +734,14 @@ def detect_event_windows(
     # zero, which would silently replace user input.
     if params is None:
         params = EventDetectionParams()
+
+    # Guard against ``fps <= 0`` -- without this the ``duration_s``
+    # computation silently divides by zero (giving inf) and subsequent
+    # ``int(...)`` conversions raise OverflowError far away from the
+    # actual cause. Raise loudly here so the caller sees what's wrong.
+    if not (fps and float(fps) > 0):
+        raise ValueError(
+            f"detect_event_windows: fps must be > 0, got {fps!r}")
 
     # 1) Flat onset times across all ROIs -> density
     # ``duration_s`` is the total recording length. ``T`` is in
@@ -1598,10 +1663,18 @@ def _ensure_cuda_alloc_conf() -> None:
     different workload), only filling in our default when the env
     var isn't present.
 
+    Skipped on Windows: PyTorch's CUDAAllocatorConfig prints
+    ``expandable_segments not supported on this platform`` and falls
+    back to the default allocator anyway. Setting it just adds noise
+    to the suite2p log.
+
     Called at import time so torch picks it up the first time CUDA
     is initialised. Setting it after torch.cuda has booted is a
     no-op.
     """
+    import sys
+    if sys.platform == "win32":
+        return
     if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -1611,6 +1684,28 @@ def _ensure_cuda_alloc_conf() -> None:
 # the first calliope modules imported, that's well before suite2p
 # spins up its CUDA context.
 _ensure_cuda_alloc_conf()
+
+
+def _silence_classifier_load_deprecation() -> None:
+    """Suppress NumPy 2.4's ``align=0`` deprecation that fires when
+    suite2p ``classification.classify`` unpickles a legacy
+    ``classifier_user.npy`` / ``classifier.npy``.
+
+    The bundled suite2p classifiers were saved with a structured dtype
+    that uses ``align=0`` instead of ``align=False``; NumPy 2.4 warns
+    on every load via ``numpy.lib._format_impl``. We don't own the
+    classifier file (lives in the user's ``~/.suite2p`` or the
+    suite2p site-package), so we can't fix it at the source -- we
+    just hide the one specific warning message.
+    """
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*align should be passed as Python or NumPy boolean.*",
+    )
+
+
+_silence_classifier_load_deprecation()
 
 
 def change_batch_according_to_free_ram() -> int:

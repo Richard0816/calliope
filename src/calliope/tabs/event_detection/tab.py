@@ -266,6 +266,11 @@ class EventDetectionTab(ctk.CTkFrame):
         self._render_worker: Optional[threading.Thread] = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
+        # When True, the next render skips persisting params to the run
+        # manifest. Set by the "Open run folder…" reload so its own
+        # recompute can't overwrite a good manifest with the params it
+        # just loaded (or with defaults, when none were found).
+        self._suppress_manifest_write = False
         # Single-instance reference to the prominence-distribution
         # popout (Tab 5 only allows one at a time per tab instance).
         self._prominence_popout = None
@@ -334,6 +339,10 @@ class EventDetectionTab(ctk.CTkFrame):
             row, text="Save summary", width=110,
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="right", padx=(0, 6))
+        self.export_btn = ctk.CTkButton(
+            row, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_btn.pack(side="right", padx=(0, 6))
         ctk.CTkButton(row, text="Reload from folder...", width=160,
                       command=self._reload_from_folder).pack(side="right")
 
@@ -405,7 +414,7 @@ class EventDetectionTab(ctk.CTkFrame):
         self.hm_canvas.get_tk_widget().pack(fill="both", expand=True,
                                             padx=4, pady=(0, 4))
         attach_resize_handle(self, f1_wrap, min_height=140,
-                             initial_height=180)
+                             initial_height=300)
 
         f2_wrap = ctk.CTkFrame(self, fg_color="transparent")
         f2_wrap.pack(fill="x", padx=14, pady=(0, 0))
@@ -427,7 +436,7 @@ class EventDetectionTab(ctk.CTkFrame):
         self.er_canvas.get_tk_widget().pack(fill="both", expand=True,
                                             padx=4, pady=(0, 4))
         attach_resize_handle(self, f2_wrap, min_height=140,
-                             initial_height=180)
+                             initial_height=300)
 
         f3_wrap = ctk.CTkFrame(self, fg_color="transparent")
         f3_wrap.pack(fill="x", padx=14, pady=(0, 10))
@@ -671,7 +680,8 @@ class EventDetectionTab(ctk.CTkFrame):
         ax.clear(); ax.set_axis_on()
         duration_s = float(T) / float(fps) if fps > 0 else 1.0
         try:
-            utils.plot_event_detection(data["diagnostics"], ax=ax)
+            diagnostics = data["diagnostics"]
+            utils.plot_event_detection(diagnostics, ax=ax)
             ev = data["event_windows"]
             if ev is not None and len(ev) > 0:
                 utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
@@ -679,7 +689,19 @@ class EventDetectionTab(ctk.CTkFrame):
             # doesn't look cut off when the auto-fit picks up only the
             # smoothed-density extent.
             ax.set_xlim(0.0, duration_s)
-            ax.relim(); ax.autoscale_view(scalex=False, scaley=True)
+            # Explicit y-axis fit: anchor the bottom at 0 (densities are
+            # non-negative) and put the top at the tallest detected
+            # peak + 10% headroom. ``peak_height`` is the smoothed-
+            # density value at each picked peak, so it's by construction
+            # the highest point the user cares about. Fall back to 1.0
+            # when no events were detected.
+            peak_h = np.asarray(
+                diagnostics.get("peak_height", []), dtype=float)
+            finite = peak_h[np.isfinite(peak_h)] if peak_h.size else peak_h
+            ymax = float(finite.max()) if finite.size else 1.0
+            if ymax <= 0:
+                ymax = 1.0
+            ax.set_ylim(0.0, ymax * 1.10)
         except Exception as e:
             ax.text(0.5, 0.5, f"plot_event_detection error:\n{e}",
                     ha="center", va="center", transform=ax.transAxes)
@@ -709,6 +731,7 @@ class EventDetectionTab(ctk.CTkFrame):
         self._last_data = data
         self.summary_btn.configure(state="normal")
         self.prominence_btn.configure(state="normal")
+        self.export_btn.configure(state="normal")
         if self._plane0 is not None:
             try:
                 self._write_summary(self._plane0, data)
@@ -735,6 +758,39 @@ class EventDetectionTab(ctk.CTkFrame):
             })
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
+
+        # Persist the params used so a future "Open run folder…" reload
+        # can restore them instead of recomputing with GUI defaults.
+        # Suppressed during a reload's own recompute (writing back the
+        # just-loaded params is pointless, and writing defaults when none
+        # were found would silently record them as the run's settings).
+        if (self._plane0 is not None
+                and not self._suppress_manifest_write):
+            try:
+                self._write_event_manifest(self._plane0)
+            except Exception as e:
+                print(f"[GUI] event manifest update failed: {e}")
+        self._suppress_manifest_write = False
+
+    def _write_event_manifest(self, plane0: Path) -> None:
+        """Merge the current event-detection params into the run manifest.
+
+        ``write_export_manifest`` merges rather than overwrites, so this
+        contributes the Tab 5 params to the shared manifest without
+        clobbering the other stages' entries -- which is what lets a
+        reload restore events without falling back to defaults.
+        """
+        from ...core.export_manifest import write_export_manifest
+        from ...core.utils import infer_recording_id
+        save_folder = plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        try:
+            rec_id = infer_recording_id(plane0)
+        except Exception:
+            rec_id = save_folder.name
+        write_export_manifest(
+            figures_root, rec_id=rec_id, params=dict(self._params),
+            plane0=plane0, ckpt_path=None)
 
     # -- Summary export -----------------------------------------------------
 
@@ -775,6 +831,56 @@ class EventDetectionTab(ctk.CTkFrame):
             self.status_var.set(f"Summary -> {path}")
         except Exception as e:
             messagebox.showerror("Summary failed", str(e))
+
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Re-render Tab 5's heatmap / raster / event-detection figures
+        for the currently-loaded recording as PNG + SVG under
+        ``<save_folder>/calliope_figures/event_detection/``, then update
+        the manifest. Re-runs the event-detection algorithm (cheap --
+        operates on the existing lowpass memmap; tens of seconds) so
+        the in-memory state can stay memory-light.
+
+        ``quiet=True`` (Tab 0 batch toggle) suppresses messageboxes.
+        """
+        plane0 = self._plane0
+        if plane0 is None:
+            if not quiet:
+                messagebox.showinfo("No data", "Load a recording first.")
+            return
+        save_folder = plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        events_dir = figures_root / "event_detection"
+        self.status_var.set("Exporting event figures ...")
+        self.update_idletasks()
+        try:
+            from ...core.event_detection_run import run_event_detection
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(plane0)
+            except Exception:
+                rec_id = save_folder.name
+            params = dict(self._params)
+            run_event_detection(
+                plane0, params, figures_dir=events_dir,
+                write_summary=False,
+            )
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params=params,
+                plane0=plane0, ckpt_path=None,
+            )
+            self.status_var.set(f"Exported event figures -> {events_dir}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote heatmap / raster / event-detection figures "
+                    f"(PNG + SVG) to:\n  {events_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}")
+        except Exception as e:
+            self.status_var.set(f"Export failed: {e}")
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
 
     # -- Plot data export ---------------------------------------------------
 

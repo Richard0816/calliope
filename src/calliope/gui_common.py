@@ -615,6 +615,26 @@ class AppState:
             except Exception as e:
                 print(f"xcorr_ready listener error: {e}")
 
+    # ---- bulk reset (used before loading a different run) ----
+
+    def reset(self) -> None:
+        """Clear every stage-output channel's latest value to ``None``.
+
+        Called before rehydrating a different run so a stale payload from
+        a prior run can't be mistaken for the new one. This resets only
+        the shared *values* -- it does not notify subscribers or force a
+        tab to wipe what it has already drawn, so the caller is expected
+        to republish the new run's channels immediately afterwards. A
+        stage absent from the new run will leave the prior tab's view in
+        place; that's a known limitation of the additive reload.
+        """
+        self.result = None
+        self.plane0 = None
+        self.lowpass_plane0 = None
+        self.event_results = None
+        self.clusters_ready = None
+        self.xcorr_ready = None
+
 
 # ---------------------------------------------------------------------------
 # Advanced parameters dialog
