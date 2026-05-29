@@ -181,19 +181,6 @@ def _compute_event_monotonicity(
     return rows
 
 
-def _resolve_keep_mask(plane0: Path, N_total: int) -> np.ndarray:
-    """Pick the same keep mask Tab 5 uses (cellfilter -> iscell ->
-    all)."""
-    mask_path = plane0 / "predicted_cell_mask.npy"
-    if mask_path.exists():
-        return np.load(mask_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-    return np.ones(N_total, dtype=bool)
-
-
 def _build_event_params(params: dict):
     """Translate the flat ``params`` dict into an
     :class:`EventDetectionParams` instance, using class defaults for
@@ -256,17 +243,22 @@ def run_event_detection(
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
 
-    mask = _resolve_keep_mask(plane0, N_total)
-    N_kept_full = int(mask.sum())
-    if N_kept_full == 0:
-        raise RuntimeError("No ROIs survive the cell-filter mask.")
-
     lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
     dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
     if not lp_path.exists() or not dt_path.exists():
         raise FileNotFoundError(
             f"Missing low-pass memmaps in {plane0}. "
             "Run Tab 4 (or core.lowpass_run.run_lowpass) first.")
+
+    # Size the memmaps against the mask they were *written* with (persisted
+    # as r0p7_cell_mask_bool.npy), not whatever the live mask resolves to
+    # now -- a drifted mask makes np.memmap request a wrong-sized mapping,
+    # which Windows reports as [WinError 8]. See utils.resolve_filtered_mask.
+    mask, N_kept_full = core_utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=lp_path, T=T)
+    if N_kept_full == 0:
+        raise RuntimeError("No ROIs survive the cell-filter mask.")
+
     lowpass = np.memmap(str(lp_path), dtype="float32", mode="r",
                         shape=(T, N_kept_full))
     derivative = np.memmap(str(dt_path), dtype="float32", mode="r",
@@ -409,7 +401,7 @@ def run_event_detection(
         data["figures"] = figs
 
     if write_summary:
-        from ..tabs.event_detection import summary_writer
+        from . import summary_writer
         summary_writer.update_recording_meta(
             plane0, fps=fps, T=T, N=N_kept)
         summary_writer.write_events_sheets(
