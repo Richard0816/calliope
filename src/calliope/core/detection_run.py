@@ -159,6 +159,9 @@ def prune_detection_intermediates(
 def archive_recording_post_detection(
     rec_root,
     *,
+    raw_paths: Optional[list] = None,
+    dest_root=None,
+    plane0=None,
     compress_raw: bool = True,
     delete_shifted: bool = True,
     delete_final_bin: bool = True,
@@ -216,8 +219,19 @@ def archive_recording_post_detection(
     compression_ok = True
     compressed_dst_for_src: dict[Path, Path] = {}
 
+    dst_root = Path(dest_root) if dest_root is not None else rec_root
     if compress_raw:
-        raw_sources = _pre.read_raw_paths_sidecar(rec_root)
+        if raw_paths:
+            # Caller passed the raw source paths directly -- the robust
+            # path. Avoids re-reading ``_calliope_raw_paths.json`` from a
+            # directory that may not hold it: the batch sidecar lives in
+            # the recording folder, but the archive was historically
+            # called against that folder's PARENT, so the lookup found
+            # nothing and silently skipped compression on every run.
+            raw_sources = [Path(p) for p in raw_paths]
+            _log(f"[archive] {len(raw_sources)} raw path(s) from caller")
+        else:
+            raw_sources = _pre.read_raw_paths_sidecar(rec_root)
         if not raw_sources:
             # Sidecar absent. This is expected when detection runs on a
             # recording that wasn't preprocessed via CalLIOPE (e.g., the
@@ -255,7 +269,8 @@ def archive_recording_post_detection(
                     )
                     compression_ok = False
                     continue
-                dst = rec_root / src.name
+                dst = dst_root / src.name
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     in_bytes, out_bytes = _pre.compress_raw_tiff(
                         src, dst, level=level, progress_cb=progress_cb,
@@ -273,6 +288,16 @@ def archive_recording_post_detection(
 
     if not compression_ok:
         _log("[archive] aborting deletions because compression had errors")
+        return summary
+
+    # Guard: if compression was requested but produced nothing (raw
+    # sources couldn't be located), do NOT delete the shifted TIFFs --
+    # that would leave the recording folder with neither a raw nor a
+    # compressed copy. Only an explicit compress_raw=False, or a
+    # successful compress, may clear them.
+    if compress_raw and summary["compressed"] == 0:
+        _log("[archive] WARNING: 0 raws compressed -- keeping shifted "
+             "TIFFs and skipping cleanup (check raw paths / sidecar).")
         return summary
 
     # ----- Step 2: delete top-level shifted TIFFs --------------------------
@@ -296,14 +321,18 @@ def archive_recording_post_detection(
 
     # ----- Step 3: delete final/.../data.bin -------------------------------
     if delete_final_bin:
-        final_bin = (
-            rec_root
-            / "detection"
-            / "final"
-            / "suite2p"
-            / "plane0"
-            / "data.bin"
-        )
+        # Prefer the real plane0 when the caller passed it: layouts differ
+        # (the GUI nests detection under ``<rec>/detection/``; the headless
+        # pipeline writes ``<rec>/final/`` directly), so the reconstructed
+        # path is wrong for one of them. Fall back to the legacy
+        # reconstruction when plane0 wasn't supplied.
+        if plane0 is not None:
+            final_bin = Path(plane0) / "data.bin"
+        else:
+            final_bin = (
+                rec_root / "detection" / "final" / "suite2p" / "plane0"
+                / "data.bin"
+            )
         if final_bin.is_file():
             # Windows holds a lock on the file until every memmap /
             # BinaryFile / torch tensor referencing it has been GC'd.
@@ -573,16 +602,13 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
 
 
 def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
-    """predicted_cell_mask -> iscell -> all-ones."""
-    mask_path = plane0 / "predicted_cell_mask.npy"
-    if mask_path.exists():
-        return np.load(mask_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return ((ic[:, 0] > 0) if ic.ndim == 2
-                else (ic > 0)).astype(bool)
-    return np.ones(n_total, dtype=bool)
+    """predicted_cell_mask -> iscell -> all-ones (current curation).
+
+    Thin delegate to :func:`utils.resolve_live_mask`, the single
+    writer-facing keep-mask resolver. Kept as a module-local name
+    because three call sites here reference it.
+    """
+    return utils.resolve_live_mask(plane0, n_total)
 
 
 def compute_filtered_dff(plane0: Path) -> Optional[Path]:
@@ -709,6 +735,9 @@ def run_detection(
     baseline_mode: str = "first_n",
     baseline_min: float = 2.0,
     figures_dir: Optional[Path] = None,
+    raw_paths: Optional[list] = None,
+    archive_root: Optional[Path] = None,
+    dest_root: Optional[Path] = None,
     write_summary: bool = True,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> dict:
@@ -793,13 +822,20 @@ def run_detection(
     # key so Tab 3 / batch tab can override.
     if bool(params.get("archive_post_detection", True)):
         try:
-            # ``save_folder`` is the ``detection/`` subfolder, but the
-            # archive expects the recording root (one level up) -- the
-            # raw-paths sidecar lives there alongside the shifted
-            # TIFFs, and the function builds ``rec_root/detection/...``
-            # internally when reaching for the final data.bin.
+            # ``archive_root`` is the recording folder (where the shifted
+            # TIFFs + raw-paths sidecar live). Batch passes it explicitly;
+            # callers that omit it fall back to the legacy
+            # ``save_folder.parent`` (correct for the GUI, whose
+            # save_folder IS the detection/ subfolder). ``raw_paths`` lets
+            # compression skip the sidecar lookup entirely -- the robust
+            # source for the batch path, where the sidecar sits in the
+            # recording folder, not its parent.
             archive_recording_post_detection(
-                Path(save_folder).parent,
+                archive_root if archive_root is not None
+                else Path(save_folder).parent,
+                raw_paths=raw_paths,
+                dest_root=dest_root,
+                plane0=plane0,
                 compress_raw=bool(
                     params.get("compress_raw_post_detection", True)),
                 delete_shifted=bool(

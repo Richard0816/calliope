@@ -57,6 +57,7 @@ def run_recording(
     baseline_mode: str = "first_n",
     baseline_min: float = 2.0,
     recording_id: Optional[str] = None,
+    final_root: Optional[Path] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run the full Tabs 1+3-8 pipeline on a single recording.
@@ -158,6 +159,9 @@ def run_recording(
             baseline_mode=baseline_mode,
             baseline_min=baseline_min,
             figures_dir=_figures_dir_for(save_folder, "detection"),
+            raw_paths=list(getattr(pre, "raw_paths", None) or tiff_input),
+            archive_root=save_folder,
+            dest_root=final_root,
             progress_cb=_emit,
         )
         plane0 = det["plane0"]

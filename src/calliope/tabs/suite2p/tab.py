@@ -828,13 +828,17 @@ class Suite2pTab(ctk.CTkFrame):
             self._run_filtered_dff(final_plane0)
 
             self._prune_detection_intermediates(save_folder)
-            self._archive_recording(save_folder, params)
+            self._archive_recording(
+                save_folder, params,
+                raw_paths=getattr(result, "raw_paths", None),
+                plane0=final_plane0)
 
     def _prune_detection_intermediates(self, save_folder: Path) -> None:
         from ...core.detection_run import prune_detection_intermediates
         prune_detection_intermediates(save_folder, progress_cb=print)
 
-    def _archive_recording(self, save_folder: Path, params: dict) -> None:
+    def _archive_recording(self, save_folder: Path, params: dict,
+                           *, raw_paths=None, plane0=None) -> None:
         """Compress raw TIFFs into the recording folder, drop shifted +
         final/data.bin. Reads the same param keys as the headless
         ``detection_run.run_detection`` archive hook so Tab 3 behaves
@@ -846,9 +850,15 @@ class Suite2pTab(ctk.CTkFrame):
         try:
             # ``save_folder`` is the ``detection/`` subfolder; the
             # archive expects the recording root (one level up), where
-            # the raw-paths sidecar and shifted TIFFs live.
+            # the raw-paths sidecar and shifted TIFFs live. ``raw_paths``
+            # lets compression skip the sidecar lookup entirely (the
+            # robust source -- the sidecar can be absent when the recording
+            # was routed through a scratch dir), and ``plane0`` points the
+            # final/data.bin cleanup at the real plane0 regardless of layout.
             archive_recording_post_detection(
                 Path(save_folder).parent,
+                raw_paths=raw_paths,
+                plane0=plane0,
                 compress_raw=bool(
                     params.get("compress_raw_post_detection", True)),
                 delete_shifted=bool(
@@ -1608,11 +1618,8 @@ class Suite2pTab(ctk.CTkFrame):
         try:
             from ...core.detection_run import _render_detection_panels
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(plane0)
             written = _render_detection_panels(plane0, detection_dir)
             ckpt_path = self.ckpt_var.get().strip() or None
             manifest_path = write_export_manifest(
