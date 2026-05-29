@@ -87,18 +87,14 @@ def build_score_image(stat, keep: np.ndarray, probs: np.ndarray,
 
 
 def load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
-    """Boolean mask of which ROIs to keep, preferring the cell-filter
-    prediction. Falls back to Suite2p's ``iscell.npy`` and finally
-    "keep everything" when neither exists.
+    """Boolean mask of which ROIs to keep, reflecting current curation
+    (``predicted_cell_mask`` -> ``iscell`` -> "keep everything").
+
+    Thin delegate to :func:`calliope.core.utils.resolve_live_mask`, the
+    single writer-facing keep-mask resolver.
     """
-    mask_path = plane0 / "predicted_cell_mask.npy"
-    if mask_path.exists():
-        return np.load(mask_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0).astype(bool)
-    return np.ones(n_total, dtype=bool)
+    from ...core import utils
+    return utils.resolve_live_mask(plane0, n_total)
 
 
 def render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:

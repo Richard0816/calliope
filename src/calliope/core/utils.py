@@ -112,33 +112,111 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
 
-def _load_keep_mask(root: Path, n_total: int) -> np.ndarray:
-    """Load a boolean ROI keep-mask of length ``n_total`` from a Suite2p
-    plane0 folder. Source preference, in order:
+def resolve_filtered_mask(plane0, n_total, *, memmap_path=None, T=None):
+    """Return ``(mask, n_kept)`` for the cell-filter-sliced dF/F memmaps.
 
-    1. ``predicted_cell_mask.npy`` -- canonical output from the cell-filter
-       prediction step (run_cellfilter / cellfilter.predict_recording).
-    2. ``r0p7_cell_mask_bool.npy`` -- legacy duplicate written by the
-       run_full_pipeline.make_filtered_memmaps step, kept for backward
-       compatibility with older recordings that don't have (1).
-    3. ``iscell.npy`` column 0 -- suite2p's built-in classifier; fallback
-       when no cell-filter prediction is present.
+    The filtered memmaps (``r0p7_filtered_dff*.memmap.float32``) are
+    column-sliced to whatever keep mask was live when Tab 3 wrote them,
+    and that exact mask is persisted next to them as
+    ``r0p7_cell_mask_bool.npy``. Re-resolving the mask from
+    ``predicted_cell_mask.npy`` / ``iscell.npy`` at *read* time is unsafe:
+    curation or "Promote to filter mask" can change those after the memmap
+    was written, so ``mask.sum()`` no longer matches the file's column
+    count. Asking ``np.memmap`` for the wrong ``(T, N)`` shape then fails
+    on Windows with ``[WinError 8] Not enough memory resources`` -- the
+    requested mapping is larger than the file. (This is a shape mismatch,
+    not real memory pressure; the memmap itself never loads into RAM.)
 
-    Raises FileNotFoundError when none of the above exist."""
-    pred_path = root / "predicted_cell_mask.npy"
-    if pred_path.exists():
-        return np.load(pred_path, allow_pickle=False).astype(bool).ravel()
-    legacy_path = root / "r0p7_cell_mask_bool.npy"
-    if legacy_path.exists():
-        return np.load(legacy_path, allow_pickle=False).astype(bool).ravel()
-    iscell_path = root / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path, allow_pickle=False)
-        return (ic[:, 0] > 0 if ic.ndim == 2 else ic > 0).astype(bool).ravel()
-    raise FileNotFoundError(
-        f"No filter mask found in {root}. Expected one of: "
-        f"predicted_cell_mask.npy, r0p7_cell_mask_bool.npy, iscell.npy."
+    Resolution order -- first candidate whose length is ``n_total`` and,
+    when the file size is known, whose ``.sum()`` matches the on-disk
+    column count:
+
+    1. ``r0p7_cell_mask_bool.npy`` -- persisted at filter time (authoritative)
+    2. ``predicted_cell_mask.npy`` -- cell-filter prediction
+    3. ``iscell.npy`` column 0 -- suite2p classifier
+    4. all-ones (every ROI kept)
+
+    When ``memmap_path`` exists and ``T`` is given, the column count
+    ``getsize // (4 * T)`` is used both to pick the matching candidate and
+    to raise a clear ``ValueError`` (instead of a cryptic WinError) when
+    the mask has drifted past every available candidate.
+    """
+    plane0 = Path(plane0)
+    n_total = int(n_total)
+
+    expected_n = None
+    if memmap_path is not None and T:
+        mp = Path(memmap_path)
+        if mp.exists():
+            denom = 4 * int(T)  # float32 bytes * frames
+            nbytes = mp.stat().st_size
+            if denom and nbytes % denom == 0:
+                expected_n = nbytes // denom
+
+    def _load(name):
+        p = plane0 / name
+        if not p.exists():
+            return None
+        arr = np.load(p, allow_pickle=False)
+        if name == "iscell.npy":
+            arr = (arr[:, 0] > 0) if arr.ndim == 2 else (arr > 0)
+        m = np.asarray(arr).astype(bool).ravel()
+        return m if m.size == n_total else None
+
+    candidates = [
+        ("r0p7_cell_mask_bool.npy", _load("r0p7_cell_mask_bool.npy")),
+        ("predicted_cell_mask.npy", _load("predicted_cell_mask.npy")),
+        ("iscell.npy", _load("iscell.npy")),
+        ("<all ROIs>", np.ones(n_total, dtype=bool)),
+    ]
+    present = [(lbl, m) for lbl, m in candidates if m is not None]
+
+    if expected_n is None:
+        # No memmap to size against: trust the authoritative-first order.
+        lbl, m = present[0]
+        return m, int(m.sum())
+
+    for lbl, m in present:
+        if int(m.sum()) == expected_n:
+            return m, int(m.sum())
+
+    sums = ", ".join(f"{lbl}={int(m.sum())}" for lbl, m in present)
+    raise ValueError(
+        f"{plane0}: filtered memmap {Path(memmap_path).name} holds "
+        f"{expected_n} ROI columns, but no keep mask matches that count "
+        f"({sums}). The keep mask drifted after the memmap was written -- "
+        f"re-run Tab 3 (filtered dF/F) to rewrite it, or restore "
+        f"r0p7_cell_mask_bool.npy."
     )
+
+
+def resolve_live_mask(plane0, n_total):
+    """Return the boolean keep mask reflecting CURRENT curation -- i.e.
+    which ROIs SHOULD be kept right now. This is the WRITER-facing
+    resolver: Tab 3 slices the filtered memmaps to this mask and persists
+    it as ``r0p7_cell_mask_bool.npy``.
+
+    Priority: ``predicted_cell_mask.npy`` -> ``iscell.npy`` col 0 ->
+    all-ones. It deliberately does NOT read ``r0p7_cell_mask_bool.npy`` --
+    that file is this function's own prior output, so consulting it here
+    would make the writer a fixpoint that can never shrink after curation,
+    re-introducing the exact ``[WinError 8]`` shape drift that
+    :func:`resolve_filtered_mask` exists to prevent.
+
+    Readers that must match an already-written memmap use
+    :func:`resolve_filtered_mask` (file-size-anchored), NOT this.
+    """
+    plane0 = Path(plane0)
+    n_total = int(n_total)
+    pred = plane0 / "predicted_cell_mask.npy"
+    if pred.exists():
+        return np.load(pred, allow_pickle=False).astype(bool).ravel()
+    iscell = plane0 / "iscell.npy"
+    if iscell.exists():
+        ic = np.load(iscell, allow_pickle=False)
+        col = ic[:, 0] if ic.ndim == 2 else ic
+        return (col > 0).ravel()
+    return np.ones(n_total, dtype=bool)
 
 
 def lowpass_causal_1d(x, fps, cutoff_hz=5.0, order=2, zi=None, sos=None):
@@ -528,6 +606,27 @@ def infer_recording_id(path) -> str:
     by hand.
     """
     return find_recording_root(path).name
+
+
+def save_folder_for_plane0(plane0) -> Path:
+    """Recording save-folder for a Suite2p ``plane0`` path.
+
+    The on-disk layout is
+    ``<save_folder>/detection/final/suite2p/plane0``, so the save folder
+    is four parents up. Centralizes the ``plane0.parents[3]`` derivation
+    repeated across every export-figure path.
+    """
+    return Path(plane0).parents[3]
+
+
+def safe_recording_id(plane0) -> str:
+    """:func:`infer_recording_id` with the GUI's standard fallback to the
+    save-folder name, so export paths don't each repeat the try/except.
+    """
+    try:
+        return infer_recording_id(plane0)
+    except Exception:
+        return save_folder_for_plane0(plane0).name
 
 
 def get_fps_from_notes(
@@ -2365,9 +2464,9 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     frames without ever loading the whole array into RAM.
 
     For filtered prefixes (e.g. ``r0p7_filtered_``), the column count
-    is derived from a keep-mask resolved via ``_load_keep_mask`` --
-    which prefers ``predicted_cell_mask.npy`` and falls back to
-    legacy / suite2p-classifier sources if it's missing.
+    is resolved via :func:`resolve_filtered_mask`, which anchors to the
+    memmap's on-disk size and prefers the persisted
+    ``r0p7_cell_mask_bool.npy`` over a (possibly drifted) live mask.
 
     Returns ``(dff, low, dt, T, N_kept)``.
     """
@@ -2375,14 +2474,14 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     F, _, num_frames, num_rois, _ = s2p_load_raw(root)
 
     if prefix.split("_")[-2] == "filtered":
-        mask = _load_keep_mask(root, num_rois)
-        if mask.size != num_rois:
-            raise ValueError(
-                f"keep-mask length {mask.size} != num_rois {num_rois} "
-                f"in {root}"
-            )
+        # Size against the mask the memmaps were written with (persisted
+        # as r0p7_cell_mask_bool.npy), cross-checked against the file size,
+        # so a drifted live mask can't request a wrong-shaped mapping
+        # ([WinError 8]). See resolve_filtered_mask.
+        dff_path = root / f"{prefix}dff.memmap.float32"
+        mask, num_rois = resolve_filtered_mask(
+            root, num_rois, memmap_path=dff_path, T=num_frames)
         F = F[mask, :]
-        num_rois = int(mask.sum())
 
     dff = np.memmap(root / f"{prefix}dff.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
     low = np.memmap(root / f"{prefix}dff_lowpass.memmap.float32", dtype="float32", mode="r",

@@ -39,23 +39,18 @@ from . import utils
 def _load_kept_count_and_T(plane0: Path) -> tuple[int, int]:
     """Resolve (T, N_kept) from suite2p outputs at ``plane0``.
 
-    Mirrors ``LowpassTab._load_data`` -- prefers
-    ``predicted_cell_mask.npy`` (cellfilter), falls back to
-    ``iscell.npy`` (suite2p classifier), then to "all ROIs kept".
+    Sizes ``N_kept`` against the source filtered memmap
+    (``r0p7_filtered_dff.memmap.float32``) so the count matches the file
+    the lowpass stage reads, even if the live keep mask has drifted since
+    Tab 3 wrote it -- a drifted mask would otherwise make ``np.memmap``
+    request a wrong-shaped mapping ([WinError 8] on Windows). See
+    ``utils.resolve_filtered_mask``.
     """
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
-    mask_path = plane0 / "predicted_cell_mask.npy"
-    if mask_path.exists():
-        mask = np.load(mask_path).astype(bool)
-    else:
-        iscell_path = plane0 / "iscell.npy"
-        if iscell_path.exists():
-            ic = np.load(iscell_path)
-            mask = ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-        else:
-            mask = np.ones(N_total, dtype=bool)
-    n_kept = int(mask.sum())
+    src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    _mask, n_kept = utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=src_path, T=T)
     if n_kept == 0:
         raise RuntimeError(f"No ROIs survive the cell-filter mask at {plane0}.")
     return int(T), n_kept

@@ -155,24 +155,21 @@ def load_filtered_dff(plane0: Path, prefix: str):
     N_total, T = F.shape
     is_filtered = "filtered" in prefix.split("_")
 
+    dff_path = plane0 / f"{prefix}dff.memmap.float32"
+    if not dff_path.exists():
+        raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
+
     if is_filtered:
-        mask = load_filter_mask(plane0)
-        if mask is None:
-            raise FileNotFoundError(
-                f"{plane0}: prefix {prefix!r} requires a cell-filter mask "
-                "(predicted_cell_mask.npy or iscell.npy).")
-        if mask.size != N_total:
-            raise ValueError(
-                f"{plane0}: cell-filter mask length {mask.size} does not "
-                f"match F.npy ROI count {N_total}.")
-        N_kept = int(mask.sum())
+        # Size against the mask the memmap was written with (persisted as
+        # r0p7_cell_mask_bool.npy), cross-checked against the file size, so
+        # a drifted predicted_cell_mask/iscell can't request a wrong-shaped
+        # mapping -> [WinError 8] on Windows. See utils.resolve_filtered_mask.
+        mask, N_kept = utils.resolve_filtered_mask(
+            plane0, N_total, memmap_path=dff_path, T=T)
     else:
         mask = None
         N_kept = N_total
 
-    dff_path = plane0 / f"{prefix}dff.memmap.float32"
-    if not dff_path.exists():
-        raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
     dff = np.memmap(dff_path, dtype="float32", mode="r",
                     shape=(T, N_kept))
     return dff, T, N_kept, mask
