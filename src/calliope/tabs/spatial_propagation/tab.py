@@ -342,11 +342,8 @@ class SpatialPropagationTab(ctk.CTkFrame):
         try:
             from ...core.spatial import render_spatial_event_figures
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(plane0)
             written = render_spatial_event_figures(
                 plane0, self._data, figures_dir=sp_dir)
             params = {

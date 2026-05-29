@@ -1167,11 +1167,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
             xc_dir.mkdir(parents=True, exist_ok=True)
             from ...core.crosscorrelation import _save_violin_pair
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(self._plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(self._plane0)
             n_files = 0
             full_pair = _load_pair_data(full_dir)
             _save_violin_pair(

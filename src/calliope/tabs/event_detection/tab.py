@@ -781,13 +781,10 @@ class EventDetectionTab(ctk.CTkFrame):
         reload restore events without falling back to defaults.
         """
         from ...core.export_manifest import write_export_manifest
-        from ...core.utils import infer_recording_id
+        from ...core.utils import safe_recording_id
         save_folder = plane0.parents[3]
         figures_root = save_folder / "calliope_figures"
-        try:
-            rec_id = infer_recording_id(plane0)
-        except Exception:
-            rec_id = save_folder.name
+        rec_id = safe_recording_id(plane0)
         write_export_manifest(
             figures_root, rec_id=rec_id, params=dict(self._params),
             plane0=plane0, ckpt_path=None)
@@ -855,11 +852,8 @@ class EventDetectionTab(ctk.CTkFrame):
         try:
             from ...core.event_detection_run import run_event_detection
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(plane0)
             params = dict(self._params)
             run_event_detection(
                 plane0, params, figures_dir=events_dir,
