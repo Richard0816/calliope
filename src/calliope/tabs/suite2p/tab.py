@@ -136,12 +136,91 @@ class Suite2pTab(ctk.CTkFrame):
     # estimate, so the user must pick the variant that matches their
     # injection. GCaMP6m is the default since it's the most common
     # variant in the lab's standing recordings.
+    #
+    # Tau values per published in-vivo measurements / spike-inference
+    # optimisations. Source paper per row:
+    #   GCaMP6f/m/s : Chen et al., Nature 2013
+    #                 https://doi.org/10.1038/nature12354
+    #                 (Suite2p-recommended bins used by Pachitariu 2018
+    #                  https://doi.org/10.1523/JNEUROSCI.3339-17.2018)
+    #   jGCaMP7f   : Dana et al., Nat Methods 2019
+    #                 https://doi.org/10.1038/s41592-019-0435-6
+    #   jGCaMP8f/m/s base : Zhang et al., Nature 2023
+    #                 https://doi.org/10.1038/s41586-023-05828-9
+    #   jGCaMP8 in-vivo OASIS tau optimum : Rupprecht et al., bioRxiv 2025
+    #                 https://doi.org/10.1101/2025.03.03.641129
+    #                 (replaces the older 0.137 s value, which matches
+    #                  the cultured-neuron half-decay rather than the
+    #                  in-vivo OASIS optimum)
     GCAMP_OPTIONS: list[tuple[str, float]] = [
-        ("GCaMP6m  (tau = 1.0 s)", 1.0),   # default
-        ("GCaMP6f  (tau = 0.7 s)", 0.7),
-        ("GCaMP6s  (tau = 1.3 s)", 1.3),
-        ("GCaMP8m  (tau = 0.137 s)", 0.137),
+        ("GCaMP6m  (tau = 1.0 s)", 1.0),   # default; Chen 2013
+        ("GCaMP6f  (tau = 0.7 s)", 0.7),   # Chen 2013
+        ("GCaMP6s  (tau = 1.5 s)", 1.5),   # Chen 2013 + Pachitariu 2018 slow bin
+        ("jGCaMP7f (tau = 0.7 s)", 0.7),   # Dana 2019
+        ("jGCaMP8f (tau = 0.15 s)", 0.15), # Zhang 2023 / Rupprecht 2025
+        ("jGCaMP8m (tau = 0.25 s)", 0.25), # Zhang 2023 / Rupprecht 2025
+        ("jGCaMP8s (tau = 0.5 s)", 0.5),   # Zhang 2023 / Rupprecht 2025 optimum
     ]
+
+    @classmethod
+    def _resolve_gcamp_tau(
+        cls, label: str
+    ) -> tuple[float, str, str]:
+        """Resolve a (possibly stale) GCaMP label to a (tau, canonical_label,
+        match_kind) tuple.
+
+        Three-stage match:
+
+        1. **exact** -- label string is in ``GCAMP_OPTIONS`` verbatim. Trivial
+           case. Returns the matched tau and the original label.
+        2. **variant** -- label contains an unambiguous GCaMP variant code
+           (``6f`` / ``6m`` / ``6s`` / ``7f`` / ``8f`` / ``8m`` / ``8s``).
+           Used when a saved batch CSV / preference carries an OBSOLETE label
+           (e.g. the pre-2026-05-26 ``"GCaMP8m  (tau = 0.137 s)"`` with the
+           cultured-neuron tau). Returns the current canonical label + tau so
+           the user gets the corrected value, the GUI can snap the StringVar
+           forward, and the lab can audit which recordings got which tau.
+        3. **fallback** -- label parses to nothing recognisable. Returns the
+           first dropdown option's tau (the lab's default GCaMP6m at 1.0 s)
+           so the run still proceeds, with the caller responsible for
+           surfacing a loud warning.
+
+        Why this isn't a one-line ``dict.get``: the label format has
+        changed at least once (the 2026-05-26 tau update went from
+        ``"GCaMP8m  (tau = 0.137 s)"`` to ``"jGCaMP8m (tau = 0.25 s)"`` --
+        both leading "j" and tau value changed), so an exact-match lookup
+        loses information whenever a saved selection round-trips through a
+        CSV. Pulling the variant code out is what makes the migration
+        idempotent.
+        """
+        import re
+        text = str(label or "")
+        # Stage 1: exact match.
+        for cand_label, cand_tau in cls.GCAMP_OPTIONS:
+            if cand_label == text:
+                return float(cand_tau), cand_label, "exact"
+        # Stage 2: variant-code match. The variant code is the two
+        # characters immediately after "GCaMP" (or "jGCaMP") in canonical
+        # labels like "GCaMP8m" / "jGCaMP8m". Anchoring on the GCaMP
+        # prefix avoids false positives on stray "8m" / "6f" substrings
+        # appearing in unrelated text (e.g. a date "2026-06-08m") and
+        # also handles the leading "j" / casing variation across the old
+        # and new label schemas.
+        m = re.search(r"j?GCaMP\s*([678][fms])(?![A-Za-z0-9])",
+                      text, flags=re.IGNORECASE)
+        if m:
+            code = m.group(1).lower()
+            # Map the variant code back to a canonical (label, tau) pair
+            # via the dropdown itself. Look at the trailing letter+digit
+            # in each canonical label and pick the matching row.
+            for cand_label, cand_tau in cls.GCAMP_OPTIONS:
+                lm = re.search(r"([678][fms])\b",
+                               cand_label, flags=re.IGNORECASE)
+                if lm and lm.group(1).lower() == code:
+                    return float(cand_tau), cand_label, "variant"
+        # Stage 3: fallback.
+        fb_label, fb_tau = cls.GCAMP_OPTIONS[0]
+        return float(fb_tau), fb_label, "fallback"
 
     KNOWN_BG_IMAGES: list[tuple[str, str]] = [
         ("meanImg",       "Mean"),
@@ -184,6 +263,25 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "max_overlap", "label": "Cellpose merge max overlap",
          "type": "float", "default": 0.3, "group": "Merge",
          "help": "drop cellpose ROIs > this fraction covered by sparsery"},
+        # Cellpose-SAM second pass on the correlation image (Vcorr).
+        # When enabled, runs Cellpose-SAM (cellpose >= 4.0) on Vcorr
+        # after the primary Sparsery + cyto2 cellpose passes. ROIs from
+        # this pass are filtered against Sparsery independently and
+        # tagged ``_source='cellpose_sam'`` in ``stat.npy``. Adds 1-2x
+        # detection time and silently skips if cellpose is 3.x.
+        # Reference: Pachitariu et al. Cellpose-SAM bioRxiv 2025,
+        # doi:10.1101/2025.04.28.651001.
+        {"name": "enable_sam_vcorr_pass",
+         "label": "Cellpose-SAM second pass on Vcorr",
+         "type": "bool", "default": False, "group": "Cellpose-SAM (Tier 2)",
+         "help": "recover silent cells via Cellpose-SAM on the "
+                 "correlation image; needs cellpose >= 4.0"},
+        {"name": "sam_flow_threshold",
+         "label": "SAM flow_threshold", "type": "float", "default": 0.8,
+         "group": "Cellpose-SAM (Tier 2)"},
+        {"name": "sam_cellprob_threshold",
+         "label": "SAM cellprob_threshold", "type": "float", "default": -1.0,
+         "group": "Cellpose-SAM (Tier 2)"},
         # dF/F
         {"name": "fps_override", "label": "FPS override (0=auto)",
          "type": "float", "default": 0.0, "group": "dF/F",
@@ -341,6 +439,10 @@ class Suite2pTab(ctk.CTkFrame):
             row, text="Save summary", width=120,
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="left", padx=(6, 0))
+        self.export_btn = ctk.CTkButton(
+            row, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_btn.pack(side="left", padx=(6, 0))
         ctk.CTkButton(row, text="Advanced...", width=110,
                       command=self._on_advanced).pack(side="left",
                                                       padx=(6, 0))
@@ -438,6 +540,12 @@ class Suite2pTab(ctk.CTkFrame):
         attach_fig_toolbar(self.fil_canvas, fil_frame)
         self.fil_canvas.get_tk_widget().pack(fill="both", expand=True,
                                              padx=6, pady=(0, 6))
+        # Click on the kept-ROI panel to curate the same way Panel 2 does.
+        # The cached label image only contains kept ROIs, so background
+        # pixels and rejected ROIs are silent no-ops.
+        self.fil_canvas.mpl_connect("button_press_event",
+                                    self._on_fil_click)
+        self._fil_label_img: Optional[np.ndarray] = None
 
     # -- Handlers -----------------------------------------------------------
 
@@ -566,16 +674,33 @@ class Suite2pTab(ctk.CTkFrame):
 
         # Resolve the GCaMP picker into a tau scalar. Picker rows are
         # ``(label, tau)`` pairs; we look up the user-chosen label.
-        # Falls back to the first option's tau if the label somehow
-        # doesn't match (shouldn't happen with a readonly combobox).
-        tau_override: float = self.GCAMP_OPTIONS[0][1]
         gcamp_label = self.gcamp_var.get()
-        for label, tau in self.GCAMP_OPTIONS:
-            if label == gcamp_label:
-                tau_override = tau
-                break
-        self._append_log(
-            f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
+        tau_override, matched_label, match_kind = self._resolve_gcamp_tau(
+            gcamp_label)
+        if match_kind == "exact":
+            self._append_log(
+                f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
+        elif match_kind == "variant":
+            # The label string is from a previous schema (e.g. an old batch
+            # CSV with ``"GCaMP8m  (tau = 0.137 s)"`` from before the
+            # 2026-05-26 tau update). Snap to the current canonical label,
+            # log loudly so the user knows the saved selection was
+            # migrated, and update the StringVar so the GUI reflects the
+            # new label after this run.
+            self._append_log(
+                f"[GUI] GCaMP variant: {gcamp_label!r} not in current "
+                f"dropdown; matched variant code -> using "
+                f"{matched_label!r} (tau={tau_override}). Update your "
+                f"saved batch CSV / preferences to use the new label.")
+            try:
+                self.gcamp_var.set(matched_label)
+            except Exception:
+                pass
+        else:
+            self._append_log(
+                f"[GUI] GCaMP variant: {gcamp_label!r} unrecognised; "
+                f"falling back to {self.GCAMP_OPTIONS[0][0]!r} "
+                f"(tau={tau_override}). Pick a variant from the dropdown.")
 
         tiff_folder = result.shifted_tiff.parent
         save_folder = result.out_dir / "detection"
@@ -645,6 +770,26 @@ class Suite2pTab(ctk.CTkFrame):
         hard_cap = int(params.get("hard_cap", 60000))
         max_overlap = float(params.get("max_overlap", 0.3))
 
+        # Tier 2 #13 Cellpose-SAM second pass on Vcorr. Off by default
+        # because (a) it requires cellpose >= 4.0 which not every box
+        # has and (b) the SAM checkpoint is ~1 GB. When the user checks
+        # the box, build a config that mirrors the primary cellpose
+        # settings but with model_type='cpsam' + channel_input='Vcorr'.
+        # The runner persists/streams Vcorr next to the shared
+        # registration so run_cellpose_pass can pick it up.
+        enable_sam = bool(params.get("enable_sam_vcorr_pass", False))
+        sam_cfg = None
+        if enable_sam:
+            sam_cfg = {
+                "cellpose_model_type": "cpsam",
+                "cellpose_channel_input": "Vcorr",
+                "cellpose_diameter": params.get("cellpose_diameter", 0),
+                "cellpose_flow_threshold": float(
+                    params.get("sam_flow_threshold", 0.8)),
+                "cellpose_cellprob_threshold": float(
+                    params.get("sam_cellprob_threshold", -1.0)),
+            }
+
         with contextlib.redirect_stdout(writer), \
                 contextlib.redirect_stderr(writer):
             print("[GUI] running sparse_plus_cellpose...")
@@ -664,6 +809,8 @@ class Suite2pTab(ctk.CTkFrame):
                 # popout. Empty dict means no overrides.
                 settings_override=(self._settings_override
                                    or None),
+                enable_sam_vcorr_pass=enable_sam,
+                sam_vcorr_cfg=sam_cfg,
                 verbose=True,
             )
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
@@ -1086,6 +1233,7 @@ class Suite2pTab(ctk.CTkFrame):
         self._redraw_with_bg()
 
         self.summary_btn.configure(state="normal")
+        self.export_btn.configure(state="normal")
         try:
             self._write_summary(plane0, stat, keep, probs)
         except Exception as e:
@@ -1128,29 +1276,50 @@ class Suite2pTab(ctk.CTkFrame):
         a pan/zoom mode (so dragging a zoom rectangle doesn't open the
         popout) and ignores any click outside ``det_ax``.
         """
-        if event.inaxes is not self.det_ax:
+        self._handle_panel_click(
+            event, self.det_ax, self.det_canvas, self._det_label_img,
+            empty_status="No ROI at pixel ({x}, {y}); click on a "
+                         "coloured ROI patch.",
+        )
+
+    def _on_fil_click(self, event) -> None:
+        """Same as ``_on_det_click`` but for Panel 3 (kept ROIs only).
+
+        The cached label image zeroes out rejected ROIs, so clicks on
+        non-kept pixels fall through to the background-hint status
+        message without opening the popout. The popout itself shows
+        any ROI the user wants (kept or not) -- this just makes
+        Panel 3 a more convenient entry point when the kept-mask is
+        the view the user is already inspecting.
+        """
+        self._handle_panel_click(
+            event, self.fil_ax, self.fil_canvas, self._fil_label_img,
+            empty_status="No kept ROI at pixel ({x}, {y}); the "
+                         "cell-filter rejected this region or the "
+                         "click missed every kept ROI.",
+        )
+
+    def _handle_panel_click(self, event, ax, canvas, label_img,
+                            *, empty_status: str) -> None:
+        if event.inaxes is not ax:
             return
         if event.button != 1:
             return
-        toolbar = getattr(self.det_canvas, "toolbar", None)
+        toolbar = getattr(canvas, "toolbar", None)
         if toolbar is not None and getattr(toolbar, "mode", ""):
             return
-        if self._det_label_img is None or self._panel_cache is None:
+        if label_img is None or self._panel_cache is None:
             return
         if event.xdata is None or event.ydata is None:
             return
-        Ly, Lx = self._det_label_img.shape
+        Ly, Lx = label_img.shape
         x = int(round(event.xdata))
         y = int(round(event.ydata))
         if not (0 <= x < Lx and 0 <= y < Ly):
             return
-        lbl = int(self._det_label_img[y, x])
+        lbl = int(label_img[y, x])
         if lbl <= 0:
-            # Click landed on background — give the user a hint in the
-            # status bar but don't open an empty popout.
-            self.status_var.set(
-                f"No ROI at pixel ({x}, {y}); click on a coloured "
-                f"ROI patch.")
+            self.status_var.set(empty_status.format(x=x, y=y))
             return
         roi_idx = lbl - 1
         c = self._panel_cache
@@ -1285,6 +1454,13 @@ class Suite2pTab(ctk.CTkFrame):
         # that was clicked. The label image stores ``roi_idx + 1`` per
         # pixel, ``0`` for background.
         self._det_label_img = label_all
+        # Panel-3 click cache: same label encoding (roi_idx + 1) but with
+        # rejected ROIs zeroed out so a click on a non-kept pixel is a
+        # silent no-op. Vectorised LUT over the label image -- O(H*W),
+        # no per-ROI Python loop.
+        lookup = np.concatenate([[False], keep.astype(bool)])
+        self._fil_label_img = np.where(
+            lookup[label_all], label_all, 0).astype(label_all.dtype)
         render_panel(
             self.det_ax, self.det_canvas, bg, label_all, vmin, vmax,
             f"All detected ROIs (n = {n_total})  [bg: {bg_label}]"
@@ -1347,4 +1523,118 @@ class Suite2pTab(ctk.CTkFrame):
             self.status_var.set(f"Summary -> {path}")
         except Exception as e:
             messagebox.showerror("Summary failed", str(e))
+
+    def _has_pending_curation(self, plane0: Path) -> bool:
+        """True when ROI labels have moved but the keep-mask hasn't
+        been refreshed -- exporting now would render figures from a
+        stale keep-mask.
+
+        Two signals, OR'd:
+        1. **In-memory:** an open CurationPopout has flipped ROIs in
+           this session that haven't been promoted yet (popout still
+           tracks them in ``self._flipped``).
+        2. **On-disk:** ``iscell.npy`` mtime > ``predicted_cell_mask.npy``
+           mtime. This catches the case where the user closed the popout
+           before exporting -- the popout's ``_flipped`` set is gone but
+           the iscell flips persisted to disk and the predicted-mask
+           never got refreshed.
+
+        Both files always have a fresh mtime ordering after a clean
+        ``run_detection`` (predicted_cell_mask is written *after*
+        suite2p's classifier writes iscell), so the disk check only
+        fires when the user's flips happened later than the last
+        promote / detection.
+        """
+        popout = self._curation_popout
+        if (popout is not None and popout.winfo_exists()
+                and popout.has_pending_promotion()):
+            return True
+        iscell = plane0 / "iscell.npy"
+        mask = plane0 / "predicted_cell_mask.npy"
+        if iscell.is_file() and mask.is_file():
+            try:
+                return iscell.stat().st_mtime > mask.stat().st_mtime
+            except OSError:
+                return False
+        return False
+
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Re-render the Tab 3 detection panels as PNG+SVG and drop a
+        ``manifest.json`` next to them. Block the export when curation
+        is uncommitted (either an open popout has un-promoted flips,
+        or ``iscell.npy`` is newer than ``predicted_cell_mask.npy``
+        on disk -- catches the case where the user closed the popout
+        before clicking Export but the keep-mask never got refreshed).
+
+        For the full per-stage figure set (lowpass / events / clusters
+        / xcorr / spatial), run the recording through the batch tab --
+        ``core/batch_pipeline.py`` writes figures for every stage as
+        part of the normal pipeline.
+
+        When ``quiet=True`` (called by the Tab 0 batch toggle), all
+        messageboxes are suppressed and failures fall back to the
+        status bar instead.
+        """
+        plane0 = self._final_plane0
+        if plane0 is None:
+            if not quiet:
+                messagebox.showinfo(
+                    "No data",
+                    "Run detection or 'Load existing panels' first.")
+            return
+
+        if self._has_pending_curation(plane0):
+            if not quiet:
+                messagebox.showwarning(
+                    "Uncommitted curation",
+                    "iscell.npy has flips that haven't been promoted to "
+                    "predicted_cell_mask.npy.\n\n"
+                    "Open the curation popout (click an ROI on Panel 2 "
+                    "or Panel 3) and click 'Promote to filter mask' "
+                    "before exporting -- otherwise the figures will "
+                    "reflect the stale keep-mask, not what you're "
+                    "looking at.")
+            else:
+                self.status_var.set(
+                    "Export skipped: uncommitted curation flips.")
+            return
+
+        # plane0 = <save_folder>/detection/final/suite2p/plane0
+        # save_folder = plane0.parents[3]; figures land under
+        # calliope_figures/<stage>/ to match the batch layout.
+        save_folder = plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        detection_dir = figures_root / "detection"
+        try:
+            from ...core.detection_run import _render_detection_panels
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(plane0)
+            except Exception:
+                rec_id = save_folder.name
+            written = _render_detection_panels(plane0, detection_dir)
+            ckpt_path = self.ckpt_var.get().strip() or None
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params=dict(self._params),
+                plane0=plane0, ckpt_path=ckpt_path,
+            )
+            n_figs = len(written) * 2  # PNG + SVG per panel
+            self.status_var.set(
+                f"Exported {n_figs} files -> {figures_root}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote {n_figs} figure files (PNG + SVG) to:\n"
+                    f"  {detection_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}\n\n"
+                    f"For the full per-stage figure set (lowpass, "
+                    f"events, clustering, xcorr, spatial), drive the "
+                    f"recording through Tab 0 (Batch).")
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
+            else:
+                self.status_var.set(f"Export failed: {e}")
 

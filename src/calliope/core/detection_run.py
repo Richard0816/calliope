@@ -305,14 +305,31 @@ def archive_recording_post_detection(
             / "data.bin"
         )
         if final_bin.is_file():
-            try:
-                sz = final_bin.stat().st_size
-                final_bin.unlink()
-                summary["bin_deleted"] = True
-                summary["bytes_freed"] += sz
-            except OSError as e:
+            # Windows holds a lock on the file until every memmap /
+            # BinaryFile / torch tensor referencing it has been GC'd.
+            # suite2p's extraction wrapper opens data.bin via a context
+            # manager that releases at scope exit, but PyTorch sparse
+            # tensors built off the same buffer survive until the
+            # generation finalises. gc.collect() + a short retry loop
+            # gives those refs a chance to drop before we unlink.
+            sz = final_bin.stat().st_size
+            last_err: OSError | None = None
+            for attempt in range(5):
+                if attempt > 0:
+                    gc.collect()
+                    time.sleep(0.5)
+                try:
+                    final_bin.unlink()
+                    summary["bin_deleted"] = True
+                    summary["bytes_freed"] += sz
+                    last_err = None
+                    break
+                except OSError as e:
+                    last_err = e
+            if last_err is not None:
                 _log(
-                    f"[archive] could not unlink final data.bin: {e}"
+                    f"[archive] could not unlink final data.bin "
+                    f"after 5 attempts: {last_err}"
                 )
 
     # ----- Step 4: optionally delete external raw originals ----------------
@@ -674,6 +691,7 @@ def _render_detection_panels(plane0: Path, figures_dir: Path) -> list[str]:
         ax.set_axis_off()
         out = figures_dir / f"{label}.png"
         fig.savefig(out, dpi=150)
+        fig.savefig(out.with_suffix(".svg"))
         plt.close(fig)
         written.append(str(out))
     return written
@@ -691,6 +709,7 @@ def run_detection(
     baseline_mode: str = "first_n",
     baseline_min: float = 2.0,
     figures_dir: Optional[Path] = None,
+    write_summary: bool = True,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run the full Tab 3 pipeline for one recording.
@@ -714,6 +733,22 @@ def run_detection(
     hard_cap = int(params.get("hard_cap", 60000))
     max_overlap = float(params.get("max_overlap", 0.3))
 
+    # Tier 2 #13: Cellpose-SAM second pass on Vcorr. Same off-by-default
+    # pattern as the GUI tab -- callers opt in via params, the runner
+    # silently skips if cellpose 4.x isn't installed.
+    enable_sam = bool(params.get("enable_sam_vcorr_pass", False))
+    sam_cfg = None
+    if enable_sam:
+        sam_cfg = {
+            "cellpose_model_type": "cpsam",
+            "cellpose_channel_input": "Vcorr",
+            "cellpose_diameter": params.get("cellpose_diameter", 0),
+            "cellpose_flow_threshold": float(
+                params.get("sam_flow_threshold", 0.8)),
+            "cellpose_cellprob_threshold": float(
+                params.get("sam_cellprob_threshold", -1.0)),
+        }
+
     plane0 = spc.run(
         tiff_folder=str(tiff_folder),
         save_folder=str(save_folder),
@@ -723,6 +758,8 @@ def run_detection(
         hard_cap=hard_cap,
         max_overlap=max_overlap,
         tau_override=tau_override,
+        enable_sam_vcorr_pass=enable_sam,
+        sam_vcorr_cfg=sam_cfg,
         verbose=True,
     )
     plane0 = Path(plane0)
@@ -777,6 +814,38 @@ def run_detection(
         except Exception as e:
             if progress_cb is not None:
                 progress_cb(f"[archive] step failed: {e}")
+
+    # Mirror the GUI Suite2p tab's ``_write_summary`` so a batch run
+    # produces the same ``Recording`` + ``ROIs`` sheets in
+    # ``calliope_summary.xlsx`` that an interactive Tab-3 run does.
+    # Without this, batch-processed recordings had no ROIs sheet at all
+    # and only got a Recording sheet later (if event detection ran).
+    if write_summary:
+        try:
+            from . import summary_writer
+            stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+            n_total = len(stat)
+            keep = _load_keep_mask(plane0, n_total)
+            prob_path = plane0 / "predicted_cell_prob.npy"
+            p_cell = np.load(prob_path) if prob_path.exists() else None
+            iscell_path = plane0 / "iscell.npy"
+            iscell_arr = None
+            if iscell_path.exists():
+                ic = np.load(iscell_path)
+                iscell_arr = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+            summary_writer.update_recording_meta(
+                plane0, recording_id=rec_id, fps=dff_info["fps"],
+                T=dff_info["T"], N=n_total)
+            summary_writer.write_rois_sheet(
+                plane0, stat, p_cell=p_cell,
+                predicted_mask=keep, iscell=iscell_arr)
+            if progress_cb is not None:
+                progress_cb("[detection] wrote Recording + ROIs sheets")
+        except Exception as e:
+            # A summary-sheet failure must never sink an otherwise
+            # successful detection run -- surface it and carry on.
+            if progress_cb is not None:
+                progress_cb(f"[detection] summary sheet write failed: {e}")
 
     figs: list[str] = []
     if figures_dir is not None:

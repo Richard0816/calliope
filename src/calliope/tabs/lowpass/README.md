@@ -72,7 +72,9 @@ y, zf  = sosfilt(sos, x, zi=zi)                     # one-direction (causal) fil
 
 Two important choices:
 
-1. **Causal**, not zero-phase. We do **not** use `filtfilt` because we want the filtered output to depend only on past samples (no leakage from future activity into earlier timepoints). The downstream derivative + onset detection assumes the smoothed signal is causal.
+1. **Causal**, not zero-phase. We do **not** use `filtfilt` here because the downstream derivative + onset detection treats the smoothed signal as causal. The deeper reason this is *safe for cross-correlation*: applying the *same* LTI filter to every ROI trace preserves the location of the inter-ROI cross-correlation peak. The filtered-CCG equals the raw-CCG convolved with the autocorrelation of the filter's impulse response, and that autocorrelation is **even (symmetric)** regardless of whether the filter itself is causal. So relative timing between any two ROIs survives identical filtering — only the **absolute** onset time of each ROI is shifted, by roughly half the impulse-response duration (≈ 0.16 s for the default order-2 Butterworth at 1 Hz cutoff and 15 fps). Subtract this constant offset if aligning to external events (stimulus, behavior, etc.).
+   The visualisation overlay uses `utils.lowpass_zero_phase_1d` (`sosfiltfilt`) instead — appropriate only because that path is comparing a single trace against its raw version, not computing CCGs.
+   **Future upgrade (planned, not yet wired):** for sharp GCaMP8 transients the IIR's frequency-dependent group delay starts to matter (the constant-group-delay intuition only holds asymptotically for a Butterworth). A linear-phase FIR replacement would make the constant-group-delay assumption exact across all frequencies. See `docs/pipeline_audit_2026-05-25.md` §2.8 for the implementation plan.
 2. **State initialisation to the first sample.** A zero-initial state would inject a startup transient as the filter "ramped up" from 0 to the dF/F mean. Setting `zi` to repeated copies of `x[0]` makes the filter start at steady state.
 
 The same filter, with the same `sos`, is reused per ROI in the worker — `sos` is computed once and cached.
@@ -131,6 +133,7 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 - **Slider debounce.** `_on_slider` uses `after(80, self._apply_cutoff)` so dragging fires at most every 80 ms, otherwise re-rendering would lag behind the slider.
 - **Cutoff entry box.** `_on_entry` clamps to bounds and snaps the slider to the typed value; Enter applies it.
 - **Source change.** Reloads the chosen trace, recomputes FFT, redraws all three panels.
+- **View toggle.** Two radio buttons under the trace-source row switch the y-axis between `dF/F` (canonical, what the on-disk memmap holds) and `Robust z (median ± 1.4826·MAD)` — a view-only transform that re-expresses each trace via `core.utils.mad_z`. No memmap is written; the toggle just rebuilds the raw + low-pass panels. The robust z view fixes the "positive artifacts following negative deviations" artifact that ΔF/F0 with a rolling baseline creates for inhibited cells (Vanwalleghem & Constantin, *Frontiers Neural Circuits* 2021, "The Curse of Negativity") and makes magnitudes comparable across recordings (the absolute-fluorescence interpretation is lost in exchange).
 - **Compute** button writes the memmaps in a worker thread and pushes status updates through a queue (`_compute_queue`).
 
 ---

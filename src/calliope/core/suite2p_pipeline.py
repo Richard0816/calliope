@@ -1329,6 +1329,28 @@ except Exception as _e:                                              # pragma: n
     _CELLPOSE_IMPORT_ERROR = repr(_e)
 
 
+def cellpose_sam_available() -> bool:
+    """True iff the installed cellpose version exposes the unified
+    Cellpose-SAM model (cellpose >= 4.0).
+
+    Used by callers that want to opt into the Tier 2 #13 second-pass
+    detector seeded by the correlation image. Returns False on cellpose
+    3.x (the SAM model wasn't published until 4.0) and on environments
+    where cellpose isn't installed at all -- the caller is expected to
+    skip the SAM pass with a clear log message in either case.
+
+    Detection mechanism: cellpose 4.x removed the ``cellpose.models.
+    Cellpose`` wrapper, keeping only ``CellposeModel``. ``hasattr``
+    against ``_cp_models`` after the import-time sentinel block above
+    is the canonical version probe used throughout this module.
+    """
+    if not _CELLPOSE_AVAILABLE or _cp_models is None:
+        return False
+    # 4.x removed the `Cellpose` convenience wrapper; only the bare
+    # `CellposeModel` survives, and it defaults to the SAM checkpoint.
+    return not hasattr(_cp_models, "Cellpose")
+
+
 def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
     """Convert a cellpose integer label mask into suite2p-style stat dicts.
 
@@ -1408,10 +1430,34 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
     # to a legacy ops.npy on older runs).
     reg_ops = utils.load_plane_view(shared_plane0)
     img_key = cfg.get("cellpose_channel_input", "meanImg")
-    if img_key not in reg_ops or reg_ops[img_key] is None:
-        # Fallback: meanImg is always present after registration.
-        img_key = "meanImg"
-    img = np.asarray(reg_ops[img_key]).astype(np.float32)
+    img = None
+    if img_key in reg_ops and reg_ops[img_key] is not None:
+        img = np.asarray(reg_ops[img_key]).astype(np.float32)
+    else:
+        # Filesystem fallback: ``<shared_plane0>/<key>.npy``. This is how
+        # the Cellpose-SAM second-pass plumbing surfaces the Vcorr image
+        # we computed/copied next to the shared registration after the
+        # Sparsery pass -- ``load_plane_view`` only finds Vcorr inside
+        # ``detect_outputs.npy`` (which the registration-only cache
+        # doesn't have), so this side-channel is what lets the second
+        # pass pick it up. Same fallback applies to any other image key
+        # a caller might want to persist by hand (e.g. ``Vcorr``,
+        # ``max_proj_custom``).
+        side_path = Path(shared_plane0) / f"{img_key}.npy"
+        if side_path.exists():
+            try:
+                img = np.load(side_path).astype(np.float32)
+                if verbose:
+                    print(f"  > cellpose: loaded {img_key} from {side_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"  > cellpose: failed to load {side_path}: {e}; "
+                          "falling back to meanImg")
+                img = None
+        if img is None:
+            # Last resort: meanImg is always present after registration.
+            img_key = "meanImg"
+            img = np.asarray(reg_ops[img_key]).astype(np.float32)
 
     # Robust rescale to [0, 1] so Cellpose's internal normalization has
     # reasonable input regardless of raw mean-image dynamic range.
@@ -1448,6 +1494,14 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
 
     t0 = time.time()
     if has_wrapper:
+        # Cellpose 3.x. Cellpose-SAM (model_type='cpsam') is 4.x-only;
+        # bail out loudly here so the user knows their config can't be
+        # honoured rather than silently falling back to cyto2.
+        if str(model_type).lower() in ("cpsam", "sam"):
+            raise RuntimeError(
+                "Cellpose-SAM (model_type='cpsam') requires cellpose>=4.0. "
+                "Installed version is 3.x; either upgrade cellpose or "
+                "remove the SAM pass from the detection config.")
         model = _cp_models.Cellpose(model_type=model_type, gpu=True)
         eval_kwargs = dict(
             diameter=diameter,
@@ -1458,7 +1512,10 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
     else:
         # Cellpose 4.x: the ``model_type`` axis no longer discriminates
         # between cyto/cyto2/nuclei -- there's only the unified cpsam
-        # model. We still record the requested type in ops for audit.
+        # model. We still record the requested type in ops for audit,
+        # which is how the downstream ``_source`` tag tells the
+        # cyto2-on-meanImg pass apart from the sam-on-Vcorr pass even
+        # though they share an underlying weight checkpoint.
         model = _cp_models.CellposeModel(gpu=True)
         eval_kwargs = dict(
             diameter=diameter,

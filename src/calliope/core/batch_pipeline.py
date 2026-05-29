@@ -33,6 +33,7 @@ from . import (
     preprocessing, detection_run, lowpass_run, event_detection_run,
     clustering, crosscorrelation, spatial,
 )
+from .export_manifest import write_export_manifest
 
 
 # Stage names match the figure subfolder layout. Order matters --
@@ -164,6 +165,18 @@ def run_recording(
             status="ok", duration_s=time.time() - t0)
         figures["detection"] = det.get("figures", [])
         _emit(f"detection: done (plane0={plane0})")
+        # Drop the manifest as soon as detection lands a plane0 -- any
+        # later stage may crash, but we still want a receipt next to
+        # the figures that did get written.
+        try:
+            manifest_path = write_export_manifest(
+                save_folder / "calliope_figures",
+                rec_id=rec_id, params=params,
+                plane0=Path(plane0), ckpt_path=ckpt_path,
+            )
+            _emit(f"manifest: {manifest_path.name}")
+        except Exception as e:
+            _emit(f"manifest: skipped ({e})")
     except Exception as e:
         stages["detection"].update(
             status="failed", duration_s=time.time() - t0,

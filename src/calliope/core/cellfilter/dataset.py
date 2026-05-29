@@ -218,6 +218,13 @@ class ROIDataset(Dataset):
     random_crop : bool
         ``True`` for random training crops, ``False`` for centred
         deterministic crops (validation).
+    augment : bool
+        ``True`` to apply spatial + trace augmentation (dihedral-group
+        flips/rotations of the patch, additive Gaussian noise on the
+        trace). Use ``True`` for the training set, ``False`` for
+        validation / inference so the eval signal stays comparable
+        across epochs. Augmentation probabilities and noise std come
+        from ``config.AUG_*``.
     cache : dict, optional
         Pre-existing ``plane0_path -> _RecordingCache`` dict. Pass
         the same one to train and val Datasets so per-recording
@@ -230,12 +237,14 @@ class ROIDataset(Dataset):
         patch_size: int = C.PATCH_SIZE,
         trace_crop: Optional[int] = C.TRACE_CROP_LEN,
         random_crop: bool = True,
+        augment: bool = False,
         cache: Optional[dict] = None,
     ):
         self.df = labels_df.reset_index(drop=True)
         self.patch_size = patch_size
         self.trace_crop = trace_crop
         self.random_crop = random_crop
+        self.augment = augment
         self._cache = cache if cache is not None else {}
 
     def _get_rec(self, plane0_path: str) -> _RecordingCache:
@@ -266,6 +275,26 @@ class ROIDataset(Dataset):
             # pad end with zeros if shorter than crop length
             pad = self.trace_crop - trace.shape[0]
             trace = np.concatenate([trace, np.zeros(pad, dtype=np.float32)])
+
+        # Train-time augmentation. A cell soma is roughly isotropic, so
+        # the 8 dihedral-group transforms (H-flip, V-flip, 0/90/180/270)
+        # are label-preserving for the spatial branch. The trace is
+        # already z-scored, so additive Gaussian noise in z-score units
+        # is a clean SNR-degrade augmentation. ``.copy()`` keeps the
+        # underlying recording cache untouched -- it's shared across
+        # epochs, multiple workers, and the val Dataset.
+        if self.augment:
+            if C.AUG_FLIP_H_PROB > 0 and np.random.rand() < C.AUG_FLIP_H_PROB:
+                patch = patch[:, :, ::-1].copy()
+            if C.AUG_FLIP_V_PROB > 0 and np.random.rand() < C.AUG_FLIP_V_PROB:
+                patch = patch[:, ::-1, :].copy()
+            if C.AUG_ROTATE_90_PROB > 0 and np.random.rand() < C.AUG_ROTATE_90_PROB:
+                k = int(np.random.randint(1, 4))   # 1, 2, or 3 quarter-turns
+                patch = np.rot90(patch, k=k, axes=(1, 2)).copy()
+            if C.AUG_TRACE_NOISE_STD > 0:
+                noise = (np.random.randn(*trace.shape).astype(np.float32)
+                         * float(C.AUG_TRACE_NOISE_STD))
+                trace = trace + noise
 
         return (
             torch.from_numpy(patch),

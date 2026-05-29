@@ -290,7 +290,9 @@ def plot_dendrogram(
     plt.xlabel("ROIs")
     plt.ylabel("Linkage distance")
     plt.tight_layout()
+    save_path = Path(save_path)
     plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path.with_suffix(".svg"))
     plt.close()
     return colors
 
@@ -369,7 +371,9 @@ def plot_spatial(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     plt.tight_layout()
+    save_path = Path(save_path)
     plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path.with_suffix(".svg"))
     plt.close(fig)
     print("Saved", save_path)
 
@@ -615,6 +619,24 @@ def run_clustering(
         roi_indices = (filtered_to_suite2p.tolist()
                        if filtered_to_suite2p is not None
                        else None)
+        # Stamp the Recording sheet too, matching the GUI Tab-6 path
+        # (clustering/tab.py). Previously the core runner wrote only the
+        # Clusters sheet, so a batch run that skipped event detection
+        # ended up with no Recording sheet at all.
+        try:
+            from .utils import get_fps_from_notes
+            fps = float(get_fps_from_notes(str(plane0)))
+        except Exception:
+            fps = None
+        try:
+            cluster_summary.update_recording_meta(
+                plane0, prefix=prefix, fps=fps,
+                T=None, N=int(len(labels)),
+                extra={"clustering_n_clusters": int(n_clusters),
+                       "clustering_threshold": float(threshold),
+                       "clustering_palette": str(palette)})
+        except Exception as e:
+            print(f"[clustering] update_recording_meta failed: {e}")
         try:
             cluster_summary.write_clusters_sheet(
                 plane0,

@@ -189,6 +189,10 @@ class LowpassTab(ctk.CTkFrame):
             row, text="Compute low-pass + derivative (write memmaps)",
             command=self._on_compute, state="disabled", width=320)
         self.compute_btn.pack(side="left")
+        self.export_btn = ctk.CTkButton(
+            row, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_btn.pack(side="left", padx=(6, 0))
         self.compute_progress = ctk.CTkProgressBar(
             row, mode="indeterminate", width=160)
         self.compute_progress.pack(side="left", padx=12)
@@ -235,6 +239,32 @@ class LowpassTab(ctk.CTkFrame):
             values=["mean", "median"], state="readonly", width=90,
             command=lambda _v: self._on_manual_entry())
         manual_agg.pack(side="left", padx=(4, 0))
+
+        # View-mode toggle: dF/F vs robust z-score. dF/F is the canonical
+        # display the on-disk memmaps carry; robust z is a *view-only*
+        # transform that re-expresses each trace as ``(x - median(x)) /
+        # (1.4826 * MAD(x))``. Useful because dF/F with a rolling baseline
+        # can create "positive artifacts following negative deviations"
+        # for inhibited cells (Vanwalleghem & Constantin, Frontiers Neural
+        # Circuits 2021, "The Curse of Negativity") and miscalibrates
+        # cross-recording magnitudes; robust z corrects both at the cost
+        # of losing the absolute fluorescence interpretation. No memmap is
+        # written -- the toggle just rebuilds the figure.
+        row2 = ctk.CTkFrame(header, fg_color="transparent")
+        row2.pack(fill="x", padx=8, pady=(0, 6))
+        ctk.CTkLabel(row2, text="View:", width=90,
+                     anchor="w").pack(side="left")
+        self.view_mode_var = tk.StringVar(value="dff")
+        ctk.CTkRadioButton(
+            row2, text="dF/F", value="dff",
+            variable=self.view_mode_var,
+            command=self._on_view_mode_change,
+        ).pack(side="left", padx=(0, 12))
+        ctk.CTkRadioButton(
+            row2, text="Robust z (median ± 1.4826·MAD)",
+            value="robust_z", variable=self.view_mode_var,
+            command=self._on_view_mode_change,
+        ).pack(side="left")
 
         self.status_var = tk.StringVar(
             value="Run detection first (or reload from a finished folder).")
@@ -351,6 +381,7 @@ class LowpassTab(ctk.CTkFrame):
             f"Loaded T={self._mean_dff.size}  N_kept={self._n_kept}  "
             f"fps={self._fps:.2f}  cutoff={self.cutoff_var.get():.3f} Hz")
         self.compute_btn.configure(state="normal")
+        self.export_btn.configure(state="normal")
 
     def _load_data(self, plane0: Path) -> None:
         from . import logic as utils
@@ -536,16 +567,43 @@ class LowpassTab(ctk.CTkFrame):
             leg.get_texts()[0].set_text(f"cutoff {cutoff:.2f} Hz")
         self.fft_canvas.draw_idle()
 
+    def _apply_view_mode(self, y: np.ndarray) -> tuple[np.ndarray, str]:
+        """Return (transformed trace, y-axis label suffix) for the
+        current view-mode toggle. ``dff`` mode passes through; ``robust_z``
+        mode normalises by the trace's median + 1.4826·MAD via
+        ``core.utils.mad_z``. Computed lazily on the trace being plotted
+        -- no memmap is touched.
+        """
+        try:
+            mode = str(self.view_mode_var.get())
+        except Exception:
+            mode = "dff"
+        if mode != "robust_z":
+            return y, "dF/F"
+        # Robust z: (x - median) / (1.4826 * MAD). ``mad_z`` returns
+        # (z, median, mad); we only need the first element.
+        from ...core import utils as core_utils
+        z, _med, _mad = core_utils.mad_z(np.asarray(y, dtype=np.float32))
+        return z.astype(np.float32, copy=False), "Robust z (median ± 1.4826·MAD)"
+
+    def _on_view_mode_change(self) -> None:
+        # Re-render both raw + low-pass panels (FFT is amplitude-scale-
+        # agnostic so it doesn't need a redraw).
+        self._draw_raw()
+        self._draw_lowpass()
+
     def _draw_raw(self) -> None:
         if self._mean_dff is None:
             return
-        t = np.arange(self._mean_dff.size, dtype=np.float32) / self._fps
+        y, ylabel = self._apply_view_mode(self._mean_dff)
+        t = np.arange(y.size, dtype=np.float32) / self._fps
         ax = self.raw_ax
         ax.clear(); ax.set_axis_on()
-        ax.plot(t, self._mean_dff, lw=0.6, color="black")
+        ax.plot(t, y, lw=0.6, color="black")
         ax.set_xlabel("Time (s)", fontsize=8)
-        ax.set_ylabel("dF/F", fontsize=8)
-        ax.set_title(f"Raw dF/F - {self._trace_label}", fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_title(f"Raw {ylabel.split(' ')[0]} - {self._trace_label}",
+                     fontsize=9)
         ax.tick_params(labelsize=7)
         ax.set_xlim(0, t[-1] if t.size else 1.0)
         self.raw_canvas.draw_idle()
@@ -556,15 +614,24 @@ class LowpassTab(ctk.CTkFrame):
         from . import logic as utils
         cutoff = float(self.cutoff_var.get())
         order = int(self._params.get("filter_order", 2))
-        lp, _, _ = utils.lowpass_causal_1d(
+        # Zero-phase here so the previewed trace lines up in time with
+        # the raw trace shown above; the on-disk lowpass memmap that
+        # feeds event detection still uses the causal filter.
+        lp, _ = utils.lowpass_zero_phase_1d(
             self._mean_dff, fps=self._fps, cutoff_hz=cutoff,
-            order=order, zi=None, sos=None)
-        t = np.arange(lp.size, dtype=np.float32) / self._fps
+            order=order, sos=None)
+        # Apply the view-mode transform to the filtered trace so the
+        # robust-z toggle is consistent across both panels. The robust-z
+        # statistics (median, MAD) are recomputed on the filtered trace
+        # rather than reused from the raw -- this matches how a
+        # downstream consumer would interpret the figure.
+        y, ylabel = self._apply_view_mode(lp)
+        t = np.arange(y.size, dtype=np.float32) / self._fps
         ax = self.lp_ax
         ax.clear(); ax.set_axis_on()
-        ax.plot(t, lp, lw=0.7, color="tab:blue")
+        ax.plot(t, y, lw=0.7, color="tab:blue")
         ax.set_xlabel("Time (s)", fontsize=8)
-        ax.set_ylabel(f"dF/F low-pass @ {cutoff:.2f} Hz", fontsize=8)
+        ax.set_ylabel(f"{ylabel} low-pass @ {cutoff:.2f} Hz", fontsize=8)
         ax.set_title(f"Low-pass - {self._trace_label}", fontsize=9)
         ax.tick_params(labelsize=7)
         ax.set_xlim(0, t[-1] if t.size else 1.0)
@@ -689,3 +756,54 @@ class LowpassTab(ctk.CTkFrame):
         self.compute_status_var.set("Error.")
         messagebox.showerror(
             "Compute failed", payload.split("\n", 1)[0])
+
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Re-render the Tab 4 lowpass figures (FFT, raw dF/F, lowpass
+        dF/F) for the currently-loaded recording. Writes PNG + SVG into
+        ``<save_folder>/calliope_figures/lowpass/`` and refreshes the
+        recording's ``manifest.json``.
+
+        ``quiet=True`` (called by the Tab 0 batch toggle) suppresses
+        messageboxes; failures fall back to the status bar.
+        """
+        plane0 = self._plane0
+        if plane0 is None:
+            if not quiet:
+                messagebox.showinfo("No data", "Load a recording first.")
+            return
+        save_folder = plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        lowpass_dir = figures_root / "lowpass"
+        try:
+            from ...core.lowpass_run import render_lowpass_figures
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(plane0)
+            except Exception:
+                rec_id = save_folder.name
+            cutoff_hz = float(self.cutoff_var.get())
+            written = render_lowpass_figures(
+                plane0, fps=self._fps, cutoff_hz=cutoff_hz,
+                figures_dir=lowpass_dir,
+                filter_order=int(self._params.get("filter_order", 2)),
+            )
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params=dict(self._params),
+                plane0=plane0, ckpt_path=None,
+            )
+            n_figs = len(written) * 2  # PNG + SVG per panel
+            self.status_var.set(
+                f"Exported {n_figs} lowpass files -> {lowpass_dir}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote {n_figs} lowpass figure files (PNG + SVG) "
+                    f"to:\n  {lowpass_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}")
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
+            else:
+                self.status_var.set(f"Export failed: {e}")

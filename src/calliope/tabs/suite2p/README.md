@@ -93,12 +93,21 @@ The user can also set `hard_cap` — a safety abort that bails out if Sparsery r
 
 | Param | Default | Notes |
 |---|---|---|
-| `cellpose_model_type` | `cyto2` | Generalist cytoplasm model. |
+| `cellpose_model_type` | `cyto2` | Generalist cytoplasm model. On cellpose 4.x the `model_type` axis is ignored (only the unified `cpsam` model exists), so this is effectively a label for audit. |
 | `cellpose_diameter` | 0 | 0 = let Cellpose auto-estimate. |
 | `cellpose_flow_threshold` | 0.8 | Standard Cellpose flow threshold. |
 | `cellpose_cellprob_threshold` | -1.0 | More inclusive than the default 0. |
 
-**Merge.** Each Cellpose ROI is dropped if its overlap with any Sparsery ROI exceeds `max_overlap` (default `0.3`, i.e. 30% of the Cellpose ROI's pixels covered by a Sparsery ROI). The remaining Cellpose ROIs are appended to Sparsery's output to form the final `stat.npy`.
+**Optional Cellpose-SAM second pass on Vcorr (Tier 2 #13).** When `enable_sam_vcorr_pass` is checked, the runner additionally:
+
+1. Reads (or stream-computes via `core/correlation_image.py::compute_vcorr`) the recording's correlation image `Vcorr` — per-pixel Pearson r with the 4-neighbour mean. Suite2p 1.0 produces this during detection (lives in `detect_outputs.npy`); the runner picks it up from the sparsery pass output and persists it next to the shared registration as `Vcorr.npy` so `run_cellpose_pass`'s filesystem fallback can find it.
+2. Runs Cellpose-SAM (`model_type='cpsam'`, cellpose ≥ 4.0) on `Vcorr` with the user-tunable `sam_flow_threshold` / `sam_cellprob_threshold`.
+3. Filters the result against the Sparsery mask *independently* (i.e. not against the cyto2 pass — the audit explicitly calls this out so SAM can recover silent cells the primary cellpose pass also flagged).
+4. Tags every ROI in the final `stat.npy` with `_source ∈ {sparsery, cellpose_cyto2, cellpose_sam}` for audit.
+
+Silently skips with a console warning when cellpose 3.x is installed (SAM is 4.x-only). The SAM checkpoint is ~1 GB; cellpose downloads it on first invocation. Reference: Pachitariu et al., Cellpose-SAM bioRxiv 2025 ([doi:10.1101/2025.04.28.651001](https://doi.org/10.1101/2025.04.28.651001)).
+
+**Merge.** Each Cellpose pass (primary + optional SAM) is independently filtered against Sparsery: a Cellpose ROI is dropped if `max_overlap` (default `0.3`, i.e. 30% of the Cellpose ROI's pixels covered by a Sparsery ROI). The surviving ROIs from every pass are appended to Sparsery's output to form the final `stat.npy`, with the `_source` field preserving provenance.
 
 **dF/F per Suite2p convention** is computed downstream (Step 2). Suite2p also produces:
 - `F.npy` — `(N_total, T)` per-ROI raw fluorescence (sum over `xpix/ypix` weighted by `lam`).
@@ -271,7 +280,7 @@ Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 
 | `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | legacy duplicate of the keep mask |
 | `r0p7_filtered_dff.csv` | optional | per-frame CSV view of filtered dF/F |
 
-A summary workbook (`<rec>_summary.xlsx`) with an ROIs sheet is also written via `summary_writer.write_rois_sheet`.
+A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `ROIs` sheet is also written via `summary_writer.update_recording_meta` + `write_rois_sheet`. The GUI tab writes these from `_write_summary` (on demand / on export); the headless `core.detection_run.run_detection` writes the same two sheets at the tail of the run when `write_summary=True` (the default), so batch and external callers get the ROIs sheet too — previously it was GUI-only.
 
 ---
 
@@ -296,7 +305,7 @@ Panels:
 
 Controls:
 - **Cell (1)** / **Not a cell (0)** flip iscell.npy in place and append to `cellfilter.config.LABELS_CSV` (default `F:\roi_curation.csv`) with columns `recording_ID, ROI_number, user_defined_cell` so the next training run picks up the new labels. Tab 3's panels 2 + 3 repaint immediately to reflect the new keep set.
-- **Retrain cell filter** stays disabled until the user has flipped at least one ROI's classification this session. On click it spawns a worker thread that runs `cellfilter.train.main()` (synchronous, ~40 epochs); the GUI stays responsive but the popout's flip buttons stay enabled (the trainer reads the CSV at start, so further mid-training flips land in the *next* round).
+- **Retrain cell filter** stays disabled until the user has flipped at least one ROI's classification this session. On click it spawns a worker thread that runs `cellfilter.train.main()` (synchronous, ~40 epochs); the GUI stays responsive but the popout's flip buttons stay enabled (the trainer reads the CSV at start, so further mid-training flips land in the *next* round). The trainer applies dihedral-group spatial augmentation (H/V flips + 90/180/270 rotation) and additive trace noise on the train split — tuneables live in `cellfilter/config.py::AUG_*`. Validation stays un-augmented so per-epoch val AUROC remains comparable across runs and against the bundled checkpoint.
 - **Promote to filter mask** stays disabled until the user has flipped at least one ROI this session. On click it overlays the flipped indices onto `predicted_cell_mask.npy` (the file every downstream tab reads), preserving CNN predictions for un-touched ROIs. Use this when you want manual flips to take effect downstream (Tab 5/6/7, cross-correlation) *without* the cost of a full retrain. If `predicted_cell_mask.npy` does not yet exist (cell-filter never ran on this recording), the file is created from `iscell.npy[:, 0]` with the flips applied.
 - **Show 1 Hz lowpass** overlays a 1 Hz order-2 causal Butterworth (`utils.lowpass_causal_1d`, the same filter the pipeline applies in Step 2) on top of the raw ΔF/F trace so the curator can preview what the trace will look like after the downstream lowpass. Toggle state persists across ROI switches — flip it on once and it stays on for the rest of the queue. Silently skipped on traces with non-finite samples (sosfilt is IIR and would propagate NaN).
 
@@ -364,3 +373,4 @@ Tab 3 inherits the global customtkinter dark theme from `pipeline_gui`.
 - **Detection panels** (2: raw ROIs, 3: after cell-filter mask). Matplotlib figures keep their white facecolor; toolbars are dark-skinned.
 - **Click an ROI** on the detected-ROIs panel to open the **CurationPopout** (`CurationPopout`) — resizable Toplevel that displays five per-ROI panels (locator + trace + four backgrounds) and lets the user re-label cells / retrain the cell-filter.
 - **Edit suite2p settings...** opens a second `AdvancedDialog`-style popout for arbitrary `ops` overrides; "Advanced..." opens the standard PARAM_SPEC form.
+- **Export figures.** Re-renders the detection ROI-overlay panels (`all_rois.{png,svg}`, `kept_rois.{png,svg}`) into `<save_folder>/calliope_figures/detection/` and drops a `manifest.json` next to the per-stage figures dirs at `<save_folder>/calliope_figures/manifest.json`. Manifest fields: `rec_id`, `created_at_iso`, `calliope_git_sha`, `gcamp_variant`, `tau`, `fs`, `n_cells_kept`, `n_cells_total`, `cellfilter_ckpt_path`, `cellfilter_ckpt_sha256`, and the full Tab 3 `params` dict. The button is enabled the moment `_final_plane0` is set (i.e. after "Run detection + cell filter" or "Load existing panels") and refuses to run while the CurationPopout has un-promoted flips (`CurationPopout.has_pending_promotion()`) — otherwise the exported figures would reflect a stale keep mask. For the full per-stage figure set (lowpass + events + clusters + xcorr + spatial), drive the recording through Tab 0 — `core/batch_pipeline.py::run_recording` produces the same `calliope_figures/<stage>/` tree plus manifest as part of the normal pipeline.

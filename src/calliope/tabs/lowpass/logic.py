@@ -17,11 +17,13 @@ from __future__ import annotations
 from ...core.utils import (
     get_fps_from_notes,
     lowpass_causal_1d,
+    lowpass_zero_phase_1d,
     sg_first_derivative_1d,
 )
 
 __all__ = [
     "get_fps_from_notes",
     "lowpass_causal_1d",
+    "lowpass_zero_phase_1d",
     "sg_first_derivative_1d",
 ]

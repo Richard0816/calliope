@@ -38,6 +38,10 @@ import sys
 # fallback) -- everything user-facing is built with customtkinter.
 import tkinter as tk
 
+# ``Path`` is used by the "Open run folder…" handler to derive a run's
+# on-disk layout.
+from pathlib import Path
+
 # customtkinter is a third-party re-skin of Tk. ``ctk.CTk`` is its
 # themed root window; we subclass it for ``PipelineApp`` so the whole
 # app inherits CTk's widget styling without extra plumbing.
@@ -208,7 +212,8 @@ class _Sidebar(ctk.CTkFrame):
     callback receives the integer index of the clicked tab.
     """
 
-    def __init__(self, master, labels, on_select, width=210):
+    def __init__(self, master, labels, on_select, on_open_run=None,
+                 width=210):
         # ``super()`` reaches the parent class (``ctk.CTkFrame``);
         # forwarding the relevant kwargs lets it set up its own widget
         # state before we add ours.
@@ -232,7 +237,23 @@ class _Sidebar(ctk.CTkFrame):
             self, text="pipeline", text_color=("gray60", "gray60"),
             font=ctk.CTkFont(size=11),
         )
-        subtitle.pack(pady=(0, 14), padx=12)
+        subtitle.pack(pady=(0, 10), padx=12)
+
+        # One-click "open a finished run" entry point. Lives in the
+        # sidebar so it's reachable from every tab, not buried inside one.
+        if on_open_run is not None:
+            ctk.CTkButton(
+                self, text="\U0001F4C2  Open run folder…",
+                height=30, corner_radius=6, command=on_open_run,
+            ).pack(fill="x", padx=8, pady=(0, 4))
+
+        # "Now viewing" indicator -- set by ``set_run_label`` after a run
+        # loads so the user can trust the whole app reflects one run.
+        self._run_label = ctk.CTkLabel(
+            self, text="", text_color=("gray55", "gray55"),
+            font=ctk.CTkFont(size=10), wraplength=190, justify="left",
+        )
+        self._run_label.pack(fill="x", padx=10, pady=(0, 8))
 
         for idx, text in enumerate(labels):
             btn = ctk.CTkButton(
@@ -263,6 +284,10 @@ class _Sidebar(ctk.CTkFrame):
                 btn.configure(fg_color=self._active_color)
             else:
                 btn.configure(fg_color="transparent")
+
+    def set_run_label(self, text: str) -> None:
+        """Show which run is currently loaded (or '' to clear)."""
+        self._run_label.configure(text=text)
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +396,8 @@ class PipelineApp(ctk.CTk):
             "8. Spatial propagation",
         ]
         self._sidebar = _Sidebar(self, labels=tab_labels,
-                                 on_select=self._show_tab)
+                                 on_select=self._show_tab,
+                                 on_open_run=self._on_open_run)
         self._sidebar.grid(row=0, column=0, sticky="nsw")
 
         # Content host: every tab body is grided into row 0 / col 0 of
@@ -488,6 +514,182 @@ class PipelineApp(ctk.CTk):
                 on_shown()
             except Exception as e:
                 print(f"on_tab_shown({type(new_tab).__name__}) failed: {e}")
+
+    # -- Open a finished run -------------------------------------------------
+
+    def _on_open_run(self) -> None:
+        """Point the whole app at one finished recording folder and
+        repopulate every tab in dependency order, without rerunning the
+        pipeline.
+
+        Most stages rehydrate by republishing their AppState channel from
+        files on disk. The exception is event detection: its
+        ``event_results`` payload is never persisted, so it is recomputed
+        from the lowpass memmaps -- using the *saved* params from the run
+        manifest, not whatever is currently in the GUI, so the reloaded
+        events match the original run.
+        """
+        from tkinter import filedialog, messagebox
+        from .core import run_loader
+
+        folder = filedialog.askdirectory(
+            title="Select a CalLIOPE run (recording) folder")
+        if not folder:
+            return
+        run_folder = Path(folder)
+        inv = run_loader.scan_run(run_folder)
+        if not inv.any_stage:
+            messagebox.showwarning(
+                "Nothing to load",
+                f"{run_folder} doesn't look like a CalLIOPE run -- no "
+                f"qc.gif / mean.npy and no "
+                f"detection/final/suite2p/plane0 outputs found.")
+            return
+
+        # Start from a clean bus so a stage missing from this run can't
+        # inherit the previous run's value.
+        self.state_obj.reset()
+        params = run_loader.manifest_params(run_folder)
+        loaded: list[str] = []
+        skipped: list[str] = []
+
+        # 1. Preprocess / QC. regenerate_shifted=False keeps this fast:
+        #    a finished run has had its shifted TIFF archived away, and
+        #    regenerating it from the compressed raw is a multi-GB,
+        #    multi-minute operation that would freeze the UI -- and
+        #    viewing never needs it (only re-detecting does).
+        if inv.has_preprocess:
+            try:
+                from .core import preprocessing
+                result = preprocessing.load_existing_preprocess(
+                    str(run_folder), regenerate_shifted=False)
+                if result is not None:
+                    self.state_obj.set_result(result)
+                    loaded.append("QC movie + mean image")
+                else:
+                    skipped.append("QC (couldn't parse preprocess outputs)")
+            except Exception as e:
+                skipped.append(f"QC ({e})")
+        else:
+            skipped.append("QC (no qc.gif / mean.npy)")
+
+        # 2. Detection -- publishing plane0 lights Tabs 4-7, which all
+        #    subscribe to this channel directly.
+        if inv.has_detection:
+            self.state_obj.set_plane0(inv.plane0)
+            loaded.append("detection (ROIs + traces)")
+        else:
+            skipped.append("detection (no plane0 F.npy / stat.npy)")
+
+        # 3. Lowpass. Tab 5 keys off plane0 + its own memmap check, but
+        #    publish this too for anything listening on the channel.
+        if inv.has_lowpass:
+            self.state_obj.set_lowpass_ready(inv.plane0)
+            loaded.append("lowpass + derivative")
+        else:
+            skipped.append("lowpass (filtered memmaps absent)")
+
+        # 4. Event detection -- the one channel never persisted to disk,
+        #    so recompute from the saved params.
+        if inv.has_lowpass:
+            had_params = self._rehydrate_events(params)
+            loaded.append(
+                "events (recomputed from saved params)" if had_params
+                else "events (recomputed, DEFAULT params -- see warning)")
+        else:
+            skipped.append("events (needs lowpass)")
+
+        # 5/6. Clusters + xcorr -- best effort via each tab's own reload,
+        #      which re-reads its files now that plane0 is published.
+        if inv.has_clusters:
+            try:
+                self.clustering_tab._on_reload_clusters()
+                loaded.append("clusters")
+            except Exception as e:
+                skipped.append(f"clusters ({e})")
+        if inv.has_xcorr:
+            try:
+                self.xcorr_tab._on_reload_inputs()
+                loaded.append("cross-correlation inputs")
+            except Exception as e:
+                skipped.append(f"cross-correlation ({e})")
+
+        # Trust signals: a persistent "now viewing" label, land on QC.
+        self._sidebar.set_run_label(f"▶ {run_folder.name}")
+        self._show_tab(2)
+        self._report_open_run(run_folder, inv, params, loaded, skipped)
+
+    def _rehydrate_events(self, params: dict) -> bool:
+        """Restore Tab 5's params from the manifest, then recompute.
+
+        Returns ``True`` if any event-detection params were found in the
+        manifest. ``False`` means the recompute fell back to defaults
+        (the caller surfaces this as a data-integrity warning).
+        """
+        ev = self.event_tab
+        params = params or {}
+        spec_keys = {s["name"] for s in ev.PARAM_SPEC}
+        applied = {k: v for k, v in params.items() if k in spec_keys}
+        ev._params.update(applied)
+        # The render path snapshots these three knobs from Tk vars, so
+        # restore them too or they'd silently revert to GUI defaults.
+        try:
+            if "manual_subset_enabled" in params:
+                ev.manual_subset_var.set(bool(params["manual_subset_enabled"]))
+            if "manual_roi_spec" in params:
+                ev.manual_roi_var.set(str(params["manual_roi_spec"]))
+            if "onset_source" in params:
+                ev.onset_source_var.set(str(params["onset_source"]))
+        except Exception:
+            pass
+        # Don't let the reload's own recompute write params back to the
+        # manifest -- we'd either rewrite what we just read or, if none
+        # were found, record GUI defaults as the run's real settings.
+        ev._suppress_manifest_write = True
+        # Async: publishes set_event_results when the worker finishes.
+        ev._on_render()
+        return bool(applied)
+
+    def _calliope_git_sha(self) -> Optional[str]:
+        try:
+            from .core.export_manifest import _git_sha
+            return _git_sha(Path(__file__).resolve().parent)
+        except Exception:
+            return None
+
+    def _report_open_run(self, run_folder, inv, params, loaded, skipped):
+        """Summarise what loaded + surface provenance/integrity warnings."""
+        from tkinter import messagebox
+
+        lines = [f"Loaded run: {run_folder.name}", ""]
+        if loaded:
+            lines.append("Restored:")
+            lines += [f"  • {x}" for x in loaded]
+        if skipped:
+            lines.append("")
+            lines.append("Not loaded:")
+            lines += [f"  • {x}" for x in skipped]
+
+        warns: list[str] = []
+        spec_keys = {s["name"] for s in self.event_tab.PARAM_SPEC}
+        if inv.has_lowpass and not (set(params or {}) & spec_keys):
+            warns.append(
+                "Event-detection parameters were not found in this run's "
+                "manifest, so events were recomputed with DEFAULT settings "
+                "and may differ from the original run.")
+        man_sha = (inv.manifest or {}).get("calliope_git_sha")
+        cur_sha = self._calliope_git_sha()
+        if man_sha and cur_sha and man_sha != cur_sha:
+            warns.append(
+                f"This run was produced by a different CalLIOPE version "
+                f"(manifest {man_sha[:8]} vs running {cur_sha[:8]}); "
+                f"recomputed stages may not match the saved figures/CSVs.")
+        if warns:
+            lines.append("")
+            lines.append("⚠ Heads up:")
+            lines += [f"  • {w}" for w in warns]
+
+        messagebox.showinfo("Open run", "\n".join(lines))
 
 
 def main() -> None:

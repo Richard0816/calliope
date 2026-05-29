@@ -58,6 +58,8 @@ TIFF stack
 
 Each stage writes its outputs to disk so later tabs can re-load without recomputing.
 
+**Reopening a finished run.** The sidebar's **📂 Open run folder…** button reloads an entire recording in one click: pick the recording folder and every tab repopulates in dependency order (QC movie + mean → detection ROIs/traces → lowpass → events → clusters → cross-correlation), no recompute. Each tab still has its own *Reload from folder…* button for loading a single stage in isolation; the sidebar button is the "open the whole run" shortcut. One stage is special — event detection's results are never written to disk, so they're recomputed from the lowpass memmaps using the **saved params from the run's `manifest.json`** (not the current GUI settings) so the reloaded events match the original run. If the manifest lacks event-detection params (e.g. a hand-run recording whose manifest was last overwritten by a later stage) or was produced by a different CalLIOPE version, the load summary says so. Implemented in `core/run_loader.py` (folder inventory) + `PipelineApp._on_open_run`.
+
 A separate **Tab 0 (Batch runner)** sits in front of all of this and chains the same per-stage code paths headlessly across many recordings — see the next section.
 
 ---
@@ -97,7 +99,7 @@ Whether scratch and output share a physical drive (detected via `os.stat(...).st
 
 ## Tab 2 — QC Preview
 
-**What it does.** Pure visualization. Plays the GIF from Tab 1 next to the mean image.
+**What it does.** Pure visualization. Plays the GIF from Tab 1 next to the mean image. An **Animate** checkbox pauses/resumes playback; the movie is streamed one frame at a time, so pausing and resuming are instant and never re-read the file.
 
 **Why it matters.** This is where you catch:
 
@@ -141,6 +143,8 @@ The cell-filter step gives you a reproducible "is this really a cell?" decision 
 **Post-detection archive.** Immediately after the prune, `core.detection_run.archive_recording_post_detection` collapses the recording to its smallest stable footprint: it locates the raw TIFF source(s) via the `_calliope_raw_paths.json` sidecar Tab 1 wrote, re-encodes each as a Zstd-19 + horizontal-predictor lossless TIFF at `<rec>/<raw.name>.tif` (top level), verifies byte-equality after decompression before atomic-renaming into place, then deletes the now-redundant `shifted_*.tif` and the orphaned hardlink twin `detection/final/.../data.bin`. Per-recording disk drops from ~20 GB to ~6.5 GB (~50–60% size reduction on the raw). If you later need to re-detect, `load_existing_preprocess` regenerates the shifted from the compressed raw in ~1 min — total re-detect cost goes from ~5 min to ~6 min, the acceptable trade for the disk savings. Every step has an opt-out via `params` (`archive_post_detection`, `compress_raw_post_detection`, `delete_shifted_post_detection`, `delete_final_data_bin_post_detection`, `delete_external_raw_after_archive`, `raw_compression_level`); destructive deletion of the user's external raw at its source path is the only opt-in (off by default).
 
 → See `tabs/suite2p/README.md` for: Sparsery + Cellpose merge logic, neuropil-correction math, the two dF/F baseline modes (rolling vs first-N-minutes), the GPU dF/F path (CuPy), and how the cell-filter CNN is loaded and applied.
+
+**Exporting figures.** Once detection finishes (or after "Load existing panels"), the **Export figures** button writes the detection ROI overlay panels (`all_rois.{png,svg}`, `kept_rois.{png,svg}`) to `<save_folder>/calliope_figures/detection/` along with a `manifest.json` at `<save_folder>/calliope_figures/manifest.json` capturing the calliope git SHA, the GCaMP variant, tau, fs, cell counts, and the cellfilter checkpoint SHA-256. The export is blocked when the curation popout has un-promoted flips — promote first so the exported figures match what you're looking at. For the full per-stage figure set (detection + lowpass + events + clustering + crosscorrelation + spatial), run the recording through **Tab 0 — Batch runner**; `core/batch_pipeline.py` writes the same `calliope_figures/<stage>/` tree plus manifest as a normal part of the batch pipeline.
 
 ---
 
@@ -229,6 +233,10 @@ Two modes:
 - **Per event** — re-runs cross-correlation cropped to each event window from Tab 5, so you can ask "during *this* seizure, who led whom?"
 
 A **violin plot** window summarises the distribution of best lags and zero-lag correlations across all cell pairs in each cluster pair. Pairs whose mean lag is significantly non-zero (sign-flip permutation test, `p < 0.05`) are coloured **blue (lead)** or **red (lag)**; ns pairs are **gray**.
+
+Per-pair p-values from a **circular-shift null distribution** (default 500 shuffles; "shuffles" GUI field) are written into the summary CSV alongside `max_corr`, with a Benjamini-Hochberg-adjusted `p_value_fdr` column for thresholding across the N×N matrix. The null preserves each ROI's autocorrelation while jittering the inter-cluster alignment, which is the field-standard fix for the autocorrelation-inflated false-positive rate that parametric tests suffer on calcium imaging traces (Cheng et al. eLife 2023, [doi:10.7554/eLife.81279](https://doi.org/10.7554/eLife.81279)). Set the field to 0 to skip the null computation.
+
+Pearson r is computed on filtered dF/F. **GCaMP rise + decay convolve every spike with a ~tens-to-hundreds-of-ms exponential**, so the visible CCG peak is blurred by the indicator's autocorrelation and correlation magnitudes are inflated relative to spike-time correlations (Yatsenko/Mishne, eLife 2021, [doi:10.7554/eLife.68046](https://doi.org/10.7554/eLife.68046)). The apparent lag resolution is indicator- not frame-rate-limited.
 
 **Why it matters biologically.** Synchronisation is necessary but not sufficient. *Direction* matters:
 

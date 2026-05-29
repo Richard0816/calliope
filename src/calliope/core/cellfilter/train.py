@@ -216,8 +216,15 @@ def main():
     # recording's mean image / max projection / dF/F memmap loads
     # only once, even though both Datasets iterate ROIs from it.
     shared_cache = {}
-    train_ds = ROIDataset(train_df, random_crop=True, cache=shared_cache)
-    val_ds = ROIDataset(val_df, random_crop=False, cache=shared_cache)
+    # ``augment=True`` enables dihedral-group spatial transforms +
+    # additive trace noise on the train set; ``augment=False`` for val
+    # so the eval signal is comparable across epochs and against a
+    # bundled checkpoint trained without augmentation. Probabilities
+    # / noise std are set in ``config.AUG_*``.
+    train_ds = ROIDataset(train_df, random_crop=True, augment=True,
+                          cache=shared_cache)
+    val_ds = ROIDataset(val_df, random_crop=False, augment=False,
+                        cache=shared_cache)
 
     # ``DataLoader`` handles batching, shuffling, multi-process
     # preloading, pinned-memory transfers. ``num_workers=0`` on

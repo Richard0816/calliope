@@ -156,6 +156,10 @@ class SpatialPropagationTab(ctk.CTkFrame):
             side="left")
         ctk.CTkButton(row, text="Refresh from Tab 5",
                       command=self._refresh).pack(side="right")
+        self.export_btn = ctk.CTkButton(
+            row, text="Export figures", width=130,
+            command=self._on_export_figures, state="disabled")
+        self.export_btn.pack(side="right", padx=(0, 6))
 
         # ---- Spks override toggle ----
         # Tab 5's hysteresis-onset detector is the default activation-
@@ -305,6 +309,69 @@ class SpatialPropagationTab(ctk.CTkFrame):
             return
         self._on_event_results(self.state.event_results)
 
+    def _on_export_figures(self, quiet: bool = False) -> None:
+        """Render one PNG + SVG per event window into
+        ``<save_folder>/calliope_figures/spatial_propagation/`` and
+        refresh the manifest. Uses the in-memory ``self._data`` from
+        Tab 5's most recent publish -- including any spks override
+        currently active -- so the export matches what the user is
+        scrolling through on the canvases.
+
+        ``quiet=True`` (Tab 0 batch toggle) suppresses messageboxes.
+        """
+        if self._data is None:
+            if not quiet:
+                messagebox.showinfo(
+                    "No events yet",
+                    "Run Tab 5 first; this tab populates automatically "
+                    "when events are detected.")
+            return
+        plane0 = self._data.get("plane0")
+        if plane0 is None:
+            if not quiet:
+                messagebox.showerror(
+                    "No plane0",
+                    "Tab 5 publish did not include a plane0.")
+            return
+        plane0 = Path(plane0)
+        save_folder = plane0.parents[3]
+        figures_root = save_folder / "calliope_figures"
+        sp_dir = figures_root / "spatial_propagation"
+        self.status_var.set("Exporting spatial-propagation figures ...")
+        self.update_idletasks()
+        try:
+            from ...core.spatial import render_spatial_event_figures
+            from ...core.export_manifest import write_export_manifest
+            from ...core.utils import infer_recording_id
+            try:
+                rec_id = infer_recording_id(plane0)
+            except Exception:
+                rec_id = save_folder.name
+            written = render_spatial_event_figures(
+                plane0, self._data, figures_dir=sp_dir)
+            params = {
+                "use_spks_override": bool(self._use_spks_var.get()),
+                "n_events": int(self._data["event_windows"].shape[0]),
+            }
+            manifest_path = write_export_manifest(
+                figures_root,
+                rec_id=rec_id, params=params,
+                plane0=plane0, ckpt_path=None,
+            )
+            n_files = len(written) * 2  # PNG + SVG per event
+            self.status_var.set(
+                f"Exported {n_files} files -> {sp_dir}")
+            if not quiet:
+                messagebox.showinfo(
+                    "Export complete",
+                    f"Wrote {n_files} per-event spatial figures "
+                    f"(PNG + SVG) to:\n  {sp_dir}\n\n"
+                    f"Manifest:\n  {manifest_path}")
+        except Exception as e:
+            self.status_var.set(f"Export failed: {e}")
+            if not quiet:
+                messagebox.showerror("Export failed", str(e))
+
     def _on_event_results(self, results: dict) -> None:
         try:
             self._ingest_results(results)
@@ -413,6 +480,7 @@ class SpatialPropagationTab(ctk.CTkFrame):
             f"Use Prev / Next or the spinner to click through.")
         self.event_spin.config(from_=1, to=n_events)
         self.event_spin.state(["!disabled"])
+        self.export_btn.configure(state="normal")
         # Stay on the current event index if it's still valid; otherwise
         # snap back to event 1. This makes "re-render Tab 5" feel
         # incremental rather than resetting.

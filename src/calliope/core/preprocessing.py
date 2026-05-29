@@ -909,6 +909,7 @@ def list_tiffs(folder: str | Path, max_depth: int = 0) -> list[Path]:
 def load_existing_preprocess(
     out_dir: str | Path,
     *,
+    regenerate_shifted: bool = True,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Optional[PreprocessResult]:
     """If a recording folder already contains preprocessing outputs, load them.
@@ -921,6 +922,16 @@ def load_existing_preprocess(
     the top level (referenced by ``_calliope_raw_paths.json``), the
     shifted is regenerated on demand by running
     ``shift_tiff_to_uint16`` again so QC / re-detect can continue.
+
+    ``regenerate_shifted=False`` suppresses that regeneration: viewing a
+    finished run (QC, lowpass, events, ...) never needs the shifted TIFF
+    -- only re-running detection does -- and regenerating it from the
+    compressed raw is a multi-gigabyte, multi-minute operation that would
+    freeze the UI. With the flag off, an archived run returns a result
+    whose ``shifted_tiff`` points at where the file *would* be
+    regenerated (so Tab 3 can still name the recording), with
+    ``shifted_paths`` empty; the actual regeneration is deferred until
+    something genuinely re-detects.
     """
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
@@ -941,6 +952,22 @@ def load_existing_preprocess(
     # Regenerate the shifted TIFF(s) from the (compressed) raw before
     # returning -- callers expect ``shifted_tiff`` to be a real file.
     raw_sources = read_raw_paths_sidecar(out_dir)
+    if not shifted_candidates and raw_sources and not regenerate_shifted:
+        # Viewing-only reload: skip the expensive shifted regeneration.
+        # Point shifted_tiff at where regeneration *would* land so Tab 3
+        # can show the recording name; leave shifted_paths empty.
+        expected = out_dir / f"shifted_{raw_sources[0].name}"
+        mean = np.load(str(mean_path))
+        return PreprocessResult(
+            out_dir=out_dir,
+            shifted_tiff=expected,
+            qc_gif=gif,
+            mean_image_path=mean_path,
+            n_frames=-1,
+            shape_yx=tuple(mean.shape),
+            raw_paths=raw_sources,
+            shifted_paths=[],
+        )
     if not shifted_candidates and raw_sources:
         def _log(msg: str) -> None:
             if progress_cb is not None:

@@ -37,9 +37,14 @@ batch; False inside the interactive tab, since the tab triggers its own
 `EventOnsets`, `RoiEventTimes`, and `EventMonotonicity` sheets to
 `<plane0>/calliope_summary.xlsx`. `EventMonotonicity` carries one row
 per event (`event_id, n_active, theta_star_deg, rho_obs, p_value,
-n_shuffles, u_x, u_y`) computed by
+p_value_fdr, n_shuffles, u_x, u_y`) computed by
 `core.spatial.directional_monotonicity_spearman` — the same Spearman-
 rank propagation-direction test Tab 8's bottom panel renders.
+`p_value_fdr` is the Benjamini-Hochberg-adjusted q-value across the
+per-event tests in this recording (compare against your target FDR,
+typically 0.05). The correction is applied automatically by
+`_compute_event_monotonicity` over events with ≥ 3 active ROIs;
+under-populated events get a blank cell.
 
 ### Step 0 — (Optional) manual ROI subset
 

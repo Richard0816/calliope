@@ -538,6 +538,20 @@ class BatchTab(ctk.CTkFrame):
                      text="(optional; outputs still land in the folder above)",
                      text_color="gray").pack(side="left", padx=(8, 0))
 
+        # Toggle for whether the headless pipeline emits PNG + SVG per
+        # stage under ``<output>/<id>/calliope_figures/``. Default ON so
+        # batch runs are self-documenting; turn off only when you're
+        # short on disk and only want the npy / xlsx outputs.
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(2, 0))
+        ctk.CTkLabel(row, text="", width=110).pack(side="left")
+        self.save_figures_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row,
+            text="Save figures during batch (PNG + SVG per stage + manifest)",
+            variable=self.save_figures_var,
+        ).pack(side="left")
+
         row = ctk.CTkFrame(top, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(6, 6))
         ctk.CTkButton(row, text="Apply defaults to all rows", width=200,
@@ -1574,9 +1588,24 @@ class BatchTab(ctk.CTkFrame):
             if "dff_baseline_min" in p:
                 det.baseline_min_var.set(str(p["dff_baseline_min"]))
             if "gcamp_variant" in p:
-                # Label round-trips verbatim; _on_run resolves the
-                # label -> tau scalar via Suite2pTab.GCAMP_OPTIONS.
-                det.gcamp_var.set(str(p["gcamp_variant"]))
+                # Round-trip through ``_resolve_gcamp_tau`` so labels saved
+                # under the pre-2026-05-26 schema (e.g. ``"GCaMP8m  (tau =
+                # 0.137 s)"`` -- no leading "j", aggressive cultured-neuron
+                # tau) get snapped to the current canonical label
+                # (``"jGCaMP8m (tau = 0.25 s)"``) at load time. Without
+                # this, the StringVar holds a string that's not in the
+                # combobox values list and the user can't tell from
+                # looking at the dropdown that their saved selection has
+                # been silently migrated. The run-time path in
+                # ``_on_run`` also calls the resolver, so this is a
+                # belt-and-suspenders fix that also makes the migration
+                # visible in the UI before the run starts.
+                raw_label = str(p["gcamp_variant"])
+                _, snapped_label, kind = det._resolve_gcamp_tau(raw_label)
+                if kind != "exact":
+                    print(f"[batch] migrated stale gcamp_variant "
+                          f"{raw_label!r} -> {snapped_label!r}")
+                det.gcamp_var.set(snapped_label)
 
         # Tab 4: lowpass -- PARAM_SPEC fields + the live cutoff slider.
         lp = getattr(app, "lowpass_tab", None)
@@ -1896,11 +1925,48 @@ class BatchTab(ctk.CTkFrame):
             self._row_results["plane0"] = str(path_hint)
         self._append_log(f"  [{stage}] done ({elapsed:.1f}s)")
 
+        # If the "Save figures during batch" toggle is on, ask the
+        # tab that just finished to dump its figures + refresh the
+        # per-recording manifest. Called with ``quiet=True`` so a
+        # 7-stage batch doesn't bury the user under 7 popups per row.
+        if self.save_figures_var.get():
+            try:
+                self._export_stage_figures(stage)
+            except Exception as e:
+                self._append_log(
+                    f"  [{stage}] figure export failed: {e}")
+
         idx = self.STAGES.index(stage) + 1
         if idx >= len(self.STAGES):
             self._on_row_done()
         else:
             self._begin_stage(self.STAGES[idx])
+
+    def _export_stage_figures(self, stage: str) -> None:
+        """Dispatch the per-tab figure export for the stage that just
+        finished. Keeps the batch tab decoupled from each tab's
+        internals -- we just call the handler the per-tab button uses,
+        with ``quiet=True`` to suppress messageboxes.
+        """
+        stage_to_tab = {
+            "detection": "detection_tab",
+            "lowpass": "lowpass_tab",
+            "event_detection": "event_tab",
+            "clustering": "clustering_tab",
+            "crosscorrelation": "xcorr_tab",
+            "spatial_propagation": "spatial_tab",
+        }
+        attr = stage_to_tab.get(stage)
+        if attr is None:
+            return  # preprocess writes its qc.gif via a separate path
+        tab = getattr(self._app, attr, None)
+        if tab is None:
+            return
+        export = getattr(tab, "_on_export_figures", None)
+        if export is None:
+            return
+        export(quiet=True)
+        self._append_log(f"  [{stage}] figures exported")
 
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
         elapsed = time.time() - self._stage_t0

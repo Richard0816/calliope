@@ -167,9 +167,13 @@ def render_lowpass_figures(
     yf = np.fft.rfft(mean_dff)
     xf = np.fft.rfftfreq(mean_dff.size, 1.0 / fps)
     power = np.abs(yf) ** 2
-    lp, _, _ = utils.lowpass_causal_1d(
+    # Diagnostic figure only — zero-phase preview so the overlay
+    # aligns with the raw mean-dF/F trace in time. The on-disk lowpass
+    # memmap that feeds event detection is still built with the causal
+    # filter in ``write_lowpass_dt_memmaps`` above.
+    lp, _ = utils.lowpass_zero_phase_1d(
         mean_dff, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
-        zi=None, sos=None)
+        sos=None)
     t = np.arange(mean_dff.size, dtype=np.float32) / fps
 
     written = []
@@ -186,6 +190,7 @@ def render_lowpass_figures(
     ax.legend(loc="upper right", fontsize=8)
     p = figures_dir / "fft.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 
@@ -198,6 +203,7 @@ def render_lowpass_figures(
     ax.set_title(f"Raw dF/F - {label}")
     p = figures_dir / "raw_dff.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 
@@ -210,6 +216,7 @@ def render_lowpass_figures(
     ax.set_title(f"Low-pass - {label}")
     p = figures_dir / "lowpass_dff.png"
     fig.savefig(p, dpi=150)
+    fig.savefig(p.with_suffix(".svg"))
     plt.close(fig)
     written.append(str(p))
 
