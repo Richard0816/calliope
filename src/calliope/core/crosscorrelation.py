@@ -528,28 +528,26 @@ def _open_dff_memmap(plane0: Path, prefix: str):
 
     Returns (dff_memmap, T, N).
     """
+    from . import utils as _cutils
+
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
 
-    if "filtered" in prefix.split("_"):
-        mask_path = plane0 / "predicted_cell_mask.npy"
-        if mask_path.exists():
-            mask = np.load(mask_path).astype(bool)
-        else:
-            ic = np.load(plane0 / "iscell.npy")
-            mask = ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-        if mask.size != N_total:
-            raise ValueError(
-                f"Cell-filter mask length {mask.size} does not match F.npy "
-                f"ROI count {N_total}.")
-        N_kept = int(mask.sum())
-    else:
-        N_kept = N_total
-
     dff_path = plane0 / f"{prefix}dff.memmap.float32"
     if not dff_path.exists():
         raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
+
+    if "filtered" in prefix.split("_"):
+        # Size against the mask the memmap was written with (persisted as
+        # r0p7_cell_mask_bool.npy), cross-checked against the file size, so
+        # a drifted predicted_cell_mask/iscell can't request a wrong-shaped
+        # mapping -> [WinError 8] on Windows. See utils.resolve_filtered_mask.
+        _mask, N_kept = _cutils.resolve_filtered_mask(
+            plane0, N_total, memmap_path=dff_path, T=T)
+    else:
+        N_kept = N_total
+
     dff = np.memmap(dff_path, dtype="float32", mode="r", shape=(T, N_kept))
     return dff, T, N_kept
 
