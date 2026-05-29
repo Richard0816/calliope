@@ -1406,11 +1406,8 @@ class ClusteringTab(ctk.CTkFrame):
         try:
             cluster_dir.mkdir(parents=True, exist_ok=True)
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(self._plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(self._plane0)
             d_png = cluster_dir / "dendrogram.png"
             s_png = cluster_dir / "spatial_clusters.png"
             self.d_fig.savefig(d_png, dpi=200)

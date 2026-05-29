@@ -574,10 +574,19 @@ class PipelineApp(ctk.CTk):
             skipped.append("QC (no qc.gif / mean.npy)")
 
         # 2. Detection -- publishing plane0 lights Tabs 4-7, which all
-        #    subscribe to this channel directly.
+        #    subscribe to this channel directly. Tab 3 itself *produces*
+        #    plane0 rather than subscribing, so publishing alone leaves
+        #    its own panels blank; render them here so the user doesn't
+        #    have to click "Load existing panels" after every reload.
         if inv.has_detection:
             self.state_obj.set_plane0(inv.plane0)
             loaded.append("detection (ROIs + traces)")
+            try:
+                self.detection_tab._final_plane0 = inv.plane0
+                self.detection_tab._draw_panels(inv.plane0)
+                self.detection_tab.status_var.set(f"Loaded -> {inv.plane0}")
+            except Exception as e:
+                skipped.append(f"detection panels ({e})")
         else:
             skipped.append("detection (no plane0 F.npy / stat.npy)")
 

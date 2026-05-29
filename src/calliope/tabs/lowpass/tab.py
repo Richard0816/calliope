@@ -777,11 +777,8 @@ class LowpassTab(ctk.CTkFrame):
         try:
             from ...core.lowpass_run import render_lowpass_figures
             from ...core.export_manifest import write_export_manifest
-            from ...core.utils import infer_recording_id
-            try:
-                rec_id = infer_recording_id(plane0)
-            except Exception:
-                rec_id = save_folder.name
+            from ...core.utils import safe_recording_id
+            rec_id = safe_recording_id(plane0)
             cutoff_hz = float(self.cutoff_var.get())
             written = render_lowpass_figures(
                 plane0, fps=self._fps, cutoff_hz=cutoff_hz,
