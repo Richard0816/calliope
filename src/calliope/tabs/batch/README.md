@@ -166,6 +166,63 @@ a future stage starts writing more redundant intermediates; nothing
 in the keep set should ever need explicit listing because the
 default is "preserve".
 
+### What to save (user-selectable output footprint)
+
+The **What to save** group in Tab 0 (preset + three checkboxes, just
+under **Save figures during batch**) lets the user drop large artifacts
+they don't need, on top of the always-on prune above. **Always kept**
+(every tab needs them to render): the `plane0` ROI arrays
+`F`/`Fneu`/`spks`/`stat`/`iscell`/`ops`, the `r0p7_*` dF/F + low-pass
+memmaps, `calliope_summary.xlsx`, and figures. **Defaults preserve
+today's behavior exactly** — an untouched run drops nothing extra.
+
+| Control | Default | Effect when changed | Consequence |
+|---------|---------|---------------------|-------------|
+| Keep suite2p registration (`data.bin`) | on | off → drop the registered movie `data.bin` (both the `_shared_reg/` and `plane0/` hardlink twins) | detection can't be re-run without re-registering from the TIFF |
+| Keep shifted / motion-corrected TIFF | on | off → drop `shifted_*.tif` / `NNN_shifted_*.tif` | a Tab 1 reload must regenerate it (from the compressed raw, if archived, or by re-preprocessing) |
+| Archive raw TIFF (compressed) | off | on → write the Zstd-compressed raw into the output folder | adds a compact archival copy of the raw |
+| Preset **Keep everything** | selected | sets all three to defaults | today's behavior |
+| Preset **Bare minimum (Calliope-only)** | — | registration + shifted both off, archive off | smallest folder that still renders every tab |
+
+Mechanics & wiring:
+
+- The shifted TIFF and `data.bin` are still **produced** during the run
+  (detection consumes them); they are pruned at row finalize, not skipped
+  at write time.
+- The keep-flags thread from the three `BooleanVar`s through
+  `prune_scratch_tree(..., keep_registration=, keep_shifted=, final_rec=)`,
+  `is_scratch_mirror_skippable(...)`, `synchronous_final_sweep(...)`, and
+  `mirror_sync_pass(...)`. The mirror skips dropped artifacts so they're
+  never copied to HDD; the finalize prune also removes any twin the mirror
+  already copied to `final_rec` (hence the `final_rec` argument).
+- `data.bin` is hardlinked between `_shared_reg/data.bin` and
+  `plane0/data.bin` (same inode — obs 663). **Both** twins are unlinked,
+  or the inode survives via the remaining link and no space is freed.
+  Dropping `data.bin` never touches the ROI arrays.
+- **Single owner per artifact across scratch / non-scratch mode.** Tab 3's
+  own end-of-detection archive (`Suite2pTab._archive_recording`, reading the
+  `*_post_detection` param keys) runs at the tail of *every* detection,
+  including batch runs (the batch tab drives detection via `det._on_run`).
+  Left at its all-True defaults it would ignore the keep toggles and, in
+  scratch mode, double-compress against the finalize worker.
+  `BatchTab._apply_save_policy_to_detection_tab` (called from `_begin_stage`
+  on every run, not just rows with per-row overrides) reconciles this:
+  - **scratch mode** → Tab 3 archive disabled
+    (`archive_post_detection=False`); the finalize worker owns compression
+    (gated on `compress_raw_var`) and `prune_scratch_tree` owns the
+    shifted / `data.bin` keep-or-drop (gated on the keep toggles).
+  - **non-scratch mode** → there is no finalize worker or
+    `prune_scratch_tree` (outputs land directly at the final dir), so Tab 3's
+    archive *is* the single owner: `compress_raw_post_detection` ←
+    `compress_raw_var`, `delete_shifted_post_detection` ← `not keep_shifted`,
+    `delete_final_data_bin_post_detection` ← `not keep_registration`.
+- The finalize worker's optional raw archive runs via
+  `core.detection_run.archive_recording_post_detection(compress_raw=True,
+  delete_shifted=False, delete_final_bin=False)` so that step owns *only*
+  compression — the keep/drop of shifted + `data.bin` belongs solely to
+  `prune_scratch_tree`, avoiding double-handling.
+- Toggles are session-only (not persisted), matching **Save figures**.
+
 ### Continuous mirror (both single-drive and two-drive scratch)
 
 The transfer architecture is now uniform across drive layouts:
