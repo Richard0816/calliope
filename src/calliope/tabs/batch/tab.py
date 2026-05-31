@@ -62,6 +62,7 @@ from ...gui_common import (
     AppState, apply_dark_to_tk_widget, attach_resize_handle,
     drain_queue, open_advanced, pick_tiffs_dialog, spec_defaults,
 )
+from ...core.detection_run import archive_recording_post_detection
 from .logic import (
     BATCH_JSON_NAME, BATCH_REPORT_NAME, SCRATCH_DETECTION_KEEP_DIRS,
     SCRATCH_PRUNE_FILE_PATTERNS, SCRATCH_RECORDING_INTERMEDIATE_DIRS,
@@ -551,6 +552,75 @@ class BatchTab(ctk.CTkFrame):
             text="Save figures during batch (PNG + SVG per stage + manifest)",
             variable=self.save_figures_var,
         ).pack(side="left")
+
+        # --- Output: what to save ------------------------------------
+        # Lets the user shrink each recording's output folder by dropping
+        # large artefacts they don't need to re-run detection or archive
+        # externally. Defaults preserve today's behavior exactly:
+        # registration + shifted TIFF kept, raw compression off. The
+        # preset bulk-sets the three checkboxes; users can still tweak
+        # each one afterward. Read at finalize (see _finalize_recording_row
+        # / _start_continuous_mirror), never persisted -- matches
+        # save_figures_var, which is also session-only.
+        self.keep_registration_var = tk.BooleanVar(value=True)
+        self.keep_shifted_var = tk.BooleanVar(value=True)
+        self.compress_raw_var = tk.BooleanVar(value=False)
+
+        def _apply_save_preset(choice: str) -> None:
+            if choice == "Bare minimum (Calliope-only)":
+                # Keep only what every CalLIOPE tab needs to render/reload
+                # its results. data.bin and the shifted TIFF are used only
+                # for re-running detection / Tab 1 reload, not for
+                # rendering, so they go. No external raw archive.
+                self.keep_registration_var.set(False)
+                self.keep_shifted_var.set(False)
+                self.compress_raw_var.set(False)
+            else:  # "Keep everything" -- today's behavior
+                self.keep_registration_var.set(True)
+                self.keep_shifted_var.set(True)
+                self.compress_raw_var.set(False)
+
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(row, text="What to save", width=110,
+                     anchor="w").pack(side="left")
+        self.save_preset_var = tk.StringVar(value="Keep everything")
+        ctk.CTkSegmentedButton(
+            row,
+            values=["Keep everything", "Bare minimum (Calliope-only)"],
+            variable=self.save_preset_var,
+            command=_apply_save_preset,
+        ).pack(side="left")
+
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(2, 0))
+        ctk.CTkLabel(row, text="", width=110).pack(side="left")
+        ctk.CTkCheckBox(
+            row,
+            text="Keep suite2p registration (data.bin)",
+            variable=self.keep_registration_var,
+        ).pack(side="left")
+        ctk.CTkCheckBox(
+            row,
+            text="Keep shifted / motion-corrected TIFF",
+            variable=self.keep_shifted_var,
+        ).pack(side="left", padx=(12, 0))
+        ctk.CTkCheckBox(
+            row,
+            text="Archive raw TIFF (compressed)",
+            variable=self.compress_raw_var,
+        ).pack(side="left", padx=(12, 0))
+
+        row = ctk.CTkFrame(top, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(0, 0))
+        ctk.CTkLabel(
+            row,
+            text=("Dropping registration means detection can't be re-run "
+                  "without re-registering; dropping the shifted TIFF means "
+                  "Tab 1 reload must regenerate it. ROIs + dF/F always kept."),
+            width=110, anchor="w", justify="left",
+            text_color="gray",
+        ).pack(side="left", fill="x", expand=True)
 
         row = ctk.CTkFrame(top, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(6, 6))
@@ -1668,6 +1738,47 @@ class BatchTab(ctk.CTkFrame):
             if "use_gpu" in p:
                 xc.gpu_var.set(bool(p["use_gpu"]))
 
+    def _apply_save_policy_to_detection_tab(self) -> None:
+        """Translate the "What to save" toggles into Tab 3's
+        post-detection archive params.
+
+        Separate from ``_apply_row_params_to_tabs`` because that method
+        early-returns when a row has no per-row overrides, whereas the
+        save policy must apply to EVERY batch run. Tab 3's
+        ``_archive_recording`` runs at the tail of detection in both
+        scratch and non-scratch mode, defaulting to compress + delete
+        shifted + delete data.bin. Left untouched it would (a) ignore
+        the keep toggles, deleting artifacts the user asked to keep, and
+        (b) in scratch mode double-compress against the finalize worker.
+
+        Single owner per artifact:
+
+        * scratch mode -- the finalize worker owns compression (gated on
+          ``compress_raw_var``) and ``prune_scratch_tree`` owns the
+          shifted / data.bin keep-or-drop (gated on the keep toggles).
+          So Tab 3's archive is disabled entirely; it must never touch
+          the scratch tree.
+        * non-scratch mode -- there is no finalize worker or
+          ``prune_scratch_tree`` (outputs land directly at the final
+          dir), so Tab 3's archive IS the single owner: compress per
+          ``compress_raw_var`` and delete per the keep toggles.
+
+        Idempotent; safe to call on every stage transition.
+        """
+        det = getattr(self._app, "detection_tab", None)
+        if det is None or not hasattr(det, "_params"):
+            return
+        if self._batch_scratch_root is not None:
+            det._params["archive_post_detection"] = False
+        else:
+            det._params["archive_post_detection"] = True
+            det._params["compress_raw_post_detection"] = \
+                bool(self.compress_raw_var.get())
+            det._params["delete_shifted_post_detection"] = \
+                not bool(self.keep_shifted_var.get())
+            det._params["delete_final_data_bin_post_detection"] = \
+                not bool(self.keep_registration_var.get())
+
     def _begin_stage(self, stage: str) -> None:
         """Trigger ``stage`` for the current row + arm the one-shot
         completion listener.
@@ -1689,6 +1800,15 @@ class BatchTab(ctk.CTkFrame):
                      else "?")
             self._append_log(
                 f"[{ident}] WARN: failed to apply per-row params: {e}")
+
+        # "What to save" archive policy -- applies to every run, not just
+        # rows with per-row overrides, so it lives outside
+        # _apply_row_params_to_tabs (which early-returns on empty params).
+        try:
+            self._apply_save_policy_to_detection_tab()
+        except Exception as e:
+            self._append_log(
+                f"  WARN: failed to apply save policy: {e}")
 
         self._current_stage = stage
         self._stage_t0 = time.time()
@@ -2140,7 +2260,9 @@ class BatchTab(ctk.CTkFrame):
                 try:
                     changed = mirror_sync_pass(
                         scratch_rec, final_rec, seen, inode_to_dst,
-                        throttle_bytes_per_sec=current_throttle)
+                        throttle_bytes_per_sec=current_throttle,
+                        keep_registration=self.keep_registration_var.get(),
+                        keep_shifted=self.keep_shifted_var.get())
                 except Exception as e:
                     _emit(f"  [batch] [{ident}] mirror: pass failed: "
                           f"{e} -- continuing")
@@ -2162,7 +2284,9 @@ class BatchTab(ctk.CTkFrame):
                 mirror_sync_pass(
                     scratch_rec, final_rec, seen, inode_to_dst,
                     stability_window_s=0.0,
-                    throttle_bytes_per_sec=_resolve_throttle())
+                    throttle_bytes_per_sec=_resolve_throttle(),
+                    keep_registration=self.keep_registration_var.get(),
+                    keep_shifted=self.keep_shifted_var.get())
             except Exception as e:
                 _emit(f"  [batch] [{ident}] mirror: final pass "
                       f"failed: {e}")
@@ -2251,7 +2375,11 @@ class BatchTab(ctk.CTkFrame):
             # already skipped them, this catches anything that
             # might have slipped through e.g. data_raw.bin written
             # late). Just to be safe.
-            n_pruned, bytes_pruned = prune_scratch_tree(scratch_rec)
+            n_pruned, bytes_pruned = prune_scratch_tree(
+                scratch_rec,
+                keep_registration=self.keep_registration_var.get(),
+                keep_shifted=self.keep_shifted_var.get(),
+                final_rec=final_rec)
             prune_msg = ""
             if n_pruned > 0:
                 prune_msg = (f" (pruned {n_pruned} skipped path"
@@ -2266,13 +2394,48 @@ class BatchTab(ctk.CTkFrame):
             # behind. Either way: by the time this returns, every
             # output file is at HDD and rmtree below is safe.
             n_swept, bytes_swept = synchronous_final_sweep(
-                scratch_rec, final_rec, worker["inode_to_dst"])
+                scratch_rec, final_rec, worker["inode_to_dst"],
+                keep_registration=self.keep_registration_var.get(),
+                keep_shifted=self.keep_shifted_var.get())
             sweep_msg = ""
             if n_swept > 0:
                 sweep_msg = (f" (sync sweep recovered {n_swept} file"
                              f"{'' if n_swept == 1 else 's'}, "
                              f"{bytes_swept / 1e9:.2f} GB the mirror "
                              f"missed)")
+
+            # Phase 3b: optional raw-TIFF archive. Off by default
+            # (matches current behavior -- nothing is compressed). When
+            # the user ticks "Archive raw TIFF (compressed)" we write
+            # the Zstd-compressed raw into the final output dir. We pass
+            # delete_shifted=False / delete_final_bin=False: the shifted
+            # TIFF + data.bin keep/drop decision is owned entirely by
+            # prune_scratch_tree above (driven by the keep toggles), so
+            # the archive step never deletes anything itself.
+            archive_msg = ""
+            if self.compress_raw_var.get():
+                try:
+                    # raw_paths=None -> the archive reads the
+                    # ``_calliope_raw_paths.json`` sidecar that
+                    # ``run_preprocess`` wrote into the recording folder
+                    # (``final_rec``), falling back to scanning for raw
+                    # TIFFs there. Compression lands the Zstd archive in
+                    # ``final_rec`` next to the outputs.
+                    summary = archive_recording_post_detection(
+                        rec_root=final_rec,
+                        compress_raw=True,
+                        delete_shifted=False,
+                        delete_final_bin=False,
+                        progress_cb=_emit,
+                    )
+                    n_comp = summary.get("compressed", 0)
+                    if n_comp > 0:
+                        archive_msg = (
+                            f" (archived {n_comp} raw TIFF"
+                            f"{'' if n_comp == 1 else 's'} compressed)")
+                except Exception as e:  # never let archive abort finalize
+                    _emit(f"  [batch] [{ident}] raw archive failed: {e}")
+
             # Phase 4: marshal repoint to Tk main thread + block.
             repoint_done = threading.Event()
 
@@ -2330,7 +2493,7 @@ class BatchTab(ctk.CTkFrame):
                   f"+ repointed + scratch cleared "
                   f"({n_synced} files on HDD, "
                   f"{time.time() - t0:.1f}s){prune_msg}{sweep_msg}"
-                  f"{deferred_msg}")
+                  f"{archive_msg}{deferred_msg}")
             if handed_to_janitor:
                 _set_row_status(
                     f"{base_status} (cleanup pending)"

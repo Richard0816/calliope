@@ -103,7 +103,13 @@ SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC: int = 10 * 1024 * 1024  # 10 MB/s
 # ---------------------------------------------------------------------------
 
 
-def prune_scratch_tree(scratch: Path) -> tuple[int, int]:
+def prune_scratch_tree(
+    scratch: Path,
+    *,
+    keep_registration: bool = True,
+    keep_shifted: bool = True,
+    final_rec: Optional[Path] = None,
+) -> tuple[int, int]:
     """Delete known-redundant files + directories under ``scratch``.
 
     Returns ``(n_paths, bytes_freed)`` for logging. Errors on
@@ -127,7 +133,40 @@ def prune_scratch_tree(scratch: Path) -> tuple[int, int]:
       name isn't ``_shared_reg`` or ``final`` -- no current code
       path uses that nesting, but earlier docstrings reference it.
     * ``.tmp`` / ``.lock`` partial-write artefacts.
+
+    The Tab 0 "What to save" toggles add two opt-out drops on top of
+    that always-on baseline (defaults preserve current behavior):
+
+    * ``keep_registration=False`` -- drop the registered movie
+      ``data.bin``. It is hardlinked between ``_shared_reg/`` and
+      ``final/.../plane0/``; BOTH names must be unlinked to free the
+      bytes (the inode survives while either link remains). The ROI
+      arrays (F/Fneu/spks/stat/iscell/ops) are never touched -- only
+      detection re-runs need ``data.bin`` and they'd just
+      re-register. ``final_rec`` is the surviving HDD copy: pass it
+      so the final-output twin is removed too, not just scratch.
+    * ``keep_shifted=False`` -- drop the motion-corrected
+      ``shifted_*.tif`` / ``NNN_shifted_*.tif``. Tab 1's "reload
+      existing" reads it, so dropping it means a Tab 1 reload would
+      have to regenerate it from a compressed raw (if archived) or
+      re-preprocess. Removed from both ``scratch`` and ``final_rec``.
     """
+    # Extra glob patterns + the data.bin special-case (both hardlink
+    # twins) are applied to scratch and -- because the continuous
+    # mirror may already have copied them -- to the surviving final
+    # output dir as well.
+    extra_patterns: list[str] = []
+    if not keep_shifted:
+        extra_patterns += ["**/shifted_*.tif", "**/shifted_*.tiff",
+                           "**/*_shifted_*.tif", "**/*_shifted_*.tiff"]
+    if not keep_registration:
+        # Match the registered movie wherever it sits. It is hardlinked
+        # between ``_shared_reg/data.bin`` and ``final/.../plane0/data.bin``
+        # (same inode -- obs 663); BOTH twins must be unlinked or the
+        # inode survives via the remaining link and zero bytes are freed.
+        # ``**/data.bin`` catches both. NOT ``data_raw*.bin`` -- that's a
+        # different name, already in SCRATCH_PRUNE_FILE_PATTERNS.
+        extra_patterns += ["**/data.bin"]
     def _dir_size(p: Path) -> int:
         total = 0
         try:
@@ -145,21 +184,35 @@ def prune_scratch_tree(scratch: Path) -> tuple[int, int]:
     bytes_freed = 0
     if not scratch.exists():
         return 0, 0
-    # File-level prune: glob each pattern from the recording root.
-    for pattern in SCRATCH_PRUNE_FILE_PATTERNS:
-        for f in scratch.glob(pattern):
-            try:
-                if f.is_file() or f.is_symlink():
-                    sz = 0
-                    try:
-                        sz = f.stat().st_size
-                    except OSError:
-                        pass
-                    f.unlink()
-                    n_paths += 1
-                    bytes_freed += sz
-            except OSError:
-                continue
+
+    def _prune_patterns(root: Path, patterns) -> None:
+        nonlocal n_paths, bytes_freed
+        for pattern in patterns:
+            for f in root.glob(pattern):
+                try:
+                    if f.is_file() or f.is_symlink():
+                        sz = 0
+                        try:
+                            sz = f.stat().st_size
+                        except OSError:
+                            pass
+                        f.unlink()
+                        n_paths += 1
+                        bytes_freed += sz
+                except OSError:
+                    continue
+
+    # File-level prune: glob each pattern from the recording root, plus
+    # any user opt-out extras (dropped shifted TIFF / registration).
+    _prune_patterns(scratch, SCRATCH_PRUNE_FILE_PATTERNS)
+    if extra_patterns:
+        _prune_patterns(scratch, extra_patterns)
+        # The continuous mirror may have already copied data.bin /
+        # shifted TIFFs to the HDD output before this finalize runs. To
+        # actually free the bytes (and, for data.bin, drop the second
+        # hardlink) the surviving final-output copies must go too.
+        if final_rec is not None and Path(final_rec).exists():
+            _prune_patterns(Path(final_rec), extra_patterns)
     # Directory-level prune: ``sparsery_pass/`` + ``cellpose_pass/``
     # live directly under the recording folder (NOT under a
     # ``detection/`` layer); this is the path layout
@@ -226,7 +279,13 @@ def throttled_copy2(src: str, dst: str, *,
     shutil.copystat(src, dst)
 
 
-def is_scratch_mirror_skippable(rel_path: Path, scratch_rec: Path) -> bool:
+def is_scratch_mirror_skippable(
+    rel_path: Path,
+    scratch_rec: Path,
+    *,
+    keep_registration: bool = True,
+    keep_shifted: bool = True,
+) -> bool:
     """Return True iff this scratch-relative path is something the
     continuous mirror should NOT copy to HDD.
 
@@ -240,6 +299,12 @@ def is_scratch_mirror_skippable(rel_path: Path, scratch_rec: Path) -> bool:
       detection-pass intermediates folded into ``final/`` already
     - Anything under ``<rec>/detection/<X>/`` for X not in
       {``_shared_reg``, ``final``} -- defensive (legacy layout)
+
+    The Tab 0 "What to save" opt-outs extend the skip set (defaults
+    keep, matching current behavior): ``keep_registration=False``
+    skips the registered movie ``data.bin``; ``keep_shifted=False``
+    skips the motion-corrected ``shifted_*.tif`` so neither is ever
+    pre-copied to the HDD output the user asked to shrink.
     """
     parts = rel_path.parts
     if not parts:
@@ -253,6 +318,11 @@ def is_scratch_mirror_skippable(rel_path: Path, scratch_rec: Path) -> bool:
         return True
     if (len(parts) >= 2 and parts[0] == "detection"
             and parts[1] not in SCRATCH_DETECTION_KEEP_DIRS):
+        return True
+    if not keep_registration and name == "data.bin":
+        return True
+    if not keep_shifted and name.lower().endswith((".tif", ".tiff")) \
+            and "shifted_" in name:
         return True
     return False
 
@@ -279,7 +349,10 @@ def measure_tree(root: Path) -> tuple[int, int]:
 
 
 def synchronous_final_sweep(scratch: Path, final: Path,
-                            inode_to_dst: dict) -> tuple[int, int]:
+                            inode_to_dst: dict,
+                            *,
+                            keep_registration: bool = True,
+                            keep_shifted: bool = True) -> tuple[int, int]:
     """Walk scratch and copy every non-skip file that isn't already at
     HDD (or is shorter at HDD than at scratch). Synchronous; no daemon
     thread; no time bound.
@@ -312,7 +385,10 @@ def synchronous_final_sweep(scratch: Path, final: Path,
                 rel = sp.relative_to(scratch)
             except ValueError:
                 continue
-            if is_scratch_mirror_skippable(rel, scratch):
+            if is_scratch_mirror_skippable(
+                    rel, scratch,
+                    keep_registration=keep_registration,
+                    keep_shifted=keep_shifted):
                 continue
             try:
                 src_st = sp.stat()
@@ -347,7 +423,9 @@ def synchronous_final_sweep(scratch: Path, final: Path,
 def mirror_sync_pass(scratch: Path, final: Path,
                      seen: dict, inode_to_dst: dict,
                      *, stability_window_s: float = 1.0,
-                     throttle_bytes_per_sec: Optional[int] = None
+                     throttle_bytes_per_sec: Optional[int] = None,
+                     keep_registration: bool = True,
+                     keep_shifted: bool = True
                      ) -> bool:
     """Walk ``scratch`` once and copy every file that's new or has
     changed since the previous pass to its mirror under ``final``.
@@ -382,7 +460,10 @@ def mirror_sync_pass(scratch: Path, final: Path,
                 rel = sp.relative_to(scratch)
             except ValueError:
                 continue
-            if is_scratch_mirror_skippable(rel, scratch):
+            if is_scratch_mirror_skippable(
+                    rel, scratch,
+                    keep_registration=keep_registration,
+                    keep_shifted=keep_shifted):
                 continue
             try:
                 st = sp.stat()
