@@ -20,7 +20,7 @@ calling headless backends. For each row it:
 What the user sees
 ------------------
 - Top: working directory + recursion depth + output folder + Scan;
-  "Apply defaults to all rows" + "Run all" / "Abort".
+  "Apply settings to selected" + "Select all" + "Run all" / "Abort".
 - Middle: scrollable list of recording rows. Each row has an
   identifier entry, a list of TIFFs (with Browse), an "Edit
   parameters..." button, and a per-row status / progress label.
@@ -139,7 +139,8 @@ class BatchRow:
 
     def merge_defaults(self, defaults: dict) -> None:
         """Overwrite per-row params with defaults; called by the
-        top-level "Apply to all rows" button."""
+        top-level "Apply settings to selected" button for each
+        checked row."""
         self.params = dict(defaults)
 
     def destroy(self) -> None:
@@ -624,9 +625,13 @@ class BatchTab(ctk.CTkFrame):
 
         row = ctk.CTkFrame(top, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(6, 6))
-        ctk.CTkButton(row, text="Apply defaults to all rows", width=200,
+        ctk.CTkButton(row, text="Apply settings to selected", width=200,
                       command=self._on_edit_defaults) \
             .pack(side="left")
+        # Tick / untick every row's checkbox in one click.
+        ctk.CTkButton(row, text="Select all", width=100,
+                      command=self._on_select_all) \
+            .pack(side="left", padx=(8, 0))
         ctk.CTkButton(row, text="+ Add row", width=110,
                       command=self.add_row) \
             .pack(side="left", padx=(8, 0))
@@ -927,16 +932,43 @@ class BatchTab(ctk.CTkFrame):
             out.extend(str(p) for p in folder.glob(pat))
         return sorted(set(out))
 
+    def _on_select_all(self) -> None:
+        """Tick every row's selection checkbox, or untick them all if
+        they're already ticked. Drives both "Apply settings to selected"
+        and "Merge selected", which read the same ``selected_var``."""
+        rows = self._rows
+        if not rows:
+            return
+        all_on = all(r.selected_var.get() for r in rows)
+        for r in rows:
+            r.selected_var.set(not all_on)
+
     def _on_edit_defaults(self) -> None:
+        """Edit params in the Advanced dialog, then overwrite the params
+        of the checked rows only (mirrors "Merge selected"'s selection
+        scope). Use "Select all" first to apply to every row."""
+        if getattr(self, "_batch_active", False):
+            messagebox.showinfo("Busy", "Stop the batch run before editing.")
+            return
+        checked = [r for r in self._rows if r.selected_var.get()]
+        if not checked:
+            messagebox.showinfo(
+                "Pick at least 1 row",
+                "Tick the box on each row you want to update, then click "
+                "Apply settings to selected. Use Select all to tick "
+                "every row.")
+            return
         snapshot = dict(self.default_params)
         if not open_advanced(
-                self, "Default parameters (apply to all rows)",
+                self, "Settings (apply to selected rows)",
                 self.PARAM_SPEC, snapshot):
             return
         self.default_params = snapshot
-        for row in self._rows:
+        for row in checked:
             row.merge_defaults(self.default_params)
-        self._log(f"Defaults updated and applied to {len(self._rows)} rows.")
+        self._log(
+            f"Settings updated and applied to {len(checked)} "
+            f"selected row(s).")
 
     def _on_reload_queue(self) -> None:
         out = self.outdir_var.get().strip()
