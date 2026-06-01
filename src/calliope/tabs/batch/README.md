@@ -10,7 +10,13 @@ the user having to click each tab one recording at a time.
 - **Resizable layout.** The recordings list and the run log each have their own draggable grip below them — drag down to grow either panel; the scrollable tab body absorbs the extra height. Default heights: recordings ~260 px, run log ~220 px.
 - **Top bar.** Working dir + recursion **Depth** + **Scan**, output folder +
   **Reload queue**, optional **Scratch dir (SSD)** for fast intermediate I/O,
-  **Apply defaults to all rows**, **+ Add row**, **Run all** / **Abort**.
+  **Apply settings to selected**, **Select all**, **+ Add row**,
+  **Run all** / **Abort**.
+  **Apply settings to selected** opens the Advanced params dialog and
+  overwrites the params of the **checked** rows only (same selection the
+  **Merge selected** button uses); **Select all** ticks/unticks every
+  row's checkbox in one click, so the old "apply to every row" behaviour
+  is just Select all → Apply settings to selected.
   **Scan** walks the working dir up to **Depth** levels deep and adds **one
   row per TIFF file** (NOT one row per folder — multiple TIFFs in the same
   folder each get their own row). Identifier defaults to the file stem; if
