@@ -2037,6 +2037,23 @@ class BatchTab(ctk.CTkFrame):
             # First publish: full done -> kick off per-event.
             if not fired[0] and self._current_stage == "crosscorrelation":
                 fired[0] = True
+                # Per-event xcorr needs population events. A recording
+                # with no detected events would stall here:
+                # xc._on_run_per_event bails early (messagebox + return)
+                # without publishing set_xcorr_ready, so the
+                # second-publish branch below never fires and the batch
+                # hangs at the crosscorrelation stage. Skip straight to
+                # stage-done in that case -- the full-recording xcorr we
+                # just ran is the only xcorr output such a recording can
+                # produce.
+                if not getattr(xc, "_event_windows", None):
+                    fired[1] = True
+                    self._append_log(
+                        "  [crosscorrelation] full done; no events "
+                        "detected -- skipping per-event xcorr")
+                    self.after(0, lambda: self._on_stage_done(
+                        "crosscorrelation", payload))
+                    return
                 self._append_log("  [crosscorrelation] full done; "
                                  "starting per-event")
                 self._xcorr_step = "per_event"

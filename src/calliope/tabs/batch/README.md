@@ -763,3 +763,13 @@ math counterpart — the algorithm lives in `core/utils.py` /
   short-circuits the rest of that row; lowpass / events / clustering /
   xcorr / spatial each fail independently. Spatial-propagation figures
   silently skip when event detection produced no event windows.
+- **No events => per-event xcorr is skipped, not stalled.** When event
+  detection finds zero population events, the xcorr tab's
+  `_on_run_per_event` bails early without publishing `set_xcorr_ready`,
+  which would otherwise hang the batch's two-step crosscorrelation
+  completion counter. `_stage_crosscorrelation` checks
+  `xc._event_windows` after the full-recording xcorr completes and, when
+  empty, advances straight to stage-done. The full-recording xcorr (no
+  events needed) still runs and its figures are kept. The headless
+  `crosscorrelation.run_crosscorrelation` already guards the same case
+  (`if event_windows is not None and len(event_windows) > 0`).
