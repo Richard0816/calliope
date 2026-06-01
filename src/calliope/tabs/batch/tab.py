@@ -1335,6 +1335,13 @@ class BatchTab(ctk.CTkFrame):
         self._app = self.winfo_toplevel()
 
         self._batch_active = True
+        # Tell every tab a batch is driving so their _on_error handlers
+        # publish to the stage-error channel and skip their blocking modal
+        # dialogs (a messagebox would freeze the queue).
+        try:
+            self.state.batch_active = True
+        except Exception:
+            pass
         # Reset the suite2p batch_size adaptive sizer so the queue
         # starts fresh: first recording uses the frame-size-aware
         # initial estimate, recordings 2..N learn from observed peak
@@ -1886,6 +1893,20 @@ class BatchTab(ctk.CTkFrame):
             self.after(0, lambda: self._on_stage_done(expected_stage, hint))
         subscribe_fn(cb)
 
+        # Fail-fast if the stage's worker thread errors before it
+        # publishes its ready signal. Without this the batch would wait
+        # forever on a signal the crashed worker never sends. Shares the
+        # one-shot ``fired`` flag with the success path, so whichever of
+        # (ready, error) arrives first wins and the other is ignored.
+        def err_cb(msg):
+            if fired[0] or self._current_stage != expected_stage:
+                return
+            fired[0] = True
+            first_line = str(msg).split("\n", 1)[0]
+            self.after(0, lambda: self._fail_stage(
+                expected_stage, RuntimeError(first_line)))
+        self.state.subscribe_stage_error(err_cb)
+
     # ---- Per-stage triggers --------------------------------------------
 
     def _stage_preprocess(self) -> None:
@@ -2009,7 +2030,16 @@ class BatchTab(ctk.CTkFrame):
             self.after(0, lambda: self._on_stage_done(
                 "clustering", plane0))
 
+        def err_cb(msg):
+            if fired[0] or self._current_stage != "clustering":
+                return
+            fired[0] = True
+            first = str(msg).split("\n", 1)[0]
+            self.after(0, lambda: self._fail_stage(
+                "clustering", RuntimeError(first)))
+
         self.state.subscribe_clusters_ready(cb)
+        self.state.subscribe_stage_error(err_cb)
         self.after(50, cl._on_run)
 
     def _stage_crosscorrelation(self) -> None:
@@ -2066,7 +2096,20 @@ class BatchTab(ctk.CTkFrame):
                 self.after(0, lambda: self._on_stage_done(
                     "crosscorrelation", hint))
 
+        def err_cb(msg):
+            # Either the full or per-event run can raise. Set both slots
+            # so a late ready publish can't kick per-event after we've
+            # already failed the stage.
+            if fired[1] or self._current_stage != "crosscorrelation":
+                return
+            fired[0] = True
+            fired[1] = True
+            first = str(msg).split("\n", 1)[0]
+            self.after(0, lambda: self._fail_stage(
+                "crosscorrelation", RuntimeError(first)))
+
         self.state.subscribe_xcorr_ready(cb)
+        self.state.subscribe_stage_error(err_cb)
         self.after(50, xc._on_run_full)
 
     def _stage_spatial_propagation(self) -> None:
@@ -2116,6 +2159,19 @@ class BatchTab(ctk.CTkFrame):
         if stage == "detection" and self._detection_has_no_rois(path_hint):
             self._skip_row_no_rois()
             return
+
+        # Clustering -- and the cross-correlation that consumes its cluster
+        # ROI files -- need >=2 ROIs; hierarchical linkage is undefined for
+        # a single trace (pdist on one column -> "empty distance matrix").
+        # A recording with exactly 1 kept ROI sails through detection,
+        # lowpass and event detection, then would crash clustering. Once
+        # events are done, skip clustering + crosscorrelation and jump to
+        # spatial (which only needs events), so the row still finishes.
+        if stage == "event_detection":
+            n_roi = self._kept_roi_count(self._row_results.get("plane0"))
+            if n_roi is not None and n_roi < 2:
+                self._skip_clustering_xcorr_few_rois(n_roi)
+                return
 
         idx = self.STAGES.index(stage) + 1
         if idx >= len(self.STAGES):
@@ -2211,6 +2267,63 @@ class BatchTab(ctk.CTkFrame):
         self._row_results["status"] = "no_rois"
         self._row_results["error"] = "no ROIs detected (recording is noise)"
         self._on_row_done()
+
+    def _kept_roi_count(self, plane0) -> Optional[int]:
+        """How many ROIs survive the cell filter at ``plane0`` -- the
+        number the clustering stage will try to cluster. Resolved the same
+        way the readers do: keep-mask files first
+        (``r0p7_cell_mask_bool`` -> ``predicted_cell_mask`` -> ``iscell``),
+        falling back to the filtered-memmap column count. Returns ``None``
+        on any read error so the caller proceeds normally rather than
+        skipping on a transient glitch.
+        """
+        if plane0 is None:
+            return None
+        try:
+            import numpy as np
+            plane0 = Path(plane0)
+            for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
+                p = plane0 / name
+                if p.exists():
+                    return int(np.load(p).astype(bool).sum())
+            iscell_path = plane0 / "iscell.npy"
+            if iscell_path.exists():
+                ic = np.load(iscell_path)
+                m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+                return int(np.asarray(m).sum())
+            # Fall back to the filtered memmap's column count (T from F.npy).
+            filt = plane0 / "r0p7_filtered_dff.memmap.float32"
+            F = plane0 / "F.npy"
+            if filt.exists() and F.exists():
+                T = int(np.load(F, mmap_mode="r").shape[1])
+                if T > 0:
+                    return int(filt.stat().st_size // (4 * T))
+            return None
+        except Exception as e:
+            self._append_log(
+                f"  [clustering] ROI-count check failed ({e}); proceeding.")
+            return None
+
+    def _skip_clustering_xcorr_few_rois(self, n_roi: int) -> None:
+        """Skip clustering + cross-correlation for a recording with <2
+        kept ROIs, then continue to spatial propagation.
+
+        Clustering needs >=2 ROIs (linkage is undefined for one trace) and
+        cross-correlation consumes clustering's per-cluster ROI files, so
+        both are skipped. Spatial propagation only needs events, so the row
+        still produces its event/spatial outputs and finishes normally.
+        """
+        self._append_log(
+            f"  [clustering] only {n_roi} ROI(s) survive the cell filter "
+            f"-- need >=2 to cluster; skipping clustering + "
+            f"cross-correlation.")
+        for st in ("clustering", "crosscorrelation"):
+            self._row_results["stages"][st] = {
+                "status": "skipped",
+                "duration_s": 0.0,
+                "error": f"only {n_roi} ROI(s); need >=2 to cluster",
+            }
+        self._begin_stage("spatial_propagation")
 
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
         elapsed = time.time() - self._stage_t0
@@ -2795,6 +2908,11 @@ class BatchTab(ctk.CTkFrame):
         self._finalize_waiting = False
 
         self._batch_active = False
+        # Restore interactive error dialogs now the queue is done.
+        try:
+            self.state.batch_active = False
+        except Exception:
+            pass
         self.run_btn.configure(state="normal")
         # Restore the abort button's label + (disabled) state ready
         # for the next batch. _on_abort flipped it to "Aborting..."

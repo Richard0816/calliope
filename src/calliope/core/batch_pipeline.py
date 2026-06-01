@@ -77,6 +77,36 @@ def _no_rois_survive(plane0: Path) -> bool:
         return False
 
 
+def _kept_roi_count(plane0: Path) -> Optional[int]:
+    """How many ROIs survive the cell filter at ``plane0`` -- the number
+    the clustering stage will try to cluster. Resolved the same way the
+    readers do (keep-mask files first, then the filtered-memmap column
+    count). Returns ``None`` on any read error so the caller proceeds
+    normally rather than skipping on a transient glitch.
+    """
+    import numpy as np
+    plane0 = Path(plane0)
+    try:
+        for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
+            p = plane0 / name
+            if p.exists():
+                return int(np.load(p).astype(bool).sum())
+        iscell = plane0 / "iscell.npy"
+        if iscell.exists():
+            ic = np.load(iscell)
+            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+            return int(np.asarray(m).sum())
+        filt = plane0 / "r0p7_filtered_dff.memmap.float32"
+        F = plane0 / "F.npy"
+        if filt.exists() and F.exists():
+            T = int(np.load(F, mmap_mode="r").shape[1])
+            if T > 0:
+                return int(filt.stat().st_size // (4 * T))
+        return None
+    except Exception:
+        return None
+
+
 def run_recording(
     src_tiffs,
     save_folder: str,
@@ -299,23 +329,34 @@ def run_recording(
         overall_status = "partial"
 
     # ----- Stage 4: clustering (Tab 6) ------------------------------
+    # Clustering needs >=2 ROIs (hierarchical linkage is undefined for a
+    # single trace). Skip it -- and the cross-correlation that consumes
+    # its cluster files -- for a 1-ROI recording rather than crashing in
+    # pdist. Spatial figures below only need events, so they still run.
     t0 = time.time()
-    try:
-        _emit("clustering: starting")
-        clustering.run_clustering(
-            plane0, params,
-            figures_dir=_figures_dir_for(save_folder, "clustering"),
-            write_summary=True,
-        )
+    n_kept = _kept_roi_count(Path(plane0))
+    if n_kept is not None and n_kept < 2:
         stages["clustering"].update(
-            status="ok", duration_s=time.time() - t0)
-        _emit("clustering: done")
-    except Exception as e:
-        stages["clustering"].update(
-            status="failed", duration_s=time.time() - t0,
-            error=f"{e}\n{traceback.format_exc()}")
-        _emit(f"clustering: FAILED -- {e}")
-        overall_status = "partial"
+            status="skipped",
+            error=f"only {n_kept} ROI(s); need >=2 to cluster")
+        _emit(f"clustering: skipped ({n_kept} ROI(s); need >=2)")
+    else:
+        try:
+            _emit("clustering: starting")
+            clustering.run_clustering(
+                plane0, params,
+                figures_dir=_figures_dir_for(save_folder, "clustering"),
+                write_summary=True,
+            )
+            stages["clustering"].update(
+                status="ok", duration_s=time.time() - t0)
+            _emit("clustering: done")
+        except Exception as e:
+            stages["clustering"].update(
+                status="failed", duration_s=time.time() - t0,
+                error=f"{e}\n{traceback.format_exc()}")
+            _emit(f"clustering: FAILED -- {e}")
+            overall_status = "partial"
 
     # ----- Stage 5: cross-correlation (Tab 7) -----------------------
     t0 = time.time()

@@ -84,7 +84,7 @@ from matplotlib.backends.backend_tkagg import (
 import customtkinter as ctk
 
 from ...gui_common import (
-    drain_queue, install_scroll_router, restyle_matplotlib_toolbar,
+    drain_queue, install_scroll_router, report_stage_error, restyle_matplotlib_toolbar,
 )
 from .logic import xc
 from .logic import utils
@@ -221,6 +221,16 @@ _NS_COLOR = "#CFCFCF"     # gray   - not significant
 
 def _plot_violin(ax, labels, arrays, ylabel: str, title: str,
                  show_sig: bool = False) -> None:
+    # matplotlib's violinplot raises "need at least one data array" on an
+    # empty list. A recording whose ROIs all collapse into a single
+    # cluster produces zero pairs and thus no arrays -- render an
+    # empty-state placeholder instead of crashing.
+    if not arrays:
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, "no cluster pairs", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title(title)
+        return
     pos = np.arange(1, len(arrays) + 1)
     ax.violinplot(arrays, positions=pos,
                   showmedians=True, showextrema=False)
@@ -1448,6 +1458,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self.status_var.set("Cross-correlation failed.")
         self._log("[error] " + payload)
         self._enable_run()
+        if report_stage_error(self.state, payload):
+            return
         messagebox.showerror(
             "Cross-correlation failed",
             payload.split("\n", 1)[0])

@@ -80,7 +80,7 @@ from .logic import PreprocessResult
 # PARAM_SPEC" helper.
 from ...gui_common import (
     AppState, apply_dark_to_tk_widget, attach_resize_handle,
-    drain_queue, open_advanced, spec_defaults,
+    drain_queue, open_advanced, report_stage_error, spec_defaults,
 )
 
 
@@ -536,4 +536,6 @@ class PreprocessTab(ctk.CTkFrame):
         self._update_existing_status()
         self.status_var.set("Error.")
         self._append_log(f"ERROR: {msg}")
+        if report_stage_error(self.state, msg):
+            return
         messagebox.showerror("Preprocessing failed", msg)

@@ -86,7 +86,7 @@ from .curation_popout import CurationPopout
 
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
-    drain_queue, open_advanced, spec_defaults,
+    drain_queue, open_advanced, report_stage_error, spec_defaults,
 )
 
 
@@ -1187,6 +1187,8 @@ class Suite2pTab(ctk.CTkFrame):
         self.run_btn.configure(state="normal")
         self.status_var.set("Error.")
         self._append_log(f"ERROR: {msg}")
+        if report_stage_error(self.state, msg):
+            return
         messagebox.showerror("Detection failed", msg.split("\n", 1)[0])
 
     # -- Panel rendering ----------------------------------------------------

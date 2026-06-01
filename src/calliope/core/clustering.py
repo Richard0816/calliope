@@ -202,6 +202,10 @@ def count_clusters(Z: np.ndarray, color_threshold: float) -> int:
     "above_threshold_color" group; ``fcluster`` gives the actual
     cluster count.
     """
+    # A degenerate (0-merge) linkage has no tree to cut -- there is at
+    # most one observation, i.e. exactly one trivial cluster.
+    if Z is None or len(Z) < 1:
+        return 1
     # Convert fractional cut to absolute distance.
     T = color_threshold * np.max(Z[:, 2])
     labels = fcluster(Z, t=T, criterion="distance")
@@ -449,6 +453,15 @@ def _ward_linkage(dff: np.ndarray,
     Mirrors ``tabs.clustering.tab._ward_linkage`` but without the Tk
     import chain. See that function's docstring for the full history.
     """
+    n_roi = int(np.asarray(dff).shape[1]) if np.asarray(dff).ndim == 2 else 0
+    if n_roi < 2:
+        # pdist on <2 columns returns an empty condensed vector and
+        # linkage raises the cryptic "The number of observations cannot
+        # be determined on an empty distance matrix". Fail with a clear,
+        # actionable message instead.
+        raise ValueError(
+            f"Need at least 2 ROIs to cluster; got {n_roi}. "
+            f"Hierarchical clustering is undefined for a single trace.")
     dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
     dist = pdist(dff_z.T, metric="euclidean")
     return linkage(dist, method=method)

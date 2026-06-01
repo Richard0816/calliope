@@ -117,6 +117,14 @@ def ward_linkage(dff: np.ndarray, method: str = "ward") -> np.ndarray:
     once we've z-scored. Switched to Ward after the user pointed
     out that z-scoring already kills amplitude differences.
     """
+    n_roi = int(np.asarray(dff).shape[1]) if np.asarray(dff).ndim == 2 else 0
+    if n_roi < 2:
+        # pdist on <2 columns yields an empty condensed vector and
+        # linkage raises the cryptic "empty distance matrix" error.
+        # Surface a clear, actionable message instead.
+        raise ValueError(
+            f"Need at least 2 ROIs to cluster; got {n_roi}. "
+            f"Hierarchical clustering is undefined for a single trace.")
     dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
     dist = pdist(dff_z.T, metric="euclidean")
     return linkage(dist, method=method)

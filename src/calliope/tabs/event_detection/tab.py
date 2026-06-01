@@ -72,7 +72,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from .logic import summary_writer
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue,
+    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, report_stage_error,
     format_roi_indices, open_advanced, parse_manual_roi_spec,
     spec_defaults,
 )
@@ -688,6 +688,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self.render_progress.stop()
         self.render_btn.configure(state="normal")
         self.status_var.set("Render error.")
+        if report_stage_error(self.state, payload):
+            return
         messagebox.showerror(
             "Render failed", payload.split("\n", 1)[0])
 

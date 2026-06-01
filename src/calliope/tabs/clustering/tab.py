@@ -115,7 +115,7 @@ from .logic import clustering as cmap_mod
 from .cluster_popout import ClusterPopout
 
 from ...gui_common import (
-    apply_dark_to_tk_widget, attach_fig_toolbar, drain_queue,
+    apply_dark_to_tk_widget, attach_fig_toolbar, drain_queue, report_stage_error,
     format_roi_indices,
 )
 
@@ -606,6 +606,10 @@ class ClusteringTab(ctk.CTkFrame):
         self.run_btn.configure(state="normal")
         self._refresh_reload_btn()
         self.status_var.set("Analysis failed.")
+        # Forward to the batch runner (so a worker crash fails-and-
+        # continues the queue) and skip the modal when a batch is driving.
+        if report_stage_error(self.state, payload):
+            return
         messagebox.showerror(
             "Analysis failed", payload.split("\n", 1)[0])
 

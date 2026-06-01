@@ -759,10 +759,35 @@ math counterpart — the algorithm lives in `core/utils.py` /
   per-tab outputs on disk already. Rows with status `no_rois` were
   genuinely noise (zero ROIs survived the cell filter) — their downstream
   stages are intentionally `skipped`, so there is nothing to re-run.
+- **A stage worker that crashes fails-and-continues — it never stalls.**
+  The driver triggers each stage's tab worker, then waits on a one-shot
+  AppState "ready" signal. If the worker raises *before* publishing that
+  signal, there is nothing to wait for, so the queue would hang forever.
+  The fix: every analysis tab's `_on_error` calls
+  `gui_common.report_stage_error(self.state, msg)`, which publishes the
+  failure on the `AppState` stage-error channel (and, while a batch is
+  active, suppresses the tab's blocking modal so it can't freeze the
+  queue). `_arm_completion` (and the custom clustering / xcorr stages)
+  subscribe to that channel and call `_fail_stage` the instant a worker
+  errors — sharing the one-shot guard with the ready path so whichever
+  arrives first wins. `state.batch_active` is set in `_on_run_all` and
+  cleared in `_batch_finish`.
 - **Failures in one stage don't poison the next.** Detection failure
   short-circuits the rest of that row; lowpass / events / clustering /
   xcorr / spatial each fail independently. Spatial-propagation figures
   silently skip when event detection produced no event windows.
+- **<2 ROIs => clustering + xcorr are skipped, not crashed.** Clustering
+  needs at least two ROIs (hierarchical linkage is undefined for a single
+  trace — `pdist` on one column raises "empty distance matrix"). A
+  recording with exactly one kept ROI clears detection / lowpass / events
+  but can't cluster. After event detection, `_on_stage_done` checks
+  `_kept_roi_count(plane0)` and, when `<2`, calls
+  `_skip_clustering_xcorr_few_rois`: clustering + crosscorrelation are
+  marked `skipped` and the row jumps to spatial propagation (which only
+  needs events), so it still finishes with its event/spatial output.
+  `core.clustering._ward_linkage` / `tabs.clustering.logic.ward_linkage`
+  also raise a clear `ValueError` for this case, and the headless
+  `batch_pipeline.run_recording` applies the same `_kept_roi_count` skip.
 - **No events => per-event xcorr is skipped, not stalled.** When event
   detection finds zero population events, the xcorr tab's
   `_on_run_per_event` bails early without publishing `set_xcorr_ready`,

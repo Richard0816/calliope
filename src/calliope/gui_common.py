@@ -388,6 +388,29 @@ def drain_queue(widget, q: "queue.Queue", handlers: dict,
     widget.after(poll_ms, _tick)
 
 
+def report_stage_error(state, msg) -> bool:
+    """Forward an analysis tab's worker-thread failure to the batch runner.
+
+    Each pipeline tab calls this from its ``_on_error`` handler. It
+    publishes the error on ``AppState.set_stage_error`` (which the batch
+    runner subscribes to, so a worker crash fails-and-continues the queue
+    instead of stalling on a "ready" signal the crashed worker never
+    sends), and returns whether a batch is actively driving.
+
+    Returns ``True`` when the caller should SKIP its modal error dialog --
+    a blocking messagebox during a batch would freeze the whole queue
+    behind an un-clicked popup. Interactive (non-batch) callers get
+    ``False`` and should show their dialog as usual.
+    """
+    if state is None:
+        return False
+    try:
+        state.set_stage_error(msg)
+    except Exception:
+        pass
+    return bool(getattr(state, "batch_active", False))
+
+
 def apply_ttk_dark_theme(root) -> None:
     """Restyle every ``ttk`` widget class to blend with the CTk
     surround. Must be called once after the root window exists.
@@ -505,6 +528,14 @@ class AppState:
         # tab just wrote.
         self.clusters_ready: Optional[Path] = None
         self.xcorr_ready: Optional[Path] = None
+        # Latest stage-error string (transient; not reset across runs --
+        # the batch runner only reads it inside a stage-scoped listener).
+        self.stage_error: Optional[str] = None
+        # True while Tab 0's batch runner is driving the pipeline. Tabs
+        # read it (via ``report_stage_error``) to suppress their modal
+        # error dialogs during a batch so a worker failure can't block
+        # the queue behind an un-clicked messagebox.
+        self.batch_active: bool = False
         # Subscriber lists. Underscore prefix is convention for
         # "internal -- don't poke this from outside the class". Python
         # does not actually enforce privacy.
@@ -514,6 +545,7 @@ class AppState:
         self._event_listeners: list = []
         self._clusters_listeners: list = []
         self._xcorr_listeners: list = []
+        self._stage_error_listeners: list = []
 
     # ---- preprocess result channel ----
 
@@ -614,6 +646,27 @@ class AppState:
                 fn(self.xcorr_ready)
             except Exception as e:
                 print(f"xcorr_ready listener error: {e}")
+
+    # ---- stage-error channel (any tab's worker failure -> batch runner) ----
+
+    def subscribe_stage_error(self, fn) -> None:
+        """Subscribe to "an analysis tab's worker thread failed" signals.
+
+        Each pipeline tab publishes here from its ``_on_error`` handler
+        (the same path that pops the failure messagebox). The batch runner
+        listens so a worker exception fails-and-continues the queue
+        instead of stalling forever waiting on a "ready" signal that the
+        crashed worker never sends. Listener receives the error string.
+        """
+        self._stage_error_listeners.append(fn)
+
+    def set_stage_error(self, payload: str) -> None:
+        self.stage_error = str(payload)
+        for fn in self._stage_error_listeners:
+            try:
+                fn(self.stage_error)
+            except Exception as e:
+                print(f"stage_error listener error: {e}")
 
     # ---- bulk reset (used before loading a different run) ----
 

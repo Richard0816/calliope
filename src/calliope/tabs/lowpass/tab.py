@@ -85,7 +85,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, drain_queue, format_roi_indices,
+    AppState, attach_fig_toolbar, drain_queue, format_roi_indices, report_stage_error,
     open_advanced, parse_manual_roi_spec, spec_defaults,
 )
 
@@ -768,6 +768,8 @@ class LowpassTab(ctk.CTkFrame):
         self.compute_progress.stop()
         self.compute_btn.configure(state="normal")
         self.compute_status_var.set("Error.")
+        if report_stage_error(self.state, payload):
+            return
         messagebox.showerror(
             "Compute failed", payload.split("\n", 1)[0])
 

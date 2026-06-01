@@ -47,7 +47,8 @@ class _StageStub:
         self.scheduled: list[tuple] = []   # (delay, fn) for nonzero delays
         self._subscribed = None
         self.state = types.SimpleNamespace(
-            subscribe_xcorr_ready=self._subscribe)
+            subscribe_xcorr_ready=self._subscribe,
+            subscribe_stage_error=lambda cb: None)
 
     def _subscribe(self, cb):
         self._subscribed = cb
