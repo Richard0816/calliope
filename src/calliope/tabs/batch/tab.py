@@ -2088,6 +2088,18 @@ class BatchTab(ctk.CTkFrame):
                 self._append_log(
                     f"  [{stage}] figure export failed: {e}")
 
+        # Genuinely-noise recordings can finish detection with zero ROIs
+        # surviving the cell filter. There's then no
+        # r0p7_filtered_dff.memmap.float32 (and no fallback keep mask) for
+        # the lowpass stage -- or anything downstream -- to read, so the
+        # lowpass tab errors in _on_compute without publishing
+        # set_lowpass_ready and the batch stalls here forever. Detect that
+        # and skip the remaining analysis stages, keeping whatever
+        # detection outputs we did get.
+        if stage == "detection" and self._detection_has_no_rois(path_hint):
+            self._skip_row_no_rois()
+            return
+
         idx = self.STAGES.index(stage) + 1
         if idx >= len(self.STAGES):
             self._on_row_done()
@@ -2119,6 +2131,69 @@ class BatchTab(ctk.CTkFrame):
             return
         export(quiet=True)
         self._append_log(f"  [{stage}] figures exported")
+
+    def _detection_has_no_rois(self, plane0) -> bool:
+        """True when detection left no ROIs for the analysis stages to
+        work on -- a genuinely-noise recording.
+
+        The lowpass stage reads ``r0p7_filtered_dff.memmap.float32``,
+        which ``detection_run.compute_filtered_dff`` writes only when at
+        least one ROI survives the cell filter. When that memmap is
+        absent we fall back to counting the live keep mask exactly as the
+        lowpass tab's ``_load_data`` does (``predicted_cell_mask`` ->
+        ``iscell`` -> all-ones). Returns ``False`` on any read error so a
+        transient glitch never silently skips a good recording.
+        """
+        if plane0 is None:
+            return False
+        try:
+            import numpy as np
+            plane0 = Path(plane0)
+            if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
+                return False  # only written when N_kept > 0
+            mask_path = plane0 / "predicted_cell_mask.npy"
+            if mask_path.exists():
+                return int(np.load(mask_path).astype(bool).sum()) == 0
+            iscell_path = plane0 / "iscell.npy"
+            if iscell_path.exists():
+                ic = np.load(iscell_path)
+                m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+                return int(np.asarray(m).sum()) == 0
+            # No filtered memmap and no mask files at all -> nothing for
+            # the lowpass stage to read.
+            return True
+        except Exception as e:
+            self._append_log(
+                f"  [detection] ROI-count check failed ({e}); "
+                f"continuing to lowpass.")
+            return False
+
+    def _skip_row_no_rois(self) -> None:
+        """Finish the current row when detection found no ROIs (the
+        recording is noise): mark every stage after detection as skipped
+        and hand off to ``_on_row_done``.
+
+        ``_on_row_done`` still runs the normal scratch -> output finalize,
+        so the detection folder + figures we did produce are kept; it only
+        overwrites the row status when it's still ``"running"``, so the
+        ``"no_rois"`` status set here survives into the batch report.
+        """
+        self._append_log(
+            "  [detection] 0 ROIs survive the cell filter -- recording is "
+            "noise. Skipping lowpass + downstream analysis.")
+        try:
+            start = self.STAGES.index("detection") + 1
+        except ValueError:
+            start = len(self.STAGES)
+        for st in self.STAGES[start:]:
+            self._row_results["stages"][st] = {
+                "status": "skipped",
+                "duration_s": 0.0,
+                "error": "no ROIs detected (recording is noise)",
+            }
+        self._row_results["status"] = "no_rois"
+        self._row_results["error"] = "no ROIs detected (recording is noise)"
+        self._on_row_done()
 
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
         elapsed = time.time() - self._stage_t0

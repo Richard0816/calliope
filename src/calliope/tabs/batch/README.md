@@ -68,7 +68,23 @@ The Run-all worker iterates rows in queue order. For each row:
    fails, the recording is marked **partial** and the worker moves on.
    Detection failure is fatal for that row only; the queue continues.
 4. Update the row's status label (`queued` → `running` → `ok` / `partial` /
-   `failed` / `aborted`).
+   `failed` / `aborted` / `no_rois`).
+
+#### Zero-ROI ("genuinely noise") recordings
+
+A recording that is just noise can finish detection with **no ROIs
+surviving the cell filter**. `detection_run.compute_filtered_dff` then
+writes no `r0p7_filtered_dff.memmap.float32`, so the lowpass stage (and
+everything downstream) has nothing to read — the lowpass tab would error
+in `_on_compute` without publishing `set_lowpass_ready`, hanging the GUI
+batch forever. Immediately after detection, `_on_stage_done` calls
+`_detection_has_no_rois(plane0)` (mirrors the lowpass reader: filtered
+memmap present → ROIs exist; else count `predicted_cell_mask` / `iscell`).
+If zero, `_skip_row_no_rois` marks `lowpass … spatial_propagation` as
+**skipped**, sets the row status to **`no_rois`**, and finalizes the row
+normally — so the detection folder + figures that *were* produced are
+kept. The headless orchestrator `core.batch_pipeline.run_recording`
+applies the same guard (`_no_rois_survive`) and returns `status="no_rois"`.
 
 ### Abort behavior
 
@@ -740,7 +756,9 @@ math counterpart — the algorithm lives in `core/utils.py` /
   JSON is the canonical record of what was actually run.
 - **`batch_report.csv` is the audit log.** Re-run only the rows whose
   status is `failed` or `partial`; the others have all their figures and
-  per-tab outputs on disk already.
+  per-tab outputs on disk already. Rows with status `no_rois` were
+  genuinely noise (zero ROIs survived the cell filter) — their downstream
+  stages are intentionally `skipped`, so there is nothing to re-run.
 - **Failures in one stage don't poison the next.** Detection failure
   short-circuits the rest of that row; lowpass / events / clustering /
   xcorr / spatial each fail independently. Spatial-propagation figures

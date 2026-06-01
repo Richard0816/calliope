@@ -46,6 +46,37 @@ def _figures_dir_for(save_folder: Path, stage: str) -> Path:
     return Path(save_folder) / "calliope_figures" / stage
 
 
+def _no_rois_survive(plane0: Path) -> bool:
+    """True when no ROIs survive the cell filter at ``plane0`` -- a
+    genuinely-noise recording.
+
+    ``detection_run.compute_filtered_dff`` writes
+    ``r0p7_filtered_dff.memmap.float32`` only when at least one ROI
+    survives, so its presence means there is data for the lowpass stage
+    (and everything downstream) to read. When it's absent we fall back to
+    counting the live keep mask the same way the lowpass reader does
+    (``predicted_cell_mask`` -> ``iscell``). Returns ``False`` on any read
+    error so a transient glitch never skips a good recording.
+    """
+    import numpy as np
+    plane0 = Path(plane0)
+    try:
+        if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
+            return False
+        mask_path = plane0 / "predicted_cell_mask.npy"
+        if mask_path.exists():
+            return int(np.load(mask_path).astype(bool).sum()) == 0
+        iscell_path = plane0 / "iscell.npy"
+        if iscell_path.exists():
+            ic = np.load(iscell_path)
+            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+            return int(np.asarray(m).sum()) == 0
+        # No filtered memmap and no mask files -> nothing to filter.
+        return True
+    except Exception:
+        return False
+
+
 def run_recording(
     src_tiffs,
     save_folder: str,
@@ -191,6 +222,27 @@ def run_recording(
             "save_folder": str(save_folder),
             "status": "failed",
             "plane0": None,
+            "stages": stages,
+            "figures": figures,
+        }
+
+    # A genuinely-noise recording can finish detection with zero ROIs
+    # surviving the cell filter -- compute_filtered_dff then writes no
+    # r0p7_filtered_dff memmap, and the lowpass stage (plus everything
+    # downstream) has nothing to read. Skip those stages cleanly with a
+    # distinct "no_rois" status instead of letting lowpass raise.
+    if _no_rois_survive(Path(plane0)):
+        _emit("detection: 0 ROIs survive the cell filter -- recording is "
+              "noise; skipping lowpass + downstream stages")
+        for s in STAGES[STAGES.index("lowpass"):]:
+            stages[s].update(
+                status="skipped",
+                error="no ROIs detected (recording is noise)")
+        return {
+            "recording_id": rec_id,
+            "save_folder": str(save_folder),
+            "status": "no_rois",
+            "plane0": str(plane0),
             "stages": stages,
             "figures": figures,
         }
