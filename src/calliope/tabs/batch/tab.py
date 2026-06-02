@@ -253,6 +253,14 @@ class BatchTab(ctk.CTkFrame):
     # so the run log doesn't fill up if a finalize is slow.
     _SCRATCH_WAIT_LOG_INTERVAL_S: float = 60.0
 
+    # RAM out-of-memory auto-retry. When a recording's stage worker dies
+    # with a memory-allocation error, re-run the WHOLE recording with
+    # progressively more conservative resource settings before giving up.
+    # ``_OOM_RETRY_SCALES`` maps the retry attempt (1-based) to the
+    # suite2p ``batch_size`` multiplier applied via the adaptive sizer.
+    _MAX_OOM_RETRIES: int = 2
+    _OOM_RETRY_SCALES: dict = {1: 0.5, 2: 0.25}
+
     def _row_scratch_budget(self, row: "BatchRow") -> int:
         """Estimate the peak scratch footprint (bytes) for ``row``.
 
@@ -1350,7 +1358,36 @@ class BatchTab(ctk.CTkFrame):
         # cohort's frame sizes).
         from ...core import utils as _core_utils
         _core_utils.reset_adaptive_sizer()
+        _core_utils.get_adaptive_sizer().conservative_scale = 1.0
         self._batch_queue = list(self._rows)
+        # RAM-OOM retry state. Snapshot the user's baseline resource knobs
+        # so conservative retries can restore them exactly (these tab
+        # fields are shared across rows). ``use_gpu_dff`` is a PARAM_SPEC
+        # field (read from det._params); ``nbins`` rides the independent
+        # det._settings_override dict that the tab passes to spc.run; the
+        # xcorr GPU + preprocess QC downsample are the other levers.
+        from copy import deepcopy as _deepcopy
+        _det = getattr(self._app, "detection_tab", None)
+        _xc = getattr(self._app, "xcorr_tab", None)
+        _prep = getattr(self._app, "preprocess_tab", None)
+        self._baseline_use_gpu_dff = bool(
+            getattr(_det, "_params", {}).get("use_gpu_dff", True)
+            if _det is not None else True)
+        self._baseline_settings_override = _deepcopy(
+            getattr(_det, "_settings_override", {}) or {}
+            if _det is not None else {})
+        try:
+            self._baseline_xc_gpu = bool(_xc.gpu_var.get()) \
+                if _xc is not None else True
+        except Exception:
+            self._baseline_xc_gpu = True
+        self._baseline_downsample_t = int(
+            getattr(_prep, "_params", {}).get("downsample_t", 4)
+            if _prep is not None else 4)
+        # Reset per-row attempt counters so a row retried in a prior batch
+        # doesn't start this one in conservative mode.
+        for _r in self._rows:
+            _r._oom_attempt = 0
         self._batch_results: list[dict] = []
         # In-flight scratch->HDD copies. Each daemon thread does its
         # own copytree/rmtree without blocking the next row's start.
@@ -1849,6 +1886,17 @@ class BatchTab(ctk.CTkFrame):
             self._append_log(
                 f"  WARN: failed to apply save policy: {e}")
 
+        # Apply the resource profile for this row -- conservative knobs on
+        # an OOM retry (lvl>0), normal otherwise. Runs AFTER
+        # _apply_row_params_to_tabs so the conservative overrides win, and
+        # deterministically every stage so they never leak into later
+        # normal rows.
+        try:
+            self._apply_resource_profile(self._current_row, stage)
+        except Exception as e:
+            self._append_log(
+                f"  WARN: failed to apply resource profile: {e}")
+
         self._current_stage = stage
         self._stage_t0 = time.time()
         self._current_row.set_status(f"running {stage}")
@@ -2325,12 +2373,182 @@ class BatchTab(ctk.CTkFrame):
             }
         self._begin_stage("spatial_propagation")
 
+    # RAM/VRAM allocation-failure signatures (lowercased substrings). We
+    # deliberately do NOT match disk-full (no space left / errno 28 /
+    # WinError 112) -- conservative compute can't free disk.
+    _OOM_SIGNATURES = (
+        "memoryerror",
+        "unable to allocate",
+        "out of memory",
+        "outofmemoryerror",
+        "cannot allocate memory",
+        "bad_alloc",
+        "bad alloc",
+        "cuda_error_out_of_memory",
+        "cudaerrormemoryallocation",
+        "cublas_status_alloc_failed",
+    )
+
+    def _is_oom_error(self, msg: str) -> bool:
+        """True when ``msg`` looks like a RAM/VRAM allocation failure."""
+        if not msg:
+            return False
+        m = str(msg).lower()
+        return any(sig in m for sig in self._OOM_SIGNATURES)
+
+    def _apply_resource_profile(self, row, stage: str) -> None:
+        """Set the resource knobs for ``row`` based on its OOM-retry level.
+
+        ``row._oom_attempt == 0`` -> normal profile, deterministically
+        re-asserted every stage from ``row.params`` + the batch-start
+        baselines so a prior conservative retry can't leak into a later
+        normal row. ``> 0`` -> progressively conservative: smaller suite2p
+        ``batch_size`` (sizer ``conservative_scale``), CPU dF/F, GPU-off
+        xcorr, ``nbins=500`` (injected into the independent
+        ``det._settings_override`` the tab passes to ``spc.run`` -- NOT
+        ``_params``, which suite2p never reads for nbins), and a coarser
+        preprocess QC downsample (shrinks the one preprocess allocation
+        not covered by its streaming fallback). Logs once, at preprocess.
+        """
+        from copy import deepcopy
+        from ...core import utils as _core_utils
+        from ...core import suite2p_pipeline as _s2p
+        lvl = int(getattr(row, "_oom_attempt", 0) or 0)
+        app = self._app
+        prep = getattr(app, "preprocess_tab", None)
+        det = getattr(app, "detection_tab", None)
+        xc = getattr(app, "xcorr_tab", None)
+        sizer = _core_utils.get_adaptive_sizer()
+        rp = row.params or {}
+        base_override = getattr(self, "_baseline_settings_override", {}) or {}
+
+        if lvl <= 0:
+            sizer.conservative_scale = 1.0
+            if det is not None and hasattr(det, "_params"):
+                det._params["use_gpu_dff"] = bool(
+                    rp.get("use_gpu_dff", self._baseline_use_gpu_dff))
+                det._settings_override = deepcopy(base_override)
+            if xc is not None:
+                try:
+                    xc.gpu_var.set(bool(rp.get("use_gpu",
+                                               self._baseline_xc_gpu)))
+                except Exception:
+                    pass
+            if prep is not None and hasattr(prep, "_params"):
+                prep._params["downsample_t"] = int(
+                    rp.get("downsample_t", self._baseline_downsample_t)
+                    or self._baseline_downsample_t)
+            return
+
+        scale = self._OOM_RETRY_SCALES.get(
+            lvl, min(self._OOM_RETRY_SCALES.values()))
+        # Wipe learned sizing so pick() uses the frame-size estimate x scale,
+        # not the (too-large) value that just OOM'd.
+        _core_utils.reset_adaptive_sizer()
+        sizer.conservative_scale = float(scale)
+        if det is not None and hasattr(det, "_params"):
+            det._params["use_gpu_dff"] = False
+            ov = deepcopy(base_override)
+            _s2p.set_setting(ov, "nbins", 500)
+            det._settings_override = ov
+        if xc is not None:
+            try:
+                xc.gpu_var.set(False)
+            except Exception:
+                pass
+        if prep is not None and hasattr(prep, "_params"):
+            base_ds = max(int(rp.get("downsample_t",
+                                     self._baseline_downsample_t)
+                              or self._baseline_downsample_t), 4)
+            prep._params["downsample_t"] = base_ds * (2 * lvl)
+        if stage == "preprocess":
+            self._append_log(
+                f"  [resource] conservative attempt {lvl}: "
+                f"batch_size x{scale:g}, nbins=500, GPU dF/F off, "
+                f"xcorr GPU off, qc downsample x{2 * lvl}")
+
+    def _retry_row_conservative(self, stage: str, msg: str) -> None:
+        """Re-run the current recording from scratch with a more
+        conservative resource profile after a RAM out-of-memory error.
+
+        Tears down the failed attempt's partial outputs race-free (stop
+        the scratch mirror, then rmtree scratch + partial HDD output) in a
+        daemon thread, then re-queues the same row at the front so
+        ``_apply_resource_profile`` runs it conservatively next.
+        """
+        row = self._current_row
+        row._oom_attempt = int(getattr(row, "_oom_attempt", 0) or 0) + 1
+        ident = row.identifier
+        attempt = row._oom_attempt
+        first = msg.splitlines()[0] if msg else ""
+        self._append_log(f"  [{stage}] RAM out-of-memory: {first}")
+        self._append_log(
+            f"  [{stage}] re-running '{ident}' with conservative settings "
+            f"(attempt {attempt + 1}/{self._MAX_OOM_RETRIES + 1})")
+        try:
+            row.set_status(f"retrying (OOM {attempt}/{self._MAX_OOM_RETRIES})")
+        except Exception:
+            pass
+
+        scratch_rec = getattr(self, "_current_row_save", None)
+        final_rec = (self._batch_final_out_root / ident
+                     if self._batch_scratch_root is not None else None)
+        worker = self._mirror_workers.pop(ident, None)
+
+        def _resume() -> None:
+            self._batch_queue.insert(0, row)
+            self._batch_next_row()
+
+        def _teardown() -> None:
+            if worker is not None:
+                try:
+                    worker["stop"].set()
+                    # Match the finalize drain bound (large partial
+                    # data.bin on a contended HDD can take minutes).
+                    worker["synced"].wait(timeout=1800.0)
+                    th = worker.get("thread")
+                    if th is not None:
+                        th.join(timeout=60.0)
+                except Exception:
+                    pass
+            for p in (scratch_rec, final_rec):
+                if p is None:
+                    continue
+                try:
+                    if Path(p).exists():
+                        shutil.rmtree(str(p), ignore_errors=True)
+                except Exception:
+                    pass
+            self.after(0, _resume)
+
+        t = threading.Thread(target=_teardown,
+                             name=f"calliope-oom-retry-{ident}",
+                             daemon=True)
+        self._batch_finalize_threads.append(t)
+        t.start()
+
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
+        # RAM out-of-memory auto-retry: re-run the whole recording with
+        # conservative resources before giving up (RAM only -- disk-full
+        # isn't fixable by smaller batches, so it falls through to failure).
+        row = getattr(self, "_current_row", None)
+        is_oom = self._is_oom_error(str(exc))
+        if (row is not None and is_oom and not self._abort_flag.is_set()
+                and int(getattr(row, "_oom_attempt", 0) or 0)
+                < self._MAX_OOM_RETRIES):
+            self._retry_row_conservative(stage, str(exc))
+            return
+
         elapsed = time.time() - self._stage_t0
+        err = str(exc)
+        if is_oom and int(getattr(row, "_oom_attempt", 0) or 0) \
+                >= self._MAX_OOM_RETRIES:
+            err = (f"{err}  (gave up after {self._MAX_OOM_RETRIES} "
+                   f"conservative OOM retries)")
         self._row_results["stages"][stage] = {
             "status": "failed",
             "duration_s": elapsed,
-            "error": str(exc),
+            "error": err,
         }
         self._row_results["status"] = "failed"
         self._append_log(

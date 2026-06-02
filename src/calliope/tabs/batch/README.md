@@ -772,6 +772,27 @@ math counterpart — the algorithm lives in `core/utils.py` /
   errors — sharing the one-shot guard with the ready path so whichever
   arrives first wins. `state.batch_active` is set in `_on_run_all` and
   cleared in `_batch_finish`.
+- **RAM out-of-memory => the recording is auto-retried conservatively.**
+  If a stage worker dies with a memory-allocation error (`MemoryError`,
+  numpy *"Unable to allocate…"*, CUDA/CuPy *"out of memory"*), the whole
+  recording is **re-run from preprocess with progressively lower resource
+  settings** before being marked failed — up to `_MAX_OOM_RETRIES` (2)
+  attempts. `_fail_stage` classifies the error via `_is_oom_error` and, if
+  retries remain, calls `_retry_row_conservative`: it tears down the
+  failed attempt race-free (stops the scratch mirror, rmtrees the partial
+  scratch + HDD output) in a daemon thread, then re-queues the same row at
+  the front. `_apply_resource_profile` (called each stage in
+  `_begin_stage`) then applies the conservative bundle for
+  `row._oom_attempt > 0`: suite2p `batch_size` ×0.5 then ×0.25 via the
+  adaptive sizer's `conservative_scale` (`utils.AdaptiveBatchSizer`), GPU
+  off (dF/F + xcorr), `nbins=500`, and a coarser preprocess QC downsample
+  (the one preprocess allocation not covered by its streaming fallback).
+  The overrides are snapshotted/restored so they never leak into later
+  normal rows. Disk-full errors are **not** retried (smaller batches can't
+  free disk) — they fall through to a normal failure. RAM OOM is most
+  likely in detection/suite2p; preprocess itself is largely OOM-safe
+  (single-TIFF shift auto-falls-back to streaming; the grouped path is
+  already streaming), so re-running from preprocess is safe.
 - **Failures in one stage don't poison the next.** Detection failure
   short-circuits the rest of that row; lowpass / events / clustering /
   xcorr / spatial each fail independently. Spatial-propagation figures

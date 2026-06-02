@@ -2240,6 +2240,18 @@ class AdaptiveBatchSizer:
         self._last_gpu_peak: Optional[float] = None
         # (batch_size, cpu_peak, gpu_peak) per learning step.
         self.history: list[tuple[int, float, float]] = []
+        # Multiplier applied to every ``pick()`` result. Stays 1.0 in
+        # normal operation; the batch runner drops it (e.g. 0.5, 0.25)
+        # when re-running a recording that hit a RAM out-of-memory error,
+        # to force a smaller batch_size than the estimate that OOM'd.
+        self.conservative_scale: float = 1.0
+
+    def _apply_conservative(self, bs: int) -> int:
+        """Scale ``bs`` down by ``conservative_scale`` (floored). No-op
+        when the scale is 1.0 (normal operation)."""
+        if self.conservative_scale != 1.0:
+            bs = max(self.floor, int(round(bs * self.conservative_scale)))
+        return bs
 
     def pick(self,
              tiff_folder: Optional[str] = None,
@@ -2265,10 +2277,14 @@ class AdaptiveBatchSizer:
                                  headroom_gib=headroom_gib,
                                  overhead_multiplier=overhead_multiplier,
                                  floor=self.floor, ceiling=self.ceiling)
+            bs = self._apply_conservative(bs)
             self._last_batch_size = bs
             print(f"[adaptive] initial batch_size={bs} "
                   f"(cpu target {self.target_fraction:.0%}, "
-                  f"gpu target {self.target_fraction_gpu:.0%})")
+                  f"gpu target {self.target_fraction_gpu:.0%}"
+                  + (f", conservative x{self.conservative_scale:g}"
+                     if self.conservative_scale != 1.0 else "")
+                  + ")")
             return bs
 
         # Closed-loop step. Compute per-resource scale; bind on the
@@ -2289,7 +2305,8 @@ class AdaptiveBatchSizer:
         # the smallest headroom-to-target ratio. Defensive fallback
         # if both peaks were None (shouldn't happen given have_feedback).
         if not scales:
-            return int(self._last_batch_size or self.floor)
+            return self._apply_conservative(
+                int(self._last_batch_size or self.floor))
 
         bind_name, bind_peak, bind_target, raw_scale = min(
             scales, key=lambda x: x[3])
@@ -2297,6 +2314,7 @@ class AdaptiveBatchSizer:
                     min(self.max_scale_per_step, raw_scale))
         new_bs = int(round(self._last_batch_size * scale))
         new_bs = max(self.floor, min(self.ceiling, new_bs))
+        new_bs = self._apply_conservative(new_bs)
         scale_log = " | ".join(
             f"{n} peak={p:.1%}/target={t:.0%} -> scale {s:.2f}"
             for n, p, t, s in scales)
@@ -2344,6 +2362,7 @@ class AdaptiveBatchSizer:
         self._last_cpu_peak = None
         self._last_gpu_peak = None
         self.history.clear()
+        self.conservative_scale = 1.0
 
 
 # Process-wide singleton. Batch mode drives this across every recording
