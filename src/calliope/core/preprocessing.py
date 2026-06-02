@@ -943,6 +943,33 @@ def preprocess_tiff_group(
     )
 
 
+def preprocess_offload(src_strs: list[str], data_root: str, *,
+                       recording_name: Optional[str] = None,
+                       group: bool = False,
+                       qc_params: Optional[dict] = None,
+                       progress_q=None) -> "PreprocessResult":
+    """Picklable :mod:`calliope.core.offload` target for Tab 1.
+
+    Dispatches the single-file vs group preprocessing path in a child
+    process so the TIFF shift / mean / QC-GIF work can't freeze the GUI.
+    Takes only picklable inputs (path *strings* + a flag + a dict) and
+    returns the picklable :class:`PreprocessResult` the tab's ``_on_done``
+    already consumes.
+    """
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q)
+    srcs = [Path(s) for s in src_strs]
+    if group:
+        return preprocess_tiff_group(
+            src_tiffs=srcs, data_root=data_root,
+            recording_name=recording_name, progress_cb=cb,
+            qc_params=qc_params)
+    return preprocess_tiff(
+        src_tiff=srcs[0], data_root=data_root,
+        recording_name=recording_name, progress_cb=cb,
+        qc_params=qc_params)
+
+
 # ---------------------------------------------------------------------------
 # Discovery helpers used by the GUI
 # ---------------------------------------------------------------------------

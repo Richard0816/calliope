@@ -341,6 +341,8 @@ Each tab folder contains:
 
 Each interactive Tab in 1, 3-8 delegates its actual computation to the matching `core/<tab>_run.py` so Tab 0's batch worker uses identical code. If you want to run a single stage from a Python script without the GUI, the `core/*_run.py` modules are the entry points.
 
+**Responsiveness / process offload.** The heavy compute for Tabs 1, 4, 5, 6, 7 runs in a *child process* (`core/offload.py` — `run_offloaded` / `ProcessJob`), not a worker thread: the GUI is single-threaded Tk and CPU-bound Python loops on a thread hold the GIL and freeze the window ("Not Responding", including when minimised). Each tab's `*_offload` target is a module-level, picklable function that takes path strings + a param dict, re-opens memmaps by path inside the child, and returns a picklable payload; progress and the final result are re-posted onto the tab's existing `queue.Queue` from the main thread, so `drain_queue` handlers (and their `AppState` / batch `set_*` publishes) are unchanged. Cross-correlation (Tab 7) aborts cooperatively via a spawn `Event`. Tab 8's directional-monotonicity sweep is fully vectorised (the 10k-shuffle null is one matmul that releases the GIL), so it runs on a *thread* with a debounce instead — a process's spawn cost per event-nav click would be too slow. Per-run process spawn currently costs ~3-4s (re-importing numpy/scipy); a future warm-worker optimisation can amortise that for large batches.
+
 ---
 
 ## Suggested reading order

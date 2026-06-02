@@ -52,6 +52,7 @@ Lifecycle
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -103,6 +104,15 @@ class SpatialPropagationTab(ctk.CTkFrame):
         self.state = state
         self._data: Optional[dict] = None  # see _ingest_results
         self._event_index: int = 0
+        # The directional-monotonicity test (10k-shuffle permutation null)
+        # is vectorised but heavy; it used to run synchronously on the
+        # main thread and froze the GUI on every event-nav click. It now
+        # runs on a background thread (the big matmul releases the GIL).
+        # ``_mono_after_id`` debounces rapid prev/next so only the settled
+        # event computes; ``_mono_token`` tags each request so a stale
+        # thread's result for a previous event is dropped.
+        self._mono_after_id: Optional[str] = None
+        self._mono_token: int = 0
         # Cache of stat/Ly/Lx/pix_to_um keyed by plane0 path so we don't
         # re-load Suite2p metadata on every Tab 5 publish.
         self._plane0_cache: dict[Path, dict] = {}
@@ -828,6 +838,18 @@ class SpatialPropagationTab(ctk.CTkFrame):
         """
         self.fig_dist.clear()
 
+        # Invalidate any in-flight worker for a previous event and cancel
+        # a pending debounced launch. Done up front so the early-return
+        # guards below (no/too-few ROIs) also drop a stale result instead
+        # of letting it paint over the guard message.
+        self._mono_token += 1
+        if self._mono_after_id is not None:
+            try:
+                self.after_cancel(self._mono_after_id)
+            except Exception:
+                pass
+            self._mono_after_id = None
+
         sel = active_col & ~np.isnan(first_col)
         if not np.any(sel):
             self.ax_dist = self.fig_dist.add_subplot(111)
@@ -869,8 +891,56 @@ class SpatialPropagationTab(ctk.CTkFrame):
             ts = ts_seconds
             t_label = "activation time (s)"
 
-        result = spatial_helpers.directional_monotonicity_spearman(
-            xs, ys, ts, n_angles=360, n_shuffles=10000, seed=0)
+        # The Spearman sweep + 10k-shuffle null is vectorised (one big
+        # matmul) so numpy releases the GIL -- run it on a background
+        # thread instead of the main thread so the GUI doesn't freeze on
+        # every event-nav click. Debounce rapid prev/next (only the
+        # settled event computes) and tag the request so a stale result
+        # for a previous event is dropped. A process would be wrong here:
+        # the ~3.4s spawn per click would make event browsing unusable.
+        ctx = {"xs": xs, "ys": ys, "ts": ts, "scale": scale,
+               "xlabel_unit": xlabel_unit, "n": n, "t_label": t_label,
+               "ev_idx": ev_idx}
+
+        # Placeholder while the worker runs (cleared above).
+        self.ax_dist = self.fig_dist.add_subplot(111)
+        self.ax_dist.set_axis_off()
+        self.ax_dist.text(
+            0.5, 0.5, "computing directional monotonicity ...",
+            ha="center", va="center", transform=self.ax_dist.transAxes)
+
+        # Token already bumped at the top of this method; capture it so
+        # the worker's result is dropped if the user navigates onward.
+        token = self._mono_token
+        self._mono_after_id = self.after(
+            150, lambda: self._start_mono_worker(token, ctx))
+
+    def _start_mono_worker(self, token: int, ctx: dict) -> None:
+        """Run the monotonicity sweep off the main thread, then marshal
+        the result back via ``after(0, ...)``. Stale results (the user
+        navigated to another event) are dropped in ``_on_mono_done``."""
+        self._mono_after_id = None
+
+        def worker():
+            try:
+                result = spatial_helpers.directional_monotonicity_spearman(
+                    ctx["xs"], ctx["ys"], ctx["ts"],
+                    n_angles=360, n_shuffles=10000, seed=0)
+            except Exception:
+                result = None
+            try:
+                self.after(0, lambda: self._on_mono_done(token, result, ctx))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mono_done(self, token: int, result, ctx: dict) -> None:
+        """Draw the monotonicity panels on the main thread (or drop a
+        stale result if the user has since navigated to another event)."""
+        if token != self._mono_token:
+            return
+        self.fig_dist.clear()
         if not result:
             self.ax_dist = self.fig_dist.add_subplot(111)
             self.ax_dist.set_axis_off()
@@ -880,7 +950,20 @@ class SpatialPropagationTab(ctk.CTkFrame):
                 "(no spread in t or in x/y)",
                 ha="center", va="center",
                 transform=self.ax_dist.transAxes)
+            self.canvas_dist.draw_idle()
             return
+        self._draw_monotonicity_panels(result, ctx)
+        self.canvas_dist.draw_idle()
+
+    def _draw_monotonicity_panels(self, result: dict, ctx: dict) -> None:
+        """Render the three monotonicity subplots from a computed result.
+
+        Split out of :meth:`_render_monotonicity_panel` so the drawing
+        runs on the main thread once the background sweep returns.
+        """
+        xs = ctx["xs"]; ys = ctx["ys"]; ts = ctx["ts"]
+        scale = ctx["scale"]; xlabel_unit = ctx["xlabel_unit"]
+        n = ctx["n"]; t_label = ctx["t_label"]; ev_idx = ctx["ev_idx"]
 
         thetas = result["thetas"]
         rho_curve = result["rho_curve"]

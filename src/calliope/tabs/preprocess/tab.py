@@ -17,14 +17,15 @@ shows up in every "long-running" tab in CalLIOPE:
 
     1. ``_on_run`` (main thread) snapshots the form values into
        plain Python types.
-    2. It launches a ``threading.Thread`` whose target is a worker
-       function defined inline. That function calls into
-       ``preprocessing.preprocess_tiff(...)`` and pushes log lines
-       and a final result onto a thread-safe ``queue.Queue``.
-    3. ``_drain_log_queue`` (main thread, scheduled with
-       ``self.after(...)``) wakes up every POLL_MS, drains the
-       queue, and writes lines into the log panel. When it sees the
-       "done" sentinel it publishes the result on ``AppState``.
+    2. It offloads ``preprocessing.preprocess_offload(...)`` to a child
+       process via ``core.offload.run_offloaded`` (a thread would let
+       the TIFF I/O / mean / QC-GIF work hold the GIL and freeze the
+       GUI). Progress strings and the final ``PreprocessResult`` are
+       re-posted from the main thread onto a ``queue.Queue``.
+    3. ``drain_queue`` (main thread, scheduled with ``self.after(...)``)
+       wakes up every POLL_MS, drains the queue, and writes lines into
+       the log panel. When it sees the "done" payload it publishes the
+       result on ``AppState``.
 
 Module layout
 -------------
@@ -130,7 +131,10 @@ class PreprocessTab(ctk.CTkFrame):
         # final ('done', result) sentinel; main thread's
         # ``_drain_log_queue`` reads them.
         self._log_queue: queue.Queue = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
+        # Preprocessing runs in a child process (see core.offload) so the
+        # TIFF shift / mean / QC-GIF work can't hold the GIL and freeze
+        # the GUI. ``None`` until the first run.
+        self._job = None
         # ``self._params`` starts as the dict of defaults pulled out
         # of ``PARAM_SPEC``. The Advanced... dialog mutates this dict
         # in place when the user clicks OK.
@@ -423,7 +427,7 @@ class PreprocessTab(ctk.CTkFrame):
         self._start_run(force=True)
 
     def _start_run(self, force: bool) -> None:
-        if self._worker is not None and self._worker.is_alive():
+        if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "Preprocessing is already running.")
             return
 
@@ -478,30 +482,25 @@ class PreprocessTab(ctk.CTkFrame):
         qc_params = {k: params[k] for k in qc_keys if k in params}
         explicit_identifier = self.identifier_var.get().strip() or None
 
-        def worker():
-            try:
-                if len(srcs) == 1:
-                    result = preprocessing.preprocess_tiff(
-                        src_tiff=srcs[0],
-                        data_root=data_root,
-                        recording_name=explicit_identifier,
-                        progress_cb=lambda m: self._log_queue.put(("log", m)),
-                        qc_params=qc_params,
-                    )
-                else:
-                    result = preprocessing.preprocess_tiff_group(
-                        src_tiffs=srcs,
-                        data_root=data_root,
-                        recording_name=identifier,
-                        progress_cb=lambda m: self._log_queue.put(("log", m)),
-                        qc_params=qc_params,
-                    )
-                self._log_queue.put(("done", result))
-            except Exception as e:
-                self._log_queue.put(("error", str(e)))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        # Offload to a child process (not a thread): TIFF I/O + the
+        # mean / QC-GIF work would otherwise hold the GIL and freeze the
+        # GUI. Only path strings + a flag + the qc_params dict cross the
+        # boundary; progress strings come back as ("log", msg) so the
+        # existing ``_append_log`` handler is reused. The done payload is
+        # the picklable PreprocessResult ``_on_done`` already expects.
+        group = len(srcs) > 1
+        rec_name = identifier if group else explicit_identifier
+        from ...core.offload import run_offloaded
+        from ...core import preprocessing as _pp
+        self._job = run_offloaded(
+            self, self._log_queue,
+            _pp.preprocess_offload,
+            args=([str(s) for s in srcs], data_root),
+            kwargs=dict(recording_name=rec_name, group=group,
+                        qc_params=qc_params),
+            progress_kind="log",
+            poll_ms=self.POLL_MS,
+        )
 
     def _on_advanced(self) -> None:
         if open_advanced(self, "Preprocess - Advanced parameters",

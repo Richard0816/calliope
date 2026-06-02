@@ -119,6 +119,26 @@ def compute_lowpass_and_dt(
     }
 
 
+def compute_lowpass_offload(plane0_str: str, *, fps: float, cutoff_hz: float,
+                            filter_order: int = 2, sg_win_ms: int = 333,
+                            sg_poly: int = 2, progress_q=None) -> float:
+    """Picklable :mod:`calliope.core.offload` target for Tab 4.
+
+    Runs the low-pass + derivative write in a child process so the GUI
+    stays responsive. Takes only picklable inputs (path *string* +
+    scalars), re-opens the source memmap by path inside the child, and
+    returns the cutoff so the tab's ``_on_compute_done`` payload is
+    unchanged.
+    """
+    from .offload import make_progress_cb
+    compute_lowpass_and_dt(
+        Path(plane0_str), fps=fps, cutoff_hz=cutoff_hz,
+        filter_order=filter_order, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
+        progress_cb=make_progress_cb(progress_q),
+    )
+    return float(cutoff_hz)
+
+
 def _population_mean_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
     """Compute the population-mean trace from ``r0p7_filtered_dff`` in
     chunks so very long recordings don't blow memory.

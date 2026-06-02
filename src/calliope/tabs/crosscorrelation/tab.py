@@ -54,12 +54,18 @@ For each (Cᵢ x Cⱼ) the tab writes one CSV per pair under
 Per-event mode writes parallel folders per event window. Each row
 has best_lag_sec, max_corr, zero_lag_corr for one ROI pair.
 
-Threading
----------
-Heavy lifting runs on a worker thread; the worker calls a progress
-callback that polls a ``threading.Event`` set by the Abort button so
-long runs can be cancelled cleanly via the ``RunAborted`` exception
-defined below.
+Process offload
+---------------
+Heavy lifting runs in a child PROCESS (``core.offload.run_offloaded``
+calling ``core.crosscorrelation.run_cluster_xcorr_offload``), not a
+thread -- the batched-matmul / shuffle work is CPU-bound and would hold
+the GIL and freeze the GUI on a thread. Abort is cooperative across the
+process boundary: the Abort button sets a spawn ``Event``
+(``core.offload.make_abort_event``); the child's progress callback polls
+it between batches and raises ``XcorrAborted`` (in
+``core.crosscorrelation``), so a run stops cleanly *between* the
+incremental per-pair writes. The legacy in-thread ``RunAborted`` class
+below is retained only for backward reference and is no longer raised.
 """
 
 from __future__ import annotations
@@ -624,17 +630,22 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self._dff_cache_key = None  # (plane0, prefix)
 
         self._q: queue.Queue = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
-        # Abort flag: set by the Abort button, polled by the per-batch
-        # progress_cb. Raises RunAborted to unwind the worker cleanly.
-        self._abort_event: threading.Event = threading.Event()
+        # Cross-correlation runs in a child process (see core.offload) so
+        # the batched-matmul / shuffle work (and any CuPy GPU context)
+        # can't freeze the GUI. ``None`` until the first run.
+        self._job = None
+        # Cooperative abort: a spawn Event passed to the child, set by
+        # the Abort button. The child's progress_cb checks it between
+        # batches and raises, so a run stops cleanly between writes.
+        # Created fresh per run; ``None`` while idle.
+        self._abort_evt = None
 
         self._build_ui()
+        # The child returns a single dict payload; ``_on_xc_done``
+        # dispatches it to the existing done / aborted handlers.
         drain_queue(self, self._q,
                     {"progress": self._on_xc_progress,
-                     "done_full": self._on_xc_done_full,
-                     "done_per_event": self._on_xc_done_per_event,
-                     "aborted": self._on_xc_aborted,
+                     "done": self._on_xc_done,
                      "error": self._on_xc_error},
                     poll_ms=POLL_MS)
 
@@ -1305,7 +1316,6 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self.full_btn.configure(state="disabled")
         self.per_event_btn.configure(state="disabled")
         # Worker is starting -- arm the abort button.
-        self._abort_event.clear()
         self.abort_btn.configure(state="normal")
 
     def _enable_run(self) -> None:
@@ -1315,23 +1325,39 @@ class CrossCorrelationTab(ctk.CTkFrame):
             state="normal" if (ok and self._event_windows) else "disabled")
         # No worker running -- abort makes no sense.
         self.abort_btn.configure(state="disabled")
-        self._abort_event.clear()
 
     def _on_abort(self) -> None:
-        """User clicked Abort. Set the flag; the next progress_cb call
-        from inside the cross-correlation routine raises RunAborted."""
-        if self._worker is None or not self._worker.is_alive():
+        """User clicked Abort. Set the cooperative abort Event; the next
+        progress_cb call inside the child raises and the run unwinds
+        cleanly between batches."""
+        if self._job is None or not self._job.running():
             return
-        self._abort_event.set()
+        if self._abort_evt is not None:
+            self._abort_evt.set()
         self.abort_btn.configure(state="disabled")
         self.status_var.set("Aborting... waiting for current batch to finish.")
         self._log("[abort] requested")
+
+    def _on_xc_done(self, payload: dict) -> None:
+        """Single done payload from the offload child -> existing handlers.
+
+        ``payload`` is ``{"mode", "aborted", "out"}``; route it to the
+        per-mode done handler or the abort handler so their behaviour
+        (progress pin, ``set_xcorr_ready`` publish, button re-enable) is
+        unchanged.
+        """
+        if payload.get("aborted"):
+            self._on_xc_aborted(payload.get("mode", ""))
+        elif payload.get("mode") == "full":
+            self._on_xc_done_full(payload.get("out"))
+        else:
+            self._on_xc_done_per_event(payload.get("out"))
 
     def _on_run_full(self) -> None:
         if self._plane0 is None or not self._inputs_ready():
             messagebox.showerror("Not ready", "Inputs incomplete.")
             return
-        if self._worker is not None and self._worker.is_alive():
+        if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "A run is already in progress.")
             return
         params = self._gather_params()
@@ -1342,24 +1368,20 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self._log(f"\n[full] plane0={plane0}")
         self._log(f"[full] params={params}")
 
-        def progress_cb(done, total, label):
-            if self._abort_event.is_set():
-                raise RunAborted()
-            self._q.put(("progress", (done, total, label)))
-
-        def worker():
-            try:
-                out = xc.run_cluster_xcorr_full_fast(
-                    plane0, progress_cb=progress_cb, **params,
-                )
-                self._q.put(("done_full", str(out)))
-            except RunAborted:
-                self._q.put(("aborted", "full"))
-            except Exception as e:
-                self._q.put(("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        # Offload to a child process (not a thread): the batched-matmul /
+        # shuffle work would otherwise hold the GIL and freeze the GUI.
+        # Cooperative abort via a spawn Event the child polls.
+        from ...core.offload import run_offloaded, make_abort_event
+        from ...core import crosscorrelation as _xc
+        self._abort_evt = make_abort_event()
+        self._job = run_offloaded(
+            self, self._q,
+            _xc.run_cluster_xcorr_offload,
+            args=("full", str(plane0)),
+            kwargs=dict(abort_evt=self._abort_evt, **params),
+            progress_kind="progress",
+            poll_ms=POLL_MS,
+        )
 
     def _on_run_per_event(self) -> None:
         if self._plane0 is None or not self._inputs_ready():
@@ -1371,7 +1393,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 "No event windows found in the recording summary "
                 "(*summary*.xlsx). Run event detection first.")
             return
-        if self._worker is not None and self._worker.is_alive():
+        if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "A run is already in progress.")
             return
         params = self._gather_params()
@@ -1400,25 +1422,20 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self._log(f"\n[per-event] plane0={plane0}")
         self._log(f"[per-event] params={params}  events={len(evts)}")
 
-        def progress_cb(done, total, label):
-            if self._abort_event.is_set():
-                raise RunAborted()
-            self._q.put(("progress", (done, total, label)))
-
-        def worker():
-            try:
-                out = xc.run_cluster_xcorr_per_event_fast(
-                    plane0, event_windows=evts,
-                    progress_cb=progress_cb, **params,
-                )
-                self._q.put(("done_per_event", str(out)))
-            except RunAborted:
-                self._q.put(("aborted", "per_event"))
-            except Exception as e:
-                self._q.put(("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
+        # Offload to a child process (not a thread); cooperative abort
+        # via a spawn Event the child polls between events.
+        from ...core.offload import run_offloaded, make_abort_event
+        from ...core import crosscorrelation as _xc
+        self._abort_evt = make_abort_event()
+        self._job = run_offloaded(
+            self, self._q,
+            _xc.run_cluster_xcorr_offload,
+            args=("per_event", str(plane0)),
+            kwargs=dict(event_windows=evts, abort_evt=self._abort_evt,
+                        **params),
+            progress_kind="progress",
+            poll_ms=POLL_MS,
+        )
 
     # -- Queue handlers ----------------------------------------------------
 

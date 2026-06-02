@@ -107,9 +107,9 @@ from scipy.spatial.distance import pdist
 
 from .logic import (
     ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
-    ReclusterWindow, build_label_image, filtered_to_suite2p_indices,
-    load_filtered_dff, spatial_image, stat_for_prefix,
-    summary_writer, utils, ward_linkage,
+    ReclusterWindow, build_label_image, compute_clustering_offload,
+    filtered_to_suite2p_indices, load_filtered_dff, reload_clustering_offload,
+    spatial_image, stat_for_prefix, summary_writer, utils, ward_linkage,
 )
 from .logic import clustering as cmap_mod
 from .cluster_popout import ClusterPopout
@@ -185,12 +185,17 @@ class ClusteringTab(ctk.CTkFrame):
         # other), since only the parent's color mapping is meaningful.
         self._recluster_palette_idx: int = 0
 
-        # Worker queue.
+        # Worker queue. Heavy linkage runs in a child process (see
+        # core.offload); ``_job`` is None until the first run.
         self._q: queue.Queue = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
+        self._job = None
 
         self._slider_user_driven = True  # gate slider events during programmatic sets
         self._summary_after_id: Optional[str] = None  # debounce id for auto-write
+        # Debounce id coalescing rapid threshold-slider / palette / toggle
+        # re-renders so a drag doesn't fire a full dendrogram + spatial
+        # repaint per pixel (which froze the GUI mid-drag).
+        self._render_after_id: Optional[str] = None
 
         self._build_ui()
         drain_queue(self, self._q,
@@ -497,7 +502,7 @@ class ClusteringTab(ctk.CTkFrame):
     # -- Run worker --------------------------------------------------------
 
     def _on_run(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
+        if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "Analysis already running.")
             return
         plane0 = Path(self.path_var.get())
@@ -511,29 +516,15 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.start()
         self.status_var.set("Computing linkage...")
 
-        def worker():
-            try:
-                payload = self._compute(plane0, prefix)
-                self._q.put(("done", payload))
-            except Exception as e:
-                self._q.put(("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
-
-    def _compute(self, plane0: Path, prefix: str) -> dict:
-        dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
-        dff = dff_mm
-        Z = ward_linkage(dff)
-        stat, _ = stat_for_prefix(plane0, prefix)
-        view = utils.load_plane_view(plane0)
-        Lx, Ly = int(view["Lx"]), int(view["Ly"])
-        auto_frac = cmap_mod.auto_choose_threshold(Z, target_counts=(4, 5))
-        return {
-            "Z": Z, "dff": dff, "dff_shape": dff.shape, "stat": stat,
-            "Lx": Lx, "Ly": Ly, "auto_frac": auto_frac,
-            "T": T, "N": N,
-        }
+        # Offload the pdist + Ward linkage to a child process (not a
+        # thread). The payload is small + picklable (Z + scalars); the
+        # dff memmap and stat list are re-opened by path in _on_done.
+        from ...core.offload import run_offloaded
+        self._job = run_offloaded(
+            self, self._q, compute_clustering_offload,
+            args=(str(plane0), prefix),
+            poll_ms=POLL_MS,
+        )
 
     def _on_reload_clusters(self) -> None:
         """Restore linkage + threshold from a previous Export *_rois.npy run.
@@ -543,7 +534,7 @@ class ClusteringTab(ctk.CTkFrame):
         still loaded fresh from disk so reclustering and the spatial map
         keep working.
         """
-        if self._worker is not None and self._worker.is_alive():
+        if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "Analysis already running.")
             return
         plane0 = Path(self.path_var.get())
@@ -566,40 +557,18 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.start()
         self.status_var.set("Reloading saved clusters...")
 
-        def worker():
-            try:
-                payload = self._reload_compute(plane0, prefix)
-                self._q.put(("reloaded", payload))
-            except Exception as e:
-                self._q.put(("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._worker = threading.Thread(target=worker, daemon=True)
-        self._worker.start()
-
-    def _reload_compute(self, plane0: Path, prefix: str) -> dict:
+        # Offload the reload (np.load linkage + leaf-count validation) to
+        # a child process. cluster_dir is resolved here on the main
+        # thread and passed as a string; dff + stat are re-opened by path
+        # in _on_reloaded.
         cluster_dir = self._existing_cluster_dir(plane0, prefix)
-        Z = np.load(cluster_dir / "linkage.npy")
-        thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
-                               dtype=float).ravel()[0])
-        dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
-        # The loaded linkage was computed on N_kept ROIs; if the cell-filter
-        # mask has changed since the export the shapes won't agree and any
-        # downstream recolouring would be silently wrong.
-        n_leaves = int(Z.shape[0]) + 1
-        if n_leaves != int(N):
-            raise ValueError(
-                f"Saved linkage has {n_leaves} leaves but the current "
-                f"dF/F memmap has {N} columns. Re-run analysis instead "
-                f"of reloading.")
-        stat, _ = stat_for_prefix(plane0, prefix)
-        view = utils.load_plane_view(plane0)
-        Lx, Ly = int(view["Lx"]), int(view["Ly"])
-        zmax = float(np.max(Z[:, 2]))
-        return {
-            "Z": Z, "dff": dff_mm, "dff_shape": dff_mm.shape, "stat": stat,
-            "Lx": Lx, "Ly": Ly, "saved_threshold": thr, "zmax": zmax,
-            "T": T, "N": N, "cluster_dir": cluster_dir,
-        }
+        from ...core.offload import run_offloaded
+        self._job = run_offloaded(
+            self, self._q, reload_clustering_offload,
+            args=(str(plane0), prefix, str(cluster_dir)),
+            done_kind="reloaded",
+            poll_ms=POLL_MS,
+        )
 
     def _on_error(self, payload: str) -> None:
         self.progress.stop()
@@ -617,9 +586,13 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
 
+        # Re-open the dF/F memmap + stat list on the main thread (they
+        # can't cross the process boundary; both are cheap by path).
+        plane0 = Path(self.path_var.get())
+        self._dff, _, _, _ = load_filtered_dff(plane0, self._prefix)
+        self._stat, _ = stat_for_prefix(plane0, self._prefix)
+
         self._Z = data["Z"]
-        self._stat = data["stat"]
-        self._dff = data["dff"]
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(np.max(self._Z[:, 2]))
@@ -672,9 +645,13 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
 
+        # Re-open the dF/F memmap + stat list on the main thread (they
+        # can't cross the process boundary; both are cheap by path).
+        plane0 = Path(self.path_var.get())
+        self._dff, _, _, _ = load_filtered_dff(plane0, self._prefix)
+        self._stat, _ = stat_for_prefix(plane0, self._prefix)
+
         self._Z = data["Z"]
-        self._stat = data["stat"]
-        self._dff = data["dff"]
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(data["zmax"])
@@ -726,6 +703,25 @@ class ClusteringTab(ctk.CTkFrame):
             return float(self._manual_T)
         return float(self._auto_threshold) * float(self._zmax)
 
+    def _schedule_render(self, delay_ms: int = 120) -> None:
+        """Coalesce rapid re-render requests (slider drag, palette spin,
+        manual toggle) into one ``_render_all`` after a short idle gap.
+
+        A full dendrogram + spatial repaint per slider pixel froze the
+        GUI mid-drag; debouncing with ``after_cancel`` (mirroring
+        ``_schedule_summary_write``) renders only the settled threshold.
+        """
+        if self._render_after_id is not None:
+            try:
+                self.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+        self._render_after_id = self.after(delay_ms, self._render_all_now)
+
+    def _render_all_now(self) -> None:
+        self._render_after_id = None
+        self._render_all()
+
     def _on_manual_toggle(self) -> None:
         if self.manual_var.get():
             self.threshold_scale.config(state="normal")
@@ -736,7 +732,7 @@ class ClusteringTab(ctk.CTkFrame):
             self._manual_T = self._auto_threshold * self._zmax
         else:
             self.threshold_scale.config(state="disabled")
-        self._render_all()
+        self._schedule_render()
         self._schedule_summary_write()
 
     def _on_slider(self, raw: str) -> None:
@@ -747,14 +743,14 @@ class ClusteringTab(ctk.CTkFrame):
         except ValueError:
             return
         if self._Z is not None:
-            self._render_all()
+            self._schedule_render()
             self._schedule_summary_write()
 
     def _on_palette_change(self, *_):
         self._palette_name = self.palette_var.get() or DEFAULT_PALETTE
         self._custom_colors = None
         if self._Z is not None:
-            self._render_all()
+            self._schedule_render()
             self._schedule_summary_write()
 
     def _on_spatial_click(self, event) -> None:

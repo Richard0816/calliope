@@ -29,7 +29,13 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import utils as core_utils
-from ..gui_common import format_roi_indices, parse_manual_roi_spec
+# NOTE: ``format_roi_indices`` / ``parse_manual_roi_spec`` are imported
+# lazily inside the manual-subset branch below, NOT at module top. They
+# live in ``gui_common``, which drags in customtkinter/tkinter -- and
+# this module is imported in a *child process* by ``core.offload`` for
+# every offloaded detection run (including each recording in a batch).
+# Keeping Tk out of the top-level import shaves ~1s off every child
+# spawn; the helpers are only needed when a manual ROI subset is set.
 
 
 # Knob names that map 1:1 to ``EventDetectionParams`` fields. Kept in
@@ -269,6 +275,8 @@ def run_event_detection(
     kept_idx = kept_full_idx.copy()
 
     if params.get("manual_subset_enabled"):
+        # Lazy import (keeps Tk out of the child-process import path).
+        from ..gui_common import format_roi_indices, parse_manual_roi_spec
         spec = params.get("manual_roi_spec", "")
         try:
             manual_ids = parse_manual_roi_spec(spec, N_total)
@@ -421,6 +429,27 @@ def run_event_detection(
                 plane0, event_monotonicity)
 
     return data
+
+
+def run_event_detection_offload(plane0_str: str, params: dict, *,
+                                progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 5.
+
+    Runs in a child process so the GUI stays responsive (the per-ROI
+    hysteresis loop is pure-Python and would otherwise hold the GIL).
+    Takes only picklable inputs (a path *string* + a plain param dict),
+    re-opens the lowpass/derivative memmaps by path inside the child via
+    :func:`run_event_detection`, and returns the same picklable payload
+    Tab 5 renders. ``write_summary`` stays False: the tab writes the
+    workbook on the main thread after rendering.
+    """
+    from .offload import make_progress_cb
+    return run_event_detection(
+        Path(plane0_str), dict(params),
+        figures_dir=None,
+        write_summary=False,
+        progress_cb=make_progress_cb(progress_q),
+    )
 
 
 def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:

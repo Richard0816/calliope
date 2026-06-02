@@ -211,6 +211,66 @@ def stat_for_prefix(plane0: Path, prefix: str):
     return full_stat, None
 
 
+def compute_clustering_offload(plane0_str: str, prefix: str, *,
+                               progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 6 Run.
+
+    Runs the ``pdist`` + Ward linkage in a child process so the GUI
+    stays responsive. Returns only PICKLABLE data: the linkage ``Z`` +
+    scalars. The live ``dff`` memmap and ``stat`` list are NOT returned
+    (a memmap can't cross the process boundary, and both are cheap to
+    re-open by path) -- the tab re-opens them on the main thread in
+    ``_on_done``. ``progress_q`` is accepted for offload uniformity even
+    though clustering has no progress stream today.
+    """
+    plane0 = Path(plane0_str)
+    dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
+    Z = ward_linkage(dff_mm)
+    view = utils.load_plane_view(plane0)
+    Lx, Ly = int(view["Lx"]), int(view["Ly"])
+    auto_frac = clustering.auto_choose_threshold(Z, target_counts=(4, 5))
+    return {
+        "Z": Z, "dff_shape": tuple(int(x) for x in dff_mm.shape),
+        "Lx": Lx, "Ly": Ly, "auto_frac": float(auto_frac),
+        "T": int(T), "N": int(N),
+    }
+
+
+def reload_clustering_offload(plane0_str: str, prefix: str,
+                              cluster_dir_str: str, *,
+                              progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 6 Reload.
+
+    Loads the saved linkage + threshold and validates the leaf count
+    against the current dF/F memmap, all in a child process. Like
+    :func:`compute_clustering_offload`, it returns only picklable data;
+    the tab re-opens ``dff`` + ``stat`` by path on the main thread.
+    """
+    plane0 = Path(plane0_str)
+    cluster_dir = Path(cluster_dir_str)
+    Z = np.load(cluster_dir / "linkage.npy")
+    thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
+                           dtype=float).ravel()[0])
+    _, T, N, _ = load_filtered_dff(plane0, prefix)
+    # The loaded linkage was computed on N_kept ROIs; if the cell-filter
+    # mask has changed since the export the shapes won't agree and any
+    # downstream recolouring would be silently wrong.
+    n_leaves = int(Z.shape[0]) + 1
+    if n_leaves != int(N):
+        raise ValueError(
+            f"Saved linkage has {n_leaves} leaves but the current "
+            f"dF/F memmap has {N} columns. Re-run analysis instead "
+            f"of reloading.")
+    view = utils.load_plane_view(plane0)
+    Lx, Ly = int(view["Lx"]), int(view["Ly"])
+    zmax = float(np.max(Z[:, 2]))
+    return {
+        "Z": Z, "Lx": Lx, "Ly": Ly, "saved_threshold": thr,
+        "zmax": zmax, "T": int(T), "N": int(N),
+        "cluster_dir": str(cluster_dir),
+    }
+
+
 def filtered_to_suite2p_indices(plane0: Path, prefix: str) -> Optional[np.ndarray]:
     """Translator from kept-ROI (dF/F column) position to Suite2p ROI index.
 

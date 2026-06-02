@@ -134,7 +134,7 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 - **Cutoff entry box.** `_on_entry` clamps to bounds and snaps the slider to the typed value; Enter applies it.
 - **Source change.** Reloads the chosen trace, recomputes FFT, redraws all three panels.
 - **View toggle.** Two radio buttons under the trace-source row switch the y-axis between `dF/F` (canonical, what the on-disk memmap holds) and `Robust z (median ± 1.4826·MAD)` — a view-only transform that re-expresses each trace via `core.utils.mad_z`. No memmap is written; the toggle just rebuilds the raw + low-pass panels. The robust z view fixes the "positive artifacts following negative deviations" artifact that ΔF/F0 with a rolling baseline creates for inhibited cells (Vanwalleghem & Constantin, *Frontiers Neural Circuits* 2021, "The Curse of Negativity") and makes magnitudes comparable across recordings (the absolute-fluorescence interpretation is lost in exchange).
-- **Compute** button writes the memmaps in a worker thread and pushes status updates through a queue (`_compute_queue`).
+- **Compute** button writes the memmaps in a child process (`core/offload.py` — not a thread; the per-ROI scipy loop would otherwise hold the GIL and freeze the GUI) and pushes status updates back through a queue (`_compute_queue`).
 
 ---
 

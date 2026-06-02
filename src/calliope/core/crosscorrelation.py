@@ -1135,6 +1135,48 @@ def run_cluster_xcorr_per_event_fast(
     return out_root
 
 
+class XcorrAborted(Exception):
+    """Raised inside the offload child when the user requests an abort."""
+
+
+def run_cluster_xcorr_offload(mode: str, plane0_str: str, *,
+                              event_windows=None, abort_evt=None,
+                              progress_q=None, **params) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 7.
+
+    Runs the full or per-event cross-correlation in a child process so
+    the GUI stays responsive (and so a GPU run's CuPy context is torn
+    down with the process). ``mode`` is ``"full"`` or ``"per_event"``.
+
+    Cooperative abort: ``abort_evt`` is a spawn ``Event`` (see
+    :func:`calliope.core.offload.make_abort_event`). The wrapped
+    ``progress_cb`` checks it between batches/events and raises
+    :class:`XcorrAborted`, so the run stops cleanly *between* the
+    incremental per-pair writes -- the same boundary the old in-thread
+    ``RunAborted`` used. Returns a picklable dict the tab dispatches on:
+    ``{"mode", "aborted", "out"}``.
+    """
+    from .offload import make_progress_cb
+    base_cb = make_progress_cb(progress_q)
+
+    def cb(done, total, label):
+        if abort_evt is not None and abort_evt.is_set():
+            raise XcorrAborted()
+        if base_cb is not None:
+            base_cb(done, total, label)
+
+    plane0 = Path(plane0_str)
+    try:
+        if mode == "full":
+            out = run_cluster_xcorr_full_fast(plane0, progress_cb=cb, **params)
+        else:
+            out = run_cluster_xcorr_per_event_fast(
+                plane0, event_windows=event_windows, progress_cb=cb, **params)
+        return {"mode": mode, "aborted": False, "out": str(out)}
+    except XcorrAborted:
+        return {"mode": mode, "aborted": True, "out": None}
+
+
 # ---------------------------------------------------------------------------
 # Headless orchestrator -- the entry point Tab 0's batch runner calls.
 # ---------------------------------------------------------------------------

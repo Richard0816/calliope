@@ -112,16 +112,19 @@ class EventDetectionTab(ctk.CTkFrame):
         the upstream memmaps are written.
     ``_on_render``
         Snapshot the manual-subset Tk vars on the main thread (Tk
-        vars are not safe to read from a worker), then launch a
-        worker thread.
-    ``_compute_render_data`` (worker thread)
-        Load the lowpass + dt memmaps, run ``mad_z`` +
+        vars are not safe to read from a worker), then offload
+        ``core.event_detection_run.run_event_detection_offload`` to a
+        child process via ``core.offload.run_offloaded`` (a thread
+        would let the pure-Python per-ROI loop hold the GIL and freeze
+        the GUI). Load the lowpass + dt memmaps, run ``mad_z`` +
         ``hysteresis_onsets`` per ROI, run
         ``utils.detect_event_windows`` over all onsets, return a
         dict of arrays.
     ``_on_render_done`` (main thread)
-        Update the three figures, write summary sheets, publish
-        ``state.set_event_results(...)``.
+        Update the three figures and publish
+        ``state.set_event_results(...)``, then defer the summary-sheet
+        + manifest writes to a follow-up ``after`` tick so the disk /
+        openpyxl work doesn't block the event loop right after a run.
     """
 
     POLL_MS = 80
@@ -263,7 +266,10 @@ class EventDetectionTab(ctk.CTkFrame):
         self.state = state
         self._plane0: Optional[Path] = None
         self._render_queue: queue.Queue = queue.Queue()
-        self._render_worker: Optional[threading.Thread] = None
+        # Heavy detection runs in a child process (see core.offload) so
+        # the pure-Python per-ROI hysteresis loop can't hold the GIL and
+        # freeze the GUI. ``None`` until the first render.
+        self._render_job = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
         # When True, the next render skips persisting params to the run
@@ -283,7 +289,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self._build_ui()
         drain_queue(self, self._render_queue,
                     {"done": self._on_render_done,
-                     "error": self._on_render_error},
+                     "error": self._on_render_error,
+                     "status": self._on_render_status},
                     poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
         state.subscribe_lowpass_ready(self._on_plane0)
@@ -621,8 +628,7 @@ class EventDetectionTab(ctk.CTkFrame):
     # -- Render worker ------------------------------------------------------
 
     def _on_render(self) -> None:
-        if (self._render_worker is not None
-                and self._render_worker.is_alive()):
+        if self._render_job is not None and self._render_job.running():
             messagebox.showinfo("Busy", "Render is already running.")
             return
         if self._plane0 is None or not self._inputs_ready(self._plane0):
@@ -656,32 +662,35 @@ class EventDetectionTab(ctk.CTkFrame):
         self.render_progress.start()
         self.status_var.set("Rendering ...")
 
-        def worker():
-            try:
-                payload = self._compute_render_data(plane0)
-                self._render_queue.put(("done", payload))
-            except Exception as e:
-                self._render_queue.put(
-                    ("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._render_worker = threading.Thread(target=worker, daemon=True)
-        self._render_worker.start()
-
-    def _compute_render_data(self, plane0: Path) -> dict:
-        """Run the full per-ROI hysteresis + population-event detection.
-
-        Delegates the actual computation to
-        :func:`calliope.core.event_detection_run.run_event_detection`
-        so Tab 0's batch runner uses the same code path. The summary
-        write is suppressed here because the existing tab flow calls
-        ``_write_summary`` separately on the rendered payload.
-        """
-        from ...core.event_detection_run import run_event_detection
-        return run_event_detection(
-            plane0, dict(self._params),
-            figures_dir=None,
-            write_summary=False,
+        # Run detection in a child process (not a thread): the per-ROI
+        # hysteresis loop is pure-Python and would hold the GIL, freezing
+        # the GUI. ``run_offloaded`` re-posts ("done"|"error"|"status",
+        # payload) onto ``_render_queue`` from the main thread, so the
+        # existing drain_queue handlers (and their AppState/batch
+        # ``set_*`` calls) keep running on the main thread untouched.
+        from ...core.offload import run_offloaded
+        from ...core import event_detection_run as edr
+        self._render_job = run_offloaded(
+            self, self._render_queue,
+            edr.run_event_detection_offload,
+            args=(str(plane0), dict(self._params)),
+            progress_kind="status",
+            poll_ms=self.POLL_MS,
         )
+
+    def _on_render_status(self, payload) -> None:
+        """Live progress string from the detection child process.
+
+        ``payload`` is the tuple of positional args the child's
+        ``progress_cb(message)`` was called with; Tab 5 only sends a
+        single status string.
+        """
+        try:
+            msg = payload[0] if isinstance(payload, tuple) and payload \
+                else str(payload)
+        except Exception:
+            return
+        self.status_var.set(msg)
 
 
     def _on_render_error(self, payload: str) -> None:
@@ -777,14 +786,11 @@ class EventDetectionTab(ctk.CTkFrame):
         self.summary_btn.configure(state="normal")
         self.prominence_btn.configure(state="normal")
         self.export_btn.configure(state="normal")
-        if self._plane0 is not None:
-            try:
-                self._write_summary(self._plane0, data)
-            except Exception as e:
-                print(f"[GUI] event summary write failed: {e}")
 
         # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
         # propagation) can render the same events without re-detecting.
+        # This MUST run before the deferred disk writes below so the
+        # batch runner advances even if the summary write later fails.
         try:
             self.state.set_event_results({
                 "plane0": self._plane0,
@@ -804,15 +810,36 @@ class EventDetectionTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
 
+        # Defer the slow disk work (openpyxl summary workbook + manifest
+        # merge) to a follow-up tick. Writing the workbook can take a
+        # second or two; running it inline here would freeze the GUI
+        # right after the figures appear. The figures + AppState publish
+        # above have already happened, so the user sees results
+        # immediately and the writes finish in the background.
+        if self._plane0 is not None:
+            self.after(1, lambda p=self._plane0, d=data:
+                       self._finish_render_writes(p, d))
+
+    def _finish_render_writes(self, plane0: Path, data: dict) -> None:
+        """Deferred summary-workbook + manifest writes (off the hot path).
+
+        Split out of :meth:`_on_render_done` so the openpyxl / disk work
+        runs on a later ``after`` tick instead of blocking the event
+        loop the moment a render completes.
+        """
+        try:
+            self._write_summary(plane0, data)
+        except Exception as e:
+            print(f"[GUI] event summary write failed: {e}")
+
         # Persist the params used so a future "Open run folder…" reload
         # can restore them instead of recomputing with GUI defaults.
         # Suppressed during a reload's own recompute (writing back the
         # just-loaded params is pointless, and writing defaults when none
         # were found would silently record them as the run's settings).
-        if (self._plane0 is not None
-                and not self._suppress_manifest_write):
+        if not self._suppress_manifest_write:
             try:
-                self._write_event_manifest(self._plane0)
+                self._write_event_manifest(plane0)
             except Exception as e:
                 print(f"[GUI] event manifest update failed: {e}")
         self._suppress_manifest_write = False

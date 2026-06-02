@@ -135,7 +135,10 @@ class LowpassTab(ctk.CTkFrame):
         self._params: dict = spec_defaults(self.PARAM_SPEC)
 
         self._compute_queue: queue.Queue = queue.Queue()
-        self._compute_worker: Optional[threading.Thread] = None
+        # Heavy filter write runs in a child process (see core.offload)
+        # so the per-ROI scipy loop can't hold the GIL and freeze the
+        # GUI. ``None`` until the first compute.
+        self._compute_job = None
         self._n_kept: int = 0
         self._T: int = 0
 
@@ -696,7 +699,7 @@ class LowpassTab(ctk.CTkFrame):
     # -- Compute (writes the lowpass + derivative memmaps) ------------------
 
     def _on_compute(self) -> None:
-        if self._compute_worker is not None and self._compute_worker.is_alive():
+        if self._compute_job is not None and self._compute_job.running():
             messagebox.showinfo(
                 "Busy", "Low-pass / derivative compute already running.")
             return
@@ -718,37 +721,27 @@ class LowpassTab(ctk.CTkFrame):
         self.compute_status_var.set(
             f"Writing lowpass + derivative @ {cutoff:.3f} Hz ...")
 
-        def worker():
-            try:
-                self._run_compute(plane0, T, N, fps, cutoff)
-                self._compute_queue.put(("done", cutoff))
-            except Exception as e:
-                self._compute_queue.put(
-                    ("error", f"{e}\n{traceback.format_exc()}"))
-
-        self._compute_worker = threading.Thread(target=worker, daemon=True)
-        self._compute_worker.start()
-
-    def _run_compute(self, plane0: Path, T: int, N: int,
-                     fps: float, cutoff: float) -> None:
-        """Causal low-pass + SG first derivative for every kept ROI.
-
-        Delegates the actual work to
-        :func:`calliope.core.lowpass_run.compute_lowpass_and_dt` so the
-        same code path is used by Tab 0's batch runner. ``T``/``N``
-        are accepted for the existing signature but are re-resolved
-        inside the helper.
-        """
-        del T, N  # re-derived inside the helper
-        from ...core.lowpass_run import compute_lowpass_and_dt
-        compute_lowpass_and_dt(
-            plane0,
-            fps=fps,
-            cutoff_hz=cutoff,
-            filter_order=int(self._params.get("filter_order", 2)),
-            sg_win_ms=int(self._params.get("sg_win_ms", 333)),
-            sg_poly=int(self._params.get("sg_poly", 2)),
-            progress_cb=lambda msg: self._compute_queue.put(("status", msg)),
+        # Offload the filter write to a child process (not a thread):
+        # the per-ROI scipy loop would otherwise hold the GIL and freeze
+        # the GUI. ``T``/``N`` are re-derived inside the helper from the
+        # source memmap, so only the path string + scalars cross the
+        # process boundary. The done payload is the cutoff, matching
+        # ``_on_compute_done``.
+        from ...core.offload import run_offloaded
+        from ...core import lowpass_run
+        self._compute_job = run_offloaded(
+            self, self._compute_queue,
+            lowpass_run.compute_lowpass_offload,
+            args=(str(plane0),),
+            kwargs=dict(
+                fps=fps,
+                cutoff_hz=cutoff,
+                filter_order=int(self._params.get("filter_order", 2)),
+                sg_win_ms=int(self._params.get("sg_win_ms", 333)),
+                sg_poly=int(self._params.get("sg_poly", 2)),
+            ),
+            progress_kind="status",
+            poll_ms=self.POLL_MS,
         )
 
     def _on_compute_done(self, cutoff_hz: float) -> None:

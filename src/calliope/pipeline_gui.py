@@ -713,6 +713,14 @@ def main() -> None:
     that time to dispatch mouse / keyboard / timer events to the
     callbacks we wired up above.
     """
+    # Heavy compute is offloaded to child processes (core.offload) via
+    # the multiprocessing ``spawn`` start method. In a frozen build
+    # (Nuitka / PyInstaller) the child re-launches this executable;
+    # ``freeze_support`` makes it run the worker instead of relaunching
+    # the whole GUI. It is a harmless no-op when running from source.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     PipelineApp().mainloop()
