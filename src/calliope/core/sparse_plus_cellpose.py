@@ -235,7 +235,8 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
                       shared_plane0: Path, base_settings: dict,
                       final_dir: Path, max_overlap: float,
                       verbose: bool = True,
-                      extra_cellpose_passes: "list[tuple[str, list]] | None" = None):
+                      extra_cellpose_passes: "list[tuple[str, list]] | None" = None,
+                      detect_plane0: "Path | None" = None):
     """Combine sparsery + non-overlapping cellpose ROIs, then extract
     fluorescence → dcnv → classify → save into ``final_dir/suite2p/plane0/``.
 
@@ -389,6 +390,27 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     final_ops['do_registration'] = 0
     final_ops['Ly'] = Ly
     final_ops['Lx'] = Lx
+
+    # Carry the detection-pass projection images (max_proj / Vcorr /
+    # maxImg) into the final ops. Suite2p computes these during Sparsery
+    # detection and writes them to the sparsery pass's detect_outputs.npy,
+    # but that pass is a pruned intermediate -- and final_ops is built from
+    # the registration-only view, which never has them. Without this copy
+    # the final plane0 has no max projection / correlation image, so the
+    # GUI background dropdown, figure export, and reload all miss them.
+    if detect_plane0 is not None:
+        try:
+            det_view = utils.load_plane_view(Path(detect_plane0))
+            for _k in ('max_proj', 'Vcorr', 'maxImg'):
+                _v = det_view.get(_k)
+                if isinstance(_v, np.ndarray) and _v.ndim == 2:
+                    final_ops[_k] = _v
+                    if verbose:
+                        print(f"    carried {_k} {tuple(_v.shape)} into "
+                              f"final ops")
+        except Exception as _e:
+            if verbose:
+                print(f"    could not carry detection projections: {_e}")
 
     median_diam = max(3, int(round(
         2.0 * float(np.sqrt(np.mean(
@@ -729,6 +751,7 @@ def run(
         sp_stat, cp_stat, shared_plane0, base_settings, final_dir,
         max_overlap=max_overlap, verbose=verbose,
         extra_cellpose_passes=extra_passes or None,
+        detect_plane0=_sp_plane0,
     )
 
     if verbose:

@@ -290,6 +290,10 @@ A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `RO
 2. **Detected ROIs (raw Suite2p output)** — overlays a `nipy_spectral` label image on a chosen background (`meanImgE` by default; user can switch to `meanImg`, `max_proj`, `Vcorr`, `refImg`, `meanImg_chan2`). **Click any ROI** to open the curation popout (see §6).
 3. **After cell-filter** — same background; if `predicted_cell_prob.npy` is present, overlays a `viridis` heatmap of `prob ∈ [0.5, 1.0]` so you can see *how confident* the classifier is per ROI. Otherwise overlays the keep set in `nipy_spectral`.
 
+**Background images in the final plane0.** `max_proj` and `Vcorr` are *detection*-pass artefacts: suite2p writes them to the **sparsery pass**'s `detect_outputs.npy`, but the **final** plane0's `ops.npy` is built by `merge_and_extract` from the *registration-only* shared view, which has neither. `merge_and_extract` now copies `max_proj`/`Vcorr`/`maxImg` from the sparsery pass into `final_ops` (`sparse_plus_cellpose.py`), so the final plane0 — what `load_plane_view`, the background dropdown, figure export, and run-reload all read — reliably carries them even though the sparsery pass is a pruned intermediate. (Previously the final plane0 never had a max projection, regardless of save preset.)
+
+**Saving the underlying background images.** A Tab 3 toggle **"Save background images (max proj / mean / Vcorr)"** (`save_background_images`, PARAM_SPEC group *Figures*, default **off**) makes the detection figure export also write a clean PNG of every available background — `bg_max_proj.png`, `bg_meanImg.png`, `bg_meanImgE.png`, `bg_Vcorr.png` (no ROI overlay, `max_proj` padded to full FOV) — into `calliope_figures/detection/`. It surfaces in the batch Edit-params dialog too. Implemented in `core/detection_run.py::_save_background_images`.
+
 ---
 
 ## 6. Curation popout (click an ROI on panel 2)

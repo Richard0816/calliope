@@ -669,10 +669,61 @@ def _build_cellpose_cfg(params: dict) -> dict:
     }
 
 
-def _render_detection_panels(plane0: Path, figures_dir: Path) -> list[str]:
+def _save_background_images(view: dict, figures_dir: Path) -> list[str]:
+    """Write a clean PNG (no ROI overlay) for every available underlying
+    background image in ``view``: max projection (padded to full FOV),
+    mean, enhanced mean, and correlation (Vcorr). Returns the paths.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    # Full-frame reference for padding a cropped max_proj back to the FOV.
+    ref = None
+    for key in ("meanImg", "meanImgE"):
+        m = view.get(key)
+        if isinstance(m, np.ndarray) and m.ndim == 2:
+            ref = np.asarray(m, dtype=np.float32)
+            break
+
+    for key in ("max_proj", "meanImg", "meanImgE", "Vcorr"):
+        img = view.get(key)
+        if not (isinstance(img, np.ndarray) and img.ndim == 2):
+            continue
+        arr = np.asarray(img, dtype=np.float32)
+        if key == "max_proj" and ref is not None and arr.shape != ref.shape:
+            full = np.zeros_like(ref)
+            yr = view.get("yrange", (0, arr.shape[0]))
+            xr = view.get("xrange", (0, arr.shape[1]))
+            y0, y1 = int(yr[0]), int(yr[1])
+            x0, x1 = int(xr[0]), int(xr[1])
+            h = min(y1 - y0, arr.shape[0])
+            w = min(x1 - x0, arr.shape[1])
+            full[y0:y0 + h, x0:x0 + w] = arr[:h, :w]
+            arr = full
+        if arr.size:
+            lo, hi = np.percentile(arr, [1, 99])
+            if hi > lo:
+                arr = np.clip(arr, lo, hi)
+        out = figures_dir / f"bg_{key}.png"
+        plt.imsave(str(out), arr, cmap="gray")
+        written.append(str(out))
+    return written
+
+
+def _render_detection_panels(plane0: Path, figures_dir: Path, *,
+                             save_backgrounds: bool = False) -> list[str]:
     """Save the same detection-overlay panels Tab 3's ``_draw_panels``
     produces (mean-image + ROI overlays) as PNGs. Falls back gracefully
     if any background image is missing.
+
+    When ``save_backgrounds`` is set, also writes a clean PNG (no ROI
+    overlay) of every available underlying background -- max projection,
+    mean, enhanced mean, and correlation image -- as ``bg_<key>.png``.
     """
     import matplotlib
     matplotlib.use("Agg", force=False)
@@ -686,6 +737,9 @@ def _render_detection_panels(plane0: Path, figures_dir: Path) -> list[str]:
     stat = np.load(plane0 / "stat.npy", allow_pickle=True)
     n_total = len(stat)
     keep = _load_keep_mask(plane0, n_total)
+
+    if save_backgrounds:
+        written.extend(_save_background_images(view, figures_dir))
 
     bg = None
     for key in ("meanImg", "meanImgE", "max_proj", "Vcorr"):
@@ -886,7 +940,10 @@ def run_detection(
     figs: list[str] = []
     if figures_dir is not None:
         try:
-            figs = _render_detection_panels(plane0, Path(figures_dir))
+            figs = _render_detection_panels(
+                plane0, Path(figures_dir),
+                save_backgrounds=bool(params.get("save_background_images",
+                                                 False)))
         except Exception as e:
             if progress_cb is not None:
                 progress_cb(f"[detection] figure render failed: {e}")

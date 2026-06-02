@@ -320,6 +320,14 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "gpu_roi_chunk", "label": "GPU ROI chunk (0=all)",
          "type": "int", "default": 0, "group": "GPU",
          "help": "split ROIs into chunks if VRAM is tight"},
+        # Save the clean underlying background images (no ROI overlay)
+        # during figure export -- max projection, mean, enhanced mean,
+        # correlation -- as bg_<key>.png alongside the ROI panels.
+        {"name": "save_background_images",
+         "label": "Save background images (max proj / mean / Vcorr)",
+         "type": "bool", "default": False, "group": "Figures",
+         "help": "when exporting detection figures, also save a clean PNG "
+                 "of each underlying background image without ROI overlays"},
     ]
 
     def __init__(self, master, state: AppState) -> None:
@@ -1624,7 +1632,10 @@ class Suite2pTab(ctk.CTkFrame):
             from ...core.export_manifest import write_export_manifest
             from ...core.utils import safe_recording_id
             rec_id = safe_recording_id(plane0)
-            written = _render_detection_panels(plane0, detection_dir)
+            written = _render_detection_panels(
+                plane0, detection_dir,
+                save_backgrounds=bool(
+                    self._params.get("save_background_images", False)))
             ckpt_path = self.ckpt_var.get().strip() or None
             manifest_path = write_export_manifest(
                 figures_root,
