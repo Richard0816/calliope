@@ -111,6 +111,22 @@ def render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:
     canvas.draw_idle()
 
 
+def render_background_panel(ax, canvas, mean, vmin, vmax, title):
+    """Paint just the background image (no ROI overlay) on a freshly
+    recreated axis. Mirrors :func:`render_score_panel`'s ``fig.clear()``
+    + ``add_subplot`` so toggling away from the score panel can't leave a
+    stale colourbar behind. Returns the new axes.
+    """
+    fig = ax.figure
+    fig.clear()
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
+    ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title(title, fontsize=9)
+    canvas.draw_idle()
+    return ax
+
+
 def render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
                        title):
     """Same overlay style as :func:`render_panel` but coloured by score

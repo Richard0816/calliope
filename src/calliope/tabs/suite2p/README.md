@@ -245,6 +245,8 @@ Immediately after the prune, `core.detection_run.archive_recording_post_detectio
 
 If compression fails on any raw, the archive step aborts **before** any deletions so the recording stays in a re-runnable state.
 
+**Runs in a child process (not the detection thread).** The prune + Zstd-19 compression is slow (minutes on multi-GB raws) and, run on the detection worker *thread*, froze the GUI ("Not Responding") at the end of every run. It now runs in a child process via `core.offload.run_offloaded` calling `core.detection_run.archive_offload` (safe to offload — unlike detection, this step uses no suite2p multiprocessing). The tab draws the panels as soon as detection finishes, then archives in the background with compression progress streamed to the console. **`set_plane0` — the signal Tab 0's batch runner waits on to advance — is published only when the archive completes** (`_on_archive_done`), preserving the previous ordering where a batch row finished only after archiving. Archive failure is logged and still publishes `plane0` (best-effort; it never blocks the pipeline).
+
 Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 GB (compressed raw + npy outputs).
 
 **Param keys** (read from the same `params` dict that drives the rest of detection):
@@ -288,11 +290,11 @@ A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `RO
 
 1. **Suite2p console** — captures stdout/stderr from the worker (`QueueWriter` + `contextlib.redirect_stdout`).
 2. **Detected ROIs (raw Suite2p output)** — overlays a `nipy_spectral` label image on a chosen background (`meanImgE` by default; user can switch to `meanImg`, `max_proj`, `Vcorr`, `refImg`, `meanImg_chan2`). **Click any ROI** to open the curation popout (see §6).
-3. **After cell-filter** — same background; if `predicted_cell_prob.npy` is present, overlays a `viridis` heatmap of `prob ∈ [0.5, 1.0]` so you can see *how confident* the classifier is per ROI. Otherwise overlays the keep set in `nipy_spectral`.
+3. **After cell-filter** — same background; if `predicted_cell_prob.npy` is present, overlays a `viridis` heatmap of `prob ∈ [0.5, 1.0]` so you can see *how confident* the classifier is per ROI. Otherwise overlays the keep set in `nipy_spectral`. A **"ROI overlay"** switch in this panel's header toggles the overlay off to show the clean background image instead (`_roi_overlay_var`, default on); it re-renders from the panel cache (no recompute) and is honoured by the figure export.
 
 **Background images in the final plane0.** `max_proj` and `Vcorr` are *detection*-pass artefacts: suite2p writes them to the **sparsery pass**'s `detect_outputs.npy`, but the **final** plane0's `ops.npy` is built by `merge_and_extract` from the *registration-only* shared view, which has neither. `merge_and_extract` now copies `max_proj`/`Vcorr`/`maxImg` from the sparsery pass into `final_ops` (`sparse_plus_cellpose.py`), so the final plane0 — what `load_plane_view`, the background dropdown, figure export, and run-reload all read — reliably carries them even though the sparsery pass is a pruned intermediate. (Previously the final plane0 never had a max projection, regardless of save preset.)
 
-**Saving the underlying background images.** A Tab 3 toggle **"Save background images (max proj / mean / Vcorr)"** (`save_background_images`, PARAM_SPEC group *Figures*, default **off**) makes the detection figure export also write a clean PNG of every available background — `bg_max_proj.png`, `bg_meanImg.png`, `bg_meanImgE.png`, `bg_Vcorr.png` (no ROI overlay, `max_proj` padded to full FOV) — into `calliope_figures/detection/`. It surfaces in the batch Edit-params dialog too. Implemented in `core/detection_run.py::_save_background_images`.
+**Panel-3 ROI overlay toggle / background export.** The **"ROI overlay"** switch in panel 3's header (`_roi_overlay_var`, default on) controls both the live panel and the exported `kept_rois` figure: with it **off**, panel 3 and the exported `kept_rois.png` show the clean background image (no ROI overlay) — that's how you get the underlying background out of the GUI. The all-detected `all_rois` panel always keeps its overlay. Threaded into export as `_render_detection_panels(..., kept_overlay=...)`; batch runs default to overlay on. (This replaced the former *Figures* advanced param `save_background_images`, which wrote separate `bg_<key>.png` files.)
 
 ---
 

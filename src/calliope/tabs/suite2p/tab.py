@@ -80,7 +80,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from .logic import (
     PreprocessResult, build_label_image, build_score_image,
     candidate_plane0, count_leaves, load_keep_mask, plane0_has_outputs,
-    render_panel, render_score_panel, summary_writer,
+    render_background_panel, render_panel, render_score_panel, summary_writer,
 )
 from .curation_popout import CurationPopout
 
@@ -320,14 +320,6 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "gpu_roi_chunk", "label": "GPU ROI chunk (0=all)",
          "type": "int", "default": 0, "group": "GPU",
          "help": "split ROIs into chunks if VRAM is tight"},
-        # Save the clean underlying background images (no ROI overlay)
-        # during figure export -- max projection, mean, enhanced mean,
-        # correlation -- as bg_<key>.png alongside the ROI panels.
-        {"name": "save_background_images",
-         "label": "Save background images (max proj / mean / Vcorr)",
-         "type": "bool", "default": False, "group": "Figures",
-         "help": "when exporting detection figures, also save a clean PNG "
-                 "of each underlying background image without ROI overlays"},
     ]
 
     def __init__(self, master, state: AppState) -> None:
@@ -342,7 +334,21 @@ class Suite2pTab(ctk.CTkFrame):
         # in-source defaults from calliope.core.calliope_settings". Gets
         # passed to spc.run via the settings_override kwarg.
         self._settings_override: dict = {}
+        # Post-detection archive (prune + zstd raw compression) runs in a
+        # child process (see core.offload) instead of the detection worker
+        # thread, so the slow level-19 compression can't freeze the GUI.
+        # ``_pending_archive`` carries the paths/params from the worker to
+        # the main-thread launcher; ``set_plane0`` (the batch-advance
+        # signal) is deferred until the archive finishes, preserving the
+        # old ordering where the row completed only after archiving.
+        self._archive_job = None
+        self._pending_archive: Optional[dict] = None
         self._bg_var = tk.StringVar(value=self.DEFAULT_BG_KEY)
+        # Panel 3 ("After filter") ROI-overlay toggle. ON (default) paints
+        # the kept-ROI overlay over the background; OFF shows the clean
+        # background image only. Controls both the live panel and the
+        # exported "kept_rois" figure.
+        self._roi_overlay_var = tk.BooleanVar(value=True)
         self._panel_cache: Optional[dict] = None
 
         self._build_ui()
@@ -350,7 +356,9 @@ class Suite2pTab(ctk.CTkFrame):
                     {"log": self._append_log,
                      "plane0": self._on_plane0_payload,
                      "done": lambda _p: self._on_done(),
-                     "error": self._on_error},
+                     "error": self._on_error,
+                     "archive_done": self._on_archive_done,
+                     "archive_error": self._on_archive_error},
                     poll_ms=self.POLL_MS)
         state.subscribe(self._on_preprocess_result)
 
@@ -536,9 +544,17 @@ class Suite2pTab(ctk.CTkFrame):
 
         fil_frame = ctk.CTkFrame(body)
         fil_frame.grid(row=1, column=1, sticky="nsew", padx=(3, 0))
-        ctk.CTkLabel(fil_frame, text="3. After cell-filter prediction mask",
-                     font=ctk.CTkFont(weight="bold")).pack(
-            anchor="w", padx=8, pady=(6, 0))
+        fil_hdr = ctk.CTkFrame(fil_frame, fg_color="transparent")
+        fil_hdr.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(fil_hdr, text="3. After cell-filter prediction mask",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left",
+                                                           anchor="w")
+        # ON: paint the kept-ROI overlay; OFF: clean background only.
+        # Re-renders from the panel cache (no recompute) and is honoured
+        # by the figure export.
+        ctk.CTkSwitch(fil_hdr, text="ROI overlay",
+                      variable=self._roi_overlay_var,
+                      command=self._redraw_with_bg).pack(side="right")
         self.fil_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
         self.fil_ax = self.fil_fig.add_subplot(111)
         self.fil_ax.set_axis_off()
@@ -653,6 +669,11 @@ class Suite2pTab(ctk.CTkFrame):
     def _on_run(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             messagebox.showinfo("Busy", "Detection is already running.")
+            return
+        if self._archive_job is not None and self._archive_job.running():
+            messagebox.showinfo(
+                "Busy", "Still archiving the previous run's raw data. "
+                "Wait for it to finish before starting another detection.")
             return
         result = self.state.result
         if result is None:
@@ -837,51 +858,16 @@ class Suite2pTab(ctk.CTkFrame):
 
             self._run_filtered_dff(final_plane0)
 
-            self._prune_detection_intermediates(save_folder)
-            self._archive_recording(
-                save_folder, params,
-                raw_paths=raw_paths,
-                plane0=final_plane0)
-
-    def _prune_detection_intermediates(self, save_folder: Path) -> None:
-        from ...core.detection_run import prune_detection_intermediates
-        prune_detection_intermediates(save_folder, progress_cb=print)
-
-    def _archive_recording(self, save_folder: Path, params: dict,
-                           *, raw_paths=None, plane0=None) -> None:
-        """Compress raw TIFFs into the recording folder, drop shifted +
-        final/data.bin. Reads the same param keys as the headless
-        ``detection_run.run_detection`` archive hook so Tab 3 behaves
-        identically to the batch pipeline.
-        """
-        if not bool(params.get("archive_post_detection", True)):
-            return
-        from ...core.detection_run import archive_recording_post_detection
-        try:
-            # ``save_folder`` is the ``detection/`` subfolder; the
-            # archive expects the recording root (one level up), where
-            # the raw-paths sidecar and shifted TIFFs live. ``raw_paths``
-            # lets compression skip the sidecar lookup entirely (the
-            # robust source -- the sidecar can be absent when the recording
-            # was routed through a scratch dir), and ``plane0`` points the
-            # final/data.bin cleanup at the real plane0 regardless of layout.
-            archive_recording_post_detection(
-                Path(save_folder).parent,
-                raw_paths=raw_paths,
-                plane0=plane0,
-                compress_raw=bool(
-                    params.get("compress_raw_post_detection", True)),
-                delete_shifted=bool(
-                    params.get("delete_shifted_post_detection", True)),
-                delete_final_bin=bool(
-                    params.get("delete_final_data_bin_post_detection", True)),
-                delete_external_raw=bool(
-                    params.get("delete_external_raw_after_archive", False)),
-                level=int(params.get("raw_compression_level", 19)),
-                progress_cb=print,
-            )
-        except Exception as e:
-            print(f"[archive] step failed: {e}")
+            # Defer prune + raw-TIFF compression to a child process,
+            # launched from the main thread in ``_on_done`` (the zstd
+            # level-19 archive is slow and would freeze the GUI here).
+            # Stash the context for that launcher.
+            self._pending_archive = {
+                "save_folder": str(save_folder),
+                "params": params,
+                "raw_paths": raw_paths,
+                "plane0": str(final_plane0),
+            }
 
     def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
         """Write the resolved µm-per-pixel onto ``plane0/ops.npy``.
@@ -1172,23 +1158,83 @@ class Suite2pTab(ctk.CTkFrame):
         self.log.configure(state="disabled")
 
     def _on_done(self) -> None:
-        self.progress.stop()
-        self.run_btn.configure(state="normal")
         plane0 = self._final_plane0
         if plane0 is None:
+            self.progress.stop()
+            self.run_btn.configure(state="normal")
             self.status_var.set("Done (no plane0 returned).")
             return
+        # Draw the panels now (fast) so results appear immediately, then
+        # hand the slow prune + raw-compression archive to a child
+        # process so it can't freeze the GUI. ``set_plane0`` (the batch
+        # advance signal) is published only after the archive finishes
+        # in ``_on_archive_done`` -- same ordering as when archiving ran
+        # inline at the end of the worker.
         try:
             self._draw_panels(plane0)
-            self.status_var.set(f"Done -> {plane0}")
         except Exception as e:
-            self.status_var.set(f"Done, render failed: {e}")
+            self.status_var.set(f"Render failed: {e}")
             self._append_log(f"[GUI] render error: {e}\n"
                              f"{traceback.format_exc()}")
+
+        ctx = self._pending_archive
+        if ctx is None:
+            # No archive context (shouldn't happen from a detection run);
+            # finish immediately so the run never hangs.
+            self._finish_detection(plane0)
+            return
+
+        self.status_var.set("Detection complete -- archiving raw data "
+                            "(compressing) in the background...")
+        self._append_log("[GUI] archiving raw data in a background "
+                         "process (GUI stays responsive)...")
+        from ...core.offload import run_offloaded
+        from ...core import detection_run as _dr
+        self._archive_job = run_offloaded(
+            self, self._log_queue, _dr.archive_offload,
+            args=(ctx["save_folder"], ctx["params"]),
+            kwargs=dict(raw_paths=ctx["raw_paths"], plane0_str=ctx["plane0"]),
+            done_kind="archive_done", error_kind="archive_error",
+            progress_kind="log", poll_ms=self.POLL_MS)
+
+    def _finish_detection(self, plane0: Path) -> None:
+        """Stop the spinner, re-enable Run, and publish ``plane0`` (the
+        batch-advance signal). Called once the archive completes (or is
+        skipped / fails) so the row finishes only after archiving."""
+        self._pending_archive = None
+        self._archive_job = None
+        self.progress.stop()
+        self.run_btn.configure(state="normal")
+        self.status_var.set(f"Done -> {plane0}")
         try:
             self.state.set_plane0(plane0)
         except Exception as e:
             self._append_log(f"[GUI] plane0 publish error: {e}")
+
+    def _on_archive_done(self, _payload) -> None:
+        self._append_log("[GUI] archive complete.")
+        plane0 = self._final_plane0
+        if plane0 is not None:
+            self._finish_detection(plane0)
+
+    def _on_archive_error(self, payload) -> None:
+        # Archiving is best-effort -- a compression failure must NOT block
+        # the pipeline (matches the old inline behaviour, which swallowed
+        # archive errors). Log it and still publish plane0 so batch
+        # advances and downstream stages run.
+        first = str(payload).split("\n", 1)[0]
+        self._append_log(f"[archive] step failed (continuing): {first}")
+        plane0 = self._final_plane0
+        if plane0 is not None:
+            self.status_var.set(f"Done (archive failed) -> {plane0}")
+            self._pending_archive = None
+            self._archive_job = None
+            try:
+                self.state.set_plane0(plane0)
+            except Exception as e:
+                self._append_log(f"[GUI] plane0 publish error: {e}")
+            self.progress.stop()
+            self.run_btn.configure(state="normal")
 
     def _on_error(self, msg: str) -> None:
         self.progress.stop()
@@ -1489,7 +1535,13 @@ class Suite2pTab(ctk.CTkFrame):
             f"  -- click an ROI to inspect / curate")
 
         kept_n = int(keep.sum())
-        if probs is not None and probs.shape[0] == n_total:
+        if not self._roi_overlay_var.get():
+            # Overlay off: show the clean background image only.
+            self.fil_ax = render_background_panel(
+                self.fil_ax, self.fil_canvas, bg, vmin, vmax,
+                f"After filter (n = {kept_n} / {n_total})  "
+                f"[bg: {bg_label}, no ROI overlay]")
+        elif probs is not None and probs.shape[0] == n_total:
             score_img = build_score_image(stat, keep, probs, Ly, Lx)
             title = (f"After filter (n = {kept_n} / {n_total})  "
                      f"[bg: {bg_label}, coloured by predicted_cell_prob]")
@@ -1634,8 +1686,7 @@ class Suite2pTab(ctk.CTkFrame):
             rec_id = safe_recording_id(plane0)
             written = _render_detection_panels(
                 plane0, detection_dir,
-                save_backgrounds=bool(
-                    self._params.get("save_background_images", False)))
+                kept_overlay=bool(self._roi_overlay_var.get()))
             ckpt_path = self.ckpt_var.get().strip() or None
             manifest_path = write_export_manifest(
                 figures_root,

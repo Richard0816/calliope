@@ -669,61 +669,50 @@ def _build_cellpose_cfg(params: dict) -> dict:
     }
 
 
-def _save_background_images(view: dict, figures_dir: Path) -> list[str]:
-    """Write a clean PNG (no ROI overlay) for every available underlying
-    background image in ``view``: max projection (padded to full FOV),
-    mean, enhanced mean, and correlation (Vcorr). Returns the paths.
+def archive_offload(save_folder_str: str, params: dict, *,
+                    raw_paths=None, plane0_str: Optional[str] = None,
+                    progress_q=None) -> dict:
+    """Picklable :mod:`calliope.core.offload` target for Tab 3's
+    post-detection archive (prune intermediates + compress raw TIFFs).
+
+    Runs in a child process so the slow zstd compression doesn't freeze
+    the GUI. Safe to offload (unlike detection itself, this step uses no
+    suite2p multiprocessing). Mirrors the inline archive Tab 3 used to do
+    in its detection worker: prune always, then compress/clean per the
+    ``*_post_detection`` params.
     """
-    import matplotlib
-    matplotlib.use("Agg", force=False)
-    import matplotlib.pyplot as plt
-
-    figures_dir = Path(figures_dir)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    written: list[str] = []
-
-    # Full-frame reference for padding a cropped max_proj back to the FOV.
-    ref = None
-    for key in ("meanImg", "meanImgE"):
-        m = view.get(key)
-        if isinstance(m, np.ndarray) and m.ndim == 2:
-            ref = np.asarray(m, dtype=np.float32)
-            break
-
-    for key in ("max_proj", "meanImg", "meanImgE", "Vcorr"):
-        img = view.get(key)
-        if not (isinstance(img, np.ndarray) and img.ndim == 2):
-            continue
-        arr = np.asarray(img, dtype=np.float32)
-        if key == "max_proj" and ref is not None and arr.shape != ref.shape:
-            full = np.zeros_like(ref)
-            yr = view.get("yrange", (0, arr.shape[0]))
-            xr = view.get("xrange", (0, arr.shape[1]))
-            y0, y1 = int(yr[0]), int(yr[1])
-            x0, x1 = int(xr[0]), int(xr[1])
-            h = min(y1 - y0, arr.shape[0])
-            w = min(x1 - x0, arr.shape[1])
-            full[y0:y0 + h, x0:x0 + w] = arr[:h, :w]
-            arr = full
-        if arr.size:
-            lo, hi = np.percentile(arr, [1, 99])
-            if hi > lo:
-                arr = np.clip(arr, lo, hi)
-        out = figures_dir / f"bg_{key}.png"
-        plt.imsave(str(out), arr, cmap="gray")
-        written.append(str(out))
-    return written
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q)
+    save_folder = Path(save_folder_str)
+    prune_detection_intermediates(save_folder, progress_cb=cb)
+    if not bool(params.get("archive_post_detection", True)):
+        return {"archived": False}
+    archive_recording_post_detection(
+        save_folder.parent,
+        raw_paths=raw_paths,
+        plane0=(Path(plane0_str) if plane0_str else None),
+        compress_raw=bool(params.get("compress_raw_post_detection", True)),
+        delete_shifted=bool(params.get("delete_shifted_post_detection", True)),
+        delete_final_bin=bool(
+            params.get("delete_final_data_bin_post_detection", True)),
+        delete_external_raw=bool(
+            params.get("delete_external_raw_after_archive", False)),
+        level=int(params.get("raw_compression_level", 19)),
+        progress_cb=cb,
+    )
+    return {"archived": True}
 
 
 def _render_detection_panels(plane0: Path, figures_dir: Path, *,
-                             save_backgrounds: bool = False) -> list[str]:
+                             kept_overlay: bool = True) -> list[str]:
     """Save the same detection-overlay panels Tab 3's ``_draw_panels``
     produces (mean-image + ROI overlays) as PNGs. Falls back gracefully
     if any background image is missing.
 
-    When ``save_backgrounds`` is set, also writes a clean PNG (no ROI
-    overlay) of every available underlying background -- max projection,
-    mean, enhanced mean, and correlation image -- as ``bg_<key>.png``.
+    ``kept_overlay`` mirrors Tab 3's panel-3 "ROI overlay" toggle: when
+    False, the ``kept_rois`` figure is the clean background image with no
+    ROI overlay (the all-detected ``all_rois`` panel always keeps its
+    overlay). Defaults True so batch runs keep the kept-ROI overlay.
     """
     import matplotlib
     matplotlib.use("Agg", force=False)
@@ -738,9 +727,6 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
     n_total = len(stat)
     keep = _load_keep_mask(plane0, n_total)
 
-    if save_backgrounds:
-        written.extend(_save_background_images(view, figures_dir))
-
     bg = None
     for key in ("meanImg", "meanImgE", "max_proj", "Vcorr"):
         img = view.get(key)
@@ -754,20 +740,25 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
             ("all_rois", np.ones(n_total, dtype=bool), "tab:cyan"),
             ("kept_rois", keep, "tab:orange"),
     ):
+        # The kept panel honours the overlay toggle; all-detected always
+        # overlays so the raw output stays visible.
+        draw_overlay = (label == "all_rois") or kept_overlay
         fig = plt.Figure(figsize=(6, 6), tight_layout=True)
         ax = fig.add_subplot(111)
         lo, hi = np.percentile(bg, [1, 99])
         ax.imshow(bg, cmap="gray", vmin=lo, vmax=hi, aspect="equal")
-        for i, s in enumerate(stat):
-            if not mask[i]:
-                continue
-            ys = np.asarray(s.get("ypix", []))
-            xs = np.asarray(s.get("xpix", []))
-            if ys.size == 0:
-                continue
-            ax.scatter(xs, ys, s=0.4, c=color, alpha=0.5,
-                       linewidths=0)
-        ax.set_title(f"{label}  (n={int(mask.sum())})")
+        if draw_overlay:
+            for i, s in enumerate(stat):
+                if not mask[i]:
+                    continue
+                ys = np.asarray(s.get("ypix", []))
+                xs = np.asarray(s.get("xpix", []))
+                if ys.size == 0:
+                    continue
+                ax.scatter(xs, ys, s=0.4, c=color, alpha=0.5,
+                           linewidths=0)
+        suffix = "" if draw_overlay else "  (background only)"
+        ax.set_title(f"{label}  (n={int(mask.sum())}){suffix}")
         ax.set_axis_off()
         out = figures_dir / f"{label}.png"
         fig.savefig(out, dpi=150)
@@ -940,10 +931,9 @@ def run_detection(
     figs: list[str] = []
     if figures_dir is not None:
         try:
-            figs = _render_detection_panels(
-                plane0, Path(figures_dir),
-                save_backgrounds=bool(params.get("save_background_images",
-                                                 False)))
+            # Batch keeps the kept-ROI overlay (the interactive panel-3
+            # "ROI overlay" toggle is a Tab 3 display control only).
+            figs = _render_detection_panels(plane0, Path(figures_dir))
         except Exception as e:
             if progress_cb is not None:
                 progress_cb(f"[detection] figure render failed: {e}")
