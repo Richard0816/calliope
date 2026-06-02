@@ -1381,6 +1381,9 @@ class CrossCorrelationTab(ctk.CTkFrame):
             kwargs=dict(abort_evt=self._abort_evt, **params),
             progress_kind="progress",
             poll_ms=POLL_MS,
+            # Dedicated process: the abort Event must be inherited at spawn
+            # (it can't be pickled to the reused warm worker).
+            warm=False,
         )
 
     def _on_run_per_event(self) -> None:
@@ -1435,6 +1438,9 @@ class CrossCorrelationTab(ctk.CTkFrame):
                         **params),
             progress_kind="progress",
             poll_ms=POLL_MS,
+            # Dedicated process: the abort Event must be inherited at spawn
+            # (it can't be pickled to the reused warm worker).
+            warm=False,
         )
 
     # -- Queue handlers ----------------------------------------------------

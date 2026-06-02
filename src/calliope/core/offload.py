@@ -35,11 +35,16 @@ Contract for offload targets
 
 Threading / process model
 --------------------------
-* One ``multiprocessing.Process`` per job, ``spawn`` context. Cheap
-  enough here because the package import is light, and it buys true GIL
-  isolation plus a real ``.cancel()`` (terminate) for cancellable runs
-  (e.g. cross-correlation). No ``ProcessPoolExecutor`` -- that can't be
-  handed a plain ``mp.Queue`` for live progress and goes
+* By default :func:`run_offloaded` uses a reused **warm worker** (a single
+  long-lived child process) so the heavy import cost (~3-4 s on Windows
+  spawn) is paid once per session, not per run -- crucial for batches. It
+  runs one job at a time; a job submitted while it's busy falls back to a
+  fresh per-run process. See the "Warm reused worker" section below.
+* ``ProcessJob`` is the per-run path (a fresh ``multiprocessing.Process``,
+  ``spawn`` context). It is used as the warm-worker overflow fallback and
+  for cancellable runs (``warm=False``) that need a live abort ``Event``
+  inherited at spawn (e.g. cross-correlation). No ``ProcessPoolExecutor``
+  -- that can't be handed a plain ``mp.Queue`` for live progress and goes
   ``BrokenProcessPool`` if a worker dies.
 * A single inherited ``mp.Queue`` carries tagged messages back:
   ``(_PROGRESS, args)`` during the run, then exactly one
@@ -53,6 +58,8 @@ Threading / process model
 
 from __future__ import annotations
 
+import atexit
+import itertools
 import multiprocessing as mp
 import queue as _queue
 import traceback
@@ -252,14 +259,232 @@ class ProcessJob:
             pass
 
 
+# ===========================================================================
+# Warm reused worker
+# ===========================================================================
+# A single long-lived child process reused across runs so the heavy import
+# cost (numpy/scipy/pandas/matplotlib, ~3-4 s on Windows spawn) is paid ONCE
+# per session instead of per run -- the difference between a 134-recording
+# batch spending ~30 min just re-importing and spending it once.
+#
+# Constraints that shape this design:
+#   * A plain spawn ``Event``/``Queue`` can only be shared by INHERITANCE
+#     (passed to ``Process`` at spawn), not pickled through a queue to an
+#     already-running worker. So progress is delivered via a job-id-tagging
+#     adapter the worker injects locally, and cancellable jobs (which need a
+#     live abort ``Event``) keep using a per-run :class:`ProcessJob`
+#     (``warm=False``) where the Event is inherited at spawn.
+#   * The worker runs ONE job at a time. Offload jobs are serial in practice
+#     (Tab 0's batch driver runs one stage at a time). If a second job is
+#     submitted while the worker is busy, the caller falls back to a per-run
+#     ``ProcessJob`` -- no internal scheduler/backlog to get wrong.
+#   * If a job crashes the worker (OOM kill, segfault), the dispatcher reports
+#     an error for that job and respawns a fresh worker for the next one.
+
+
+class _TaggedPut:
+    """``progress_q`` adapter handed to offload targets inside the warm
+    worker. ``make_progress_cb`` calls ``put((_PROGRESS, payload))``; this
+    re-tags it with the job id so the shared result queue can be
+    demultiplexed by the parent. Constructed in the child, so it need not
+    be picklable.
+    """
+
+    __slots__ = ("_q", "_jid")
+
+    def __init__(self, result_q, job_id: int) -> None:
+        self._q = result_q
+        self._jid = job_id
+
+    def put(self, item) -> None:
+        try:
+            tag, payload = item
+        except Exception:
+            tag, payload = _PROGRESS, item
+        try:
+            self._q.put((self._jid, tag, payload))
+        except Exception:
+            pass
+
+
+def _warm_loop(task_q, result_q) -> None:
+    """Warm-worker entry: run submitted jobs until a ``None`` sentinel.
+
+    Each task is ``(job_id, fn, args, kwargs)``. The worker injects a
+    job-id-tagging ``progress_q`` so the target's progress callback routes
+    back over the shared ``result_q`` as ``(job_id, tag, payload)``.
+    """
+    while True:
+        try:
+            job = task_q.get()
+        except (EOFError, OSError):
+            break
+        if job is None:
+            break
+        job_id, fn, args, kwargs = job
+        kwargs = dict(kwargs)
+        kwargs["progress_q"] = _TaggedPut(result_q, job_id)
+        try:
+            result = fn(*args, **kwargs)
+            result_q.put((job_id, _DONE, result))
+        except BaseException:  # noqa: BLE001 - report everything back
+            result_q.put((job_id, _ERROR, traceback.format_exc()))
+
+
+class _WarmJobHandle:
+    """Returned by the warm pool; mirrors :class:`ProcessJob`'s public API
+    (``running``/``cancel``) so tab busy-guards work the same either way."""
+
+    def __init__(self) -> None:
+        self._terminal = False
+
+    def running(self) -> bool:
+        return not self._terminal
+
+    def cancel(self) -> None:
+        # The warm worker can't be force-cancelled without killing the
+        # shared process; cancellable tabs use ``warm=False`` + a
+        # cooperative abort Event instead.
+        pass
+
+
+class _WarmPool:
+    """Single-slot manager for the long-lived warm worker (main-thread only;
+    Tk is single-threaded so no locking is needed on the parent side)."""
+
+    def __init__(self) -> None:
+        self._proc = None
+        self._task_q = None
+        self._result_q = None
+        self._busy = False
+        self._cur: Optional[dict] = None
+        self._counter = itertools.count(1)
+        self._armed = False
+        self._poll_ms = 80
+
+    def busy(self) -> bool:
+        return self._busy
+
+    def _ensure_worker(self) -> None:
+        if self._proc is not None and self._proc.is_alive():
+            return
+        self._task_q = _CTX.Queue()
+        self._result_q = _CTX.Queue()
+        self._proc = _CTX.Process(
+            target=_warm_loop, args=(self._task_q, self._result_q),
+            daemon=True)
+        self._proc.start()
+
+    def submit(self, widget, out_queue, fn, args, kwargs, *,
+               done_kind: str, error_kind: str, progress_kind: str,
+               poll_ms: int) -> _WarmJobHandle:
+        """Hand a job to the warm worker. Caller guarantees ``not busy()``."""
+        self._ensure_worker()
+        self._poll_ms = int(poll_ms)
+        jid = next(self._counter)
+        handle = _WarmJobHandle()
+        root = widget.winfo_toplevel()
+        self._busy = True
+        self._cur = {"id": jid, "out": out_queue, "done": done_kind,
+                     "error": error_kind, "progress": progress_kind,
+                     "handle": handle}
+        try:
+            self._task_q.put((jid, fn, tuple(args), dict(kwargs or {})))
+        except Exception as e:
+            # e.g. an arg that can't be pickled through the task queue.
+            self._busy = False
+            self._cur = None
+            handle._terminal = True
+            out_queue.put((error_kind,
+                           f"Could not submit job to warm worker: {e}"))
+            return handle
+        if not self._armed:
+            self._armed = True
+            root.after(self._poll_ms, lambda: self._pump(root))
+        return handle
+
+    def _pump(self, root) -> None:
+        try:
+            while True:
+                jid, tag, payload = self._result_q.get_nowait()
+                cur = self._cur
+                if cur is None or jid != cur["id"]:
+                    continue  # stale message from a finished/dead job
+                if tag == _PROGRESS:
+                    cur["out"].put((cur["progress"], payload))
+                elif tag == _DONE:
+                    cur["out"].put((cur["done"], payload))
+                    cur["handle"]._terminal = True
+                    self._busy = False
+                    self._cur = None
+                elif tag == _ERROR:
+                    cur["out"].put((cur["error"], payload))
+                    cur["handle"]._terminal = True
+                    self._busy = False
+                    self._cur = None
+        except _queue.Empty:
+            pass
+
+        # Worker died mid-job (OOM kill / crash): report + respawn next time.
+        if self._busy and (self._proc is None or not self._proc.is_alive()):
+            cur = self._cur
+            if cur is not None:
+                cur["out"].put((cur["error"],
+                                "Warm worker process died (likely out of "
+                                "memory or a crash). It will be respawned "
+                                "for the next run."))
+                cur["handle"]._terminal = True
+            self._busy = False
+            self._cur = None
+            self._proc = None  # _ensure_worker respawns on next submit
+
+        if self._busy:
+            root.after(self._poll_ms, lambda: self._pump(root))
+        else:
+            self._armed = False  # idle: stop polling until the next submit
+
+    def shutdown(self) -> None:
+        try:
+            if self._task_q is not None:
+                self._task_q.put(None)
+        except Exception:
+            pass
+        try:
+            if self._proc is not None and self._proc.is_alive():
+                self._proc.join(timeout=0.5)
+        except Exception:
+            pass
+
+
+_POOL = _WarmPool()
+atexit.register(_POOL.shutdown)
+
+
 def run_offloaded(widget, out_queue, fn: Callable, args: Sequence = (),
-                  kwargs: Optional[dict] = None, **opts) -> ProcessJob:
-    """Construct, start, and return a :class:`ProcessJob`.
+                  kwargs: Optional[dict] = None, *,
+                  done_kind: str = "done", error_kind: str = "error",
+                  progress_kind: str = "progress",
+                  aborted_kind: Optional[str] = None,
+                  poll_ms: int = 80, warm: bool = True):
+    """Run ``fn`` in a child process; return a handle with ``running()``.
 
     Thin convenience so a tab call site reads like the old
     ``threading.Thread(target=worker, daemon=True).start()`` it replaces.
-    ``opts`` are forwarded to :class:`ProcessJob` (``done_kind``,
-    ``error_kind``, ``progress_kind``, ``aborted_kind``, ``poll_ms``).
+
+    By default the work goes to the reused **warm worker** (amortising the
+    ~3-4 s spawn import cost across the session). Falls back to a fresh
+    per-run :class:`ProcessJob` when the warm worker is busy. Pass
+    ``warm=False`` for jobs that need a live abort ``Event`` (it must be
+    inherited at spawn, so they require a dedicated process) -- those always
+    use a :class:`ProcessJob`.
     """
-    return ProcessJob(widget, out_queue, fn, args=args, kwargs=kwargs,
-                      **opts).start()
+    if warm and aborted_kind is None and not _POOL.busy():
+        return _POOL.submit(
+            widget, out_queue, fn, args, kwargs,
+            done_kind=done_kind, error_kind=error_kind,
+            progress_kind=progress_kind, poll_ms=poll_ms)
+    return ProcessJob(
+        widget, out_queue, fn, args=args, kwargs=kwargs,
+        done_kind=done_kind, error_kind=error_kind,
+        progress_kind=progress_kind, aborted_kind=aborted_kind,
+        poll_ms=poll_ms).start()
