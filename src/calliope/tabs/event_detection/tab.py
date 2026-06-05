@@ -164,10 +164,35 @@ class EventDetectionTab(ctk.CTkFrame):
          "group": "Population events - density",
          "help": "scale density to per-ROI rate so recordings with "
                  "different ROI counts are comparable"},
+        {"name": "auto_min_prominence",
+         "label": "Auto min prominence (null estimate)",
+         "type": "bool", "default": True,
+         "group": "Population events - peaks",
+         "help": "set the prominence floor automatically from the "
+                 "circular-shift null per recording; uncheck to use the "
+                 "fixed value below"},
+        {"name": "auto_min_prominence_percentile",
+         "label": "Auto prominence percentile",
+         "type": "float", "default": 99.0,
+         "group": "Population events - peaks",
+         "help": "null percentile used when Auto min prominence is on "
+                 "(fitted to ~99 against hand-tuned recordings)"},
+        {"name": "auto_min_prominence_n_shuffles",
+         "label": "Auto prominence shuffles",
+         "type": "int", "default": 200,
+         "group": "Population events - peaks",
+         "help": "circular-shift count for the null estimate "
+                 "(more = steadier, slower)"},
+        {"name": "auto_min_prominence_seed",
+         "label": "Auto prominence seed",
+         "type": "int", "default": 0,
+         "group": "Population events - peaks",
+         "help": "RNG seed for the null estimate (reproducibility)"},
         {"name": "min_prominence", "label": "Min peak prominence",
          "type": "float", "default": 0.002,
          "group": "Population events - peaks",
-         "help": "find_peaks prominence floor on the smoothed density"},
+         "help": "find_peaks prominence floor on the smoothed density; "
+                 "used only when Auto min prominence is off"},
         {"name": "min_width_bins", "label": "Min peak width (bins)",
          "type": "float", "default": 1.0,
          "group": "Population events - peaks",
@@ -618,8 +643,12 @@ class EventDetectionTab(ctk.CTkFrame):
         """Callback from the popout's Apply button: update
         ``min_prominence`` and kick off a re-render."""
         self._params["min_prominence"] = float(new_value)
+        # Applying a value by hand is an explicit override: switch off the
+        # auto (null-estimate) floor so this value actually takes effect.
+        self._params["auto_min_prominence"] = False
         self.status_var.set(
-            f"min_prominence set to {new_value:.4f}. Re-rendering...")
+            f"min_prominence set to {new_value:.4f} (auto off). "
+            "Re-rendering...")
         # Trigger the normal render path so all downstream artefacts
         # (heatmap, raster, diagnostic panel, AppState.event_results,
         # summary workbook) refresh against the new threshold.

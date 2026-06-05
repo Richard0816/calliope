@@ -1485,6 +1485,12 @@ class Suite2pTab(ctk.CTkFrame):
         flip. Reload the keep mask from the freshly-written iscell.npy
         and repaint both panels so Tab 3 stays in sync with the new
         labels.
+
+        The sentinel ``(-1, -1)`` means "Promote to filter mask" just
+        rewrote ``predicted_cell_mask.npy``. In that case also regenerate
+        the filtered dF/F memmap so downstream tabs (lowpass ``n_kept``,
+        Tab 5/6/7, cross-correlation) reflect the curated cell set --
+        see :meth:`_regenerate_after_promote`.
         """
         c = self._panel_cache
         if c is None:
@@ -1494,6 +1500,52 @@ class Suite2pTab(ctk.CTkFrame):
         except Exception:
             return
         self._redraw_with_bg()
+        if roi_idx == -1 and new_value == -1:
+            self._regenerate_after_promote(Path(c["plane0"]))
+
+    def _regenerate_after_promote(self, plane0: Path) -> None:
+        """Rewrite the filtered dF/F memmap after a "Promote to filter
+        mask" so downstream tabs see the curated cell set.
+
+        Promote only updates ``predicted_cell_mask.npy``. The memmap that
+        downstream tabs actually read (``r0p7_filtered_dff.memmap.float32``)
+        is column-sliced to the keep mask that was live when it was
+        written and is hard-anchored to ``r0p7_cell_mask_bool.npy`` by
+        :func:`calliope.core.utils.resolve_filtered_mask` (the WinError 8
+        fix). So on a reloaded completed run the promotion is invisible
+        until the memmap is rewritten.
+
+        :meth:`_run_filtered_dff` re-slices from the full-ROI source
+        ``r0p7_dff.memmap.float32`` using the now-current keep mask, so
+        both removing and re-adding cells take effect. Republishing
+        ``plane0`` then tells subscribers (lowpass etc.) to reload.
+
+        No-op when the source/filtered memmaps don't exist yet -- there
+        is nothing downstream to refresh until a detection run has
+        produced them. Note: already-computed downstream *results* (Tab 5
+        events, Tab 6/7 clusters, cross-correlation) are NOT recomputed;
+        they stay stale until those stages are re-run.
+        """
+        src = plane0 / "r0p7_dff.memmap.float32"
+        filt = plane0 / "r0p7_filtered_dff.memmap.float32"
+        if not (src.exists() and filt.exists()):
+            return
+        try:
+            self._run_filtered_dff(plane0)
+        except Exception as e:
+            messagebox.showwarning(
+                "Filtered dF/F not updated",
+                f"The promotion was saved, but the filtered dF/F memmap "
+                f"could not be regenerated:\n{e}\n\nRe-run Tab 3 "
+                f"'filtered dF/F' to apply the new cell set downstream.")
+            return
+        # Re-fire the plane0 channel so memmap-reading tabs (lowpass
+        # n_kept, etc.) reload from the rewritten memmap. set_plane0
+        # re-publishes unconditionally, so the same path still refreshes.
+        try:
+            self.state.set_plane0(plane0)
+        except Exception:
+            pass
 
     def _redraw_with_bg(self) -> None:
         c = self._panel_cache

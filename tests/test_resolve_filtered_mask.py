@@ -180,6 +180,59 @@ def test_writer_reader_agree_on_fresh_run(tmp_path):
     assert n_kept == int(live.sum()) == 5
 
 
+def test_promote_regenerate_updates_n_kept(tmp_path):
+    """Regression for the "promote doesn't change n_kept on a reloaded run"
+    bug. Promote rewrites predicted_cell_mask, but downstream tabs read the
+    filtered memmap (anchored to r0p7_cell_mask_bool). The fix re-runs
+    Suite2pTab._run_filtered_dff, which re-slices from the full-ROI source
+    r0p7_dff memmap and rewrites both the filtered memmap and the persisted
+    mask -- so resolve_filtered_mask reports the NEW count afterwards.
+
+    Calls the real production writer (unbound, with a stub self) so the test
+    guards _run_filtered_dff itself, not a re-implementation of it.
+    """
+    from types import SimpleNamespace
+    from calliope.tabs.suite2p.tab import Suite2pTab
+
+    T, N_total = 6, 10
+    # Full-ROI dF/F source: column j holds the constant value j so we can
+    # later assert exactly which ROIs survive into the filtered memmap.
+    src = np.memmap(tmp_path / "r0p7_dff.memmap.float32", dtype="float32",
+                    mode="w+", shape=(T, N_total))
+    for j in range(N_total):
+        src[:, j] = float(j)
+    src.flush(); del src
+    # _run_filtered_dff reads N_total, T from F.npy (shape (N_total, T)).
+    np.save(tmp_path / "F.npy", np.zeros((N_total, T), dtype=np.float32))
+
+    stub = SimpleNamespace(csv_dff_var=SimpleNamespace(get=lambda: False))
+    mm = tmp_path / "r0p7_filtered_dff.memmap.float32"
+
+    # Fresh run: cell-filter keeps the first 7 ROIs.
+    np.save(tmp_path / "predicted_cell_mask.npy",
+            np.array([True] * 7 + [False] * 3))
+    Suite2pTab._run_filtered_dff(stub, tmp_path)
+    _mask, n_kept = utils.resolve_filtered_mask(
+        tmp_path, N_total, memmap_path=mm, T=T)
+    assert n_kept == 7
+
+    # Promote curates DOWN to the first 3, then regenerate (the fix).
+    promoted = np.array([True] * 3 + [False] * 7)
+    np.save(tmp_path / "predicted_cell_mask.npy", promoted)
+    Suite2pTab._run_filtered_dff(stub, tmp_path)
+
+    mask, n_kept = utils.resolve_filtered_mask(
+        tmp_path, N_total, memmap_path=mm, T=T)
+    assert n_kept == 3
+    assert np.array_equal(mask, promoted)
+    # The rewritten memmap holds exactly columns for ROIs 0, 1, 2.
+    filt = np.memmap(mm, dtype="float32", mode="r", shape=(T, 3))
+    assert filt[0].tolist() == [0.0, 1.0, 2.0]
+    # And the persisted anchor now matches the promoted set.
+    persisted = np.load(tmp_path / "r0p7_cell_mask_bool.npy")
+    assert np.array_equal(persisted, promoted)
+
+
 def test_wrong_length_mask_skipped(tmp_path):
     """A mask whose length != n_total is ignored (stale from a different
     detection run), falling through to the next candidate."""

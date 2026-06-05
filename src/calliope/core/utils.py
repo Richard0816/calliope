@@ -735,10 +735,20 @@ class EventDetectionParams:
     normalize_by_num_rois: bool = True
 
     # Peak detection on smoothed density (scipy.signal.find_peaks)
-    min_prominence: float = 0.002          # OLD: 0.007
+    min_prominence: float = 0.002          # OLD: 0.007  (used only when auto_min_prominence is False)
     min_width_bins: float = 1.0            # OLD: 2.0  (looser; fine bins => narrow real peaks)
     min_distance_bins: float = 4.0         # OLD: 3.0  (~100 ms at bin_sec=0.025)
     prominence_wlen_s: float = 1.0         # NEW: local-window for find_peaks prominence
+
+    # Auto prominence floor from the circular-shift null. When True the
+    # effective floor is the null distribution's
+    # ``auto_min_prominence_percentile`` for this recording, not the static
+    # ``min_prominence`` above. Falls back to the static value if the null
+    # is empty/degenerate.
+    auto_min_prominence: bool = True
+    auto_min_prominence_percentile: float = 99.0
+    auto_min_prominence_n_shuffles: int = 200
+    auto_min_prominence_seed: int = 0
 
     # Baseline / noise (for boundary walking)
     baseline_mode: str = "rolling"  # "rolling" or "global"
@@ -862,6 +872,27 @@ def detect_event_windows(
     )
 
     # 2) Peak detection
+    # Effective prominence floor. When auto_min_prominence is on, take it
+    # from the circular-shift null's percentile for THIS recording (a
+    # per-recording estimate of the coincidence floor) instead of the
+    # static ``min_prominence``. Degenerate/empty nulls fall back to the
+    # static value so detection never silently breaks.
+    effective_min_prominence = float(params.min_prominence)
+    if getattr(params, "auto_min_prominence", False):
+        try:
+            _pct = float(params.auto_min_prominence_percentile)
+            _null = null_prominence_percentiles(
+                onsets_by_roi, T, fps, params,
+                percentiles=(_pct,),
+                n_shuffles=int(params.auto_min_prominence_n_shuffles),
+                seed=int(params.auto_min_prominence_seed),
+            )
+            _val = _null.get(_pct, float("nan"))
+            if np.isfinite(_val) and _val > 0:
+                effective_min_prominence = float(_val)
+        except Exception:
+            pass  # keep the static fallback
+
     # NEW: pass prominence_wlen_s through so prominence is measured
     # locally (matches event_detection_short.py behaviour). We need
     # this in *bin* units, so we convert seconds -> bins via
@@ -873,7 +904,7 @@ def detect_event_windows(
     # width / distance thresholds.
     peak_indices = _detect_density_peaks(
         smooth=smooth,
-        min_prominence=params.min_prominence,
+        min_prominence=effective_min_prominence,
         min_width_bins=params.min_width_bins,
         min_distance_bins=params.min_distance_bins,
         wlen_bins=wlen_bins_val,
@@ -953,6 +984,7 @@ def detect_event_windows(
             boundaries["boundary_source_right"]),
         "prominence": _slice_per_peak(boundaries["prominence"]),
         "duration_s": _slice_per_peak(boundaries["duration_s"]),
+        "min_prominence_used": effective_min_prominence,
     }
     return event_windows, A, first_time, diagnostics
 

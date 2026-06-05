@@ -45,6 +45,8 @@ _EVENT_DETECTION_FIELDS = (
     "bin_sec", "smooth_sigma_bins", "normalize_by_num_rois",
     "min_prominence", "min_width_bins", "min_distance_bins",
     "prominence_wlen_s", "min_active_rois",
+    "auto_min_prominence", "auto_min_prominence_percentile",
+    "auto_min_prominence_n_shuffles", "auto_min_prominence_seed",
     "baseline_mode", "baseline_percentile",
     "baseline_window_s", "noise_quiet_percentile",
     "noise_mad_factor", "end_threshold_k",

@@ -229,7 +229,11 @@ Defaults are tuned for **<0.5 s epileptiform events**. Every entry below is edit
 | `bin_sec` | 0.025 | Density histogram bin width. |
 | `smooth_sigma_bins` | 1.5 | Gaussian smoothing of the density. |
 | `normalize_by_num_rois` | True | Normalise to onsets/ROI/bin. |
-| `min_prominence` | 0.002 | `find_peaks` prominence floor. Also editable visually via the *Prominence distribution...* popout, which overlays the circular-shift null p95/p99 as a reference floor (not auto-applied — see Popouts below). |
+| `auto_min_prominence` | True | When on, the prominence floor is estimated **per recording** from the circular-shift null instead of the fixed `min_prominence` below — see the note under the table. |
+| `auto_min_prominence_percentile` | 99.0 | Null percentile used as the floor when `auto_min_prominence` is on. |
+| `auto_min_prominence_n_shuffles` | 200 | Circular-shift count for the null estimate (higher = steadier, slower). |
+| `auto_min_prominence_seed` | 0 | RNG seed for the null estimate. |
+| `min_prominence` | 0.002 | Fixed `find_peaks` prominence floor, used **only when `auto_min_prominence` is off**. Also editable visually via the *Prominence distribution...* popout (applying a value there turns auto off). |
 | `min_width_bins` | 1.0 | Peak min width. |
 | `min_distance_bins` | 4.0 | Min separation between peaks (~100 ms). |
 | `prominence_wlen_s` | 1.0 | Local window for prominence. |
@@ -248,6 +252,8 @@ Defaults are tuned for **<0.5 s epileptiform events**. Every entry below is edit
 | `gaussian_quantile` | 0.99 | Quantile of the Gaussian fit used to set the boundary. |
 | `gaussian_fit_pad_s` | 0.5 | Padding around each peak included in the Gaussian fit. |
 | `gaussian_min_sigma_s` | 0.05 | Lower bound on the Gaussian fit's sigma. |
+
+**Auto prominence floor.** By default the prominence floor is no longer a single fixed number. With `auto_min_prominence` on, detection derives the floor for *each recording* from that recording's circular-shift null — the p99 (by default) of the prominences a random-coincidence onset pattern produces. This is a deliberately **weak, per-recording estimate**: it tracks the recording's own noise level rather than imposing one global cut, and it errs slightly permissive (the floor lands just under where a careful human would place it, so borderline events survive to curation rather than being silently dropped). The percentile was fitted against nine hand-tuned recordings, where null p99 matched the manual median to within a few percent while p95 ran ~50 % too low. It is only an estimate, so it stays fully overridable: untick `auto_min_prominence` (or apply a value in the prominence popout) to fall back to the fixed `min_prominence`, or nudge `auto_min_prominence_percentile` within the 95–99 range. The trade-off is cost — each detection now runs `auto_min_prominence_n_shuffles` circular shifts, adding a few seconds per render; lower the shuffle count if that matters.
 
 The last five rows (the legacy merge gap and the Gaussian-fit refinement) are inactive in the default short-event configuration but remain editable so a user can revert to the older boundary heuristics by flipping `use_gaussian_boundary` (and disabling `enable_watershed_split`) without leaving the GUI.
 
@@ -272,7 +278,7 @@ Manual subset (UI-only, not in `PARAM_SPEC`):
    - Histogram all onsets across ROIs into bins of `bin_sec`.
    - Optionally normalise by ROI count.
    - `gaussian_filter1d(sigma=smooth_sigma_bins)`.
-3. **Peak detection:** `scipy.signal.find_peaks` with `prominence=min_prominence`, `width=min_width_bins`, `distance=min_distance_bins`, `wlen=round(prominence_wlen_s/bin_sec)|1`.
+3. **Peak detection:** `scipy.signal.find_peaks` with `prominence=`*effective floor*, `width=min_width_bins`, `distance=min_distance_bins`, `wlen=round(prominence_wlen_s/bin_sec)|1`. The effective floor is the circular-shift null percentile when `auto_min_prominence` is on (default), else the fixed `min_prominence`; the value actually used is reported in `diagnostics["min_prominence_used"]`.
 4. **Baseline:** rolling 5th percentile over `baseline_window_s` (or scalar global). **Noise:** MAD of the smooth-density values below the 40th percentile, scaled by `1.4826`. **End threshold:** `baseline + end_threshold_k · noise`.
 5. **Walk** outward from each peak until the trace falls below `end_threshold` *or* you hit `max_walk_duration_s`.
 6. **Watershed split** overlapping windows at the bin of minimum smoothed density between consecutive peaks.
@@ -289,5 +295,5 @@ Tab 5 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Per-panel resize grips.** All three stacked matplotlib panels (1. heatmap, 2. event raster, 3. population event detection) carry a draggable handle below them. Drag any grip to grow that panel — the scrollable tab body absorbs the extra height. The other panels stay at their current size (no PanedWindow sash redistribution).
 - **Popouts.**
-  - **Prominence distribution** (`ProminencePopout`) — opens from the "Prominence distribution..." button after a render completes; resizable Toplevel with a histogram of candidate-peak prominences and a slider for picking `min_prominence` interactively. It also overlays the **circular-shift null floor** (p95 dotted, p99 dash-dot vertical reference lines): the null independently time-shifts each ROI's onset train so any cross-cell coincidence is pure chance, and `min_prominence` should sit at/above that floor. The null is computed off-thread (`utils.circular_shift_null_prominences`, 200 shuffles) so the popout opens instantly and the lines fill in a few seconds later (a "null floor: computing…" note shows meanwhile); the count label then reports the threshold as a `×` multiple of null p99. Per the 2026-05-29 council verdict the null is a **floor reference only — never auto-applied** as the default (the user's hand-tuned value consistently sits above it, well above on event-rich recordings). Same null engine as `scripts/null_prominence_audit.py`.
+  - **Prominence distribution** (`ProminencePopout`) — opens from the "Prominence distribution..." button after a render completes; resizable Toplevel with a histogram of candidate-peak prominences and a slider for picking `min_prominence` interactively. It also overlays the **circular-shift null floor** (p95 dotted, p99 dash-dot vertical reference lines): the null independently time-shifts each ROI's onset train so any cross-cell coincidence is pure chance, and `min_prominence` should sit at/above that floor. The null is computed off-thread (`utils.circular_shift_null_prominences`, 200 shuffles) so the popout opens instantly and the lines fill in a few seconds later (a "null floor: computing…" note shows meanwhile); the count label then reports the threshold as a `×` multiple of null p99. By default the same null now also *drives* the floor automatically (`auto_min_prominence`, p99) rather than only being shown — see the Auto prominence floor note in §4. The popout is the manual escape hatch: **applying a value here turns `auto_min_prominence` off** so your pick takes effect. Same null engine as `scripts/null_prominence_audit.py`.
 - **Onset source** + **Manual ROI subset** rows let you pick between derivative / Suite2p `spks` and optionally restrict the heatmap + raster to a user-supplied ROI list.

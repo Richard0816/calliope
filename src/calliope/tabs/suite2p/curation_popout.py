@@ -679,9 +679,12 @@ class CurationPopout(ctk.CTkToplevel):
                 "Promote to filter mask",
                 f"Promote {n_flipped} flipped ROI{plural} to "
                 f"{_cf_cfg.PREDICTED_MASK_NAME}?\n\n"
-                f"Downstream stages (Tab 5/6/7, cross-correlation) "
-                f"will see the new labels on next load. CNN "
-                f"predictions for the other ROIs are preserved."):
+                f"The filtered dF/F memmap will be rewritten to the new "
+                f"cell set, so tabs that read it (e.g. lowpass n_kept) "
+                f"refresh immediately. Already-computed results "
+                f"(Tab 5/6/7, cross-correlation) must be re-run to "
+                f"reflect the change. CNN predictions for the other ROIs "
+                f"are preserved."):
             return
         try:
             if mask_path.exists():
