@@ -1049,11 +1049,21 @@ def load_existing_preprocess(
     # Regenerate the shifted TIFF(s) from the (compressed) raw before
     # returning -- callers expect ``shifted_tiff`` to be a real file.
     raw_sources = read_raw_paths_sidecar(out_dir)
-    if not shifted_candidates and raw_sources and not regenerate_shifted:
-        # Viewing-only reload: skip the expensive shifted regeneration.
-        # Point shifted_tiff at where regeneration *would* land so Tab 3
-        # can show the recording name; leave shifted_paths empty.
-        expected = out_dir / f"shifted_{raw_sources[0].name}"
+    if not shifted_candidates and not regenerate_shifted:
+        # Viewing-only reload: QC / lowpass / events only need qc.gif +
+        # mean.npy. The shifted TIFF is required solely for re-detection,
+        # so when it has been archived away we still return a usable
+        # result instead of None -- otherwise "Load from folder" reports
+        # "couldn't parse preprocess outputs" for any finished run whose
+        # shifted TIFFs were pruned. shifted_tiff points at where the file
+        # *would* be regenerated so Tab 3 can still name the recording;
+        # shifted_paths stays empty. The raw sidecar is optional here: it
+        # is absent for older runs and manually-placed shifted TIFFs, and
+        # viewing doesn't need the raw at all.
+        if raw_sources:
+            expected = out_dir / f"shifted_{raw_sources[0].name}"
+        else:
+            expected = out_dir / f"shifted_{out_dir.name}.tif"
         mean = np.load(str(mean_path))
         return PreprocessResult(
             out_dir=out_dir,

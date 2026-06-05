@@ -919,6 +919,26 @@ def load_base_settings(config: Suite2pPipelineConfig):
             print(f"Lowering nbins {current_nbinned} -> {safe_nbinned} to fit available RAM")
         set_setting(settings, 'nbins', safe_nbinned)
 
+    # --- Tiny-FOV guard: disable non-rigid registration when the frame
+    # is smaller than the non-rigid block. Suite2p builds its block grid
+    # as ceil(1.5 * L / block_size); when a frame dimension is smaller
+    # than its block_size the grid degenerates to a single block, and
+    # nonrigid.transform_data's F.interpolate of that 1x1 shift field
+    # collapses to a 0-sized output -- crashing registration with
+    # "Input and output sizes should be greater than 0" (e.g. a 60x80
+    # demo movie against the default [128, 128] block). Non-rigid warping
+    # is meaningless on a sub-block FOV anyway, so fall back to rigid-only.
+    if get_setting(settings, 'nonrigid', False):
+        frame_hw = utils._peek_tiff_frame_shape(config.tiff_folder)
+        block_size = get_setting(settings, 'block_size') or [128, 128]
+        if (frame_hw is not None and len(block_size) >= 2
+                and (frame_hw[0] < block_size[0] or frame_hw[1] < block_size[1])):
+            set_setting(settings, 'nonrigid', False)
+            if config.verbose:
+                print(f"[nonrigid] frame {frame_hw[0]}x{frame_hw[1]} is smaller "
+                      f"than block_size {block_size[0]}x{block_size[1]}; "
+                      f"disabling non-rigid registration (rigid-only)")
+
     if config.verbose:
         summary = (
             f"algorithm={settings['detection'].get('algorithm', '?')} "
