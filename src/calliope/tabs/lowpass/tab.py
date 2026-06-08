@@ -504,7 +504,8 @@ class LowpassTab(ctk.CTkFrame):
             self._trace_label = (f"ROI {best_orig} (score {best_score:.3f})")
         elif source in ("mean", "median"):
             agg = np.zeros(T, dtype=np.float32)
-            chunk = max(1, min(T, 8192))
+            from ...core import utils as _u
+            chunk = max(1, min(T, _u.DFF_TIME_CHUNK))
             reducer = (np.median if source == "median" else np.mean)
             for t0 in range(0, T, chunk):
                 t1 = min(T, t0 + chunk)
@@ -780,7 +781,8 @@ class LowpassTab(ctk.CTkFrame):
             if not quiet:
                 messagebox.showinfo("No data", "Load a recording first.")
             return
-        save_folder = plane0.parents[3]
+        from ...core.utils import save_folder_for_plane0
+        save_folder = save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
         lowpass_dir = figures_root / "lowpass"
         try:

@@ -583,7 +583,7 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
     from .cellfilter.predict import predict_recording
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model = CellFilter().to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -634,7 +634,7 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
                     shape=(T, N_total))
     filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
                      shape=(T, N_kept))
-    chunk = max(1, min(T, 4096))
+    chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)
         filt[t0:t1, :] = dff[t0:t1, :][:, mask]
@@ -738,6 +738,14 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
     if bg is None:
         return written
 
+    # Micrometre scale bar, drawn only when the recording carries a pixel
+    # calibration (stamp_pix_to_um ran with a zoom / µm-per-pixel set). The
+    # panels keep ``axis('off')`` and pixel data coords, so the bar is sized
+    # in pixels (length_um / pix_to_um); the ROI scatter needs no rescaling.
+    from .figscale import add_scale_bar
+    pix_to_um = view.get("pix_to_um")
+    Ly, Lx = bg.shape
+
     for label, mask, color in (
             ("all_rois", np.ones(n_total, dtype=bool), "tab:cyan"),
             ("kept_rois", keep, "tab:orange"),
@@ -747,7 +755,8 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
         draw_overlay = (label == "all_rois") or kept_overlay
         fig = plt.Figure(figsize=(6, 6), tight_layout=True)
         ax = fig.add_subplot(111)
-        lo, hi = np.percentile(bg, [1, 99])
+        lo, hi = np.percentile(
+            bg, [utils.DISPLAY_CLIP_LOW_PCT, utils.DISPLAY_CLIP_HIGH_PCT])
         ax.imshow(bg, cmap="gray", vmin=lo, vmax=hi, aspect="equal")
         if draw_overlay:
             for i, s in enumerate(stat):
@@ -762,6 +771,9 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
         suffix = "" if draw_overlay else "  (background only)"
         ax.set_title(f"{label}  (n={int(mask.sum())}){suffix}")
         ax.set_axis_off()
+        add_scale_bar(ax, pix_to_um, axes_in_um=False,
+                      span_um=(Lx * pix_to_um if pix_to_um else None),
+                      color="white")
         out = figures_dir / f"{label}.png"
         fig.savefig(out, dpi=150)
         fig.savefig(out.with_suffix(".svg"))

@@ -538,7 +538,7 @@ def _open_dff_memmap(plane0: Path, prefix: str):
     if not dff_path.exists():
         raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
 
-    if "filtered" in prefix.split("_"):
+    if _cutils.is_filtered_prefix(prefix):
         # Size against the mask the memmap was written with (persisted as
         # r0p7_cell_mask_bool.npy), cross-checked against the file size, so
         # a drifted predicted_cell_mask/iscell can't request a wrong-shaped
@@ -600,7 +600,8 @@ def _load_keep_mask(plane0: Path, prefix: str) -> Optional[np.ndarray]:
     Returns ``None`` when the prefix is not filtered (in which case the
     'kept' set is every Suite2p ROI). Mirrors clustering_tab._load_filter_mask.
     """
-    if "filtered" not in prefix.split("_"):
+    from . import utils as _cutils
+    if not _cutils.is_filtered_prefix(prefix):
         return None
     plane0 = Path(plane0)
     pred_path = plane0 / "predicted_cell_mask.npy"

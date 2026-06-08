@@ -131,7 +131,7 @@ dF/F[t]    = (F_corr[t] − F0[t]) / F0[t]                   # relative change
 Two **baseline modes** controlled by the radio buttons:
 
 - **Rolling**: `F0[t]` is a rolling 10th-percentile over a `win_sec=45 s` window (`utils.robust_df_over_f_1d`). Sliding-window percentile (`scipy.ndimage.percentile_filter`) tracks slow brightness changes (photobleaching, slice swelling) without being skewed by transients.
-- **First N minutes**: `F0` is a single scalar = the 10th percentile of the first `baseline_min · 60 · fps` frames (`utils.first_n_min_df_over_f_1d`). Best for short recordings where the baseline doesn't drift, and **required** for the GPU path.
+- **First N minutes**: `F0` is a single scalar = the **mean** of the first `baseline_min · 60 · fps` frames (`utils.first_n_min_df_over_f_1d`). Best for short recordings where the baseline doesn't drift, and **required** for the GPU path. (The `perc` setting only affects the rolling mode; first-N mode always uses the mean.)
 
 `r = 0.7` is the **neuropil correction coefficient** (Chen et al. 2013). Subtracting `0.7×Fneu` removes ~70% of out-of-focus contamination on average; the residual is what's actually from the soma.
 
@@ -295,6 +295,8 @@ A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `RO
 **Background images in the final plane0.** `max_proj` and `Vcorr` are *detection*-pass artefacts: suite2p writes them to the **sparsery pass**'s `detect_outputs.npy`, but the **final** plane0's `ops.npy` is built by `merge_and_extract` from the *registration-only* shared view, which has neither. `merge_and_extract` now copies `max_proj`/`Vcorr`/`maxImg` from the sparsery pass into `final_ops` (`sparse_plus_cellpose.py`), so the final plane0 — what `load_plane_view`, the background dropdown, figure export, and run-reload all read — reliably carries them even though the sparsery pass is a pruned intermediate. (Previously the final plane0 never had a max projection, regardless of save preset.)
 
 **Panel-3 ROI overlay toggle / background export.** The **"ROI overlay"** switch in panel 3's header (`_roi_overlay_var`, default on) controls both the live panel and the exported `kept_rois` figure: with it **off**, panel 3 and the exported `kept_rois.png` show the clean background image (no ROI overlay) — that's how you get the underlying background out of the GUI. The all-detected `all_rois` panel always keeps its overlay. Threaded into export as `_render_detection_panels(..., kept_overlay=...)`; batch runs default to overlay on. (This replaced the former *Figures* advanced param `save_background_images`, which wrote separate `bg_<key>.png` files.)
+
+**Scale bar.** When the recording carries a pixel calibration (the Pixel-scale params produced a `pix_to_um` via `_stamp_pix_to_um`), both the live detection panels and the exported `all_rois`/`kept_rois` figures draw a white micrometre scale bar in the lower-right corner. The panels keep their axes off and pixel data coordinates, so the bar is sized in pixels (`length_um / pix_to_um`) and the ROI overlay needs no rescaling. The bar length is a round 1/2/5×10ⁿ number ≈ 20% of the field of view, picked by `core.figscale.nice_bar_length_um`; the shared drawer is `core.figscale.add_scale_bar` (matplotlib `AnchoredSizeBar`, no extra dependency). With no calibration the panels fall back to bare pixels and draw no bar. The `pix_to_um` used is also recorded in the export `manifest.json` so the bar length is reproducible.
 
 ---
 

@@ -619,6 +619,120 @@ def save_folder_for_plane0(plane0) -> Path:
     return Path(plane0).parents[3]
 
 
+# Default frame rate (Hz) used as a fallback when a recording's fps can't
+# be read from the notes spreadsheet. Mirrors ``calliope_settings.fs``;
+# kept here as the single literal so the ~6 scattered ``15.07`` fallbacks
+# reference one source. (Defined here rather than imported from
+# calliope_settings to avoid an import cycle.)
+DEFAULT_FPS: float = 15.07
+
+
+# Canonical display contrast window (percentiles) for showing
+# fluorescence / projection images (mean, correlation, max, detection
+# backgrounds, per-ROI heatmaps). Unifies the previously divergent
+# clip points ([1, 99] in some panels, 0.995/0.01 quantiles in others)
+# so every panel renders with the same contrast. NOTE: this is display
+# only -- it is deliberately NOT used for Cellpose input rescaling
+# (suite2p_pipeline uses 0.01/0.999 there), which is algorithmic.
+DISPLAY_CLIP_LOW_PCT: float = 1.0
+DISPLAY_CLIP_HIGH_PCT: float = 99.5
+
+# Time-axis chunk (frames) for streaming (T, N) dF/F memmaps blockwise
+# without loading the whole array into RAM. Single value replaces the
+# scattered 4096 / 8192 literals (chunking affects only memory/speed,
+# not numerical results).
+DFF_TIME_CHUNK: int = 4096
+
+
+def no_rois_survive(plane0, on_error=None) -> bool:
+    """True when no ROIs survive the cell filter at ``plane0`` -- a
+    genuinely-noise recording.
+
+    ``detection_run.compute_filtered_dff`` writes
+    ``r0p7_filtered_dff.memmap.float32`` only when at least one ROI
+    survives, so its presence means there is data for the lowpass stage
+    (and everything downstream) to read. When it's absent we fall back to
+    counting the live keep mask the same way the lowpass reader does
+    (``predicted_cell_mask`` -> ``iscell`` -> all-ones). Returns ``False``
+    on any read error (or a ``None`` plane0) so a transient glitch never
+    silently skips a good recording. Shared by the GUI batch runner and
+    the headless ``batch_pipeline`` so the skip policy can't drift.
+
+    ``on_error`` (optional) is called with the exception so callers can
+    log the read failure without re-implementing the resolution logic.
+    """
+    if plane0 is None:
+        return False
+    plane0 = Path(plane0)
+    try:
+        if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
+            return False  # only written when N_kept > 0
+        mask_path = plane0 / "predicted_cell_mask.npy"
+        if mask_path.exists():
+            return int(np.load(mask_path).astype(bool).sum()) == 0
+        iscell_path = plane0 / "iscell.npy"
+        if iscell_path.exists():
+            ic = np.load(iscell_path)
+            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+            return int(np.asarray(m).sum()) == 0
+        # No filtered memmap and no mask files -> nothing to filter.
+        return True
+    except Exception as e:
+        if on_error is not None:
+            on_error(e)
+        return False
+
+
+def kept_roi_count(plane0, on_error=None) -> Optional[int]:
+    """How many ROIs survive the cell filter at ``plane0`` -- the number
+    the clustering stage will try to cluster. Resolved the same way the
+    readers do: keep-mask files first (``r0p7_cell_mask_bool`` ->
+    ``predicted_cell_mask`` -> ``iscell``), falling back to the filtered
+    memmap's column count (``T`` from F.npy). Returns ``None`` on any read
+    error (or a ``None`` plane0) so the caller proceeds normally rather
+    than skipping on a transient glitch. Shared by the GUI batch runner
+    and the headless ``batch_pipeline``.
+
+    ``on_error`` (optional) is called with the exception so callers can
+    log the read failure.
+    """
+    if plane0 is None:
+        return None
+    plane0 = Path(plane0)
+    try:
+        for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
+            p = plane0 / name
+            if p.exists():
+                return int(np.load(p).astype(bool).sum())
+        iscell = plane0 / "iscell.npy"
+        if iscell.exists():
+            ic = np.load(iscell)
+            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
+            return int(np.asarray(m).sum())
+        filt = plane0 / "r0p7_filtered_dff.memmap.float32"
+        F = plane0 / "F.npy"
+        if filt.exists() and F.exists():
+            T = int(np.load(F, mmap_mode="r").shape[1])
+            if T > 0:
+                return int(filt.stat().st_size // (4 * T))
+        return None
+    except Exception as e:
+        if on_error is not None:
+            on_error(e)
+        return None
+
+
+def is_filtered_prefix(prefix) -> bool:
+    """True when a dF/F memmap ``prefix`` denotes a cell-filtered set.
+
+    The convention is an underscore-delimited ``filtered`` token, e.g.
+    ``"r0p7_filtered_"``. Centralizes the ``"filtered" in prefix.split("_")``
+    test (and replaces the fragile ``prefix.split("_")[-2] == "filtered"``
+    variant, which raised IndexError on short/untrailing prefixes).
+    """
+    return "filtered" in str(prefix).split("_")
+
+
 def safe_recording_id(plane0) -> str:
     """:func:`infer_recording_id` with the GUI's standard fallback to the
     save-folder name, so export paths don't each repeat the try/except.
@@ -632,7 +746,7 @@ def safe_recording_id(plane0) -> str:
 def get_fps_from_notes(
         path: str,
         notes_root: str = r"F:\notes_recordings",
-        default_fps: float = 15.07,
+        default_fps: float = DEFAULT_FPS,
 ) -> float:
     """Resolve FPS for a recording, given ANY path inside that recording.
 
@@ -2634,7 +2748,7 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     root = Path(root)
     F, _, num_frames, num_rois, _ = s2p_load_raw(root)
 
-    if prefix.split("_")[-2] == "filtered":
+    if is_filtered_prefix(prefix):
         # Size against the mask the memmaps were written with (persisted
         # as r0p7_cell_mask_bool.npy), cross-checked against the file size,
         # so a drifted live mask can't request a wrong-shaped mapping
@@ -2946,10 +3060,10 @@ def first_n_min_df_over_f_1d(F, baseline_min=2.0, perc=10, fps=30.0):
     """Constant baseline dF/F using only the first ``baseline_min``
     minutes of the trace.
 
-    Used for short, stable recordings where the baseline doesn't
-    drift (e.g. a 5-minute slice with constant aCSF). Cheaper than
-    the rolling version and easier to interpret -- F0 is just one
-    number.
+    F0 is the *mean* of the first N minutes. Used for short, stable
+    recordings where the baseline doesn't drift (e.g. a 5-minute
+    slice with constant aCSF). Cheaper than the rolling version and
+    easier to interpret -- F0 is just one number.
 
     Tab 3 picks between this and ``robust_df_over_f_1d`` based on
     the user's "rolling vs. first-N-min" radio button.

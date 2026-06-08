@@ -1113,7 +1113,8 @@ class Suite2pTab(ctk.CTkFrame):
                         shape=(T, N_total))
         filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
                          shape=(T, N_kept))
-        chunk = max(1, min(T, 4096))
+        from ...core import utils
+        chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
         for t0 in range(0, T, chunk):
             t1 = min(T, t0 + chunk)
             filt[t0:t1, :] = dff[t0:t1, :][:, mask]
@@ -1146,7 +1147,8 @@ class Suite2pTab(ctk.CTkFrame):
 
         filt = np.memmap(str(filtered_path), dtype="float32", mode="r",
                          shape=(T, N_kept))
-        chunk = max(1, min(T, 4096))
+        from ...core import utils
+        chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
         first = True
         for t0 in range(0, T, chunk):
             t1 = min(T, t0 + chunk)
@@ -1176,7 +1178,7 @@ class Suite2pTab(ctk.CTkFrame):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"  device: {device}   ckpt: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         model = CellFilter().to(device)
         model.load_state_dict(ckpt["model"])
         model.eval()
@@ -1624,8 +1626,19 @@ class Suite2pTab(ctk.CTkFrame):
             bg_label = "Mean (fallback)"
         Ly, Lx = bg.shape
 
-        vmax = float(np.quantile(bg, 0.995))
-        vmin = float(np.quantile(bg, 0.01))
+        # Pixel calibration for the µm scale bar (None when the recording
+        # has no zoom / µm-per-pixel set -> panels fall back to bare pixels).
+        pix_to_um = None
+        if self._final_plane0 is not None:
+            try:
+                from ...core import utils as _utils
+                pix_to_um = _utils.load_pix_to_um(self._final_plane0)
+            except Exception:
+                pix_to_um = None
+
+        from ...core import utils
+        vmax = float(np.quantile(bg, utils.DISPLAY_CLIP_HIGH_PCT / 100.0))
+        vmin = float(np.quantile(bg, utils.DISPLAY_CLIP_LOW_PCT / 100.0))
 
         label_all = build_label_image(stat, Ly, Lx)
         # Cache the label image so the click handler can map a
@@ -1643,7 +1656,8 @@ class Suite2pTab(ctk.CTkFrame):
         render_panel(
             self.det_ax, self.det_canvas, bg, label_all, vmin, vmax,
             f"All detected ROIs (n = {n_total})  [bg: {bg_label}]"
-            f"  -- click an ROI to inspect / curate")
+            f"  -- click an ROI to inspect / curate",
+            pix_to_um=pix_to_um)
 
         kept_n = int(keep.sum())
         if not self._roi_overlay_var.get():
@@ -1651,14 +1665,15 @@ class Suite2pTab(ctk.CTkFrame):
             self.fil_ax = render_background_panel(
                 self.fil_ax, self.fil_canvas, bg, vmin, vmax,
                 f"After filter (n = {kept_n} / {n_total})  "
-                f"[bg: {bg_label}, no ROI overlay]")
+                f"[bg: {bg_label}, no ROI overlay]",
+                pix_to_um=pix_to_um)
         elif probs is not None and probs.shape[0] == n_total:
             score_img = build_score_image(stat, keep, probs, Ly, Lx)
             title = (f"After filter (n = {kept_n} / {n_total})  "
                      f"[bg: {bg_label}, coloured by predicted_cell_prob]")
             self.fil_ax = render_score_panel(
                 self.fil_ax, self.fil_canvas, bg, score_img,
-                vmin, vmax, title)
+                vmin, vmax, title, pix_to_um=pix_to_um)
         else:
             kept_stat = [s for i, s in enumerate(stat) if keep[i]]
             label_kept = build_label_image(kept_stat, Ly, Lx)
@@ -1667,7 +1682,8 @@ class Suite2pTab(ctk.CTkFrame):
                 self.fil_ax, self.fil_canvas, bg, label_kept,
                 vmin, vmax,
                 f"After filter (n = {kept_n} / {n_total})  "
-                f"[bg: {bg_label}, {keep_src}]")
+                f"[bg: {bg_label}, {keep_src}]",
+                pix_to_um=pix_to_um)
 
     # -- Summary export -----------------------------------------------------
 
@@ -1784,10 +1800,10 @@ class Suite2pTab(ctk.CTkFrame):
                     "Export skipped: uncommitted curation flips.")
             return
 
-        # plane0 = <save_folder>/detection/final/suite2p/plane0
-        # save_folder = plane0.parents[3]; figures land under
-        # calliope_figures/<stage>/ to match the batch layout.
-        save_folder = plane0.parents[3]
+        # plane0 = <save_folder>/detection/final/suite2p/plane0; figures
+        # land under calliope_figures/<stage>/ to match the batch layout.
+        from ...core.utils import save_folder_for_plane0
+        save_folder = save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
         detection_dir = figures_root / "detection"
         try:

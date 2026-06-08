@@ -131,6 +131,7 @@ def write_export_manifest(
         # call supplies a plane0.
         "tau": prev.get("tau"),
         "fs": prev.get("fs"),
+        "pix_to_um": prev.get("pix_to_um"),
         "n_cells_kept": prev.get("n_cells_kept"),
         "n_cells_total": prev.get("n_cells_total"),
         "cellfilter_ckpt_path": ckpt_path or prev.get("cellfilter_ckpt_path"),
@@ -153,6 +154,16 @@ def write_export_manifest(
                 manifest["fs"] = fs or None
             except Exception:
                 pass
+        # Pixel calibration (µm/px) so an exported figure's scale bar is
+        # reproducible from the manifest alone. Lives in
+        # calliope_calibration.npy (falls back to ops['pix_to_um']).
+        try:
+            from .utils import load_pix_to_um
+            pix = load_pix_to_um(plane0)
+            if pix:
+                manifest["pix_to_um"] = float(pix)
+        except Exception:
+            pass
         stat_p = plane0 / "stat.npy"
         if stat_p.is_file():
             try:

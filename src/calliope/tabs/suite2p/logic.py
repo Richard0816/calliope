@@ -97,9 +97,27 @@ def load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
     return utils.resolve_live_mask(plane0, n_total)
 
 
-def render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:
+def _add_panel_scale_bar(ax, mean, pix_to_um) -> None:
+    """Draw a white µm scale bar on an axis-off detection panel.
+
+    No-op when ``pix_to_um`` is missing. The panels keep pixel data
+    coordinates (no ``extent``), so the bar is sized in pixels by the
+    shared helper (``length_um / pix_to_um``).
+    """
+    if pix_to_um is None:
+        return
+    from ...core.figscale import add_scale_bar
+    span_um = mean.shape[1] * pix_to_um
+    add_scale_bar(ax, pix_to_um, axes_in_um=False, span_um=span_um,
+                  color="white")
+
+
+def render_panel(ax, canvas, mean, label_img, vmin, vmax, title,
+                 pix_to_um=None) -> None:
     """Paint ``mean`` on ``ax`` and overlay any non-zero pixels of
     ``label_img`` coloured by ``nipy_spectral`` cluster index.
+
+    A µm scale bar is drawn when ``pix_to_um`` is supplied.
     """
     ax.clear(); ax.set_axis_off()
     ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
@@ -108,10 +126,12 @@ def render_panel(ax, canvas, mean, label_img, vmin, vmax, title) -> None:
         ax.imshow(overlay, cmap="nipy_spectral", alpha=0.45,
                   interpolation="nearest")
     ax.set_title(title, fontsize=9)
+    _add_panel_scale_bar(ax, mean, pix_to_um)
     canvas.draw_idle()
 
 
-def render_background_panel(ax, canvas, mean, vmin, vmax, title):
+def render_background_panel(ax, canvas, mean, vmin, vmax, title,
+                            pix_to_um=None):
     """Paint just the background image (no ROI overlay) on a freshly
     recreated axis. Mirrors :func:`render_score_panel`'s ``fig.clear()``
     + ``add_subplot`` so toggling away from the score panel can't leave a
@@ -123,12 +143,13 @@ def render_background_panel(ax, canvas, mean, vmin, vmax, title):
     ax.set_axis_off()
     ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
     ax.set_title(title, fontsize=9)
+    _add_panel_scale_bar(ax, mean, pix_to_um)
     canvas.draw_idle()
     return ax
 
 
 def render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
-                       title):
+                       title, pix_to_um=None):
     """Same overlay style as :func:`render_panel` but coloured by score
     across ``[0.5, 1.0]`` (the cell-filter pass range). Adds a
     colourbar to the right of the panel. The figure is wiped and the
@@ -150,5 +171,6 @@ def render_score_panel(ax, canvas, mean, score_img, vmin, vmax,
                      fontsize=8)
         cb.ax.tick_params(labelsize=7)
     ax.set_title(title, fontsize=9)
+    _add_panel_scale_bar(ax, mean, pix_to_um)
     canvas.draw_idle()
     return ax

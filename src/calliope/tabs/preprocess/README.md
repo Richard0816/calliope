@@ -37,8 +37,8 @@ For Suite2p, pixel values must fit in `uint16` (range `[0, 65535]`). Raw frames 
 ```python
 data = tifffile.imread(src).astype(np.int32)  # whole stack into RAM
 data += abs(min(data))                        # make global min = 0
-if data.max() >= 65535:
-    raise ValueError(...)                     # dynamic range too wide
+if data.max() > 65535:
+    raise ValueError(...)                     # exceeds uint16 max (65535 is valid)
 data = data.astype(np.uint16)
 tifffile.imwrite(dst, data)
 ```

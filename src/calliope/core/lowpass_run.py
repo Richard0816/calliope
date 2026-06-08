@@ -146,7 +146,7 @@ def _population_mean_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
     src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
     src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
     out = np.zeros(T, dtype=np.float32)
-    chunk = max(1, min(T, 8192))
+    chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)
         out[t0:t1] = np.mean(np.asarray(src[t0:t1, :]), axis=1)

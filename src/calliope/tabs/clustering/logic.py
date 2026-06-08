@@ -80,6 +80,7 @@ __all__ = [
     "filtered_to_suite2p_indices",
     "build_label_image",
     "spatial_image",
+    "render_spatial_map",
     "CustomColorDialog",
     "ReclusterWindow",
 ]
@@ -162,7 +163,7 @@ def load_filtered_dff(plane0: Path, prefix: str):
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
-    is_filtered = "filtered" in prefix.split("_")
+    is_filtered = utils.is_filtered_prefix(prefix)
 
     dff_path = plane0 / f"{prefix}dff.memmap.float32"
     if not dff_path.exists():
@@ -200,7 +201,7 @@ def stat_for_prefix(plane0: Path, prefix: str):
     ``len(stat) != N`` guard with "Spatial unavailable (stat / dF/F mismatch)".
     """
     full_stat = list(np.load(plane0 / "stat.npy", allow_pickle=True))
-    if "filtered" in prefix.split("_"):
+    if utils.is_filtered_prefix(prefix):
         dff_path = plane0 / f"{prefix}dff.memmap.float32"
         F = np.load(plane0 / "F.npy", mmap_mode="r")
         N_total, T = F.shape
@@ -285,7 +286,7 @@ def filtered_to_suite2p_indices(plane0: Path, prefix: str) -> Optional[np.ndarra
     filtered-list positions (not Suite2p ids) whenever ``mask.sum()`` no
     longer matched the leaf count.
     """
-    if "filtered" not in prefix.split("_"):
+    if not utils.is_filtered_prefix(prefix):
         return None
     plane0 = Path(plane0)
     dff_path = plane0 / f"{prefix}dff.memmap.float32"
@@ -322,6 +323,33 @@ def spatial_image(stat, Lx, Ly, roi_rgb: np.ndarray) -> np.ndarray:
     coverage = utils.paint_spatial(np.ones(len(stat)), stat, Ly, Lx)
     img[coverage == 0] = np.nan
     return img
+
+
+def render_spatial_map(ax, img, Lx, Ly, pix_to_um, title) -> None:
+    """Draw a clustering spatial map on ``ax`` in micrometres when a pixel
+    calibration is available, else in raw pixels.
+
+    Shared by the Tab 6 main view (``_render_all``) and the recluster
+    popout (``ReclusterWindow._render``) so both honour ``pix_to_um``
+    identically. Sets an ``imshow`` extent in µm (preserving the
+    origin="upper" orientation), labels the axes, and adds a black scale
+    bar (contrasts the light NaN background). Pixel fallback keeps the
+    prior "x (px)" / "y (px)" labels and no bar.
+    """
+    ax.clear()
+    if pix_to_um:
+        extent = [0.0, Lx * pix_to_um, Ly * pix_to_um, 0.0]
+        ax.imshow(img, origin="upper", aspect="equal", extent=extent)
+        ax.set_xlabel("x (µm)")
+        ax.set_ylabel("y (µm)")
+        from ...core.figscale import add_scale_bar
+        add_scale_bar(ax, pix_to_um, axes_in_um=True,
+                      span_um=Lx * pix_to_um, color="black")
+    else:
+        ax.imshow(img, origin="upper", aspect="equal")
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
+    ax.set_title(title)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +438,8 @@ class ReclusterWindow(ctk.CTkToplevel):
 
     def __init__(self, master, *, Z: np.ndarray, stat, Lx: int, Ly: int,
                  init_threshold: float, zmax: float,
-                 palette_resolver, branch_label: str, n_rois: int) -> None:
+                 palette_resolver, branch_label: str, n_rois: int,
+                 pix_to_um=None) -> None:
         super().__init__(master)
         self.title(f"Recluster - branch(es) {branch_label}  "
                    f"({n_rois} ROIs)")
@@ -421,6 +450,7 @@ class ReclusterWindow(ctk.CTkToplevel):
         self._stat = stat
         self._Lx = int(Lx)
         self._Ly = int(Ly)
+        self._pix_to_um = pix_to_um
         self._zmax = float(zmax)
         self._T = float(init_threshold)
         self._palette_resolver = palette_resolver
@@ -570,10 +600,6 @@ class ReclusterWindow(ctk.CTkToplevel):
             return
 
         img = spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
-        ax = self.s_ax
-        ax.clear()
-        ax.imshow(img, origin="upper", aspect="equal")
-        ax.set_title(f"{n_clusters} sub-clusters")
-        ax.set_xlabel("x (px)")
-        ax.set_ylabel("y (px)")
+        render_spatial_map(self.s_ax, img, self._Lx, self._Ly,
+                           self._pix_to_um, f"{n_clusters} sub-clusters")
         self.s_canvas.draw_idle()

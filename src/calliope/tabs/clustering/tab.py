@@ -7,11 +7,12 @@ Cells in a slice are not independent -- groups of them have tightly
 correlated firing patterns ("functional ensembles"). Tab 6 finds
 those ensembles by:
 
-1. Computing the **pairwise correlation distance** ``1 - Pearson r``
-   between every pair of ROI dF/F traces (``scipy.spatial.distance.
-   pdist`` with metric="correlation").
-2. Running **average-linkage hierarchical agglomerative clustering**
-   on that distance vector (``scipy.cluster.hierarchy.linkage``).
+1. Z-scoring each ROI's dF/F trace, then computing the **pairwise
+   Euclidean distance** between every pair of z-scored traces
+   (``scipy.spatial.distance.pdist`` with metric="euclidean").
+2. Running **Ward (minimum-variance) hierarchical agglomerative
+   clustering** on that distance vector
+   (``scipy.cluster.hierarchy.linkage`` with method="ward").
 3. **Cutting the tree** at a user-selectable height to produce flat
    cluster labels (``fcluster``).
 4. Rendering a **dendrogram** + a **spatial map** of the FOV with
@@ -109,7 +110,8 @@ from .logic import (
     ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
     ReclusterWindow, build_label_image, compute_clustering_offload,
     filtered_to_suite2p_indices, load_filtered_dff, reload_clustering_offload,
-    spatial_image, stat_for_prefix, summary_writer, utils, ward_linkage,
+    render_spatial_map, spatial_image, stat_for_prefix, summary_writer, utils,
+    ward_linkage,
 )
 from .logic import clustering as cmap_mod
 from .cluster_popout import ClusterPopout
@@ -796,8 +798,14 @@ class ClusteringTab(ctk.CTkFrame):
         if event.xdata is None or event.ydata is None:
             return
         Ly, Lx = self._spatial_label_img.shape
-        x = int(round(event.xdata))
-        y = int(round(event.ydata))
+        # The spatial map's axes are in µm when a calibration is set (extent
+        # = [0, Lx*pix, Ly*pix, 0]); the label image is indexed in pixels, so
+        # divide the cursor coords back to pixel indices in that case.
+        pix_to_um = self._resolve_pix_to_um()
+        sx = event.xdata / pix_to_um if pix_to_um else event.xdata
+        sy = event.ydata / pix_to_um if pix_to_um else event.ydata
+        x = int(round(sx))
+        y = int(round(sy))
         if not (0 <= x < Lx and 0 <= y < Ly):
             return
         lbl = int(self._spatial_label_img[y, x])
@@ -1035,7 +1043,7 @@ class ClusteringTab(ctk.CTkFrame):
         local_idx = np.where(local_mask)[0].astype(int)
         # Translate filtered-list positions to Suite2p ROI ids when the
         # active prefix is filtered (mirrors _export_clusters).
-        if ("filtered" in self._prefix.split("_")
+        if (utils.is_filtered_prefix(self._prefix)
                 and self._plane0 is not None):
             translator = filtered_to_suite2p_indices(
                 self._plane0, self._prefix)
@@ -1166,9 +1174,24 @@ class ClusteringTab(ctk.CTkFrame):
             init_threshold=init_T, zmax=new_zmax,
             palette_resolver=palette_resolver,
             branch_label=branch_str, n_rois=int(global_idx.size),
+            pix_to_um=self._resolve_pix_to_um(),
         )
 
     # -- Render ------------------------------------------------------------
+
+    def _resolve_pix_to_um(self):
+        """µm-per-pixel for the loaded run, or ``None`` when uncalibrated.
+
+        Read from ``<plane0>/calliope_calibration.npy`` via the shared
+        loader so the spatial map matches the detection / Tab 8 figures.
+        """
+        plane0 = getattr(self, "_plane0", None)
+        if plane0 is None:
+            return None
+        try:
+            return utils.load_pix_to_um(plane0)
+        except Exception:
+            return None
 
     def _render_all(self) -> None:
         if self._Z is None:
@@ -1242,12 +1265,9 @@ class ClusteringTab(ctk.CTkFrame):
         # render so a re-cluster / palette change keeps it in sync.
         self._spatial_label_img = build_label_image(
             self._stat, self._Ly, self._Lx)
-        ax = self.s_ax
-        ax.clear()
-        ax.imshow(img, origin="upper", aspect="equal")
-        ax.set_title(f"{n_clusters} clusters  -- click an ROI for cluster panel")
-        ax.set_xlabel("x (px)")
-        ax.set_ylabel("y (px)")
+        render_spatial_map(
+            self.s_ax, img, self._Lx, self._Ly, self._resolve_pix_to_um(),
+            f"{n_clusters} clusters  -- click an ROI for cluster panel")
         self.s_canvas.draw_idle()
 
         # Cluster numbering / ROI->cluster assignment may have changed
@@ -1284,7 +1304,7 @@ class ClusteringTab(ctk.CTkFrame):
         # filtered-position -> Suite2p ROI index translator from the same
         # mask the loaders use.
         filtered_to_suite2p: Optional[np.ndarray] = None
-        if "filtered" in self._prefix.split("_"):
+        if utils.is_filtered_prefix(self._prefix):
             translator = filtered_to_suite2p_indices(
                 self._plane0, self._prefix)
             if translator is not None and translator.size == len(labels):
@@ -1375,7 +1395,7 @@ class ClusteringTab(ctk.CTkFrame):
         # of cluster_labels refers to the i-th *kept* ROI. Translate to
         # Suite2p ROI indices so the Clusters sheet's `roi` column lines
         # up with the ROIs sheet (where `roi` is the Suite2p index).
-        if "filtered" in self._prefix.split("_"):
+        if utils.is_filtered_prefix(self._prefix):
             translator = filtered_to_suite2p_indices(
                 self._plane0, self._prefix)
             if translator is not None and translator.size == len(labels):
@@ -1401,7 +1421,7 @@ class ClusteringTab(ctk.CTkFrame):
             self._plane0, visual_labels,
             cluster_colors=visual_colors,
             threshold=float(T),
-            method="average", metric="correlation",
+            method="ward", metric="euclidean",
             roi_indices=roi_indices)
 
     def _on_export_figures(self, quiet: bool = False) -> None:
@@ -1421,7 +1441,8 @@ class ClusteringTab(ctk.CTkFrame):
                     "Run analysis (or 'Reload clusters') before "
                     "exporting figures.")
             return
-        save_folder = self._plane0.parents[3]
+        from ...core.utils import save_folder_for_plane0
+        save_folder = save_folder_for_plane0(self._plane0)
         figures_root = save_folder / "calliope_figures"
         cluster_dir = figures_root / "clustering"
         try:

@@ -624,9 +624,18 @@ class EventDetectionTab(ctk.CTkFrame):
 
         def worker():
             try:
+                # Honour the user-editable Advanced knobs rather than
+                # hardcoding. Always include 95/99 so the popout's fixed
+                # p95/p99 reference styling keeps working, plus the user's
+                # configured percentile (which drives the actual AUTO floor
+                # in detect_event_windows).
+                pct = float(params.auto_min_prominence_percentile)
+                wanted = sorted({95.0, 99.0, pct})
                 pcts = null_prominence_percentiles(
                     onsets_by_roi, T, fps, params,
-                    percentiles=(95.0, 99.0), n_shuffles=200, seed=0)
+                    percentiles=tuple(wanted),
+                    n_shuffles=int(params.auto_min_prominence_n_shuffles),
+                    seed=int(params.auto_min_prominence_seed))
             except Exception as e:
                 print(f"[GUI] null-floor computation failed: {e}")
                 pcts = None
@@ -882,8 +891,8 @@ class EventDetectionTab(ctk.CTkFrame):
         reload restore events without falling back to defaults.
         """
         from ...core.export_manifest import write_export_manifest
-        from ...core.utils import safe_recording_id
-        save_folder = plane0.parents[3]
+        from ...core.utils import safe_recording_id, save_folder_for_plane0
+        save_folder = save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
         rec_id = safe_recording_id(plane0)
         write_export_manifest(
@@ -945,7 +954,8 @@ class EventDetectionTab(ctk.CTkFrame):
             if not quiet:
                 messagebox.showinfo("No data", "Load a recording first.")
             return
-        save_folder = plane0.parents[3]
+        from ...core.utils import save_folder_for_plane0
+        save_folder = save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
         events_dir = figures_root / "event_detection"
         self.status_var.set("Exporting event figures ...")

@@ -310,7 +310,7 @@ def _stat_for_prefix(root: Path, prefix: str) -> tuple[list, Optional[np.ndarray
     """
     root = Path(root)
     stat = list(np.load(root / "stat.npy", allow_pickle=True))
-    if "filtered" in prefix.split("_"):
+    if utils.is_filtered_prefix(prefix):
         mask_path = root / "r0p7_cell_mask_bool.npy"
         if mask_path.exists():
             mask = np.load(mask_path)
@@ -374,6 +374,10 @@ def plot_spatial(
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    if pix_to_um is not None:
+        from .figscale import add_scale_bar
+        add_scale_bar(ax, pix_to_um, axes_in_um=True,
+                      span_um=Lx * pix_to_um, color="black")
     plt.tight_layout()
     save_path = Path(save_path)
     plt.savefig(save_path, dpi=200)
@@ -418,7 +422,7 @@ def _load_filtered_dff(plane0: Path, prefix: str):
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
-    is_filtered = "filtered" in prefix.split("_")
+    is_filtered = utils.is_filtered_prefix(prefix)
 
     dff_path = plane0 / f"{prefix}dff.memmap.float32"
     if not dff_path.exists():
@@ -551,7 +555,7 @@ def run_clustering(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     filtered_to_suite2p: Optional[np.ndarray] = None
-    if "filtered" in prefix.split("_"):
+    if utils.is_filtered_prefix(prefix):
         mask = _load_filter_mask(plane0)
         if mask is not None and int(mask.sum()) == len(labels):
             filtered_to_suite2p = np.where(

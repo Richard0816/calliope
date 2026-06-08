@@ -622,7 +622,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self._plane0: Optional[Path] = None
         self._prefix = DEFAULT_PREFIX
         self._cluster_folder = DEFAULT_CLUSTER_FOLDER
-        self._fps: float = 15.07
+        self._fps: float = utils.DEFAULT_FPS
         self._event_windows: list[tuple[float, float]] = []
 
         # Cache for the single-pair preview plot (avoid reopening memmap).
@@ -699,7 +699,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
             side="left", padx=(4, 12))
 
         ctk.CTkLabel(row2, text="fps:").pack(side="left")
-        self.fps_var = tk.StringVar(value="15.07")
+        self.fps_var = tk.StringVar(value=f"{utils.DEFAULT_FPS:g}")
         ctk.CTkEntry(row2, textvariable=self.fps_var, width=70).pack(
             side="left", padx=(4, 0))
 
@@ -1067,7 +1067,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         self._dff_cache_key = None
         try:
             fps = float(utils.get_fps_from_notes(str(plane0),
-                                                 default_fps=15.07))
+                                                 default_fps=utils.DEFAULT_FPS))
             self._fps = fps
             self.fps_var.set(f"{fps:.3f}")
         except Exception:
@@ -1191,7 +1191,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
                     f"Run the full-recording cross-correlation first.\n\n"
                     f"Expected:\n{full_dir}")
             return
-        save_folder = self._plane0.parents[3]
+        from ...core.utils import save_folder_for_plane0
+        save_folder = save_folder_for_plane0(self._plane0)
         figures_root = save_folder / "calliope_figures"
         xc_dir = figures_root / "crosscorrelation"
         try:

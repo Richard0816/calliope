@@ -194,14 +194,14 @@ def shift_tiff_to_uint16(
         shifted_max = gmax + shift
         _log(f"[shift] global min={gmin} max={gmax}  -> shift+={shift}  "
              f"(shifted max={shifted_max})")
-        if data.max() >= 65535:
-            # uint16's max is 65535. If the dynamic range is wider
-            # than that we'd alias high values back to zero -- bail
-            # rather than silently corrupt the data.
+        if data.max() > 65535:
+            # uint16's max is 65535 (a valid value). Only bail when the
+            # shifted max EXCEEDS it, where the cast would alias high
+            # values back down and silently corrupt the data. Matches the
+            # ``shifted_max > 65535`` guard on the streaming/group paths.
             raise ValueError(
-                f"Shifted range exceeds uint16 ({data.max()}); "
-                f"raw dynamic range too wide."
-            ) #todo create alternative solution for this case
+                f"Shifted max {data.max()} > 65535; uint16 overflow."
+            )
         data = data.astype(np.uint16)
         # Free: mean over already-in-RAM stack; ``data[::N]`` is a
         # stride view (no copy) -- ``ascontiguousarray`` makes a small

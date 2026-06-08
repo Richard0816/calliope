@@ -344,7 +344,7 @@ class SpatialPropagationTab(ctk.CTkFrame):
                     "Tab 5 publish did not include a plane0.")
             return
         plane0 = Path(plane0)
-        save_folder = plane0.parents[3]
+        save_folder = core_utils.save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
         sp_dir = figures_root / "spatial_propagation"
         self.status_var.set("Exporting spatial-propagation figures ...")
@@ -758,6 +758,10 @@ class SpatialPropagationTab(ctk.CTkFrame):
             ax.set_title(title, fontsize=10)
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)
+            if pix_to_um is not None:
+                from ...core.figscale import add_scale_bar
+                add_scale_bar(ax, pix_to_um, axes_in_um=True,
+                              span_um=extent[1], color="white")
             cbar = fig.colorbar(
                 im, ax=ax, fraction=0.04, pad=0.02,
                 ticks=[0.0, 0.5, 1.0])

@@ -10,8 +10,13 @@ batch of ROIs in the labelling spreadsheet.
 Steps performed
 ---------------
 1. Load the curation CSV (``LABELS_CSV`` in ``config.py``) and split
-   by ROI into train + validation sets (no recording-level leakage,
-   roughly equivalent to a stratified ``createDataPartition`` in R).
+   by ROI into train + validation sets (``split_by_roi``, stratified
+   on label -- roughly a stratified ``createDataPartition`` in R).
+   NOTE: this is a per-ROI split, so ROIs from the same recording can
+   land on both sides (recording-level leakage). It is an intentional
+   tradeoff for the lab's small labelled set; switch the import to
+   ``split_by_recording`` once you have >= ~5 labelled recordings for a
+   leak-free holdout (see README).
 2. Build two ``ROIDataset`` instances and wrap them in
    ``torch.utils.data.DataLoader`` for batched, shuffled iteration.
 3. Instantiate ``CellFilter``, the optimiser (Adam) and the loss

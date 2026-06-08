@@ -639,7 +639,7 @@ the slow output folder, matching pre-scratch behavior.
 ├── detection/_shared_reg/suite2p/plane0/   ← registration metadata only (no data.bin)
 ├── calliope_summary.xlsx              ← Recording + ROIs (detection stage) + EventWindows/EventOnsets/RoiEventTimes/EventMonotonicity (event-detection stage) + Clusters (clustering stage) sheets. The `Recording` + `ROIs` sheets are written by `detection_run.run_detection(write_summary=True)`; before 2026-05-28 the batch detection stage wrote no sheets, so the workbook had no ROIs sheet and only got a Recording sheet if event detection ran.
 ├── calliope_figures/
-│   ├── manifest.json                  ← rec_id, calliope_git_sha, gcamp_variant, tau, fs, n_cells_{kept,total}, cellfilter_ckpt_sha256, full params dict
+│   ├── manifest.json                  ← rec_id, calliope_git_sha, gcamp_variant, tau, fs, pix_to_um, n_cells_{kept,total}, cellfilter_ckpt_sha256, full params dict
 │   ├── preprocess/qc.gif              ← copy of Tab 1's QC GIF
 │   ├── detection/{all_rois,kept_rois}.{png,svg}
 │   ├── lowpass/{fft,raw_dff,lowpass_dff}.{png,svg}

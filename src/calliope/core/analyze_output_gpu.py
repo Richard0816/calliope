@@ -77,7 +77,6 @@ def _gpu_process_all(
     cutoff_hz: float,
     sg_win_ms: float,
     sg_poly: int,
-    perc: int = 10,
     roi_chunk: int | None = None,
     pad: int = 64,
 ):
@@ -100,8 +99,8 @@ def _gpu_process_all(
         Fn = cp.asarray(F_neuropil[:, start:end], dtype=cp.float32)
 
         F_corr = Fc - r * Fn
-        # match CPU: percentile of first-N-min window, not mean
-        F0 = cp.percentile(F_corr[:n_baseline, :], perc, axis=0, keepdims=True)
+        # match CPU first_n_min_df_over_f_1d: mean of the first-N-min window
+        F0 = cp.mean(F_corr[:n_baseline, :], axis=0, keepdims=True)
         F0_safe = cp.maximum(F0, cp.full_like(F0, 1e-9))
         dff = (F_corr - F0) / F0_safe
 

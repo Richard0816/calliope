@@ -365,7 +365,8 @@ class QcTab(ctk.CTkFrame):
 
         self.ax.clear()
         self.ax.set_axis_off()
-        vmax = float(np.quantile(mean, 0.995))
+        from ...core import utils as _u
+        vmax = float(np.quantile(mean, _u.DISPLAY_CLIP_HIGH_PCT / 100.0))
         self.ax.imshow(mean, cmap="gray", vmax=vmax)
         self.ax.set_title("Mean image")
         self.canvas.draw_idle()

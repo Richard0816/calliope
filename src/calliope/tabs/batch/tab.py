@@ -2174,12 +2174,26 @@ class BatchTab(ctk.CTkFrame):
     def _stage_spatial_propagation(self) -> None:
         """Tab 8 has no Run button -- it renders reactively from the
         ``set_event_results`` publish that already fired during the
-        event-detection stage. Switching the notebook gives the user
-        the live render; we wait a beat then advance.
+        event-detection stage. Rather than advance on a blind fixed
+        timer, gate on the real readiness condition: the tab has
+        ingested that publish into ``_data`` (which ``_on_export_figures``
+        re-renders from deterministically). Poll briefly for that flag,
+        with a safety cap so a malformed/missing publish can't hang the
+        batch forever.
         """
-        # Advance after a short delay to let the renderer paint.
-        self.after(750,
-                   lambda: self._on_stage_done("spatial_propagation", None))
+        sp = getattr(self._app, "spatial_tab", None)
+        deadline = time.time() + 10.0  # safety cap; events already published
+
+        def _wait():
+            if self._current_stage != "spatial_propagation":
+                return
+            ready = sp is not None and getattr(sp, "_data", None) is not None
+            if ready or time.time() >= deadline:
+                self._on_stage_done("spatial_propagation", None)
+            else:
+                self.after(50, _wait)
+
+        self.after(0, _wait)
 
     # ---- Stage / row completion ---------------------------------------
 

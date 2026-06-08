@@ -879,14 +879,16 @@ def load_base_settings(config: Suite2pPipelineConfig):
             apply_db_overrides(db, loaded)
             apply_settings_overrides(settings, loaded)
 
-    # --- Pipeline-required settings, applied unconditionally. preclassify
-    # in particular is the junk-culling mechanism; without it, low-threshold
-    # passes produce thousands of speckle ROIs. spatial_scale=0 lets
-    # suite2p auto-pick (calliope's monkey-patch coerces the result to int).
+    # --- Pipeline-required settings, applied unconditionally.
+    # spatial_scale=0 lets suite2p auto-pick (calliope's monkey-patch
+    # coerces the result to int). NOTE: preclassify is intentionally NOT
+    # forced here -- it is a user-facing knob (Tab 3 PARAM_SPEC, default
+    # 0.0/off) and whatever the user / popout / base settings supply is
+    # respected. preclassify > 0 culls speckle ROIs in low-threshold
+    # passes, so users who see speckle should raise it.
     apply_settings_overrides(settings, {
         'sparse_mode':       True,
         'spatial_scale':     0,
-        'preclassify':       0.5,
         'allow_overlap':     False,
     })
 

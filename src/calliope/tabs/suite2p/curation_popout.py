@@ -112,9 +112,11 @@ def _open_dff(plane0: Path, n_total: int) -> tuple[Optional[np.memmap], int]:
     return None, 0
 
 
-def _fps_for(plane0: Path, fallback: float = 15.07) -> float:
+def _fps_for(plane0: Path, fallback: Optional[float] = None) -> float:
+    from ...core import utils
+    if fallback is None:
+        fallback = utils.DEFAULT_FPS
     try:
-        from ...core import utils
         return float(utils.get_fps_from_notes(str(plane0),
                                               default_fps=fallback))
     except Exception:

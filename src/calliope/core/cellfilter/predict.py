@@ -131,7 +131,7 @@ def load_model_from_checkpoint(ckpt_path: Path,
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"No checkpoint at {ckpt_path}. Train first.")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model = CellFilter().to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

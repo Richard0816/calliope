@@ -508,6 +508,10 @@ def render_spatial_event_figures(
             aspect="equal", vmin=0.0, vmax=1.0, extent=extent,
         )
         ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        if pix_to_um is not None:
+            from .figscale import add_scale_bar
+            add_scale_bar(ax, pix_to_um, axes_in_um=True,
+                          span_um=Lx * scale, color="white")
         ax.set_title(
             f"Event {ev_idx + 1} / {n_events}  ({t0:.2f}-{t1:.2f} s)\n"
             f"active = {n_active} / {n_total} ({100 * frac:.1f}%)",

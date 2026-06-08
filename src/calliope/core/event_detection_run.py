@@ -353,7 +353,9 @@ def run_event_detection(
             if onsets.size:
                 raster[i, onsets.clip(0, num_cols - 1)] = 1
 
-        lo, hi = np.percentile(lp_ds, [1, 99])
+        lo, hi = np.percentile(
+            lp_ds,
+            [core_utils.DISPLAY_CLIP_LOW_PCT, core_utils.DISPLAY_CLIP_HIGH_PCT])
         if hi <= lo:
             heatmap[i, :] = 0
         else:

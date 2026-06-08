@@ -94,7 +94,9 @@ img[w>0] /= w[w>0]                      # normalize
 
 Done independently for R, G, B channels. Background (no ROI coverage) is `NaN` so matplotlib draws it transparent over the figure background.
 
-A parallel `(Ly, Lx)` int label image (`_build_label_image`) encoding `filtered_idx + 1` per painted pixel is also rebuilt every render so the spatial-click handler can resolve a cursor position back to an ROI without a per-pixel scan over `stat`. Click any coloured ROI to open the cluster popout (see §"Cluster popout").
+**Axes in µm + scale bar.** When the run carries a pixel calibration (`<plane0>/calliope_calibration.npy` → `utils.load_pix_to_um`, resolved by `_resolve_pix_to_um`), the live spatial map (and the `ReclusterWindow` sub-map) sets an `imshow` extent of `[0, Lx·pix, Ly·pix, 0]`, labels the axes `x (µm)` / `y (µm)`, and adds a black scale bar. Without a calibration it keeps the prior `x (px)` / `y (px)` labels and no bar. Both render paths go through the shared `logic.render_spatial_map(ax, img, Lx, Ly, pix_to_um, title)` helper so they behave identically; this matches the already-µm batch export (`core.clustering.plot_spatial`) and the Tab 8 maps.
+
+A parallel `(Ly, Lx)` int label image (`_build_label_image`) encoding `filtered_idx + 1` per painted pixel is also rebuilt every render so the spatial-click handler can resolve a cursor position back to an ROI without a per-pixel scan over `stat`. Because the axes are in µm when calibrated, the click handler divides the cursor `(xdata, ydata)` by `pix_to_um` before indexing the (pixel-space) label image. Click any coloured ROI to open the cluster popout (see §"Cluster popout").
 
 ### Step 4 — Per-cluster colours
 
