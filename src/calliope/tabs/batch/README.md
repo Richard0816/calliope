@@ -698,8 +698,15 @@ queue).
 from:
 
 - `PreprocessTab.PARAM_SPEC` — 5 knobs (QC GIF).
-- `Suite2pTab.PARAM_SPEC` — 23 knobs (Sparsery / Cellpose / Merge / dF/F /
-  Default low-pass / Pixel scale / GPU).
+- `Suite2pTab.PARAM_SPEC` — 24 knobs (Sparsery / Cellpose / Merge / dF/F /
+  Default low-pass / Pixel scale [`scope_zoom`, `fov_um_reference`,
+  `um_per_pixel`] / GPU).
+- Hand-built detection keys `gcamp_variant` (choice; sets the suite2p
+  deconvolution τ, drawn from `Suite2pTab.GCAMP_OPTIONS`) and
+  `gcamp_tau_custom` (float; a positive value overrides the variant τ,
+  `0` = use the dropdown). These live as Tk vars on Tab 3, not in its
+  PARAM_SPEC, so they're surfaced here and applied onto `gcamp_var` /
+  `custom_tau_var` in `_apply_row_params_to_tabs`.
 - `LowpassTab.PARAM_SPEC` — 5 knobs + an injected `cutoff_hz` (which Tab 4
   binds to its slider rather than a PARAM_SPEC entry).
 - `EventDetectionTab.PARAM_SPEC` — 26 knobs (per-ROI hysteresis + display +

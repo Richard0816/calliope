@@ -623,6 +623,22 @@ def build_batch_param_spec() -> list:
                     "deconvolution; pick the GECI you injected",
         })
         seen.add("gcamp_variant")
+        # Optional custom tau override mirroring Tab 3's free-text field:
+        # a positive value wins over the variant dropdown (for an indicator
+        # not in the preset list or a rig-calibrated tau); 0 means "use the
+        # variant dropdown". Applied onto Tab 3's ``custom_tau_var`` in
+        # ``_apply_row_params_to_tabs`` so the existing ``_on_run`` override
+        # path handles it.
+        spec.append({
+            "name": "gcamp_tau_custom",
+            "label": "Custom tau (s) -- overrides variant",
+            "type": "float",
+            "default": 0.0,
+            "group": "2. Detection - dF/F",
+            "help": "positive value overrides the GCaMP variant tau passed "
+                    "to suite2p deconvolution; 0 = use the variant dropdown",
+        })
+        seen.add("gcamp_tau_custom")
     except Exception:
         pass
 

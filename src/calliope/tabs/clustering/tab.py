@@ -209,6 +209,7 @@ class ClusteringTab(ctk.CTkFrame):
             try:
                 state.subscribe_plane0(self._on_plane0_broadcast)
                 state.subscribe_lowpass_ready(self._on_plane0_broadcast)
+                state.subscribe_release_memmaps(self._release_dff)
                 if getattr(state, "lowpass_plane0", None) is not None:
                     self._on_plane0_broadcast(state.lowpass_plane0)
                 elif getattr(state, "plane0", None) is not None:
@@ -459,6 +460,26 @@ class ClusteringTab(ctk.CTkFrame):
             try:
                 if popout.winfo_exists() and _under_scratch(
                         getattr(popout, "_dff", None)):
+                    popout._dff = None
+            except Exception:
+                pass
+
+    def _release_dff(self) -> None:
+        """Drop the cached filtered dF/F memmap (and the open popout's copy)
+        so a producer can rewrite the file in place -- Windows locks open
+        mappings, so Tab 3's "Promote to filter mask" can't truncate
+        ``r0p7_filtered_dff.memmap.float32`` while we hold it. Fired by
+        ``AppState.release_memmaps``. ``self._dff`` is read only behind a
+        ``self._dff is None`` guard (see ``_on_recluster``) and is
+        repopulated by the next Run analysis / Reload clusters, so nulling
+        it here is safe; the user must re-run clustering after a promote
+        anyway since the cell set changed.
+        """
+        self._dff = None
+        popout = self._cluster_popout
+        if popout is not None:
+            try:
+                if popout.winfo_exists():
                     popout._dff = None
             except Exception:
                 pass

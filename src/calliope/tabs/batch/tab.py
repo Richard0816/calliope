@@ -1752,6 +1752,17 @@ class BatchTab(ctk.CTkFrame):
                     print(f"[batch] migrated stale gcamp_variant "
                           f"{raw_label!r} -> {snapped_label!r}")
                 det.gcamp_var.set(snapped_label)
+            # Custom tau override: set unconditionally (even when the key is
+            # absent) so a positive value from a previous row never carries
+            # over to a recording that didn't ask for one. A positive value
+            # populates Tab 3's custom-tau field (which wins over the variant
+            # in ``_on_run``); 0 / missing / unparseable clears it back to the
+            # dropdown.
+            try:
+                _ct = float(p.get("gcamp_tau_custom", 0.0))
+            except (TypeError, ValueError):
+                _ct = 0.0
+            det.custom_tau_var.set(f"{_ct:g}" if _ct > 0 else "")
 
         # Tab 4: lowpass -- PARAM_SPEC fields + the live cutoff slider.
         lp = getattr(app, "lowpass_tab", None)

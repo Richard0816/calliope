@@ -2969,7 +2969,12 @@ def first_n_min_df_over_f_1d(F, baseline_min=2.0, perc=10, fps=30.0):
     n_baseline = max(1, int(round(float(baseline_min) * 60.0 * float(fps))))
     n_baseline = min(n_baseline, n)
     # ``F[:n_baseline]`` is the slice "first n_baseline samples".
-    F0_scalar = float(np.nanpercentile(F[:n_baseline], perc))
+    # F0 is the *mean* of the baseline window. For a short, stable
+    # recording the first N minutes are quiescent, so the mean is the
+    # natural resting fluorescence; a low percentile would bias F0
+    # downward and inflate dF/F. (``perc`` is accepted for call-site
+    # symmetry with ``robust_df_over_f_1d`` but is not used here.)
+    F0_scalar = float(np.nanmean(F[:n_baseline]))
     eps = max(F0_scalar, 1e-9)
     return ((F - F0_scalar) / eps).astype(np.float32)
 

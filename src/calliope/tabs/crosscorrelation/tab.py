@@ -655,6 +655,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 state.subscribe_lowpass_ready(self._on_plane0_broadcast)
                 state.subscribe_event_results(
                     self._on_event_results_broadcast)
+                state.subscribe_release_memmaps(self._release_dff_cache)
                 if getattr(state, "lowpass_plane0", None) is not None:
                     self._on_plane0_broadcast(state.lowpass_plane0)
                 elif getattr(state, "plane0", None) is not None:
@@ -1023,6 +1024,15 @@ class CrossCorrelationTab(ctk.CTkFrame):
             return
         self.path_var.set(path)
         self._set_plane0(Path(path))
+
+    def _release_dff_cache(self) -> None:
+        """Drop the cached dF/F memmap handle so a producer can rewrite
+        the file in place (Windows locks open mappings). Fired by
+        ``AppState.release_memmaps``; the cache reopens lazily against
+        the (rewritten) file on the next ``_get_cached_dff`` call.
+        """
+        self._dff_cache = None
+        self._dff_cache_key = None
 
     def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
         """BatchTab calls this after a row's scratch->HDD copy. If

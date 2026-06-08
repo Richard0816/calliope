@@ -402,6 +402,8 @@ def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
     """
     zoom = params.get("scope_zoom", 0.0) or None
     um_px = params.get("um_per_pixel", 0.0) or None
+    fov_um = params.get("fov_um_reference", scale_mod.FOV_UM_REFERENCE) \
+        or scale_mod.FOV_UM_REFERENCE
     if zoom is None and um_px is None:
         return None
     view = utils.load_plane_view(plane0)
@@ -409,7 +411,7 @@ def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
         return None
     try:
         resolved = scale_mod.resolve_pix_to_um(
-            view, zoom=zoom, um_per_pixel=um_px,
+            view, zoom=zoom, um_per_pixel=um_px, fov_um=fov_um,
         )
     except (TypeError, ValueError):
         return None

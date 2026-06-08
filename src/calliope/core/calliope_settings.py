@@ -29,14 +29,13 @@ from typing import Any
 # the correct nested location matching suite2p 1.0's settings schema.
 #
 # Notes on the chosen values:
-#     * ``tau`` defaults to GCaMP6m (1.0 s) -- the dropdown's first entry,
-#       matching the lab's most common indicator. Tab 3's GCaMP-variant
-#       dropdown sets the per-recording tau via the suite2p_pipeline
-#       ``tau_override`` field, which wins over this fallback. Pre-2026-05-26
-#       this was 0.137 s (cultured-neuron half-decay for jGCaMP8m); replaced
-#       because (a) jGCaMP8m wasn't the lab's default indicator and (b) the
-#       in-vivo OASIS-optimum tau for jGCaMP8m is ~0.25 s, not 0.137
-#       (Rupprecht et al. bioRxiv 2025, doi:10.1101/2025.03.03.641129).
+#     * ``tau`` defaults to jGCaMP8m (0.25 s) -- the dropdown's first entry.
+#       Tab 3's GCaMP-variant dropdown sets the per-recording tau via the
+#       suite2p_pipeline ``tau_override`` field, which wins over this
+#       fallback. The 0.25 s value is the in-vivo OASIS-optimum for jGCaMP8m
+#       (Rupprecht et al. bioRxiv 2025, doi:10.1101/2025.03.03.641129); note
+#       this is NOT the old 0.137 s cultured-neuron half-decay that pre-
+#       2026-05-26 builds used.
 #     * ``fs`` is the lab's 2-photon scope's nominal frame rate; the tab
 #       overrides per recording from the notes.txt sidecar when present.
 #     * ``registration.batch_size`` is much larger than suite2p's default
@@ -51,7 +50,7 @@ from typing import Any
 
 CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
     # Top-level
-    "tau":     1.0,    # GCaMP6m fallback; per-recording tau set by Tab 3 dropdown.
+    "tau":     0.25,   # jGCaMP8m fallback; per-recording tau set by Tab 3 dropdown.
     "fs":      15.07,
     # NB: ``diameter`` is intentionally NOT overridden. Suite2p 1.0's
     # default of [12.0, 12.0] is used; the legacy ``diameter=0`` we

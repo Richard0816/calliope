@@ -84,6 +84,7 @@ from .logic import (
 )
 from .curation_popout import CurationPopout
 
+from ...core.scale import FOV_UM_REFERENCE
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
     drain_queue, open_advanced, report_stage_error, spec_defaults,
@@ -153,12 +154,12 @@ class Suite2pTab(ctk.CTkFrame):
     #                  the cultured-neuron half-decay rather than the
     #                  in-vivo OASIS optimum)
     GCAMP_OPTIONS: list[tuple[str, float]] = [
-        ("GCaMP6m  (tau = 1.0 s)", 1.0),   # default; Chen 2013
+        ("jGCaMP8m (tau = 0.25 s)", 0.25), # default; Zhang 2023 / Rupprecht 2025
+        ("GCaMP6m  (tau = 1.0 s)", 1.0),   # Chen 2013
         ("GCaMP6f  (tau = 0.7 s)", 0.7),   # Chen 2013
         ("GCaMP6s  (tau = 1.5 s)", 1.5),   # Chen 2013 + Pachitariu 2018 slow bin
         ("jGCaMP7f (tau = 0.7 s)", 0.7),   # Dana 2019
         ("jGCaMP8f (tau = 0.15 s)", 0.15), # Zhang 2023 / Rupprecht 2025
-        ("jGCaMP8m (tau = 0.25 s)", 0.25), # Zhang 2023 / Rupprecht 2025
         ("jGCaMP8s (tau = 0.5 s)", 0.5),   # Zhang 2023 / Rupprecht 2025 optimum
     ]
 
@@ -181,7 +182,7 @@ class Suite2pTab(ctk.CTkFrame):
            the user gets the corrected value, the GUI can snap the StringVar
            forward, and the lab can audit which recordings got which tau.
         3. **fallback** -- label parses to nothing recognisable. Returns the
-           first dropdown option's tau (the lab's default GCaMP6m at 1.0 s)
+           first dropdown option's tau (the lab's default jGCaMP8m at 0.25 s)
            so the run still proceeds, with the caller responsible for
            surfacing a loud warning.
 
@@ -308,7 +309,12 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "scope_zoom", "label": "Scope zoom (0=skip)",
          "type": "float", "default": 0.0, "group": "Pixel scale",
          "help": "compute pix_to_um as (FOV_um / zoom) / Lx using the "
-                 "lab reference FOV (3080.9 µm at 1x)"},
+                 "reference FOV below"},
+        {"name": "fov_um_reference", "label": "Reference FOV µm at 1x",
+         "type": "float", "default": FOV_UM_REFERENCE, "group": "Pixel scale",
+         "help": "FOV width in µm at 1x zoom for your rig; only used by the "
+                 "scope-zoom path. Default is the lab's two-photon rig "
+                 f"({FOV_UM_REFERENCE:.1f} µm)"},
         {"name": "um_per_pixel", "label": "µm per pixel direct (0=skip)",
          "type": "float", "default": 0.0, "group": "Pixel scale",
          "help": "explicit calibration; takes priority over scope_zoom"},
@@ -424,10 +430,20 @@ class Suite2pTab(ctk.CTkFrame):
             width=240,
         )
         gcamp_combo.pack(side="left", padx=(0, 8))
+        # Optional custom tau override: when non-empty, this scalar wins
+        # over the dropdown variant (for indicators not in the preset list,
+        # or a rig-calibrated tau). Leave blank to use the dropdown.
+        ctk.CTkLabel(row, text="or custom τ (s):", anchor="w").pack(
+            side="left", padx=(0, 4))
+        self.custom_tau_var = tk.StringVar(value="")
+        ctk.CTkEntry(
+            row, textvariable=self.custom_tau_var, width=70,
+            placeholder_text="blank",
+        ).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(
             row,
             text=("Pick the GECI you injected; the chosen variant sets "
-                  "the suite2p tau."),
+                  "the suite2p tau. A custom τ overrides the dropdown."),
             text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left")
 
@@ -706,7 +722,27 @@ class Suite2pTab(ctk.CTkFrame):
         gcamp_label = self.gcamp_var.get()
         tau_override, matched_label, match_kind = self._resolve_gcamp_tau(
             gcamp_label)
-        if match_kind == "exact":
+        # A non-blank custom tau wins over the dropdown variant. Validate
+        # it as a positive float; bail loudly on garbage rather than
+        # silently falling back to the variant tau.
+        custom_tau_raw = self.custom_tau_var.get().strip()
+        if custom_tau_raw:
+            try:
+                custom_tau = float(custom_tau_raw)
+                if custom_tau <= 0:
+                    raise ValueError("tau must be positive")
+            except ValueError as e:
+                messagebox.showerror(
+                    "Invalid custom τ",
+                    f"Custom τ must be a positive number of seconds "
+                    f"(got {custom_tau_raw!r}): {e}. Clear the field to "
+                    f"use the GCaMP dropdown instead.")
+                return
+            self._append_log(
+                f"[GUI] Custom τ override: {custom_tau} s "
+                f"(dropdown variant {gcamp_label!r} ignored)")
+            tau_override = custom_tau
+        elif match_kind == "exact":
             self._append_log(
                 f"[GUI] GCaMP variant: {gcamp_label} -> tau={tau_override}")
         elif match_kind == "variant":
@@ -884,6 +920,8 @@ class Suite2pTab(ctk.CTkFrame):
         from ...core import utils
         zoom = params.get("scope_zoom", 0.0) or None
         um_px = params.get("um_per_pixel", 0.0) or None
+        fov_um = params.get("fov_um_reference", FOV_UM_REFERENCE) \
+            or FOV_UM_REFERENCE
         if zoom is None and um_px is None:
             return
         view = utils.load_plane_view(plane0)
@@ -893,7 +931,7 @@ class Suite2pTab(ctk.CTkFrame):
             return
         try:
             resolved = resolve_pix_to_um(
-                view, zoom=zoom, um_per_pixel=um_px,
+                view, zoom=zoom, um_per_pixel=um_px, fov_um=fov_um,
             )
         except (TypeError, ValueError) as e:
             print(f"[GUI] pix_to_um: invalid calibration ({e}); skipping")
@@ -1520,23 +1558,44 @@ class Suite2pTab(ctk.CTkFrame):
         both removing and re-adding cells take effect. Republishing
         ``plane0`` then tells subscribers (lowpass etc.) to reload.
 
+        **Windows file-lock handling.** On a reloaded run, downstream
+        tabs hold open ``np.memmap`` handles on the filtered file --
+        Tab 7's ``_dff_cache`` and Tab 6's ``self._dff`` (both opened by
+        the reload flow's ``_on_reload_inputs`` / ``_on_reload_clusters``).
+        On Windows an open mapping locks the file, so the ``mode="w+"``
+        truncate inside ``_run_filtered_dff`` fails with
+        ``PermissionError``. ``AppState.release_memmaps()`` tells those
+        tabs to drop their cached handles first (they reopen lazily / on
+        the next run); a ``gc.collect()`` then frees any transient
+        mappings before we truncate.
+
         No-op when the source/filtered memmaps don't exist yet -- there
         is nothing downstream to refresh until a detection run has
         produced them. Note: already-computed downstream *results* (Tab 5
         events, Tab 6/7 clusters, cross-correlation) are NOT recomputed;
         they stay stale until those stages are re-run.
         """
+        import gc
+
         src = plane0 / "r0p7_dff.memmap.float32"
         filt = plane0 / "r0p7_filtered_dff.memmap.float32"
         if not (src.exists() and filt.exists()):
             return
+        # Drop downstream tabs' cached handles on the filtered memmap so
+        # Windows releases the file lock before we truncate it below.
+        try:
+            self.state.release_memmaps()
+        except Exception:
+            pass
+        gc.collect()
         try:
             self._run_filtered_dff(plane0)
         except Exception as e:
             messagebox.showwarning(
                 "Filtered dF/F not updated",
                 f"The promotion was saved, but the filtered dF/F memmap "
-                f"could not be regenerated:\n{e}\n\nRe-run Tab 3 "
+                f"could not be regenerated:\n{e}\n\nClose any open "
+                f"cross-correlation / cluster popouts and re-run Tab 3 "
                 f"'filtered dF/F' to apply the new cell set downstream.")
             return
         # Re-fire the plane0 channel so memmap-reading tabs (lowpass

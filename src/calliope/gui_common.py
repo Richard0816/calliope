@@ -546,6 +546,7 @@ class AppState:
         self._clusters_listeners: list = []
         self._xcorr_listeners: list = []
         self._stage_error_listeners: list = []
+        self._release_listeners: list = []
 
     # ---- preprocess result channel ----
 
@@ -667,6 +668,30 @@ class AppState:
                 fn(self.stage_error)
             except Exception as e:
                 print(f"stage_error listener error: {e}")
+
+    # ---- release-memmap-handles channel ----
+
+    def subscribe_release_memmaps(self, fn) -> None:
+        """Register ``fn`` to drop any cached ``np.memmap`` handles a tab
+        holds on the dF/F memmaps.
+
+        Used before a producer rewrites one of those files in place
+        (e.g. Tab 3's "Promote to filter mask" regenerates
+        ``r0p7_filtered_dff.memmap.float32``). On Windows an open mapping
+        locks the file, so a ``mode="w+"`` truncate fails with
+        ``PermissionError`` until every reader releases its handle.
+        Subscribers should null their cache and rely on their existing
+        lazy-reopen path; the producer republishes ``plane0`` afterwards
+        so tabs reload from the rewritten file.
+        """
+        self._release_listeners.append(fn)
+
+    def release_memmaps(self) -> None:
+        for fn in self._release_listeners:
+            try:
+                fn()
+            except Exception as e:
+                print(f"release_memmaps listener error: {e}")
 
     # ---- bulk reset (used before loading a different run) ----
 
