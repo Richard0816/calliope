@@ -244,12 +244,44 @@ def auto_choose_threshold(
     """
     # ``set(...)`` for fast ``in`` lookup below.
     target_counts = set(target_counts)
-    # Walk from start downward in ``step``-sized decrements.
-    # ``stop - 1e-9`` is a hair below the lower bound so np.arange
-    # actually visits ``stop``.
-    for ct in np.arange(start, stop - 1e-9, -step):
-        if count_clusters(Z, float(ct)) in target_counts:
-            return float(ct)
+    if not target_counts:
+        return start
+    lo_target = min(target_counts)
+    hi_target = max(target_counts)
+
+    # The candidate grid is the same descending ``start -> stop`` sweep as
+    # before (``stop - 1e-9`` so np.arange actually visits ``stop``), so we
+    # return a value identical to the original linear scan.
+    grid = np.arange(start, stop - 1e-9, -step)
+    if len(grid) == 0:
+        return start
+
+    # ``count_clusters`` is monotonically non-decreasing along this grid:
+    # the cut height shrinks as the fraction drops, which can only split
+    # clusters (never merge), so the count only grows. That lets us binary
+    # search for the first grid index whose count reaches ``lo_target``
+    # instead of re-running fcluster at every one of the ~85 steps.
+    n = len(grid)
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count_clusters(Z, float(grid[mid])) >= lo_target:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    # From the first index that reaches the target band, the original scan
+    # returned the first grid point whose count is actually in the set.
+    # Counts are monotonic, so a short forward scan (bounded by hi_target)
+    # reproduces that exactly -- and handles a non-contiguous target set.
+    i = lo
+    while i < n:
+        c = count_clusters(Z, float(grid[i]))
+        if c in target_counts:
+            return float(grid[i])
+        if c > hi_target:
+            break
+        i += 1
     return start
 
 

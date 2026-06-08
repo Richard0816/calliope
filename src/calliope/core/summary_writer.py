@@ -82,7 +82,6 @@ def summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
 
 
 def _to_dataframe(data) -> pd.DataFrame:
-    """Coerce ``data`` to a DataFrame without copying when possible."""
     """Coerce ``data`` to a pandas DataFrame.
 
     Handles the three idioms callers use:

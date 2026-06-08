@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,8 +28,8 @@ def _git_sha(repo_hint: Path) -> Optional[str]:
     """HEAD SHA of the calliope checkout, or None when unavailable.
 
     ``repo_hint`` should point at a directory inside the calliope
-    source tree. Returns ``None`` inside Nuitka-frozen binaries (no
-    .git) or when the ``git`` binary isn't on PATH.
+    source tree. Returns ``None`` when there's no ``.git`` (e.g. a
+    packaged/exported copy) or the ``git`` binary isn't on PATH.
     """
     try:
         out = subprocess.check_output(
@@ -39,7 +40,9 @@ def _git_sha(repo_hint: Path) -> Optional[str]:
             timeout=2.0,
         )
         return out.strip() or None
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
+        # git binary absent (frozen build / not on PATH) or the call
+        # failed/timed out -- all expected; the SHA is optional provenance.
         return None
 
 
@@ -152,8 +155,8 @@ def write_export_manifest(
                 fs = float(ops.get("fs", 0.0) or 0.0)
                 manifest["tau"] = tau or None
                 manifest["fs"] = fs or None
-            except Exception:
-                pass
+            except (OSError, ValueError, pickle.UnpicklingError) as e:
+                print(f"[manifest] could not read tau/fs from {ops_p}: {e}")
         # Pixel calibration (µm/px) so an exported figure's scale bar is
         # reproducible from the manifest alone. Lives in
         # calliope_calibration.npy (falls back to ops['pix_to_um']).
@@ -162,22 +165,22 @@ def write_export_manifest(
             pix = load_pix_to_um(plane0)
             if pix:
                 manifest["pix_to_um"] = float(pix)
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            print(f"[manifest] could not read pix_to_um for {plane0}: {e}")
         stat_p = plane0 / "stat.npy"
         if stat_p.is_file():
             try:
                 stat = np.load(stat_p, allow_pickle=True)
                 manifest["n_cells_total"] = int(len(stat))
-            except Exception:
-                pass
+            except (OSError, ValueError, pickle.UnpicklingError) as e:
+                print(f"[manifest] could not read stat.npy at {stat_p}: {e}")
         mask_p = plane0 / "predicted_cell_mask.npy"
         if mask_p.is_file():
             try:
                 mask = np.load(mask_p)
                 manifest["n_cells_kept"] = int(np.asarray(mask).sum())
-            except Exception:
-                pass
+            except (OSError, ValueError, pickle.UnpicklingError) as e:
+                print(f"[manifest] could not read mask at {mask_p}: {e}")
 
     out.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),

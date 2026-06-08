@@ -174,6 +174,13 @@ class ClusteringTab(ctk.CTkFrame):
         # Visual cluster index -> raw fcluster label, refreshed every render
         # so the cluster picker matches what the user sees in the dendrogram.
         self._visual_to_label: dict[int, int] = {}
+        # Cache for ``_compute_visual_cluster_map`` (render/export/summary all
+        # call it with the same Z + threshold within one cycle, so the
+        # dendrogram+fcluster work is memoised on linkage identity + T).
+        # The Z reference is held so its identity can't be recycled.
+        self._vmap_cache_z = None
+        self._vmap_cache_T: Optional[float] = None
+        self._vmap_cache: dict[int, int] = {}
         # Visual cluster index -> hex color shown in the dendrogram, used
         # to paint the dropdown menu items and seed the per-cluster dialog.
         self._visual_to_color: dict[int, str] = {}
@@ -220,6 +227,33 @@ class ClusteringTab(ctk.CTkFrame):
                 pass
 
     # -- UI ----------------------------------------------------------------
+
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's prefix / palette / threshold (no PARAM_SPEC;
+        Tk vars + internal state).
+
+        Public seam the Tab 0 batch runner calls instead of poking this
+        tab's internals.
+        """
+        p = params or {}
+        if "prefix" in p:
+            self.prefix_var.set(str(p["prefix"]))
+        if "palette" in p:
+            self.palette_var.set(str(p["palette"]))
+            self._palette_name = str(p["palette"])
+        if "threshold" in p:
+            try:
+                t = float(p["threshold"])
+                # threshold == 0 means "auto"; leave the tab alone so its
+                # auto_choose_threshold path runs.
+                if t > 0.0:
+                    self._manual_T = t
+                    try:
+                        self.threshold_scale.set(t)
+                    except Exception:
+                        pass
+            except (TypeError, ValueError):
+                pass
 
     def _build_ui(self) -> None:
         head = ctk.CTkFrame(self)
@@ -905,6 +939,9 @@ class ClusteringTab(ctk.CTkFrame):
         so we never trust scipy's ``set_link_color_palette`` cycling."""
         if self._Z is None:
             return {}
+        # Memoised: render -> export -> summary all ask for the same (Z, T).
+        if self._Z is self._vmap_cache_z and self._vmap_cache_T == T:
+            return self._vmap_cache
         info = dendrogram(self._Z, no_plot=True, color_threshold=T,
                           above_threshold_color=ABOVE_CUT_COLOR)
         leaves = list(info["leaves"])
@@ -914,7 +951,11 @@ class ClusteringTab(ctk.CTkFrame):
             lbl = int(labels[leaf_idx])
             if lbl not in seen:
                 seen.append(lbl)
-        return {i + 1: lbl for i, lbl in enumerate(seen)}
+        result = {i + 1: lbl for i, lbl in enumerate(seen)}
+        self._vmap_cache_z = self._Z
+        self._vmap_cache_T = T
+        self._vmap_cache = result
+        return result
 
     def _build_label_color_map(self, n_clusters: int) -> dict[int, str]:
         """Map each fcluster label to the color the user expects for that

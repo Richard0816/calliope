@@ -326,6 +326,25 @@ class EventDetectionTab(ctk.CTkFrame):
 
     # -- UI -----------------------------------------------------------------
 
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's PARAM_SPEC fields + the manual-subset /
+        onset-source Tk vars that ``_on_render`` snapshots into ``_params``.
+
+        Public seam the Tab 0 batch runner calls instead of poking this
+        tab's internals.
+        """
+        p = params or {}
+        for entry in self.PARAM_SPEC:
+            name = entry["name"]
+            if name in p:
+                self._params[name] = p[name]
+        if "manual_subset_enabled" in p:
+            self.manual_subset_var.set(bool(p["manual_subset_enabled"]))
+        if "manual_roi_spec" in p:
+            self.manual_roi_var.set(str(p["manual_roi_spec"]))
+        if "onset_source" in p:
+            self.onset_source_var.set(str(p["onset_source"]))
+
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))

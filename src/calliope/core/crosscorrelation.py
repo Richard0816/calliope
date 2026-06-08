@@ -56,19 +56,12 @@ import numpy as np
 from pathlib import Path
 
 # CuPy is the GPU-accelerated drop-in for NumPy. We import it
-# defensively: not every machine has CUDA, and we'd rather print a
-# warning and fall back to CPU than crash on import.
-#
-# bytes.fromhex(...).decode() is a runtime construction. Nuitka's
-# ExpressionImportlibImportModuleCall.computeExpression only static-folds
-# compile-time-constant arguments into the nofollow machinery
-# (see nuitka/nodes/ImportNodes.py); a function-call result is left as a
-# dynamic runtime import. This bypasses --nofollow-import-to=cupy so
-# Python's normal sys.path lookup resolves the side-loaded cupy/ in the
-# dist root. A literal "cupy" or "cu"+"py" would be folded and blocked.
+# defensively via _cuda_import (the single place the optional dependency
+# is handled): not every machine has CUDA, and we'd rather warn and fall
+# back to CPU than crash on import.
 try:
-    import importlib as _importlib
-    cp = _importlib.import_module(bytes.fromhex("63757079").decode())
+    from ._cuda_import import import_cupy
+    cp = import_cupy()
 except ImportError:
     cp = None
     print("[warn] CuPy not available; GPU cross-correlation will fall back to CPU.")
@@ -283,8 +276,7 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
 
     # Running per-pair best so far. ``-inf`` means "anything is
     # better than this" so the first iteration always wins.
-    neg_inf = xp.asarray(-np.inf, dtype=ZA.dtype)
-    best_corr = xp.full((nA, nB), float(neg_inf), dtype=ZA.dtype)
+    best_corr = xp.full((nA, nB), -np.inf, dtype=ZA.dtype)
     best_lag_idx = xp.zeros((nA, nB), dtype=xp.int32)
     zero_lag_corr = None
 
@@ -1336,5 +1328,3 @@ def run_crosscorrelation(
                              if per_event_outdir is not None
                              and per_event_outdir.exists() else None),
     }
-
-    return out_root

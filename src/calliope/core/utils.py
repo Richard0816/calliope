@@ -75,6 +75,7 @@ from __future__ import annotations
 
 # --- standard library ---
 import os                  # OS utilities: path joining, listing, env vars
+import pickle              # caught explicitly when reading .npy sidecars
 import re                  # Regex utilities for parsing filenames
 import threading           # daemon thread for the peak-RAM monitor
 
@@ -663,8 +664,8 @@ def no_rois_survive(plane0, on_error=None) -> bool:
     """
     if plane0 is None:
         return False
-    plane0 = Path(plane0)
     try:
+        plane0 = Path(plane0)
         if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
             return False  # only written when N_kept > 0
         mask_path = plane0 / "predicted_cell_mask.npy"
@@ -698,8 +699,8 @@ def kept_roi_count(plane0, on_error=None) -> Optional[int]:
     """
     if plane0 is None:
         return None
-    plane0 = Path(plane0)
     try:
+        plane0 = Path(plane0)
         for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
             p = plane0 / name
             if p.exists():
@@ -2891,32 +2892,32 @@ def load_plane_view(plane0: Union[str, Path]) -> dict:
             if isinstance(db, dict):
                 view.update(db)
                 have_canonical = True
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[plane_view] could not read {db_path}: {e}")
     if settings_path.exists():
         try:
             settings = np.load(settings_path, allow_pickle=True).item()
             if isinstance(settings, dict):
                 view.update(_flatten_settings(settings))
                 have_canonical = True
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[plane_view] could not read {settings_path}: {e}")
     if reg_path.exists():
         try:
             reg = np.load(reg_path, allow_pickle=True).item()
             if isinstance(reg, dict):
                 view.update(reg)
                 have_canonical = True
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[plane_view] could not read {reg_path}: {e}")
     if det_path.exists():
         try:
             det = np.load(det_path, allow_pickle=True).item()
             if isinstance(det, dict):
                 view.update(det)
                 have_canonical = True
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[plane_view] could not read {det_path}: {e}")
 
     # Fallback: legacy ops.npy. Suite2p still writes this by default
     # (save_ops_orig=True), so fresh outputs have it too -- but the
@@ -2928,8 +2929,8 @@ def load_plane_view(plane0: Union[str, Path]) -> dict:
                 ops = np.load(ops_path, allow_pickle=True).item()
                 if isinstance(ops, dict):
                     view.update(ops)
-            except Exception:
-                pass
+            except (OSError, ValueError, pickle.UnpicklingError) as e:
+                print(f"[plane_view] could not read {ops_path}: {e}")
 
     # Layer calliope-side calibration on top.
     pix = load_pix_to_um(plane0)
@@ -2970,8 +2971,8 @@ def load_pix_to_um(plane0: Union[str, Path]) -> Optional[float]:
             if isinstance(cal, dict) and "pix_to_um" in cal:
                 v = cal["pix_to_um"]
                 return float(v) if v is not None else None
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[pix_to_um] could not read {cal_path}: {e}")
     # Legacy fallback.
     ops_path = plane0 / "ops.npy"
     if ops_path.exists():
@@ -2980,8 +2981,8 @@ def load_pix_to_um(plane0: Union[str, Path]) -> Optional[float]:
             if isinstance(ops, dict) and "pix_to_um" in ops:
                 v = ops["pix_to_um"]
                 return float(v) if v is not None else None
-        except Exception:
-            pass
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[pix_to_um] could not read legacy {ops_path}: {e}")
     return None
 
 
@@ -2996,7 +2997,9 @@ def save_pix_to_um(plane0: Union[str, Path], value: float) -> None:
             existing = np.load(cal_path, allow_pickle=True).item()
             if isinstance(existing, dict):
                 payload = existing
-        except Exception:
+        except (OSError, ValueError, pickle.UnpicklingError) as e:
+            print(f"[pix_to_um] could not read existing {cal_path}, "
+                  f"overwriting: {e}")
             payload = {}
     payload["pix_to_um"] = float(value)
     np.save(cal_path, payload, allow_pickle=True)

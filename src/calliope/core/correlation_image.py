@@ -99,6 +99,9 @@ def _streaming_pearson_with_neighbours(
     neigh_count[:-1, :] += 1  # down neighbour exists
     neigh_count[:, 1:] += 1  # left neighbour exists
     neigh_count[:, :-1] += 1  # right neighbour exists
+    # ``np.maximum(..., 1.0)`` guards a degenerate 1-px-wide/tall FOV
+    # where an edge pixel could have 0 neighbours; any >=2x2 FOV always
+    # has >=2 per pixel, so it's a no-op there.
     inv_neigh = 1.0 / np.maximum(neigh_count, 1.0)
 
     T_total = 0

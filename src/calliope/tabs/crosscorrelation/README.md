@@ -223,7 +223,7 @@ Significance markers: `***` (`p < 0.001`), `**` (`p < 0.01`), `*` (`p < 0.05`).
 
 ### Step 7 — Aborting
 
-A long full-recording run on a large cluster set can take minutes. The Abort button sets `_abort_event`; the next call to `progress_cb` from inside the worker raises `RunAborted`, which unwinds the worker cleanly and posts an `("aborted", …)` queue message instead of an error dialog.
+A long full-recording run on a large cluster set can take minutes. The run executes in a child process (`core.offload`); the Abort button sets the shared `_abort_event`, the worker checks it between batches and exits cleanly, and the dispatcher posts an `("aborted", …)` queue message instead of an error dialog. (This replaced the legacy in-thread `RunAborted` exception, which is no longer used.)
 
 ---
 

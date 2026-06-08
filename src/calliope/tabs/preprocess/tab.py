@@ -155,6 +155,20 @@ class PreprocessTab(ctk.CTkFrame):
 
     # -- UI -----------------------------------------------------------------
 
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's per-row overrides to this tab's state.
+
+        Public seam the Tab 0 batch runner calls before this tab's run
+        method fires, instead of poking ``_params`` directly. Consumes
+        only the keys this tab owns (the 5 QC-gif knobs) and ignores the
+        rest; keys the row didn't override leave tab state untouched.
+        """
+        p = params or {}
+        for k in ("downsample_t", "max_size_px", "playback_fps",
+                  "clip_low", "clip_high"):
+            if k in p:
+                self._params[k] = p[k]
+
     def _build_ui(self) -> None:
         # Panels stack vertically at their natural heights. Only panels
         # 2 (TIFF files) and 5 (Log) carry a draggable resize grip --

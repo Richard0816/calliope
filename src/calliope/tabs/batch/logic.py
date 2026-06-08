@@ -167,19 +167,6 @@ def prune_scratch_tree(
         # ``**/data.bin`` catches both. NOT ``data_raw*.bin`` -- that's a
         # different name, already in SCRATCH_PRUNE_FILE_PATTERNS.
         extra_patterns += ["**/data.bin"]
-    def _dir_size(p: Path) -> int:
-        total = 0
-        try:
-            for dp, _dn, fn in os.walk(p):
-                for f in fn:
-                    try:
-                        total += (Path(dp) / f).stat().st_size
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return total
-
     n_paths = 0
     bytes_freed = 0
     if not scratch.exists():
@@ -221,7 +208,7 @@ def prune_scratch_tree(
         p = scratch / sub
         if not p.is_dir():
             continue
-        sz = _dir_size(p)
+        sz = measure_tree(p)[1]
         try:
             shutil.rmtree(p, ignore_errors=True)
             n_paths += 1
@@ -237,7 +224,7 @@ def prune_scratch_tree(
                 continue
             if child.name in SCRATCH_DETECTION_KEEP_DIRS:
                 continue
-            sz = _dir_size(child)
+            sz = measure_tree(child)[1]
             try:
                 shutil.rmtree(child, ignore_errors=True)
                 n_paths += 1

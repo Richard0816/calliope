@@ -45,8 +45,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .. import utils
-
 from . import config as C
 from .dataset import _RecordingCache
 from .model import CellFilter

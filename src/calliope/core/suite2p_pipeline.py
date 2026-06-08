@@ -43,6 +43,7 @@ Two monkey-patches are installed: :func:`_install_sparsery_roi_cap`
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import shutil
@@ -458,11 +459,10 @@ def _clear_cuda_arena() -> None:
     try:
         # CuPy's pool is independent of torch's allocator -- clearing one
         # doesn't touch the other. Skip silently if CuPy isn't installed
-        # or the device isn't reachable. Runtime-constructed name avoids
-        # Nuitka's static-fold on --nofollow-import-to=cupy
-        # (see crosscorrelation.py for the long explanation).
-        import importlib as _importlib
-        _cp = _importlib.import_module(bytes.fromhex("63757079").decode())
+        # or the device isn't reachable. CuPy is imported via _cuda_import
+        # (the single place the optional GPU dependency is handled).
+        from ._cuda_import import import_cupy
+        _cp = import_cupy()
         try:
             _cp.get_default_memory_pool().free_all_blocks()
         except Exception:
@@ -642,22 +642,42 @@ class _RoiHardCapExceeded(Exception):
 
 
 _SPARSERY_PROGRESS_RE = re.compile(r'^\s*(\d+)\s+ROIs')
+# Looser detector used only to fail loud: a line that clearly reports an
+# ROI count (digits followed by "ROIs") but doesn't match the strict
+# anchored pattern above signals that suite2p's log wording has drifted.
+_SPARSERY_PROGRESS_LOOSE_RE = re.compile(r'\d+\s*ROIs', re.IGNORECASE)
 
 
 def _install_sparsery_roi_cap(cap: int):
     """Monkey-patch suite2p.detection.sparsedetect to abort once len(stats)>=cap.
 
     Returns the original print so the caller can restore it.
+
+    The abort hinges on suite2p's progress line format ("<n> ROIs"). If a
+    suite2p upgrade changes that wording, ``_SPARSERY_PROGRESS_RE`` stops
+    matching and the hard cap would silently go inert -- detection would
+    run to completion producing the noise-blob explosion the cap exists to
+    prevent. To fail loud instead, the shim warns once if it sees a line
+    that looks like an ROI count yet doesn't match the strict parser.
     """
     import suite2p.detection.sparsedetect as _sd
     original_print = getattr(_sd, 'print', print)
+    warned = [False]
 
     def _watching_print(*args, **kwargs):
         if args:
             msg = args[0] if isinstance(args[0], str) else str(args[0])
             m = _SPARSERY_PROGRESS_RE.match(msg)
-            if m and int(m.group(1)) >= cap:
-                raise _RoiHardCapExceeded(int(m.group(1)), cap)
+            if m:
+                if int(m.group(1)) >= cap:
+                    raise _RoiHardCapExceeded(int(m.group(1)), cap)
+            elif not warned[0] and _SPARSERY_PROGRESS_LOOSE_RE.search(msg):
+                warned[0] = True
+                original_print(
+                    "[warn] suite2p ROI-progress line did not match the "
+                    "hard-cap parser (%r); the ROI hard cap may be INERT -- "
+                    "verify _SPARSERY_PROGRESS_RE against this suite2p "
+                    "version." % (msg.strip()[:120],))
         return original_print(*args, **kwargs)
 
     _sd.print = _watching_print
@@ -957,15 +977,6 @@ def load_base_settings(config: Suite2pPipelineConfig):
     return db, settings
 
 
-# Backward-compat aliases. ``AdaptiveConfig`` was the dataclass name
-# back when this module hosted the adaptive binary-search loop;
-# ``load_base_ops`` was the pre-1.0 entry point that returned a flat
-# ops dict. The new names are ``Suite2pPipelineConfig`` and
-# ``load_base_settings``. Aliases let old scripts keep importing.
-AdaptiveConfig = Suite2pPipelineConfig
-load_base_ops = load_base_settings
-
-
 # ============================================================================
 # ROI pixel mask
 # ============================================================================
@@ -1144,17 +1155,12 @@ def _get_or_create_shared_registration(config: 'Suite2pPipelineConfig',
 
 
 def _deep_copy_settings(settings: dict) -> dict:
-    """Recursively copy a settings dict (one level of nesting is enough
-    for suite2p's schema). Top-level dict and any nested dict values
-    are shallow-copied so mutating the copy doesn't bleed back.
+    """Deep-copy a settings dict so mutating the copy never bleeds back
+    into the original (including nested dicts AND list values like
+    ``block_size`` -- the previous hand-rolled version shallow-copied
+    non-dict values, leaving lists shared by reference).
     """
-    out = {}
-    for k, v in settings.items():
-        if isinstance(v, dict):
-            out[k] = _deep_copy_settings(v)
-        else:
-            out[k] = v
-    return out
+    return copy.deepcopy(settings)
 
 
 def run_one_pass(tiff_folder: str, save_dir: Path,

@@ -71,6 +71,7 @@ below is retained only for backward reference and is no longer raised.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import tkinter as tk
 import traceback
@@ -107,28 +108,6 @@ DEFAULT_FULL_OUTPUT_SUBDIR = "cross_correlation_full"
 POLL_MS = 100
 
 
-class RunAborted(Exception):
-    """Raised inside the progress callback when the user clicks Abort.
-
-    Propagates out of the cross-correlation routine, gets caught by the
-    worker's outer try/except, and surfaces as an ``aborted`` queue
-    message instead of an error dialog.
-
-    Implementation note
-    -------------------
-    The cross-correlation routines in ``core.crosscorrelation`` accept
-    an optional ``progress_cb(done, total)`` callback they invoke
-    after every batch. The Abort button sets a
-    ``threading.Event``; the callback checks it and raises this
-    exception when the flag is set, unwinding out of the heavy loop
-    cleanly. Subclassing ``Exception`` (instead of ``BaseException``)
-    means it gets caught by ordinary ``except Exception:`` blocks --
-    important so we don't accidentally trigger a "hard" abort that
-    propagates past the worker thread's outer ``except``.
-    """
-    pass
-
-
 # ---------------------------------------------------------------------------
 # Violin-plot helpers (mirrors fig6_real_paper.plot_violin so the standalone
 # paper figure script and this tab stay visually consistent).
@@ -136,9 +115,16 @@ class RunAborted(Exception):
 
 
 def _natural_pair_key(name: str) -> tuple[int, int]:
-    """Sort 'C1xC10' before 'C2xC3' by parsing the trailing integers."""
-    a, b = name.split("x")
-    return int(a[1:]), int(b[1:])
+    """Sort 'C1xC10' before 'C2xC3' by the two cluster integers.
+
+    Pulls the first two integers out of the name with a regex rather than
+    assuming a single-character prefix and exactly one 'x' separator, so
+    multi-digit ids and longer prefixes still sort numerically.
+    """
+    nums = re.findall(r"\d+", name)
+    a = int(nums[0]) if len(nums) >= 1 else 0
+    b = int(nums[1]) if len(nums) >= 2 else 0
+    return a, b
 
 
 def _load_pair_data(xcorr_root: Path) -> dict[str, pd.DataFrame]:
@@ -664,6 +650,21 @@ class CrossCorrelationTab(ctk.CTkFrame):
                     self._on_event_results_broadcast(state.event_results)
             except Exception:
                 pass
+
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's xcorr Tk-var knobs (no PARAM_SPEC; everything
+        flows through ``_gather_params`` reading Tk vars).
+
+        Public seam the Tab 0 batch runner calls instead of poking this
+        tab's internals.
+        """
+        p = params or {}
+        if "max_lag_seconds" in p:
+            self.maxlag_var.set(str(p["max_lag_seconds"]))
+        if "zero_lag" in p:
+            self.zero_lag_var.set(bool(p["zero_lag"]))
+        if "use_gpu" in p:
+            self.gpu_var.set(bool(p["use_gpu"]))
 
     # -- UI ----------------------------------------------------------------
 

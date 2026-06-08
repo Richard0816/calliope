@@ -41,7 +41,7 @@ import queue     # Thread-safe FIFO queue used by QueueWriter.
 import tkinter as tk
 from pathlib import Path  # Modern object-oriented filesystem path API.
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Callable, Optional
 
 # ``customtkinter`` ships its own theme manager. The palette helpers
 # below pull whatever appearance is active so raw ``tk`` widgets
@@ -502,7 +502,8 @@ class AppState:
 
         1. A public attribute holds the latest value (or ``None``).
         2. A private list holds the subscriber callbacks.
-        3. ``subscribe_X(fn)`` appends ``fn`` to the list.
+        3. ``subscribe_X(fn)`` appends ``fn`` to the list and returns an
+           unsubscribe callable that removes it again.
         4. ``set_X(value)`` updates the attribute and fans the new
            value out to every subscriber.
 
@@ -548,11 +549,31 @@ class AppState:
         self._stage_error_listeners: list = []
         self._release_listeners: list = []
 
+    @staticmethod
+    def _add_listener(listeners: list, fn) -> Callable[[], None]:
+        """Append ``fn`` to ``listeners`` and return an unsubscribe
+        callable that removes it again (idempotent / safe if already gone).
+
+        Lets short-lived subscribers (e.g. the batch runner's per-stage,
+        per-row listeners) drop themselves once they've fired, instead of
+        accumulating dead closures that get invoked on every later publish
+        for the lifetime of the app.
+        """
+        listeners.append(fn)
+
+        def _unsubscribe() -> None:
+            try:
+                listeners.remove(fn)
+            except ValueError:
+                pass
+
+        return _unsubscribe
+
     # ---- preprocess result channel ----
 
-    def subscribe(self, fn) -> None:
-        """Register ``fn`` to be called every time ``set_result`` runs."""
-        self._listeners.append(fn)
+    def subscribe(self, fn) -> Callable[[], None]:
+        """Register ``fn`` for every ``set_result``; returns an unsubscribe."""
+        return self._add_listener(self._listeners, fn)
 
     def set_result(self, result: PreprocessResult) -> None:
         """Publish a new ``PreprocessResult`` to every subscriber.
@@ -569,8 +590,8 @@ class AppState:
 
     # ---- plane0 (Suite2p output folder) channel ----
 
-    def subscribe_plane0(self, fn) -> None:
-        self._plane0_listeners.append(fn)
+    def subscribe_plane0(self, fn) -> Callable[[], None]:
+        return self._add_listener(self._plane0_listeners, fn)
 
     def set_plane0(self, plane0: Path) -> None:
         # Always normalise to a ``Path`` so subscribers can rely on the
@@ -584,8 +605,8 @@ class AppState:
 
     # ---- lowpass-ready channel ----
 
-    def subscribe_lowpass_ready(self, fn) -> None:
-        self._lowpass_listeners.append(fn)
+    def subscribe_lowpass_ready(self, fn) -> Callable[[], None]:
+        return self._add_listener(self._lowpass_listeners, fn)
 
     def set_lowpass_ready(self, plane0: Path) -> None:
         self.lowpass_plane0 = Path(plane0)
@@ -602,8 +623,8 @@ class AppState:
 
         Listener receives a dict with keys: ``plane0``, ``event_windows``,
         ``A``, ``first_time``, ``kept_idx``, ``fps``, ``T``,
-        ``onsets_by_roi``."""
-        self._event_listeners.append(fn)
+        ``onsets_by_roi``. Returns an unsubscribe callable."""
+        return self._add_listener(self._event_listeners, fn)
 
     def set_event_results(self, results: dict) -> None:
         self.event_results = results
@@ -619,9 +640,10 @@ class AppState:
         """Subscribe to Tab 6's "clustering analysis finished" signal.
 
         Listener receives the plane0 path the clustering ran on so
-        callers (batch runner) can move on to the next stage.
+        callers (batch runner) can move on to the next stage. Returns an
+        unsubscribe callable.
         """
-        self._clusters_listeners.append(fn)
+        return self._add_listener(self._clusters_listeners, fn)
 
     def set_clusters_ready(self, plane0: Path) -> None:
         self.clusters_ready = Path(plane0)
@@ -636,9 +658,10 @@ class AppState:
     def subscribe_xcorr_ready(self, fn) -> None:
         """Subscribe to Tab 7's "xcorr finished" signal.
 
-        Listener receives the output directory Tab 7 wrote into.
+        Listener receives the output directory Tab 7 wrote into. Returns
+        an unsubscribe callable.
         """
-        self._xcorr_listeners.append(fn)
+        return self._add_listener(self._xcorr_listeners, fn)
 
     def set_xcorr_ready(self, out_path: Path) -> None:
         self.xcorr_ready = Path(out_path)
@@ -658,8 +681,9 @@ class AppState:
         listens so a worker exception fails-and-continues the queue
         instead of stalling forever waiting on a "ready" signal that the
         crashed worker never sends. Listener receives the error string.
+        Returns an unsubscribe callable.
         """
-        self._stage_error_listeners.append(fn)
+        return self._add_listener(self._stage_error_listeners, fn)
 
     def set_stage_error(self, payload: str) -> None:
         self.stage_error = str(payload)
@@ -671,7 +695,7 @@ class AppState:
 
     # ---- release-memmap-handles channel ----
 
-    def subscribe_release_memmaps(self, fn) -> None:
+    def subscribe_release_memmaps(self, fn) -> Callable[[], None]:
         """Register ``fn`` to drop any cached ``np.memmap`` handles a tab
         holds on the dF/F memmaps.
 
@@ -682,9 +706,10 @@ class AppState:
         ``PermissionError`` until every reader releases its handle.
         Subscribers should null their cache and rely on their existing
         lazy-reopen path; the producer republishes ``plane0`` afterwards
-        so tabs reload from the rewritten file.
+        so tabs reload from the rewritten file. Returns an unsubscribe
+        callable.
         """
-        self._release_listeners.append(fn)
+        return self._add_listener(self._release_listeners, fn)
 
     def release_memmaps(self) -> None:
         for fn in self._release_listeners:

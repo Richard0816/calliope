@@ -1697,133 +1697,26 @@ class BatchTab(ctk.CTkFrame):
         runtime effect -- it just round-trips through
         ``calliope_batch.json``.
 
-        For each key the row defines, we copy it into the matching tab's
-        ``_params`` dict (for PARAM_SPEC-style fields) and/or set the
-        matching Tk variable (for UI-only knobs like Tab 3's GCaMP
-        variant, Tab 4's cutoff slider, Tab 5's manual subset toggles,
-        Tab 6's prefix/palette/threshold, and Tab 7's xcorr knobs).
-        Keys the row didn't override leave the tab state untouched.
+        Each tab owns a public ``apply_batch_row(params, log=...)`` that
+        consumes only the keys it cares about (PARAM_SPEC fields and/or its
+        own Tk vars) and ignores the rest; keys the row didn't override
+        leave that tab's state untouched. The batch runner no longer
+        reaches into any tab's private attributes / Tk vars -- so a rename
+        inside a tab is a normal (loud) error there, not a silent no-op
+        here.
         """
         p = row.params or {}
         if not p:
             return
         app = self._app
-
-        # Tab 1: preprocess -- 5 QC-gif knobs read from self._params
-        prep = getattr(app, "preprocess_tab", None)
-        if prep is not None:
-            for k in ("downsample_t", "max_size_px", "playback_fps",
-                      "clip_low", "clip_high"):
-                if k in p:
-                    prep._params[k] = p[k]
-
-        # Tab 3: detection -- PARAM_SPEC fields go through _params; the
-        # baseline + GCaMP knobs live as Tk vars and are read directly
-        # in _on_run.
-        det = getattr(app, "detection_tab", None)
-        if det is not None:
-            for entry in det.PARAM_SPEC:
-                name = entry["name"]
-                if name in p:
-                    det._params[name] = p[name]
-            # Tab 3 dF/F baseline lives under dff_baseline_mode /
-            # dff_baseline_min in the batch spec (renamed to avoid
-            # colliding with Tab 5's PARAM_SPEC ``baseline_mode``).
-            if "dff_baseline_mode" in p:
-                det.baseline_var.set(str(p["dff_baseline_mode"]))
-            if "dff_baseline_min" in p:
-                det.baseline_min_var.set(str(p["dff_baseline_min"]))
-            if "gcamp_variant" in p:
-                # Round-trip through ``_resolve_gcamp_tau`` so labels saved
-                # under the pre-2026-05-26 schema (e.g. ``"GCaMP8m  (tau =
-                # 0.137 s)"`` -- no leading "j", aggressive cultured-neuron
-                # tau) get snapped to the current canonical label
-                # (``"jGCaMP8m (tau = 0.25 s)"``) at load time. Without
-                # this, the StringVar holds a string that's not in the
-                # combobox values list and the user can't tell from
-                # looking at the dropdown that their saved selection has
-                # been silently migrated. The run-time path in
-                # ``_on_run`` also calls the resolver, so this is a
-                # belt-and-suspenders fix that also makes the migration
-                # visible in the UI before the run starts.
-                raw_label = str(p["gcamp_variant"])
-                _, snapped_label, kind = det._resolve_gcamp_tau(raw_label)
-                if kind != "exact":
-                    print(f"[batch] migrated stale gcamp_variant "
-                          f"{raw_label!r} -> {snapped_label!r}")
-                det.gcamp_var.set(snapped_label)
-            # Custom tau override: set unconditionally (even when the key is
-            # absent) so a positive value from a previous row never carries
-            # over to a recording that didn't ask for one. A positive value
-            # populates Tab 3's custom-tau field (which wins over the variant
-            # in ``_on_run``); 0 / missing / unparseable clears it back to the
-            # dropdown.
-            try:
-                _ct = float(p.get("gcamp_tau_custom", 0.0))
-            except (TypeError, ValueError):
-                _ct = 0.0
-            det.custom_tau_var.set(f"{_ct:g}" if _ct > 0 else "")
-
-        # Tab 4: lowpass -- PARAM_SPEC fields + the live cutoff slider.
-        lp = getattr(app, "lowpass_tab", None)
-        if lp is not None:
-            for entry in lp.PARAM_SPEC:
-                name = entry["name"]
-                if name in p:
-                    lp._params[name] = p[name]
-            if "cutoff_hz" in p:
-                try:
-                    lp.cutoff_var.set(float(p["cutoff_hz"]))
-                except (TypeError, ValueError):
-                    pass
-
-        # Tab 5: event detection -- PARAM_SPEC fields + the three Tk
-        # vars _on_render snapshots into _params on the main thread.
-        ev = getattr(app, "event_tab", None)
-        if ev is not None:
-            for entry in ev.PARAM_SPEC:
-                name = entry["name"]
-                if name in p:
-                    ev._params[name] = p[name]
-            if "manual_subset_enabled" in p:
-                ev.manual_subset_var.set(bool(p["manual_subset_enabled"]))
-            if "manual_roi_spec" in p:
-                ev.manual_roi_var.set(str(p["manual_roi_spec"]))
-            if "onset_source" in p:
-                ev.onset_source_var.set(str(p["onset_source"]))
-
-        # Tab 6: clustering -- no PARAM_SPEC; Tk vars + internal state.
-        cl = getattr(app, "clustering_tab", None)
-        if cl is not None:
-            if "prefix" in p:
-                cl.prefix_var.set(str(p["prefix"]))
-            if "palette" in p:
-                cl.palette_var.set(str(p["palette"]))
-                cl._palette_name = str(p["palette"])
-            if "threshold" in p:
-                try:
-                    t = float(p["threshold"])
-                    # threshold == 0 means "auto"; leave the tab alone
-                    # so its auto_choose_threshold path runs.
-                    if t > 0.0:
-                        cl._manual_T = t
-                        try:
-                            cl.threshold_scale.set(t)
-                        except Exception:
-                            pass
-                except (TypeError, ValueError):
-                    pass
-
-        # Tab 7: xcorr -- no PARAM_SPEC; everything flows through
-        # _gather_params reading Tk vars.
-        xc = getattr(app, "xcorr_tab", None)
-        if xc is not None:
-            if "max_lag_seconds" in p:
-                xc.maxlag_var.set(str(p["max_lag_seconds"]))
-            if "zero_lag" in p:
-                xc.zero_lag_var.set(bool(p["zero_lag"]))
-            if "use_gpu" in p:
-                xc.gpu_var.set(bool(p["use_gpu"]))
+        # Order is cosmetic (tabs are independent); kept pipeline-order for
+        # readability. ``log`` carries tab-side notices (e.g. Tab 3's GCaMP
+        # migration) into the batch log.
+        for attr in ("preprocess_tab", "detection_tab", "lowpass_tab",
+                     "event_tab", "clustering_tab", "xcorr_tab"):
+            tab = getattr(app, attr, None)
+            if tab is not None and hasattr(tab, "apply_batch_row"):
+                tab.apply_batch_row(p, log=self._append_log)
 
     def _apply_save_policy_to_detection_tab(self) -> None:
         """Translate the "What to save" toggles into Tab 3's
@@ -1936,21 +1829,32 @@ class BatchTab(ctk.CTkFrame):
         """Attach a one-shot AppState listener that fires ``_on_stage_done``
         the first time it's called for the current stage.
 
-        AppState's subscribe API has no unsubscribe; we use an internal
-        flag to short-circuit subsequent calls. The listener also bails
-        if the orchestrator has already moved on to a different stage.
+        An internal flag short-circuits subsequent calls, and whichever of
+        (ready, error) arrives first unsubscribes BOTH listeners so dead
+        closures don't accumulate across the run's stages/rows. The
+        listener also bails if the orchestrator has already moved on.
         """
         fired = [False]
+        unsubs: list = []
+
+        def _cleanup():
+            for u in unsubs:
+                try:
+                    u()
+                except Exception:
+                    pass
+
         def cb(payload):
             if fired[0] or self._current_stage != expected_stage:
                 return
             fired[0] = True
+            _cleanup()
             try:
                 hint = path_extractor(payload)
             except Exception:
                 hint = None
             self.after(0, lambda: self._on_stage_done(expected_stage, hint))
-        subscribe_fn(cb)
+        unsubs.append(subscribe_fn(cb))
 
         # Fail-fast if the stage's worker thread errors before it
         # publishes its ready signal. Without this the batch would wait
@@ -1961,10 +1865,11 @@ class BatchTab(ctk.CTkFrame):
             if fired[0] or self._current_stage != expected_stage:
                 return
             fired[0] = True
+            _cleanup()
             first_line = str(msg).split("\n", 1)[0]
             self.after(0, lambda: self._fail_stage(
                 expected_stage, RuntimeError(first_line)))
-        self.state.subscribe_stage_error(err_cb)
+        unsubs.append(self.state.subscribe_stage_error(err_cb))
 
     # ---- Per-stage triggers --------------------------------------------
 
@@ -2070,11 +1975,20 @@ class BatchTab(ctk.CTkFrame):
         """
         cl = self._app.clustering_tab
         fired = [False]
+        unsubs: list = []
+
+        def _cleanup():
+            for u in unsubs:
+                try:
+                    u()
+                except Exception:
+                    pass
 
         def cb(plane0):
             if fired[0] or self._current_stage != "clustering":
                 return
             fired[0] = True
+            _cleanup()
             try:
                 cl._on_export()
             except Exception as e:
@@ -2093,12 +2007,13 @@ class BatchTab(ctk.CTkFrame):
             if fired[0] or self._current_stage != "clustering":
                 return
             fired[0] = True
+            _cleanup()
             first = str(msg).split("\n", 1)[0]
             self.after(0, lambda: self._fail_stage(
                 "clustering", RuntimeError(first)))
 
-        self.state.subscribe_clusters_ready(cb)
-        self.state.subscribe_stage_error(err_cb)
+        unsubs.append(self.state.subscribe_clusters_ready(cb))
+        unsubs.append(self.state.subscribe_stage_error(err_cb))
         self.after(50, cl._on_run)
 
     def _stage_crosscorrelation(self) -> None:
@@ -2121,6 +2036,17 @@ class BatchTab(ctk.CTkFrame):
         xc = self._app.xcorr_tab
         self._xcorr_step = "full"
         fired = [False, False]   # one slot per step, shared via closure
+        unsubs: list = []
+
+        def _cleanup():
+            # Only call once the stage is fully resolved (fired[1]): the
+            # cb must stay subscribed between the first (full) and second
+            # (per-event) publishes.
+            for u in unsubs:
+                try:
+                    u()
+                except Exception:
+                    pass
 
         def cb(payload):
             # First publish: full done -> kick off per-event.
@@ -2137,6 +2063,7 @@ class BatchTab(ctk.CTkFrame):
                 # produce.
                 if not getattr(xc, "_event_windows", None):
                     fired[1] = True
+                    _cleanup()
                     self._append_log(
                         "  [crosscorrelation] full done; no events "
                         "detected -- skipping per-event xcorr")
@@ -2151,6 +2078,7 @@ class BatchTab(ctk.CTkFrame):
             # Second publish: per-event done -> advance to spatial.
             if not fired[1] and self._current_stage == "crosscorrelation":
                 fired[1] = True
+                _cleanup()
                 hint = payload
                 self.after(0, lambda: self._on_stage_done(
                     "crosscorrelation", hint))
@@ -2163,12 +2091,13 @@ class BatchTab(ctk.CTkFrame):
                 return
             fired[0] = True
             fired[1] = True
+            _cleanup()
             first = str(msg).split("\n", 1)[0]
             self.after(0, lambda: self._fail_stage(
                 "crosscorrelation", RuntimeError(first)))
 
-        self.state.subscribe_xcorr_ready(cb)
-        self.state.subscribe_stage_error(err_cb)
+        unsubs.append(self.state.subscribe_xcorr_ready(cb))
+        unsubs.append(self.state.subscribe_stage_error(err_cb))
         self.after(50, xc._on_run_full)
 
     def _stage_spatial_propagation(self) -> None:
@@ -2290,29 +2219,14 @@ class BatchTab(ctk.CTkFrame):
         ``iscell`` -> all-ones). Returns ``False`` on any read error so a
         transient glitch never silently skips a good recording.
         """
-        if plane0 is None:
-            return False
-        try:
-            import numpy as np
-            plane0 = Path(plane0)
-            if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
-                return False  # only written when N_kept > 0
-            mask_path = plane0 / "predicted_cell_mask.npy"
-            if mask_path.exists():
-                return int(np.load(mask_path).astype(bool).sum()) == 0
-            iscell_path = plane0 / "iscell.npy"
-            if iscell_path.exists():
-                ic = np.load(iscell_path)
-                m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
-                return int(np.asarray(m).sum()) == 0
-            # No filtered memmap and no mask files at all -> nothing for
-            # the lowpass stage to read.
-            return True
-        except Exception as e:
-            self._append_log(
+        # Shared with the headless batch_pipeline via utils so the skip
+        # policy can't drift; on_error preserves the GUI log line.
+        from ...core import utils
+        return utils.no_rois_survive(
+            plane0,
+            on_error=lambda e: self._append_log(
                 f"  [detection] ROI-count check failed ({e}); "
-                f"continuing to lowpass.")
-            return False
+                f"continuing to lowpass."))
 
     def _skip_row_no_rois(self) -> None:
         """Finish the current row when detection found no ROIs (the
@@ -2350,32 +2264,13 @@ class BatchTab(ctk.CTkFrame):
         on any read error so the caller proceeds normally rather than
         skipping on a transient glitch.
         """
-        if plane0 is None:
-            return None
-        try:
-            import numpy as np
-            plane0 = Path(plane0)
-            for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
-                p = plane0 / name
-                if p.exists():
-                    return int(np.load(p).astype(bool).sum())
-            iscell_path = plane0 / "iscell.npy"
-            if iscell_path.exists():
-                ic = np.load(iscell_path)
-                m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
-                return int(np.asarray(m).sum())
-            # Fall back to the filtered memmap's column count (T from F.npy).
-            filt = plane0 / "r0p7_filtered_dff.memmap.float32"
-            F = plane0 / "F.npy"
-            if filt.exists() and F.exists():
-                T = int(np.load(F, mmap_mode="r").shape[1])
-                if T > 0:
-                    return int(filt.stat().st_size // (4 * T))
-            return None
-        except Exception as e:
-            self._append_log(
-                f"  [clustering] ROI-count check failed ({e}); proceeding.")
-            return None
+        # Shared with the headless batch_pipeline via utils so the count
+        # resolution can't drift; on_error preserves the GUI log line.
+        from ...core import utils
+        return utils.kept_roi_count(
+            plane0,
+            on_error=lambda e: self._append_log(
+                f"  [clustering] ROI-count check failed ({e}); proceeding."))
 
     def _skip_clustering_xcorr_few_rois(self, n_roi: int) -> None:
         """Skip clustering + cross-correlation for a recording with <2

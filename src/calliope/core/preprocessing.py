@@ -648,20 +648,26 @@ def make_qc_gif(
     # ``movie[::N]`` is "every Nth element along the first axis" --
     # cheapest possible time-downsample.
     frames = movie[::max(1, int(downsample_t))]
-    # ``np.percentile`` ignores none of the values -- it works on
-    # the full array. clip_low=1, clip_high=99.5 keeps the GIF
-    # contrast reasonable.
-    lo = float(np.percentile(frames, clip_low))
-    hi = float(np.percentile(frames, clip_high))
+    # Percentile clip points. Computing this on the full stack would
+    # flatten/partition a multi-GiB array; a strided subsample of frames
+    # gives an effectively identical window at a fraction of the memory.
+    stride = max(1, frames.shape[0] // 200)
+    sample = frames[::stride]
+    lo = float(np.percentile(sample, clip_low))
+    hi = float(np.percentile(sample, clip_high))
     span = max(hi - lo, 1e-6)
-    # Vectorised normalisation: rescale ``[lo, hi]`` -> ``[0, 1]``
-    # then clip outliers.
-    norm = np.clip((frames.astype(np.float32) - lo) / span, 0.0, 1.0)
-    u8 = (norm * 255.0).astype(np.uint8)
 
     # Convert each frame to a Pillow ``Image`` and resize if too big.
+    # Normalise one frame at a time rather than materialising a single
+    # float32 copy of the whole stack -- a 6000-frame 512x512 movie
+    # would need ~6 GiB as float32 and blow past the offload worker's
+    # RAM. Per-frame keeps the working set at ~1 MB.
     pil_frames = []
-    for f in u8:
+    for raw in frames:
+        # Vectorised normalisation: rescale ``[lo, hi]`` -> ``[0, 1]``
+        # then clip outliers, per frame.
+        norm = np.clip((raw.astype(np.float32) - lo) / span, 0.0, 1.0)
+        f = (norm * 255.0).astype(np.uint8)
         # mode="L" is single-channel grayscale.
         im = Image.fromarray(f, mode="L")
         if max(im.size) > max_size_px:

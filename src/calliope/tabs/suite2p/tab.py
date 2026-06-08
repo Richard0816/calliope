@@ -370,6 +370,47 @@ class Suite2pTab(ctk.CTkFrame):
 
     # -- UI -----------------------------------------------------------------
 
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's per-row overrides before ``_on_run`` fires.
+
+        Public seam the Tab 0 batch runner calls instead of poking this
+        tab's internals. PARAM_SPEC fields go through ``_params``; the
+        dF/F baseline + GCaMP + custom-tau knobs are Tk vars read directly
+        in ``_on_run``. ``log`` (optional) receives the GCaMP-migration
+        notice so it surfaces in the batch log.
+        """
+        p = params or {}
+        for entry in self.PARAM_SPEC:
+            name = entry["name"]
+            if name in p:
+                self._params[name] = p[name]
+        # Tab 3 dF/F baseline lives under dff_baseline_mode /
+        # dff_baseline_min in the batch spec (renamed to avoid colliding
+        # with Tab 5's PARAM_SPEC ``baseline_mode``).
+        if "dff_baseline_mode" in p:
+            self.baseline_var.set(str(p["dff_baseline_mode"]))
+        if "dff_baseline_min" in p:
+            self.baseline_min_var.set(str(p["dff_baseline_min"]))
+        if "gcamp_variant" in p:
+            # Round-trip through ``_resolve_gcamp_tau`` so labels saved
+            # under the pre-2026-05-26 schema get snapped to the current
+            # canonical label at load time, and the migration is visible
+            # in the UI before the run starts.
+            raw_label = str(p["gcamp_variant"])
+            _, snapped_label, kind = self._resolve_gcamp_tau(raw_label)
+            if kind != "exact" and log is not None:
+                log(f"  [batch] migrated stale gcamp_variant "
+                    f"{raw_label!r} -> {snapped_label!r}")
+            self.gcamp_var.set(snapped_label)
+        # Custom tau override: set unconditionally (even when the key is
+        # absent) so a positive value from a previous row never carries
+        # over to a recording that didn't ask for one.
+        try:
+            _ct = float(p.get("gcamp_tau_custom", 0.0))
+        except (TypeError, ValueError):
+            _ct = 0.0
+        self.custom_tau_var.set(f"{_ct:g}" if _ct > 0 else "")
+
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))
@@ -986,7 +1027,7 @@ class Suite2pTab(ctk.CTkFrame):
                 baseline_min=baseline_min, fps=fps,
                 cutoff_hz=cutoff_hz_default,
                 sg_win_ms=sg_win_ms_default, sg_poly=sg_poly_default,
-                r=r_default):
+                r=r_default, F=F, Fneu=Fneu):
             return
         cutoff_hz = float(self._params.get("default_lowpass_hz", 1.0))
         sg_win_ms = int(self._params.get("default_sg_win_ms", 333))
@@ -1043,7 +1084,7 @@ class Suite2pTab(ctk.CTkFrame):
     def _maybe_run_dff_gpu(
         self, plane0: Path, baseline_mode: str, baseline_min: float,
         fps: float, cutoff_hz: float, sg_win_ms: int, sg_poly: int,
-        r: float,
+        r: float, F: np.ndarray, Fneu: np.ndarray,
     ) -> bool:
         """If the GPU path is enabled and usable, run it and return True.
         The GPU module only supports a 'first-N seconds mean' baseline,
@@ -1071,8 +1112,8 @@ class Suite2pTab(ctk.CTkFrame):
         roi_chunk = int(self._params.get("gpu_roi_chunk", 0))
         if roi_chunk <= 0:
             roi_chunk = None
-        F = np.load(plane0 / "F.npy", allow_pickle=False)
-        Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
+        # F / Fneu are loaded + normalised once in ``_run_dff`` and passed
+        # in, so neither path re-reads these (often large) arrays.
         print(f"[GUI] dF/F (GPU): baseline_sec={baseline_sec:g}  "
               f"cutoff={cutoff_hz:g} Hz  sg=({sg_win_ms} ms, p{sg_poly})")
         try:

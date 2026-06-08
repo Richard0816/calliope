@@ -31,7 +31,7 @@ from typing import Callable, Optional
 
 from . import (
     preprocessing, detection_run, lowpass_run, event_detection_run,
-    clustering, crosscorrelation, spatial,
+    clustering, crosscorrelation, spatial, utils,
 )
 from .export_manifest import write_export_manifest
 
@@ -46,65 +46,15 @@ def _figures_dir_for(save_folder: Path, stage: str) -> Path:
     return Path(save_folder) / "calliope_figures" / stage
 
 
+# ROI-survival / kept-count resolution is shared with the GUI batch
+# runner via ``utils`` so the skip policy can't drift between the two
+# entry points. These thin wrappers keep the module-local names.
 def _no_rois_survive(plane0: Path) -> bool:
-    """True when no ROIs survive the cell filter at ``plane0`` -- a
-    genuinely-noise recording.
-
-    ``detection_run.compute_filtered_dff`` writes
-    ``r0p7_filtered_dff.memmap.float32`` only when at least one ROI
-    survives, so its presence means there is data for the lowpass stage
-    (and everything downstream) to read. When it's absent we fall back to
-    counting the live keep mask the same way the lowpass reader does
-    (``predicted_cell_mask`` -> ``iscell``). Returns ``False`` on any read
-    error so a transient glitch never skips a good recording.
-    """
-    import numpy as np
-    plane0 = Path(plane0)
-    try:
-        if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
-            return False
-        mask_path = plane0 / "predicted_cell_mask.npy"
-        if mask_path.exists():
-            return int(np.load(mask_path).astype(bool).sum()) == 0
-        iscell_path = plane0 / "iscell.npy"
-        if iscell_path.exists():
-            ic = np.load(iscell_path)
-            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
-            return int(np.asarray(m).sum()) == 0
-        # No filtered memmap and no mask files -> nothing to filter.
-        return True
-    except Exception:
-        return False
+    return utils.no_rois_survive(plane0)
 
 
 def _kept_roi_count(plane0: Path) -> Optional[int]:
-    """How many ROIs survive the cell filter at ``plane0`` -- the number
-    the clustering stage will try to cluster. Resolved the same way the
-    readers do (keep-mask files first, then the filtered-memmap column
-    count). Returns ``None`` on any read error so the caller proceeds
-    normally rather than skipping on a transient glitch.
-    """
-    import numpy as np
-    plane0 = Path(plane0)
-    try:
-        for name in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
-            p = plane0 / name
-            if p.exists():
-                return int(np.load(p).astype(bool).sum())
-        iscell = plane0 / "iscell.npy"
-        if iscell.exists():
-            ic = np.load(iscell)
-            m = (ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)
-            return int(np.asarray(m).sum())
-        filt = plane0 / "r0p7_filtered_dff.memmap.float32"
-        F = plane0 / "F.npy"
-        if filt.exists() and F.exists():
-            T = int(np.load(F, mmap_mode="r").shape[1])
-            if T > 0:
-                return int(filt.stat().st_size // (4 * T))
-        return None
-    except Exception:
-        return None
+    return utils.kept_roi_count(plane0)
 
 
 def run_recording(

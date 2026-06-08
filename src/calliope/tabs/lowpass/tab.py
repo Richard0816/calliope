@@ -154,6 +154,23 @@ class LowpassTab(ctk.CTkFrame):
 
     # -- UI -----------------------------------------------------------------
 
+    def apply_batch_row(self, params: dict, log=None) -> None:
+        """Apply a batch row's PARAM_SPEC fields + the live cutoff slider.
+
+        Public seam the Tab 0 batch runner calls instead of poking this
+        tab's internals.
+        """
+        p = params or {}
+        for entry in self.PARAM_SPEC:
+            name = entry["name"]
+            if name in p:
+                self._params[name] = p[name]
+        if "cutoff_hz" in p:
+            try:
+                self.cutoff_var.set(float(p["cutoff_hz"]))
+            except (TypeError, ValueError):
+                pass
+
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))
