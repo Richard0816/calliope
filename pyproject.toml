@@ -24,7 +24,7 @@ name = "calliope"
 version = "0.1.0"
 description = "Calcium Live-imaging Output Pipeline for Epileptiform-recordings (CalLIOPE) - customtkinter dark-mode GUI for Suite2p-based 2P calcium imaging analysis."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [
     { name = "Richard Jiang" },
@@ -41,29 +41,37 @@ keywords = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Operating System :: OS Independent",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
+# Version constraints anchored to the proven, tested stack (see
+# ``requirements.txt`` for the exact reproducible lock). Lower bounds are
+# the tested floor; upper bounds stop a fresh ``pip install`` from pulling
+# an untested next-major. ``suite2p`` is pinned EXACTLY: the detection code
+# monkey-patches suite2p-1.0.0.1 internals (the estimate_spatial_scale
+# ndarray shim and the "<n> ROIs" progress-line ROI cap), so any other
+# version silently breaks detection. ``numba`` is constrained (though only
+# a transitive dep) because it is the numpy-ABI linchpin for suite2p/cellpose.
 dependencies = [
-    "numpy",
-    "pandas",
-    "scipy",
-    "matplotlib",
-    "seaborn",
-    "scikit-image",
-    "openpyxl",
-    "Pillow",
-    "psutil",
+    "numpy>=2.1,<3",
+    "pandas>=2.2,<4",
+    "scipy>=1.13,<2",
+    "matplotlib>=3.8,<4",
+    "seaborn>=0.13,<0.14",
+    "scikit-image>=0.24,<0.27",
+    "openpyxl>=3.1,<4",
+    "Pillow>=10,<13",
+    "psutil>=5.9",
     "tifffile>=2022.2.2",
-    "imagecodecs",
-    "torch",
-    "suite2p",
-    "cellpose",
-    "customtkinter>=5.2",
+    "imagecodecs>=2023.1.23",
+    "torch>=2.4,<3",
+    "suite2p==1.0.0.1",
+    "cellpose>=4.1,<5",
+    "numba>=0.60,<0.66",
+    "customtkinter>=5.2,<6",
 ]
 
 [project.optional-dependencies]

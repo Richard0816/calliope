@@ -85,75 +85,90 @@ sub-tree, violin plots).
 
 ## Installing
 
-### Using pip
+> **Python 3.11 or 3.12 is required.** The tested scientific stack
+> (NumPy 2.4, pandas 3.0, Suite2p 1.0.0.1) needs Python ≥3.11 — on 3.10
+> or earlier `pip` silently back-solves to an older, untested set of
+> packages (a common cause of "works in the GUI but the Detection tab
+> errors"). Check with `python --version`.
 
-Editable install (development), from the repo root:
+CalLIOPE pins `suite2p==1.0.0.1` exactly (the detection code patches that
+specific Suite2p release) and constrains the rest of the stack to tested
+ranges. For a guaranteed-reproducible environment use one of the two
+**locked** paths below; the loose path is fine for development but can
+drift as upstream releases move.
+
+### Reproducible install (recommended)
+
+Two equivalent paths reproduce the exact tested environment.
+
+**With [uv](https://docs.astral.sh/uv/)** (uses the committed `uv.lock`):
 
 ```bash
-pip install -e .
+uv sync                 # builds .venv at the exact locked versions
+uv run calliope         # launch
 ```
 
-For development (runs the smoke-test suite):
+**With pip + the pinned lockfile:**
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/
+python -m venv venv                       # from a Python 3.11 / 3.12 interpreter
+venv\Scripts\activate                     # Windows
+# source venv/bin/activate                # macOS / Linux
+pip install -r requirements.txt           # exact tested versions (incl. PyTorch)
+pip install -e . --no-deps                # CalLIOPE itself; deps already satisfied
 ```
 
-For GPU support, install the CuPy extra that matches your
-CUDA toolkit (`nvcc --version` or check `CUDA_PATH`):
+`requirements.txt` pins the CUDA 12.6 PyTorch wheel, which is
+self-contained and also runs on CPU-only machines. For a smaller
+CPU-only download, change the index URL at the top of `requirements.txt`
+to `https://download.pytorch.org/whl/cpu` and drop the `+cu126` suffix
+from the torch line before installing.
+
+### Latest-compatible install (development)
+
+Pulls the newest versions allowed by the ranges in `pyproject.toml` —
+handy for development, not guaranteed identical to the tested set:
 
 ```bash
-# CUDA 11.2 - 11.8
-pip install -e ".[gpu-cuda11]"
-
-# CUDA 12.x
-pip install -e ".[gpu-cuda12]"
+pip install -e .            # runtime
+pip install -e ".[dev]"     # + pytest, then: pytest tests/
 ```
 
-GPU support is optional — the cross-correlation module falls back to
-NumPy automatically if CuPy isn't installed.
+### conda / mamba
 
-> **Note on CUDA 13.** The CuPy team currently ships pre-built wheels
-> only for CUDA 11 / 12. CUDA 13 toolkits work fine for the rest of the
-> pipeline (PyTorch, Suite2p), but the GPU cross-correlation extras
-> above don't have a CuPy wheel to match. Workaround: install the
-> CUDA 12 toolkit alongside, then `pip install -e ".[gpu-cuda12]"`.
-
-### Using conda
-
-If you prefer conda (or `mamba`), create a fresh environment and then
-install the package with `pip` inside it. Suite2p, cellpose, and PyTorch
-all have well-tested conda-forge builds, so pulling them through conda
-first avoids the heaviest source builds:
+Suite2p, cellpose, and PyTorch have well-tested conda-forge builds, so
+pulling them through conda first avoids the heaviest source builds:
 
 ```bash
-# create + activate env (Python 3.10 is a known-good pin)
-conda create -n calliope python=3.10
+conda create -n calliope python=3.11        # 3.11 or 3.12
 conda activate calliope
-
-# pull the heavy scientific stack from conda-forge
 conda install -c conda-forge numpy pandas scipy matplotlib seaborn \
     scikit-image openpyxl pillow psutil tifffile pytorch
-
-# install calliope itself (editable install from the repo root)
-pip install -e .
+pip install -e .                            # CalLIOPE on top of the conda stack
 ```
 
-For GPU support inside a conda env, install the matching CuPy
-build from conda-forge instead of the pip extra:
+`mamba` is a faster drop-in for `conda`.
+
+### GPU acceleration (optional)
+
+The GPU cross-correlation path needs a CuPy wheel matching your CUDA
+toolkit (`nvcc --version` / `CUDA_PATH`); without it CalLIOPE falls back
+to NumPy automatically.
 
 ```bash
-# CUDA 11.x
-conda install -c conda-forge cupy cudatoolkit=11.8
-
-# CUDA 12.x
-conda install -c conda-forge cupy cuda-version=12
+pip install -e ".[gpu-cuda11]"   # CUDA 11.2 – 11.8
+pip install -e ".[gpu-cuda12]"   # CUDA 12.x
 ```
 
-Tip: `mamba` is a drop-in replacement for `conda` that resolves the
-environment much faster — swap `conda` for `mamba` in any of the
-commands above if you have it installed.
+> **CUDA 13.** CuPy ships wheels only for CUDA 11 / 12. The rest of the
+> pipeline (PyTorch, Suite2p) is fine on CUDA 13; for the GPU extra,
+> install the CUDA 12 toolkit alongside and use `".[gpu-cuda12]"`.
+
+### First-run note
+
+The first time you run **Detection**, cellpose downloads its segmentation
+model (one-time, needs internet). CalLIOPE's own cell-filter checkpoint is
+bundled in the package, so it needs no download.
 
 ## Running the GUI
 
