@@ -52,6 +52,22 @@ CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
     # Top-level
     "tau":     0.25,   # jGCaMP8m fallback; per-recording tau set by Tab 3 dropdown.
     "fs":      15.07,
+
+    # Run-control overrides
+    "run": {
+        # Disable suite2p's PC-based registration-quality metrics
+        # (``registration.get_pc_metrics`` -> ``pclowhigh``). That step
+        # loads a single contiguous float32 array of
+        # ``nsamp x (Ly*Lx)`` -- for our ~512x504 FOVs with >=5000
+        # frames suite2p picks nsamp=5000, i.e. a 4.81 GiB block that
+        # can fail to allocate on Windows even with tens of GB free
+        # (it needs one *contiguous* commit, not just free RAM).
+        # CalLIOPE never reads the resulting regDX/regPC/tPC -- they're
+        # a suite2p-GUI QC diagnostic only -- so the metric is pure
+        # dead weight here and disabling it removes the spike without
+        # changing registration or detection output.
+        "do_regmetrics": False,
+    },
     # NB: ``diameter`` is intentionally NOT overridden. Suite2p 1.0's
     # default of [12.0, 12.0] is used; the legacy ``diameter=0`` we
     # inherited from suite2p 0.x means "auto-pick", but in 1.0
