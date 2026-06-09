@@ -199,7 +199,7 @@ from calliope.core.cellfilter.model import CellFilter
 from calliope.core.cellfilter.predict import predict_recording
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
 model = CellFilter().to(device); model.load_state_dict(ckpt['model']); model.eval()
 predict_recording(rec_id, model, device, plane0=plane0)
 ```

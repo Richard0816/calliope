@@ -118,7 +118,7 @@ num_cols   = T // downsample
 
 For each ROI:
 - `lp_ds = lp_i[:num_cols*downsample].reshape(num_cols, downsample).mean(axis=1)`  ← bin-mean of low-pass.
-- `(lo, hi) = percentile(lp_ds, [1, 99])`
+- `(lo, hi) = percentile(lp_ds, [1, 99.5])`  ← shared `utils.DISPLAY_CLIP_{LOW,HIGH}_PCT`
 - `heatmap[i] = clip((lp_ds − lo)/(hi − lo), 0, 1) · 255`  ← uint8 row.
 - For the raster: `raster[i, onsets // downsample] = 1` (binary marks).
 
@@ -284,7 +284,7 @@ Manual subset (UI-only, not in `PARAM_SPEC`):
 6. **Watershed split** overlapping windows at the bin of minimum smoothed density between consecutive peaks.
 7. **Hard cap** any final window > `max_event_duration_s` to peak ± `max_event_duration_s/2`.
 8. **Activation matrix:** for each event, mark every ROI that has at least one onset inside `[start_s, end_s]`; record the earliest such onset.
-9. The display heatmap is per-ROI 1st/99th-percentile-normalised `lp_ds` with rows sorted by event count (descending). The raster is binary onsets at downsampled bin resolution.
+9. The display heatmap is per-ROI 1st/99.5th-percentile-normalised `lp_ds` with rows sorted by event count (descending). The raster is binary onsets at downsampled bin resolution.
 
 The full annotated reference is in `core/utils.py` lines ~250–820.
 

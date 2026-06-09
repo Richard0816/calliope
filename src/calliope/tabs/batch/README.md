@@ -706,7 +706,10 @@ from:
   `gcamp_tau_custom` (float; a positive value overrides the variant τ,
   `0` = use the dropdown). These live as Tk vars on Tab 3, not in its
   PARAM_SPEC, so they're surfaced here and applied onto `gcamp_var` /
-  `custom_tau_var` in `_apply_row_params_to_tabs`.
+  `custom_tau_var` by `Suite2pTab.apply_batch_row` (the public per-tab
+  seam the batch runner calls — it no longer pokes tab internals
+  directly; `_apply_row_params_to_tabs` just dispatches to each tab's
+  `apply_batch_row`).
 - `LowpassTab.PARAM_SPEC` — 5 knobs + an injected `cutoff_hz` (which Tab 4
   binds to its slider rather than a PARAM_SPEC entry).
 - `EventDetectionTab.PARAM_SPEC` — 26 knobs (per-ROI hysteresis + display +
