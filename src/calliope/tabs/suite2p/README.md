@@ -71,6 +71,27 @@ read `ops['Ly']` / `ops['spatial_scale']` / `ops['pix_to_um']`
 straight from suite2p's own output. Translation only happens at the
 `run_s2p` call boundary.
 
+### CPU / GPU and memory defaults
+
+Detection runs on whatever `torch` reports:
+`device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')`.
+Both the Suite2p extraction wrapper and the hand-rolled deconvolution
+(`dcnv.preprocess` in `sparse_plus_cellpose.merge_and_extract`) are passed
+this resolved device, so a **CPU-only `torch` build runs the full
+pipeline** — slower, but it completes. Suite2p's `dcnv.preprocess`
+otherwise defaults to `device=torch.device('cuda')` and raises
+`Torch not compiled with CUDA enabled` on a CPU build; CalLIOPE overrides
+it explicitly.
+
+The base settings (`core/calliope_settings.py`) also set
+`run.do_regmetrics = False`. Suite2p's PC registration-quality metrics
+load a single contiguous `nsamp × (Ly·Lx)` float32 array (≈5 GB on a
+512×512 FOV with ≥5000 frames) and are a GUI-only QC diagnostic CalLIOPE
+never reads — disabling them removes a large transient allocation (which
+could fail on memory-/commit-constrained Windows boxes) without changing
+registration or detection output. Re-enable via the "Edit suite2p
+settings…" popout if you want the regDX/regPC numbers.
+
 ### Step 1 — `sparse_plus_cellpose.run` (ROI detection)
 
 A union of two complementary detectors. Sparsery is bright-and-bursty; Cellpose is a generalist segmenter that catches morphologically obvious cells which never fired enough during the recording for Sparsery to spot.
