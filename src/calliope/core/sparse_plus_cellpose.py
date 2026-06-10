@@ -471,6 +471,11 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
         sig_baseline=float(final_ops.get('sig_baseline', 10.0)),
         fs=fs,
         prctile_baseline=float(final_ops.get('prctile_baseline', 8.0)),
+        # suite2p's dcnv.preprocess defaults device=torch.device('cuda');
+        # pass the device we resolved above (cpu when torch.cuda is
+        # unavailable) so the maximin baseline runs on CPU-only torch
+        # builds instead of raising "Torch not compiled with CUDA enabled".
+        device=device,
     )
     spks = dcnv.oasis(
         F=F_pp, batch_size=int(final_ops.get('batch_size', 3000)),
