@@ -240,21 +240,23 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
     # share their public API so the same code runs on either.
     xp = cp if use_gpu else np
 
-    # ``xp.asarray(..., dtype=...)`` is a no-op if the input is
-    # already on the right device + dtype, otherwise copies. Saves
-    # us from manually shipping data to/from the GPU.
-    XA = xp.asarray(X_A, dtype=dtype)
-    XB = xp.asarray(X_B, dtype=dtype)
-    T, nA = XA.shape
-    nB = XB.shape[1]
+    # Read shapes from the host arrays so we never ship X_A/X_B to the
+    # device just to learn their dimensions. When the caller supplies
+    # ZA_pre/ZB_pre (the full-recording and per-event runners always do),
+    # X_A/X_B are never touched on the GPU -- avoiding a wasted full
+    # (T, n) VRAM copy that would otherwise sit alongside ZA/ZB.
+    T, nA = int(np.shape(X_A)[0]), int(np.shape(X_A)[1])
+    nB = int(np.shape(X_B)[1])
 
     # Z-score each cluster's traces unless the caller already did.
+    # ``xp.asarray(..., dtype=...)`` is a no-op if the input is already on
+    # the right device + dtype, otherwise copies.
     if ZA_pre is None:
-        ZA = _zscore_cols_xp(XA, xp)
+        ZA = _zscore_cols_xp(xp.asarray(X_A, dtype=dtype), xp)
     else:
         ZA = xp.asarray(ZA_pre, dtype=dtype)
     if ZB_pre is None:
-        ZB = _zscore_cols_xp(XB, xp)
+        ZB = _zscore_cols_xp(xp.asarray(X_B, dtype=dtype), xp)
     else:
         ZB = xp.asarray(ZB_pre, dtype=dtype)
 
@@ -409,17 +411,19 @@ def circular_shift_null_pvalues(X_A, X_B, observed_max_corr, fps,
     use_gpu = bool(use_gpu and cp is not None)
     xp = cp if use_gpu else np
 
-    XA = xp.asarray(X_A, dtype=dtype)
-    XB = xp.asarray(X_B, dtype=dtype)
-    T, nA = XA.shape
-    nB = XB.shape[1]
+    # Shapes come from the host arrays; X_A/X_B are only materialised on
+    # the device when we actually have to z-score them here. The callers
+    # always pass ZA_pre/ZB_pre, so this avoids a wasted full (T, n) VRAM
+    # copy in the dominant (per-cluster-pair) null path.
+    T, nA = int(np.shape(X_A)[0]), int(np.shape(X_A)[1])
+    nB = int(np.shape(X_B)[1])
 
     if ZA_pre is None:
-        ZA = _zscore_cols_xp(XA, xp)
+        ZA = _zscore_cols_xp(xp.asarray(X_A, dtype=dtype), xp)
     else:
         ZA = xp.asarray(ZA_pre, dtype=dtype)
     if ZB_pre is None:
-        ZB = _zscore_cols_xp(XB, xp)
+        ZB = _zscore_cols_xp(xp.asarray(X_B, dtype=dtype), xp)
     else:
         ZB = xp.asarray(ZB_pre, dtype=dtype)
 
@@ -440,12 +444,17 @@ def circular_shift_null_pvalues(X_A, X_B, observed_max_corr, fps,
     rng = np.random.default_rng(seed)
     n_hits = xp.zeros((nA, nB), dtype=xp.int32)
 
+    # ``pad`` is loop-invariant (L, nA and ZA.dtype are all fixed before the
+    # loop) and is never mutated -- concatenate reads it -- so allocate it
+    # once instead of n_shuffles times (matters on the GPU, where each
+    # iteration would otherwise hit the CuPy memory pool).
+    pad = xp.zeros((L, nA), dtype=ZA.dtype)
+
     for _k in range(int(n_shuffles)):
         offset = int(rng.integers(lo, hi))
         # ``xp.roll`` along axis=0 rotates rows; column structure of
         # ZA stays intact, so each ROI keeps its autocorrelation.
         ZA_shuf = xp.roll(ZA, offset, axis=0)
-        pad = xp.zeros((L, nA), dtype=ZA.dtype)
         ZA_pad = xp.concatenate([pad, ZA_shuf, pad], axis=0)
         shuf_max = xp.full((nA, nB), -np.inf, dtype=ZA.dtype)
         for j in range(2 * L + 1):

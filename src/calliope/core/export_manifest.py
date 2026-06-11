@@ -153,8 +153,15 @@ def write_export_manifest(
                 ops = np.load(ops_p, allow_pickle=True).item()
                 tau = float(ops.get("tau", 0.0) or 0.0)
                 fs = float(ops.get("fs", 0.0) or 0.0)
-                manifest["tau"] = tau or None
-                manifest["fs"] = fs or None
+                # Only refresh when this stage's ops supplies a usable value.
+                # A zero/missing tau or fs (degenerate or partial ops.npy)
+                # must NOT clobber the valid value already carried forward
+                # from a prior stage's manifest (manifest["tau"]/["fs"] were
+                # set from prev.get(...) above).
+                if tau:
+                    manifest["tau"] = tau
+                if fs:
+                    manifest["fs"] = fs
             except (OSError, ValueError, pickle.UnpicklingError) as e:
                 print(f"[manifest] could not read tau/fs from {ops_p}: {e}")
         # Pixel calibration (µm/px) so an exported figure's scale bar is

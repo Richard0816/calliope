@@ -93,20 +93,25 @@ def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
     N = rec.N
 
     probs = np.zeros(N, dtype=np.float32)
-    for roi in range(N):
-        patch = rec.get_patch(roi, C.PATCH_SIZE)          # (3, H, W)
-        trace = rec.get_trace(roi)                        # (T,)
-        # ``[None]`` is NumPy/Torch shorthand for "insert a new axis
-        # of size 1 here". The model expects a batch dimension, so
-        # we add one to turn (3, H, W) into (1, 3, H, W).
-        spatial = torch.from_numpy(patch)[None].to(device)
-        # ``[None, None]`` adds two new axes: trace was (T,), now
-        # (1, 1, T) which is (batch, channels, time).
-        trace_t = torch.from_numpy(trace)[None, None].to(device)
-        logit = model(spatial, trace_t)
-        # ``sigmoid`` -> probability; ``.item()`` extracts the Python
-        # scalar from a 0-D tensor.
-        probs[roi] = torch.sigmoid(logit).item()
+    # Score ROIs in batches rather than one host->device transfer + forward
+    # per ROI. All ROIs in a recording share patch shape (3, PATCH_SIZE,
+    # PATCH_SIZE) and trace length T, so they stack cleanly. This is
+    # numerically identical to the per-ROI loop because model.eval() makes
+    # BatchNorm use running stats (no cross-sample leakage), but replaces N
+    # tiny kernel launches / transfers / syncs with N/BATCH of each.
+    BATCH = 256
+    for s in range(0, N, BATCH):
+        e = min(s + BATCH, N)
+        patches = np.stack(
+            [rec.get_patch(roi, C.PATCH_SIZE) for roi in range(s, e)],
+            axis=0)                                       # (B, 3, H, W)
+        traces = np.stack(
+            [rec.get_trace(roi) for roi in range(s, e)],
+            axis=0)                                       # (B, T)
+        spatial = torch.from_numpy(patches).to(device)            # (B, 3, H, W)
+        trace_t = torch.from_numpy(traces)[:, None, :].to(device)  # (B, 1, T)
+        logits = model(spatial, trace_t)                          # (B,)
+        probs[s:e] = torch.sigmoid(logits).cpu().numpy()
 
     out_prob = rec.plane0 / C.PREDICTED_PROB_NAME
     out_mask = rec.plane0 / C.PREDICTED_MASK_NAME

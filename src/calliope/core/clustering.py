@@ -608,7 +608,17 @@ def run_clustering(
             np.array([threshold], dtype=float))
     (export_dir / "_indices_are_suite2p").write_text("1")
 
-    link_colors = resolve_palette(palette, n_colors=max(1, n_clusters))
+    _base_colors = resolve_palette(palette, n_colors=max(1, n_clusters))
+    # resolve_palette caps categorical palettes (e.g. tab10 -> 10) at their
+    # discrete size, so for n_clusters > len(palette) the list is too short and
+    # the link_colors[vid - 1] lookups below would IndexError. Cycle the
+    # palette (matching scipy's set_link_color_palette behaviour) so the list
+    # always has exactly n_clusters entries. For n_clusters <= len(palette)
+    # this is a no-op (i % len == i), so the common case is unchanged.
+    link_colors = [
+        _base_colors[i % len(_base_colors)]
+        for i in range(max(1, n_clusters))
+    ]
 
     if figures_dir is not None:
         figures_dir = Path(figures_dir)

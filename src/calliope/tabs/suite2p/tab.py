@@ -1681,7 +1681,16 @@ class Suite2pTab(ctk.CTkFrame):
         vmax = float(np.quantile(bg, utils.DISPLAY_CLIP_HIGH_PCT / 100.0))
         vmin = float(np.quantile(bg, utils.DISPLAY_CLIP_LOW_PCT / 100.0))
 
-        label_all = build_label_image(stat, Ly, Lx)
+        # build_label_image is a per-ROI Python loop (up to hard_cap=60000
+        # ROIs); stat/Ly/Lx are fixed across bg-radio and ROI-overlay
+        # redraws, so cache it on the panel-cache dict. Key on the bg shape
+        # because the KNOWN_BG_IMAGES backgrounds could differ in (Ly, Lx).
+        # The cache is naturally dropped when _draw_panels rebuilds
+        # _panel_cache for a new plane0.
+        label_all = c.get("label_all")
+        if label_all is None or label_all.shape != (Ly, Lx):
+            label_all = build_label_image(stat, Ly, Lx)
+            c["label_all"] = label_all
         # Cache the label image so the click handler can map a
         # (x_data, y_data) cursor position to the Suite2p ROI index
         # that was clicked. The label image stores ``roi_idx + 1`` per

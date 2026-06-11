@@ -1281,6 +1281,19 @@ class BatchTab(ctk.CTkFrame):
                 f"the fast-disk savings disappear.")
         return issues
 
+    def _abort_batch_startup(self) -> None:
+        """Undo the ``batch_active`` flags set early in ``_on_run_all`` when
+        startup bails out before the run actually begins. Without this, an
+        early return (e.g. a bad scratch dir) would leave ``_batch_active``
+        True forever -- every later 'Run all' click would hit the
+        already-in-progress guard and all tabs would keep suppressing their
+        error dialogs until the app restarts."""
+        self._batch_active = False
+        try:
+            self.state.batch_active = False
+        except Exception:
+            pass
+
     def _on_run_all(self) -> None:
         if getattr(self, "_batch_active", False):
             messagebox.showinfo("Busy", "A batch run is already in progress.")
@@ -1428,6 +1441,7 @@ class BatchTab(ctk.CTkFrame):
                     "Bad scratch dir",
                     "Scratch dir is the same as the output folder. "
                     "Pick a separate location on the fast drive.")
+                self._abort_batch_startup()
                 return
             try:
                 scratch_root.mkdir(parents=True, exist_ok=True)
@@ -1435,6 +1449,7 @@ class BatchTab(ctk.CTkFrame):
                 messagebox.showerror(
                     "Bad scratch dir",
                     f"Could not create scratch directory:\n{e}")
+                self._abort_batch_startup()
                 return
             self._batch_scratch_root = scratch_root
             self._batch_out_root = scratch_root

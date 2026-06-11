@@ -398,6 +398,7 @@ class ClusteringTab(ctk.CTkFrame):
         self.s_canvas.mpl_connect("button_press_event",
                                   self._on_spatial_click)
         self._spatial_label_img: Optional[np.ndarray] = None
+        self._spatial_label_key: Optional[tuple] = None
         self._cluster_popout: Optional[ClusterPopout] = None
 
         # Bottom controls.
@@ -1300,12 +1301,21 @@ class ClusteringTab(ctk.CTkFrame):
             return
 
         img = spatial_image(self._stat, self._Lx, self._Ly, roi_rgb)
-        # Parallel int label image so the click handler can map a
-        # cursor pixel back to the filtered-list ROI index. Encoded
-        # as ``filtered_idx + 1`` (0 = background); rebuilt on every
-        # render so a re-cluster / palette change keeps it in sync.
-        self._spatial_label_img = build_label_image(
-            self._stat, self._Ly, self._Lx)
+        # Parallel int label image so the click handler can map a cursor
+        # pixel back to the filtered-list ROI index. Encoded as
+        # ``filtered_idx + 1`` (0 = background). It depends ONLY on ROI
+        # geometry (stat/Ly/Lx), which is invariant across threshold,
+        # palette, manual-toggle and custom-color renders -- so cache it and
+        # rebuild only when a new recording/reload swaps the geometry in
+        # (_on_done / _on_reloaded reassign self._stat, a fresh list each
+        # load, so id() is a reliable key). Without this the per-ROI paint
+        # loop re-ran on every slider/palette change.
+        label_key = (id(self._stat), int(self._Ly), int(self._Lx))
+        if (self._spatial_label_img is None
+                or self._spatial_label_key != label_key):
+            self._spatial_label_img = build_label_image(
+                self._stat, self._Ly, self._Lx)
+            self._spatial_label_key = label_key
         render_spatial_map(
             self.s_ax, img, self._Lx, self._Ly, self._resolve_pix_to_um(),
             f"{n_clusters} clusters  -- click an ROI for cluster panel")

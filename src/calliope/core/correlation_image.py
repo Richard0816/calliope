@@ -125,11 +125,18 @@ def _streaming_pearson_with_neighbours(
         # Accumulate the five running sums. ``.sum(axis=0)`` reduces over
         # the time axis of this chunk, giving per-pixel partial sums in
         # (Ly, Lx).
+        # Cast each chunk to float64 ONCE and reuse it across the three
+        # second-moment accumulators. Each cast is a full
+        # (chunk_frames, Ly, Lx) float64 array (~2 GB for a 1000-frame
+        # 512x512 chunk), so reusing the buffers roughly halves the float64
+        # temporaries materialised in this hot loop.
+        chunk64 = chunk.astype(np.float64)
+        neigh64 = neigh.astype(np.float64)
         Sx += chunk.sum(axis=0, dtype=np.float64)
         Sy += neigh.sum(axis=0, dtype=np.float64)
-        Sxx += (chunk.astype(np.float64) ** 2).sum(axis=0)
-        Syy += (neigh.astype(np.float64) ** 2).sum(axis=0)
-        Sxy += (chunk.astype(np.float64) * neigh.astype(np.float64)).sum(axis=0)
+        Sxx += (chunk64 * chunk64).sum(axis=0)
+        Syy += (neigh64 * neigh64).sum(axis=0)
+        Sxy += (chunk64 * neigh64).sum(axis=0)
         T_total += int(c1 - c0)
 
     del mm

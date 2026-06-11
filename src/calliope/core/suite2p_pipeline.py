@@ -1009,10 +1009,16 @@ def build_roi_pixel_mask(stat, Ly: int, Lx: int) -> np.ndarray:
 # Keys whose values determine whether a cached pass is reusable. RAM-varying
 # keys like nbinned and batch_size are deliberately excluded — they don't
 # materially change which ROIs get detected.
+# NOTE: ``nchannels``/``nplanes`` are db-only keys (pinned to 1 by
+# load_base_settings) -- they never live in ``settings``, so get_setting()
+# returns None for them while the cached on-disk view carries 1, producing a
+# permanent false mismatch that defeated the cache entirely. They are excluded
+# here. ``high_pass`` only compares correctly because utils._FLAT_FROM_SETTINGS
+# now exposes it in the cached view (see that table).
 _CACHE_COMPARE_KEYS = (
     'threshold_scaling', 'max_iterations', 'spatial_scale', 'sparse_mode',
     'high_pass', 'smooth_sigma', 'preclassify', 'allow_overlap', 'tau',
-    'max_overlap', 'fs', 'nchannels', 'nplanes',
+    'max_overlap', 'fs',
 )
 
 
@@ -1390,13 +1396,30 @@ def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
     stat: list[dict] = []
     if masks is None:
         return stat
-    labels = np.unique(masks)
-    labels = labels[labels > 0]
-    for lbl in labels:
-        ys, xs = np.where(masks == lbl)
-        if ys.size == 0:
+    masks = np.asarray(masks)
+    # Single grouping pass instead of one full-array ``np.where(masks == lbl)``
+    # scan per label (which was O(N_labels * Ly * Lx) -- hundreds of full
+    # megapixel scans on a dense cellpose segmentation). Collect every
+    # foreground pixel once, then sort by label so each label's pixels form a
+    # contiguous run.
+    ys_all, xs_all = np.nonzero(masks)              # one O(Ly*Lx) scan
+    if ys_all.size == 0:
+        return stat
+    labs = masks[ys_all, xs_all]
+    order = np.argsort(labs, kind='stable')
+    ys_all = ys_all[order]
+    xs_all = xs_all[order]
+    labs = labs[order]
+    uniq, starts = np.unique(labs, return_index=True)
+    ends = np.append(starts[1:], labs.size)
+    for lbl, s, e in zip(uniq, starts, ends):
+        if lbl <= 0:                               # skip background
             continue
+        ys = ys_all[s:e]
+        xs = xs_all[s:e]
         npix = int(ys.size)
+        if npix == 0:
+            continue
         stat.append({
             'ypix': ys.astype(np.int32),
             'xpix': xs.astype(np.int32),

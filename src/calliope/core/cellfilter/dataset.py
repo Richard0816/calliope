@@ -169,9 +169,16 @@ class _RecordingCache:
         mean_patch, y0, x0 = _pad_to_patch(self.mean_img_z, cy, cx, size)
         max_patch, _, _ = _pad_to_patch(self.max_img_z, cy, cx, size)
 
-        mask_full = np.zeros((self.H, self.W), dtype=np.float32)
-        mask_full[ypix, xpix] = 1.0
-        mask_patch, _, _ = _pad_to_patch(mask_full, cy, cx, size)
+        # Build the ROI mask directly in patch coordinates instead of
+        # allocating a full (H, W) buffer and cropping it (a ~1 MB zero-fill
+        # per call for a 512x512 FOV, once per ROI per epoch). _pad_to_patch
+        # maps image pixel (yi, xi) -> patch (yi - y0, xi - x0), keeping only
+        # pixels inside the [0, size) window, so this is exactly equivalent.
+        mask_patch = np.zeros((size, size), dtype=np.float32)
+        py = ypix.astype(np.int64) - y0
+        px = xpix.astype(np.int64) - x0
+        m = (py >= 0) & (py < size) & (px >= 0) & (px < size)
+        mask_patch[py[m], px[m]] = 1.0
 
         return np.stack([mean_patch, max_patch, mask_patch], axis=0)
 

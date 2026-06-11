@@ -18,12 +18,17 @@ Data sources
   lowpass dF/F memmap, ``(T, N_kept)``) -- the same array Tab 6
   feeds into its linkage. Rows are min-max normalised per ROI so
   bursts read regardless of absolute brightness.
-- **Raster** prefers ``AppState.event_results`` (Tab 5's per-ROI
-  hysteresis onsets) when its ``kept_idx`` aligns with Tab 6's
-  filtered stat list and the column count matches the heatmap. When
-  not available, a derivative-threshold fallback computes a simple
-  raster from the dF/F (``|d/dt|`` above a robust per-ROI threshold)
-  so the user still sees something useful.
+- **Raster**: in the GUI this currently uses a derivative-threshold
+  fallback computed from the dF/F (``|d/dt|`` above a robust per-ROI
+  threshold). The Tab 5 hysteresis-onset raster is only emitted by the
+  headless event-detection runner; the live ``AppState.event_results``
+  payload published by Tab 5 does not carry a precomputed ``"raster"``
+  (it is popped before publishing), so ``_slice_state_raster`` returns
+  ``None`` and the fallback is used. The ``event_results``-raster branch
+  is kept as forward-compatible "Phase 1" scaffolding: it activates only
+  if a future payload supplies a ``"raster"`` whose column count matches
+  the heatmap (row-alignment to Tab 6's filtered stat list still has to
+  be established before it can be trusted).
 
 Single-instance pattern
 -----------------------

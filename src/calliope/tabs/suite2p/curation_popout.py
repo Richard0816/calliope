@@ -906,6 +906,11 @@ class CurationPopout(ctk.CTkToplevel):
                 arr = np.stack(
                     [arr.astype(float), np.zeros_like(arr, dtype=float)],
                     axis=1)
+            if arr.shape[0] != self._n_total:
+                # Stale / partially-written file (e.g. re-detection changed
+                # the ROI count). Treat as absent rather than indexing past
+                # the end in _refresh_status (self._iscell[self._roi_idx]).
+                return None
             return arr.astype(float)
         except Exception:
             return None
@@ -915,6 +920,11 @@ class CurationPopout(ctk.CTkToplevel):
         if not path.exists():
             return None
         try:
-            return np.load(path).astype(float)
+            arr = np.load(path).astype(float)
+            if arr.shape[0] != self._n_total:
+                # Stale / partially-written prob file -> treat as absent so
+                # _refresh_status's self._probs[self._roi_idx] can't go OOB.
+                return None
+            return arr
         except Exception:
             return None

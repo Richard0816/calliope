@@ -269,8 +269,9 @@ def run_event_detection(
 
     lowpass = np.memmap(str(lp_path), dtype="float32", mode="r",
                         shape=(T, N_kept_full))
-    derivative = np.memmap(str(dt_path), dtype="float32", mode="r",
-                           shape=(T, N_kept_full))
+    # ``derivative`` is mapped lazily once onset_source is known (below): the
+    # spks onset path never reads it, so there's no need to open the handle.
+    derivative = None
 
     kept_full_idx = np.flatnonzero(mask)
     pos_in_memmap = np.arange(N_kept_full)
@@ -326,44 +327,64 @@ def run_event_detection(
     spks_arr = None
     if onset_source == "spks":
         spks_arr = core_utils.s2p_load_spks(plane0, kept_full_idx)
+    else:
+        # Only open the derivative memmap when the loop will actually read it.
+        derivative = np.memmap(str(dt_path), dtype="float32", mode="r",
+                               shape=(T, N_kept_full))
 
     report_every = max(1, N_kept // 20)
-    for i in range(N_kept):
-        mem_col = int(pos_in_memmap[i])
-        lp_i = np.asarray(lowpass[:, mem_col], dtype=np.float32)
+    # ``lowpass`` / ``derivative`` are C-order (T, N) memmaps, so a single
+    # column is maximally strided -- a per-ROI column read faults essentially
+    # every page of the file, so N reads scan the whole (multi-GB) file N
+    # times. Read a band of COLS columns into RAM at once (gathered by
+    # pos_in_memmap; a contiguous slice in the default path), then iterate the
+    # in-memory columns. mad_z / hysteresis_onsets are per-column, so results
+    # are identical; this just bounds the strided I/O to ceil(N_kept/COLS)
+    # passes over the file.
+    COLS = 256
+    for b0 in range(0, N_kept, COLS):
+        b1 = min(N_kept, b0 + COLS)
+        sel = pos_in_memmap[b0:b1]
+        lp_block = np.asarray(lowpass[:, sel], dtype=np.float32)
         if onset_source == "spks":
-            src_i = np.asarray(spks_arr[:, mem_col], dtype=np.float32)
+            src_block = np.asarray(spks_arr[:, sel], dtype=np.float32)
         else:
-            src_i = np.asarray(derivative[:, mem_col], dtype=np.float32)
-        z, _, _ = ed_utils.mad_z(src_i)
-        onsets = ed_utils.hysteresis_onsets(
-            z, z_enter, z_exit, fps, min_sep_s=min_sep_s)
-        event_counts[i] = onsets.size
-        onsets_by_roi.append(np.asarray(onsets, dtype=np.float64) / fps)
+            src_block = np.asarray(derivative[:, sel], dtype=np.float32)
 
-        if downsample > 1:
-            trimmed = lp_i[:num_cols * downsample].reshape(
-                num_cols, downsample)
-            lp_ds = trimmed.mean(axis=1)
-            if onsets.size:
-                bins = (onsets // downsample).clip(0, num_cols - 1)
-                raster[i, np.unique(bins)] = 1
-        else:
-            lp_ds = lp_i
-            if onsets.size:
-                raster[i, onsets.clip(0, num_cols - 1)] = 1
+        for k in range(b1 - b0):
+            i = b0 + k
+            lp_i = lp_block[:, k]
+            src_i = src_block[:, k]
+            z, _, _ = ed_utils.mad_z(src_i)
+            onsets = ed_utils.hysteresis_onsets(
+                z, z_enter, z_exit, fps, min_sep_s=min_sep_s)
+            event_counts[i] = onsets.size
+            onsets_by_roi.append(np.asarray(onsets, dtype=np.float64) / fps)
 
-        lo, hi = np.percentile(
-            lp_ds,
-            [core_utils.DISPLAY_CLIP_LOW_PCT, core_utils.DISPLAY_CLIP_HIGH_PCT])
-        if hi <= lo:
-            heatmap[i, :] = 0
-        else:
-            norm = np.clip((lp_ds - lo) / (hi - lo), 0, 1)
-            heatmap[i, :] = (norm * 255.0 + 0.5).astype(np.uint8)
+            if downsample > 1:
+                trimmed = lp_i[:num_cols * downsample].reshape(
+                    num_cols, downsample)
+                lp_ds = trimmed.mean(axis=1)
+                if onsets.size:
+                    bins = (onsets // downsample).clip(0, num_cols - 1)
+                    raster[i, np.unique(bins)] = 1
+            else:
+                lp_ds = lp_i
+                if onsets.size:
+                    raster[i, onsets.clip(0, num_cols - 1)] = 1
 
-        if progress_cb is not None and (i + 1) % report_every == 0:
-            progress_cb(f"event detection: {i + 1}/{N_kept} ROIs")
+            lo, hi = np.percentile(
+                lp_ds,
+                [core_utils.DISPLAY_CLIP_LOW_PCT,
+                 core_utils.DISPLAY_CLIP_HIGH_PCT])
+            if hi <= lo:
+                heatmap[i, :] = 0
+            else:
+                norm = np.clip((lp_ds - lo) / (hi - lo), 0, 1)
+                heatmap[i, :] = (norm * 255.0 + 0.5).astype(np.uint8)
+
+            if progress_cb is not None and (i + 1) % report_every == 0:
+                progress_cb(f"event detection: {i + 1}/{N_kept} ROIs")
 
     order = np.argsort(-event_counts)
     heatmap = heatmap[order]

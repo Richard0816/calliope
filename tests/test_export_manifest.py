@@ -9,11 +9,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
+
 from calliope.core.export_manifest import write_export_manifest
 
 
 def _read(figs: Path) -> dict:
     return json.loads((figs / "manifest.json").read_text(encoding="utf-8"))
+
+
+def _write_ops(plane0: Path, **ops) -> Path:
+    plane0.mkdir(parents=True, exist_ok=True)
+    np.save(plane0 / "ops.npy", np.array(ops, dtype=object))
+    return plane0
 
 
 def test_first_write_records_params(tmp_path):
@@ -57,6 +65,31 @@ def test_prior_metadata_carried_forward_when_absent(tmp_path):
     man = _read(figs)
     assert man["gcamp_variant"] == "jGCaMP8m"
     assert man["params"]["gcamp_variant"] == "jGCaMP8m"
+
+
+def test_zero_or_missing_tau_does_not_clobber_carried_forward(tmp_path):
+    figs = tmp_path / "calliope_figures"
+    # An earlier stage records a valid tau/fs from its ops.npy.
+    good = _write_ops(tmp_path / "good", tau=0.7, fs=15.0)
+    write_export_manifest(figs, rec_id="rec", params={}, plane0=good)
+    man = _read(figs)
+    assert man["tau"] == 0.7
+    assert man["fs"] == 15.0
+
+    # A later stage whose ops has tau/fs == 0 (degenerate/partial ops) must
+    # NOT erase the good values carried forward (the bug this fixes).
+    degenerate = _write_ops(tmp_path / "degenerate", tau=0.0, fs=0.0)
+    write_export_manifest(figs, rec_id="rec", params={}, plane0=degenerate)
+    man = _read(figs)
+    assert man["tau"] == 0.7
+    assert man["fs"] == 15.0
+
+    # Likewise an ops.npy with no tau/fs keys at all leaves them intact.
+    no_keys = _write_ops(tmp_path / "nokeys", nframes=100)
+    write_export_manifest(figs, rec_id="rec", params={}, plane0=no_keys)
+    man = _read(figs)
+    assert man["tau"] == 0.7
+    assert man["fs"] == 15.0
 
 
 def test_corrupt_existing_manifest_is_replaced_not_fatal(tmp_path):

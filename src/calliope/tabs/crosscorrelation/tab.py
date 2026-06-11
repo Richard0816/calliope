@@ -237,7 +237,8 @@ def _plot_violin(ax, labels, arrays, ylabel: str, title: str,
         _add_significance(ax, pos, arrays)
 
 
-def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str) -> None:
+def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str,
+                     pvals=None) -> None:
     """Lead/Lag-styled violin plot for per-pair best-lag distributions.
 
     Each violin is coloured by the sign of its mean and the sign-flip
@@ -252,7 +253,12 @@ def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str) -> None:
     if not arrays:
         return
     pos = np.arange(1, len(arrays) + 1)
-    pvals = [_sign_flip_pvalue(arr) for arr in arrays]
+    # The caller may pass precomputed p-values (each pair's permutation test
+    # depends only on its own best-lag array, which is invariant across
+    # cluster-filter re-renders); compute them here only when absent (e.g.
+    # the one-shot export path).
+    if pvals is None:
+        pvals = [_sign_flip_pvalue(arr) for arr in arrays]
     means = [float(np.mean(arr)) for arr in arrays]
 
     colors: list[str] = []
@@ -331,6 +337,11 @@ class ViolinWindow(ctk.CTkToplevel):
         self.wm_minsize(720, 540)
 
         self._xcorr_root = xcorr_root
+        # Per-pair-label cache of sign-flip permutation p-values. Each pair's
+        # best-lag array (and thus its p-value) is identical across cluster
+        # re-renders, so this avoids re-running the 10k-permutation test for
+        # every still-included pair on every Apply click.
+        self._pval_cache: dict[str, float] = {}
         # Recording label = human-readable name shown in the title
         # bar. ``xcorr_root`` lives at
         # ``<plane0>/<prefix>cluster_results/<cluster_folder>/cross_correlation_full``
@@ -541,10 +552,20 @@ class ViolinWindow(ctk.CTkToplevel):
                               transform=self.ax_corr.transAxes)
 
         if lag_arrays:
+            # Reuse cached per-pair p-values across cluster-filter renders;
+            # only newly-seen pairs pay the permutation test.
+            lag_pvals = []
+            for label, arr in zip(lag_labels, lag_arrays):
+                p = self._pval_cache.get(label)
+                if p is None:
+                    p = _sign_flip_pvalue(arr)
+                    self._pval_cache[label] = p
+                lag_pvals.append(p)
             _plot_lag_violin(
                 self.ax_lag, lag_labels, lag_arrays,
                 "Lag at peak correlation (s)",
                 f"Per-pair best-lag distribution  ({title_suffix})",
+                pvals=lag_pvals,
             )
         else:
             self.ax_lag.set_axis_off()
@@ -965,6 +986,21 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 sigA, sigB, fps, max_lag_seconds=eff_max_lag)
         except Exception as e:
             messagebox.showerror("xcorr failed", str(e))
+            return
+
+        # A constant (zero-variance) ROI makes single_pair_xcorr_curve return
+        # an all-zero r, where np.argmax picks index 0 (the most-negative lag)
+        # and would report a confident-but-meaningless "peak: lag=-2.000s,
+        # r=0.000". Flag it as undefined instead.
+        if not np.any(np.isfinite(r)) or np.allclose(r, 0.0):
+            messagebox.showinfo(
+                "Flat trace",
+                f"ROI {iA} or ROI {iB} is constant over this window; "
+                "cross-correlation is undefined.")
+            self._sp_placeholder(
+                "Cross-correlation undefined (a selected ROI is "
+                "constant over this window).")
+            self.sp_canvas.draw_idle()
             return
 
         peak_idx = int(np.argmax(r))

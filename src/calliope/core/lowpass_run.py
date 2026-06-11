@@ -94,17 +94,28 @@ def compute_lowpass_and_dt(
     sos = None
     report_every = max(1, N // 20)
     t0 = time.time()
-    for i in range(N):
-        trace = np.asarray(src[:, i], dtype=np.float32)
-        lp, _, sos = utils.lowpass_causal_1d(
-            trace, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
-            zi=None, sos=sos)
-        dt = utils.sg_first_derivative_1d(
-            lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
-        lp_mm[:, i] = lp
-        dt_mm[:, i] = dt
-        if progress_cb is not None and (i + 1) % report_every == 0:
-            progress_cb(f"{i + 1}/{N} ROIs ({time.time() - t0:.1f}s)")
+    # ``src`` is a C-order (T, N) memmap, so a single column src[:, i] is
+    # maximally strided -- each per-ROI read touches every page of the file,
+    # so N reads scan the whole (multi-GB) file N times. Read a contiguous
+    # band of columns into RAM once per block, then iterate its in-memory
+    # columns; this bounds the strided I/O to ceil(N / col_blk) passes while
+    # preserving the per-ROI sos reuse and streaming semantics.
+    col_blk = max(1, min(N, 256))
+    for j0 in range(0, N, col_blk):
+        j1 = min(N, j0 + col_blk)
+        block = np.ascontiguousarray(src[:, j0:j1])
+        for k in range(j1 - j0):
+            i = j0 + k
+            trace = block[:, k]
+            lp, _, sos = utils.lowpass_causal_1d(
+                trace, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
+                zi=None, sos=sos)
+            dt = utils.sg_first_derivative_1d(
+                lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
+            lp_mm[:, i] = lp
+            dt_mm[:, i] = dt
+            if progress_cb is not None and (i + 1) % report_every == 0:
+                progress_cb(f"{i + 1}/{N} ROIs ({time.time() - t0:.1f}s)")
 
     lp_mm.flush()
     dt_mm.flush()

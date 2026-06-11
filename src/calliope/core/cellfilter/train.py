@@ -168,6 +168,12 @@ def _run_epoch(model, loader, device, optim=None, pos_weight=None):
         all_scores.append(torch.sigmoid(logit).detach().cpu().numpy())
         all_labels.append(label.detach().cpu().numpy())
 
+    # No batches were seen (empty loader, e.g. an empty val split when a
+    # class has a single ROI) -> np.concatenate([]) would raise. Return the
+    # zero loss and NaN metrics, which downstream formatting already handles.
+    if not all_scores:
+        return total_loss / max(1, total_n), float("nan"), float("nan")
+
     # Concatenate every batch's scores / labels and compute the
     # epoch-level metrics.
     scores = np.concatenate(all_scores)

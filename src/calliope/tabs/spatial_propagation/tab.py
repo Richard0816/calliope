@@ -567,11 +567,16 @@ class SpatialPropagationTab(ctk.CTkFrame):
         self._data["first_time"] = first_time_spks
         if not quiet:
             n_active_per_event = A_spks.sum(axis=0)
-            self.status_var.set(
-                f"Using spks: median {int(np.median(n_active_per_event))} "
-                f"ROIs / event "
-                f"(min {int(n_active_per_event.min())}, "
-                f"max {int(n_active_per_event.max())}).")
+            if n_active_per_event.size == 0:
+                # 0-event recording: A_spks is (N_kept, 0), so median/min/max
+                # would raise on the empty array.
+                self.status_var.set("Using spks: no events to summarize.")
+            else:
+                self.status_var.set(
+                    f"Using spks: median "
+                    f"{int(np.median(n_active_per_event))} ROIs / event "
+                    f"(min {int(n_active_per_event.min())}, "
+                    f"max {int(n_active_per_event.max())}).")
 
     def _load_spks(self, plane0: Path, kept_idx: np.ndarray) -> np.ndarray:
         """Read ``spks.npy`` from a plane0 folder, subset to the kept
@@ -877,12 +882,22 @@ class SpatialPropagationTab(ctk.CTkFrame):
             return
 
         # Pixel positions; the test is rotation-invariant so the px↔µm
-        # conversion only matters for the scatter axis labels.
+        # conversion only matters for the scatter axis labels. Reuse the
+        # per-ROI centroids _ingest_results precomputed once into
+        # xs_all/ys_all (same np.median over stat_filtered, positionally
+        # aligned), instead of recomputing 2*N_active medians on every
+        # event-nav click. Fall back to the per-call loop for older _data.
         stat_filtered = data["stat_filtered"]
-        xs = np.array([float(np.median(stat_filtered[i]["xpix"]))
-                       for i in roi_local], dtype=float)
-        ys = np.array([float(np.median(stat_filtered[i]["ypix"]))
-                       for i in roi_local], dtype=float)
+        xs_all = data.get("xs_all")
+        ys_all = data.get("ys_all")
+        if xs_all is not None and ys_all is not None:
+            xs = np.asarray(xs_all, dtype=float)[roi_local]
+            ys = np.asarray(ys_all, dtype=float)[roi_local]
+        else:
+            xs = np.array([float(np.median(stat_filtered[i]["xpix"]))
+                           for i in roi_local], dtype=float)
+            ys = np.array([float(np.median(stat_filtered[i]["ypix"]))
+                           for i in roi_local], dtype=float)
         ts_seconds = first_col[roi_local].astype(float)
         # Spearman only cares about ordering, so either frame index or
         # seconds works as t. Use frames when fps is known (matches the

@@ -67,6 +67,9 @@ def _sg_derivative_gpu(x, fps: float, win_ms: float, poly: int):
 def _gpu_process_all(
     F_cell: np.ndarray,
     F_neuropil: np.ndarray,
+    dff_out: np.ndarray,
+    lp_out: np.ndarray,
+    dt_out: np.ndarray,
     *,
     r: float,
     fps: float,
@@ -77,17 +80,21 @@ def _gpu_process_all(
     roi_chunk: int | None = None,
     pad: int = 64,
 ):
-    """Core GPU pipeline.  F_cell / F_neuropil must be (T, N) float32."""
+    """Core GPU pipeline.  F_cell / F_neuropil must be (T, N) float32.
+
+    Results are written directly into the supplied ``(T, N)`` float32
+    output arrays (the open ``w+`` memmaps), avoiding a second full set of
+    host result buffers that would otherwise be allocated and copied.
+    """
     T, N = F_cell.shape
     if roi_chunk is None or roi_chunk <= 0:
         roi_chunk = N
 
-    n_baseline = max(3, min(T, int(round(baseline_sec * fps))))
+    # Floor at 1 frame (not 3) to match the CPU reference
+    # utils.first_n_min_df_over_f_1d (max(1, ...) then min(., n)); a floor of
+    # 3 would diverge from the CPU path for tiny baseline windows.
+    n_baseline = max(1, min(T, int(round(baseline_sec * fps))))
     sos_gpu = cp.asarray(_butter_sos(fps, cutoff_hz))
-
-    dff_out = np.empty((T, N), dtype=np.float32)
-    lp_out = np.empty((T, N), dtype=np.float32)
-    dt_out = np.empty((T, N), dtype=np.float32)
 
     for start in range(0, N, roi_chunk):
         end = min(N, start + roi_chunk)
@@ -96,6 +103,27 @@ def _gpu_process_all(
         Fn = cp.asarray(F_neuropil[:, start:end], dtype=cp.float32)
 
         F_corr = Fc - r * Fn
+        # Match CPU first_n_min_df_over_f_1d's non-finite handling: linearly
+        # interpolate NaN/Inf samples per ROI before computing the baseline,
+        # so a single bad sample doesn't turn the whole ROI's dF/F into NaN
+        # (which would silently diverge from the CPU path). Only round-trips
+        # to the host when non-finite values are actually present.
+        finite = cp.isfinite(F_corr)
+        if not bool(finite.all()):
+            Fc_host = cp.asnumpy(F_corr)             # (T, chunk)
+            fin_host = np.isfinite(Fc_host)
+            xs = np.arange(T)
+            for j in range(Fc_host.shape[1]):
+                col_fin = fin_host[:, j]
+                if col_fin.all():
+                    continue
+                if not col_fin.any():
+                    Fc_host[:, j] = 0.0              # all-NaN ROI -> finite 0
+                else:
+                    Fc_host[:, j] = np.interp(
+                        xs, np.flatnonzero(col_fin),
+                        Fc_host[col_fin, j]).astype(np.float32)
+            F_corr = cp.asarray(Fc_host, dtype=cp.float32)
         # match CPU first_n_min_df_over_f_1d: mean of the first-N-min window
         F0 = cp.mean(F_corr[:n_baseline, :], axis=0, keepdims=True)
         F0_safe = cp.maximum(F0, cp.full_like(F0, 1e-9))
@@ -138,7 +166,7 @@ def _gpu_process_all(
     except Exception:
         pass
 
-    return dff_out, lp_out, dt_out
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +215,16 @@ def process_suite2p_traces_gpu(
                       mode="w+", dtype="float32", shape=shape)
 
     t0 = time.time()
-    dff, lp, dt = _gpu_process_all(
+    # Write results straight into the open memmaps instead of allocating a
+    # second full (T, N) host array per output and copying it back.
+    _gpu_process_all(
         F_t, Fneu_t,
+        dff_mm, lp_mm, dt_mm,
         r=r, fps=fps, baseline_sec=baseline_sec,
         cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
         roi_chunk=roi_chunk,
     )
     print(f"[GPU] {N} ROIs × {T} frames in {time.time() - t0:.2f}s")
 
-    dff_mm[:] = dff
-    lp_mm[:] = lp
-    dt_mm[:] = dt
     dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
     del dff_mm, lp_mm, dt_mm

@@ -2713,12 +2713,25 @@ def s2p_load_spks(plane0: Union[str, Path],
     if spks_full.ndim != 2:
         raise ValueError(
             f"Unexpected spks.npy shape {spks_full.shape}")
-    # Pick whichever axis matches the kept-ROI range.
-    n_rois_axis = (0 if spks_full.shape[0] >= int(kept_idx.max()) + 1
-                   else 1)
+    # Canonical Suite2p layout is (N_total, T) -- same as F.npy -- so axis 0
+    # is the ROI axis. Only flip to axis 1 for a transposed (T, N_total)
+    # variant, detected when axis 0 provably cannot hold the ROI index range
+    # but axis 1 can. (The old ``shape[0] >= max+1`` test was ambiguous: for a
+    # genuinely transposed file where both axes exceed the range it would pick
+    # the time axis and silently return mis-oriented traces.) Also guard the
+    # empty kept_idx case, which would otherwise crash on ``kept_idx.max()``.
+    n_rois_axis = 0
+    if kept_idx.size:
+        max_id = int(kept_idx.max())
+        if spks_full.shape[0] <= max_id < spks_full.shape[1]:
+            n_rois_axis = 1
     if n_rois_axis == 0:
+        if kept_idx.size == 0:
+            return np.empty((spks_full.shape[1], 0), np.float32)   # (T, 0)
         spks = spks_full[kept_idx, :].T            # (T, N_kept)
     else:
+        if kept_idx.size == 0:
+            return np.empty((spks_full.shape[0], 0), np.float32)   # (T, 0)
         spks = spks_full[:, kept_idx]              # (T, N_kept)
     return np.ascontiguousarray(spks, dtype=np.float32)
 
@@ -2747,7 +2760,14 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     Returns ``(dff, low, dt, T, N_kept)``.
     """
     root = Path(root)
-    F, _, num_frames, num_rois, _ = s2p_load_raw(root)
+    # We only need the (N_ROIs, T) shape to size the memmap views below --
+    # never the F/Fneu data itself. Read just the .npy shape header via mmap
+    # instead of np.load-ing both full (N_ROIs, T) float32 arrays (hundreds
+    # of MB each) into RAM. F.npy is canonically (N_ROIs, T) (see
+    # s2p_infer_orientation), so unpack accordingly.
+    _F = np.load(root / "F.npy", mmap_mode="r", allow_pickle=False)
+    num_rois, num_frames = _F.shape
+    del _F  # drop the header mmap handle
 
     if is_filtered_prefix(prefix):
         # Size against the mask the memmaps were written with (persisted
@@ -2755,9 +2775,8 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
         # so a drifted live mask can't request a wrong-shaped mapping
         # ([WinError 8]). See resolve_filtered_mask.
         dff_path = root / f"{prefix}dff.memmap.float32"
-        mask, num_rois = resolve_filtered_mask(
+        _mask, num_rois = resolve_filtered_mask(
             root, num_rois, memmap_path=dff_path, T=num_frames)
-        F = F[mask, :]
 
     dff = np.memmap(root / f"{prefix}dff.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
     low = np.memmap(root / f"{prefix}dff_lowpass.memmap.float32", dtype="float32", mode="r",
@@ -2821,6 +2840,10 @@ _FLAT_FROM_SETTINGS: dict[str, tuple[str, ...]] = {
     "denoise":                   ("detection", "denoise"),
     "threshold_scaling":         ("detection", "threshold_scaling"),
     "max_overlap":               ("detection", "max_overlap"),
+    # Exposed under the flat alias the suite2p cache comparator uses
+    # (suite2p_pipeline._CACHE_COMPARE_KEYS reads 'high_pass'); without this
+    # the cached view lacked the key and every cache check falsely missed.
+    "high_pass":                 ("detection", "highpass_time"),
     "spatial_scale":             ("detection", "sparsery_settings", "spatial_scale"),
     "max_iterations":            ("detection", "sourcery_settings", "max_iterations"),
     # classification
