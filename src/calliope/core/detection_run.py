@@ -820,6 +820,10 @@ def run_detection(
     cellpose_cfg = _build_cellpose_cfg(params)
     hard_cap = int(params.get("hard_cap", 60000))
     max_overlap = float(params.get("max_overlap", 0.3))
+    # User's FPS override (0 = unset) so suite2p's deconvolution / spike
+    # timing run at the real acquisition rate rather than the baked-in
+    # fallback; the same value drives the dF/F fps in compute_dff_memmaps.
+    fps_override = float(params.get("fps_override", 0.0) or 0.0)
 
     # Tier 2 #13: Cellpose-SAM second pass on Vcorr. Same off-by-default
     # pattern as the GUI tab -- callers opt in via params, the runner
@@ -846,6 +850,7 @@ def run_detection(
         hard_cap=hard_cap,
         max_overlap=max_overlap,
         tau_override=tau_override,
+        fps_override=fps_override,
         enable_sam_vcorr_pass=enable_sam,
         sam_vcorr_cfg=sam_cfg,
         verbose=True,

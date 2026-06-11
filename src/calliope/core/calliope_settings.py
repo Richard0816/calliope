@@ -36,8 +36,11 @@ from typing import Any
 #       (Rupprecht et al. bioRxiv 2025, doi:10.1101/2025.03.03.641129); note
 #       this is NOT the old 0.137 s cultured-neuron half-decay that pre-
 #       2026-05-26 builds used.
-#     * ``fs`` is the lab's 2-photon scope's nominal frame rate; the tab
-#       overrides per recording from the notes.txt sidecar when present.
+#     * ``fs`` is only a FALLBACK frame rate (the lab's 2-photon scope's
+#       nominal rate). Tab 3's "FPS override" sets the real per-recording fs
+#       via ``Suite2pPipelineConfig.fs_override`` (overlaid in
+#       ``load_base_settings``). When no override is given the pipeline warns
+#       that this rig-specific fallback is being used.
 #     * ``registration.batch_size`` is much larger than suite2p's default
 #       because the rig has plenty of RAM for the registration buffer; the
 #       runtime ``change_batch_according_to_free_ram`` helper trims it

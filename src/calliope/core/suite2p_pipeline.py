@@ -777,6 +777,13 @@ class Suite2pPipelineConfig:
     # settings dict from ``calliope.core.calliope_settings``.
     tau_override: Optional[float] = None
 
+    # ---- Per-recording fs (acquisition frame rate, Hz) ----
+    # Tab 3's "FPS override" flows in here so suite2p's deconvolution / spike
+    # timing run at the user's true rate. ``None`` (or <= 0) falls back to the
+    # rig-specific ``fs`` in the base settings, and ``load_base_settings``
+    # warns that the baked-in fallback is being used.
+    fs_override: Optional[float] = None
+
     # ---- Caching ----
     # When True, each pass checks its save_dir for an existing completed
     # suite2p run with matching settings and reuses it instead of rerunning.
@@ -919,6 +926,20 @@ def load_base_settings(config: Suite2pPipelineConfig):
         settings['tau'] = float(config.tau_override)
         if config.verbose:
             print(f"Set tau={settings['tau']} from GCaMP-variant picker")
+
+    # --- Sample-specific fs (acquisition frame rate, Hz) ---
+    # Apply the user's FPS override so suite2p's deconvolution / spike timing
+    # match the real acquisition rate. With no override, keep the base-settings
+    # fs but warn that it is a rig-specific fallback -- silently running another
+    # scope at this rate would mis-scale tau-to-decay and spike timing.
+    if config.fs_override is not None and float(config.fs_override) > 0:
+        settings['fs'] = float(config.fs_override)
+        if config.verbose:
+            print(f"Set fs={settings['fs']} Hz from the FPS override")
+    elif config.verbose:
+        print(f"[fps] WARNING: no frame rate provided; suite2p using the "
+              f"default fs={settings.get('fs')} Hz -- verify this matches "
+              f"your acquisition (set Tab 3's 'FPS override').")
 
     # --- Dynamic batch size (frame-size aware + closed-loop in batch mode) ---
     # First recording in a queue: frame-size-aware initial estimate.

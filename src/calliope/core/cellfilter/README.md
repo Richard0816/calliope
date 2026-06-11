@@ -127,9 +127,9 @@ Schema (column order canonical, see `config.LABELS_CSV_COLUMNS`):
 
 ```
 plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso
-E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  0, 1, 2026-05-12T14:03:22
-E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  1, 0, 2026-05-12T14:03:25
-E:\calliope\2024-07-01_00018\detection\final\suite2p\plane0,  2024-07-01_00018,  2, 1, 2026-05-12T14:03:28
+<data-root>\REC_0001\detection\final\suite2p\plane0,  REC_0001,  0, 1, 2026-05-12T14:03:22
+<data-root>\REC_0001\detection\final\suite2p\plane0,  REC_0001,  1, 0, 2026-05-12T14:03:25
+<data-root>\REC_0001\detection\final\suite2p\plane0,  REC_0001,  2, 1, 2026-05-12T14:03:28
 ...
 ```
 

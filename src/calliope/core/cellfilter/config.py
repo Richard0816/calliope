@@ -33,11 +33,11 @@ Sections
 
 History
 -------
-Pre-2026-05-12 this module hardcoded ``LABELS_CSV =
-F:\\roi_curation.csv``, ``DATA_ROOT = F:\\data\\2p_shifted``, and
-``CHECKPOINT_DIR = F:\\cellfilter_checkpoints``. Training was fragile
-to drive-letter changes and could only find recordings whose folders
-sat in a specific ``Cx/`` or ``Hip/`` layout under ``DATA_ROOT``.
+Pre-2026-05-12 this module hardcoded its labels CSV, data root, and
+checkpoint directory to fixed external-drive paths. Training was
+fragile to drive-letter changes and could only find recordings whose
+folders sat in a specific ``Cx/`` or ``Hip/`` layout under the old
+data root.
 
 The 2026-05-12 refactor moved labels in-project, switched the CSV
 schema to carry the absolute ``plane0_path`` per row (so the trainer

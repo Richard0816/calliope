@@ -104,8 +104,11 @@ from . import utils
 # CONFIGURATION
 # ============================================================================
 
-TIFF_FOLDER = r'D:\2024-11-20_00003'
-SAVE_FOLDER = r'D:\sparse_plus_cellpose\2024-11-20_00003'
+# Standalone-harness paths (only used by ``main()`` below when this module
+# is run directly; the GUI / batch pipeline imports functions and never
+# touches these). Fill in your own input/output folders before running.
+TIFF_FOLDER = r'<path-to-tiff-folder>'
+SAVE_FOLDER = r'<path-to-save-folder>'
 # PATH_TO_OPS is kept None: base settings come from
 # calliope.core.calliope_settings.build_base_settings (in-source).
 # Set to a .npy path here only if you want to override with a saved
@@ -526,6 +529,7 @@ def run(
     hard_cap: int | None = HARD_CAP,
     max_overlap: float = CELLPOSE_MERGE_MAX_OVERLAP,
     tau_override: float | None = None,
+    fps_override: float | None = None,
     settings_override: dict | None = None,
     enable_sam_vcorr_pass: bool = False,
     sam_vcorr_cfg: dict | None = None,
@@ -607,6 +611,8 @@ def run(
     )
     if tau_override is not None:
         cfg_kwargs["tau_override"] = float(tau_override)
+    if fps_override is not None and float(fps_override) > 0:
+        cfg_kwargs["fs_override"] = float(fps_override)
     if settings_override:
         cfg_kwargs["settings_override"] = dict(settings_override)
     cfg = Suite2pPipelineConfig(**cfg_kwargs)

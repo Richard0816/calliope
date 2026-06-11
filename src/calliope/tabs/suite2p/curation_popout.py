@@ -19,8 +19,8 @@ Side effects of a flip
 ----------------------
 1. Mutates ``<plane0>/iscell.npy[roi, 0]`` to the new value.
 2. Appends a row to the curation CSV
-   (``cellfilter.config.LABELS_CSV`` by default,
-   ``F:\\roi_curation.csv``) with columns
+   (``cellfilter.config.LABELS_CSV``, by default the in-project
+   ``calliope/data/cellfilter_labels.csv``) with columns
    ``recording_ID, ROI_number, user_defined_cell``. This is the same
    CSV ``cellfilter.train.main()`` reads, so retraining picks up the
    new labels immediately.

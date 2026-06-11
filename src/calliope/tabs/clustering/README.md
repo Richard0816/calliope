@@ -245,7 +245,7 @@ Stacked panels:
 1. **Heatmap** of filtered lowpass dF/F restricted to that ROI's cluster (`(n_in_cluster, T)`, per-row min-max normalised, `magma` colormap). The cluster's colour from the spatial map tints the title background so the popout reads at a glance.
 2. **Event raster** for the same rows. In the GUI this is the `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout: the live `AppState.event_results` payload published by Tab 5 does **not** carry a precomputed `'raster'` (only the headless event-detection runner emits one), so the `event_results['raster']` branch is forward-compatible scaffolding that activates only if a future payload supplies a column-matched raster (and its row-alignment to the filtered stat list is established).
 
-Both panels share the time axis (seconds when `notes.txt` provides fps, frame indices otherwise) and draw a yellow row marker for the clicked ROI's position within the cluster. The status bar lists the cluster's filtered-position roster (capped at 30 + overflow count).
+Both panels share the time axis (seconds, using the resolved frame rate — Tab 3's FPS override, else the default fallback) and draw a yellow row marker for the clicked ROI's position within the cluster. The status bar lists the cluster's filtered-position roster (capped at 30 + overflow count).
 
 The popout reuses Tab 6's already-loaded `_dff` and `_stat`, so no extra disk reads happen on click.
 

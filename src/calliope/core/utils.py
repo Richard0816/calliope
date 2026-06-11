@@ -744,22 +744,44 @@ def safe_recording_id(plane0) -> str:
         return save_folder_for_plane0(plane0).name
 
 
+# Set once we've warned that the baked-in fps fallback is being used, so the
+# log isn't spammed (one notice per process is enough to alert the user).
+_FPS_FALLBACK_WARNED = False
+
+
 def get_fps_from_notes(
         path: str,
-        notes_root: str = r"F:\notes_recordings",
+        notes_root: Optional[str] = None,
         default_fps: float = DEFAULT_FPS,
 ) -> float:
     """Resolve FPS for a recording, given ANY path inside that recording.
 
-    The lab keeps notes XLSX files keyed by date in ``F:\\notes_recordings``;
-    each contains a "2P settings" sheet whose rows describe one
-    recording per row, with columns including ``filename`` and
-    ``rate (hz)``. We search that sheet for the row matching the
+    Frame rate is a user-facing parameter (set per-run in the GUI / passed
+    through the pipeline params), so this notes-XLSX lookup is now an
+    **opt-in legacy convenience**, disabled by default. When ``notes_root``
+    is ``None`` (the default) the function simply returns ``default_fps``.
+
+    If a caller passes an explicit ``notes_root``, it is treated as a folder
+    of per-date notes XLSX files; each contains a "2P settings" sheet whose
+    rows describe one recording per row, with columns including ``filename``
+    and ``rate (hz)``. We search that sheet for the row matching the
     recording folder we're inside and read the frame rate.
 
-    Safe fallback: any failure (missing notes, missing column, weird
-    value) returns ``default_fps`` instead of raising.
+    Safe fallback: any failure (no ``notes_root``, missing notes, missing
+    column, weird value) returns ``default_fps`` instead of raising.
     """
+    # Notes lookup is opt-in: with no notes_root we hand back the caller's
+    # default fps rather than reaching for any lab-specific drive. The default
+    # is a rig-specific fallback, so warn once that it's being used -- a user
+    # on a different scope would otherwise be silently mis-scaled.
+    if not notes_root:
+        global _FPS_FALLBACK_WARNED
+        if not _FPS_FALLBACK_WARNED:
+            _FPS_FALLBACK_WARNED = True
+            print(f"[fps] WARNING: no frame rate provided; assuming "
+                  f"{default_fps} Hz. Verify this matches your acquisition "
+                  f"(set Tab 3's 'FPS override'; 0 = this default).")
+        return default_fps
     # The whole function is wrapped in a try/except because we'd
     # rather hand the caller a sane default than crash the GUI on a
     # missing notes file.

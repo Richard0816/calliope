@@ -252,7 +252,7 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 |---|---|---|
 | `prefix` | `r0p7_filtered_` | dF/F memmap prefix (must match Tab 6 export). |
 | `cluster_folder` | `gui_recluster` | Subfolder under `r0p7_filtered_cluster_results/`. |
-| `fps` | from notes (fallback 15.07) | Editable at runtime. |
+| `fps` | Tab 3 FPS override, else fallback 15.07 | Editable at runtime. |
 | `max_lag_seconds` | 2.0 | Search range ±L = ±round(max_lag · fps). |
 | `also output zero-lag corr` | True | Track the lag-0 matrix during the per-lag loop. |
 | `use GPU if available` | True | Falls back to NumPy if CuPy is missing. |
