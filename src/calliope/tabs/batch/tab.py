@@ -2490,11 +2490,52 @@ class BatchTab(ctk.CTkFrame):
             f"  [{stage}] FAILED: {exc}\n{traceback.format_exc()}")
         self._on_row_done()
 
+    def _maybe_export_nwb_for_row(self) -> None:
+        """Export the just-finished recording to NWB when the row's
+        ``export_nwb`` param is set.
+
+        Reads the still-on-scratch plane0 (so the .nwb is mirrored to the
+        output drive with the rest of the run) and writes
+        ``<recording_folder>/<id>.nwb``. Fully best-effort: missing pynwb,
+        an unfinished plane0, or a write error are logged and swallowed so
+        the batch never stalls on the export.
+        """
+        row = self._current_row
+        params = getattr(row, "params", None) or {}
+        if not bool(params.get("export_nwb", False)):
+            return
+        plane0 = self._row_results.get("plane0")
+        if not plane0:
+            return
+        try:
+            from ...core import nwb_export
+            if not nwb_export.nwb_available():
+                self._append_log(
+                    "  [nwb] export_nwb set but pynwb not installed; "
+                    "skipping (pip install 'calliope[nwb]')")
+                return
+            plane0 = Path(plane0)
+            ident = row.identifier
+            out_nwb = plane0.parents[3] / f"{ident}.nwb"
+            self._append_log(f"  [nwb] exporting -> {out_nwb.name}")
+            nwb_export.export_recording_to_nwb(
+                plane0, out_nwb, recording_id=ident)
+            self._append_log("  [nwb] done")
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"  [nwb] export failed ({e}); continuing")
+
     def _on_row_done(self) -> None:
         elapsed = time.time() - self._row_t0
         self._row_results["total_s"] = elapsed
         if self._row_results["status"] == "running":
             self._row_results["status"] = "ok"
+
+        # Optional NWB export. Done here -- after every stage, before the
+        # scratch->final finalize -- so the .nwb (a) includes the event
+        # windows the event stage wrote and (b) gets mirrored to the output
+        # drive along with the rest of the recording. Synchronous and
+        # best-effort: a failure never changes the row status.
+        self._maybe_export_nwb_for_row()
 
         # Finalize: copy this recording's tree from scratch to the real
         # output folder, then delete the scratch copy. We do this on

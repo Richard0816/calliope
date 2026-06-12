@@ -1,7 +1,6 @@
 """Regression tests for QcTab GIF playback (Tab 2).
 
-These guard the bugs the LLM-council audit (2026-05-28) found in the old
-buffered design, where re-checking the "Animate" toggle could silently
+These guard bugs in the old buffered design, where re-checking the "Animate" toggle could silently
 do nothing:
 
   * pausing must not destroy state, so resuming never re-reads the file;

@@ -687,6 +687,56 @@ def compute_partial_correlation(Z, ridge: float = 1e-6):
     return P
 
 
+def _save_corr_heatmaps(pair_dir, cA, cB, roisA, roisB,
+                        pearson_block=None, partial_block=None):
+    """Render this cluster pair's zero-lag Pearson and partial-correlation
+    matrices as a side-by-side heatmap PNG in ``pair_dir``.
+
+    ``pearson_block`` / ``partial_block`` are (nA, nB) matrices over the
+    pair's ROIs (rows = cluster A, cols = cluster B). Either may be None;
+    a panel with no matrix shows an explanatory placeholder. Uses the Agg
+    canvas directly so it is safe to call off the GUI thread and in
+    headless/batch runs. Returns the written PNG path.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    nA = len(roisA)
+    nB = len(roisB)
+    panels = [("Zero-lag Pearson r", pearson_block),
+              ("Partial correlation", partial_block)]
+    fig = Figure(figsize=(11, 4.8), dpi=130)
+    FigureCanvasAgg(fig)
+    for col, (title, M) in enumerate(panels):
+        ax = fig.add_subplot(1, 2, col + 1)
+        if M is None or np.size(M) == 0:
+            ax.text(0.5, 0.5, f"{title}\n(not computed)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=11, color="0.4")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        im = ax.imshow(np.asarray(M, dtype=float), aspect="auto",
+                       cmap="RdBu_r", vmin=-1.0, vmax=1.0,
+                       interpolation="nearest")
+        ax.set_title(f"{title}  ({cA} x {cB})", fontsize=10)
+        ax.set_xlabel(f"{cB} ROIs (n={nB})", fontsize=9)
+        ax.set_ylabel(f"{cA} ROIs (n={nA})", fontsize=9)
+        # Per-ROI tick labels only when the block is small enough to read.
+        if nA <= 20:
+            ax.set_yticks(range(nA))
+            ax.set_yticklabels([str(int(r)) for r in roisA], fontsize=7)
+        if nB <= 20:
+            ax.set_xticks(range(nB))
+            ax.set_xticklabels([str(int(r)) for r in roisB], fontsize=7,
+                               rotation=90)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    out_png = pair_dir / f"{cA}x{cB}_corr_heatmaps.png"
+    fig.savefig(out_png)
+    return out_png
+
+
 def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
                             zero_lag_corr=None, p_value=None,
                             p_value_fdr=None, partial_corr=None,
@@ -965,12 +1015,28 @@ def run_cluster_xcorr_full_fast(
                     block[np.ix_(rowmap, colmap)] = block_valid
                 partial_block = block
 
+            # Write the zero-lag Pearson column whenever it is requested OR
+            # whenever partial corr is on -- so the per-pair CSV always
+            # carries the numbers behind the heatmap PNG below and the user
+            # can recreate either matrix from the CSV alone.
             _write_pair_summary_csv(
                 summary_path, roisA, roisB, best_lag, max_c,
-                zero_lag_corr=z0 if zero_lag else None,
+                zero_lag_corr=z0 if (zero_lag or compute_partial) else None,
                 p_value=p_val, p_value_fdr=p_val_fdr,
                 partial_corr=partial_block,
             )
+
+            # When partial correlation is requested, also drop a side-by-side
+            # Pearson | partial heatmap PNG next to the CSV so the matrix view
+            # ships with the run (no separate GUI window needed).
+            if compute_partial:
+                try:
+                    _save_corr_heatmaps(
+                        pair_dir, cA, cB, roisA, roisB,
+                        pearson_block=z0, partial_block=partial_block)
+                except Exception as _hm_exc:
+                    print(f"[xcorr] heatmap render failed for "
+                          f"{cA}x{cB}: {_hm_exc}")
 
             done_groups += 1
             if progress_cb is not None:

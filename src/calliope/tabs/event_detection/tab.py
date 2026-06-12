@@ -609,8 +609,9 @@ class EventDetectionTab(ctk.CTkFrame):
         # Circular-shift null floor: computed off-thread (a few seconds at
         # 200 shuffles) so the popout opens instantly with the observed
         # histogram and the null p95/p99 reference lines fill in when ready.
-        # Per the 2026-05-29 council verdict the null is a *floor reference*,
-        # not an auto-applied default.
+        # By default (auto_min_prominence) the null p99 drives the applied
+        # per-recording floor; in this popout the null lines are a reference
+        # for picking a manual value, and applying one here turns auto off.
         onsets_by_roi = self._last_data.get("onsets_by_roi")
         T = self._last_data.get("T")
         fps = self._last_data.get("fps")

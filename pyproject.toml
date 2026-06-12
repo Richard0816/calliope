@@ -89,6 +89,11 @@ dev = ["pytest>=7"]
 gpu-cuda11 = ["cupy-cuda11x"]
 gpu-cuda12 = ["cupy-cuda12x"]
 
+# NWB / DANDI export. Optional: the base pipeline never
+# imports pynwb -- calliope.core.nwb_export guards every import.
+#   pip install -e ".[nwb]"
+nwb = ["pynwb>=2.5", "nwbinspector>=0.4"]
+
 [project.scripts]
 calliope = "calliope.pipeline_gui:main"
 

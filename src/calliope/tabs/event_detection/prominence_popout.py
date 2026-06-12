@@ -24,12 +24,12 @@ built by ``utils.circular_shift_null_prominences`` — independently
 time-shifting each ROI's onset train so any cross-cell coincidence is
 pure chance — and answers "how tall does a density bump get from
 random coincidence alone?". A real population event must clear that
-floor. Per the 2026-05-29 council verdict, the null is shown as a
-*floor reference*, NOT auto-applied as the threshold: the user's
-hand-tuned ``min_prominence`` consistently sits at or above the null
-floor (well above it on event-rich recordings), so the human stays in
-the loop and just gains a principled lower bound. The null is computed
-off-thread by Tab 5 and pushed in via :meth:`ProminencePopout.set_null_percentiles`.
+floor. By default (``auto_min_prominence``) the null p99 is applied
+automatically as the per-recording prominence floor; this popout lets
+the user inspect the distribution against the p95/p99 lines and, if
+desired, apply a manual ``min_prominence`` instead — applying a value
+here turns auto off. The null is computed off-thread by Tab 5 and
+pushed in via :meth:`ProminencePopout.set_null_percentiles`.
 
 Wiring
 ------

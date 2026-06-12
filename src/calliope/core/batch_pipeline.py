@@ -366,6 +366,25 @@ def run_recording(
             status="skipped",
             error="event detection did not produce event_data")
 
+    # ----- Optional: NWB / DANDI export ----------------
+    # Fired at the very end so the .nwb picks up the event windows the
+    # event-detection stage wrote to calliope_summary.xlsx. Best-effort:
+    # a failure never changes the pipeline's overall status.
+    if bool(params.get("export_nwb", False)) and plane0 is not None:
+        try:
+            from . import nwb_export
+            if nwb_export.nwb_available():
+                out_nwb = Path(save_folder) / f"{rec_id}.nwb"
+                _emit(f"nwb: exporting -> {out_nwb.name}")
+                nwb_export.export_recording_to_nwb(
+                    Path(plane0), out_nwb, recording_id=rec_id)
+                _emit("nwb: done")
+            else:
+                _emit("nwb: export_nwb set but pynwb not installed; "
+                      "skipping (pip install 'calliope[nwb]')")
+        except Exception as e:
+            _emit(f"nwb: FAILED -- {e}")
+
     return {
         "recording_id": rec_id,
         "save_folder": str(save_folder),

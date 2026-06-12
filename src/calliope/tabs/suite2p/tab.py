@@ -516,6 +516,10 @@ class Suite2pTab(ctk.CTkFrame):
             row, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_btn.pack(side="left", padx=(6, 0))
+        self.nwb_btn = ctk.CTkButton(
+            row, text="Export NWB", width=110,
+            command=self._on_export_nwb, state="disabled")
+        self.nwb_btn.pack(side="left", padx=(6, 0))
         ctk.CTkButton(row, text="Advanced...", width=110,
                       command=self._on_advanced).pack(side="left",
                                                       padx=(6, 0))
@@ -831,6 +835,7 @@ class Suite2pTab(ctk.CTkFrame):
                     baseline_min=baseline_min,
                     tau_override=tau_override,
                     raw_paths=getattr(result, "raw_paths", None),
+                    gcamp_label=gcamp_label,
                 )
                 self._log_queue.put(("done", None))
             except Exception as e:
@@ -852,6 +857,7 @@ class Suite2pTab(ctk.CTkFrame):
         baseline_min: float,
         tau_override: float = 1.0,
         raw_paths=None,
+        gcamp_label: Optional[str] = None,
     ) -> None:
         writer = QueueWriter(self._log_queue)
         params = dict(self._params)
@@ -924,6 +930,19 @@ class Suite2pTab(ctk.CTkFrame):
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
             self._log_queue.put(("plane0", final_plane0))
 
+            # Stamp the GUI-supplied GCaMP variant label into meta.json (the
+            # core extraction stage records tau/neuropil coef but not the
+            # label). Best-effort -- a metadata failure never sinks the run.
+            if gcamp_label:
+                try:
+                    from ...core import recording_meta
+                    recording_meta.update_meta(
+                        final_plane0,
+                        extraction={"gcamp_variant_label": gcamp_label},
+                    )
+                except Exception as _e:
+                    print(f"[GUI] could not stamp gcamp label: {_e}")
+
             self._stamp_pix_to_um(final_plane0, params)
 
             self._run_dff(final_plane0, baseline_mode, baseline_min)
@@ -934,6 +953,22 @@ class Suite2pTab(ctk.CTkFrame):
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
+
+            # Post-detection z-drift QC (detection only): writes
+            # zdrift_pc1.csv + zdrift_qc.png and stamps meta.json.
+            if bool(params.get("zdrift_qc", True)):
+                try:
+                    from ...core import utils, zdrift
+                    _zfps = float(params.get("fps_override", 0.0) or 0.0)
+                    if _zfps <= 0:
+                        _zfps = float(
+                            utils.get_fps_from_notes(str(final_plane0)))
+                    zinfo = zdrift.detect_zdrift(final_plane0, fps=_zfps)
+                    if zinfo.get("detected"):
+                        print(f"[GUI] z-drift QC: {zinfo['n_steps']} "
+                              f"step(s) flagged -> zdrift_qc.png")
+                except Exception as _ze:
+                    print(f"[GUI] z-drift QC failed: {_ze}")
 
             # Defer prune + raw-TIFF compression to a child process,
             # launched from the main thread in ``_on_done`` (the zstd
@@ -1383,6 +1418,7 @@ class Suite2pTab(ctk.CTkFrame):
 
         self.summary_btn.configure(state="normal")
         self.export_btn.configure(state="normal")
+        self.nwb_btn.configure(state="normal")
         try:
             self._write_summary(plane0, stat, keep, probs)
         except Exception as e:
@@ -1808,6 +1844,57 @@ class Suite2pTab(ctk.CTkFrame):
             except OSError:
                 return False
         return False
+
+    def _on_export_nwb(self) -> None:
+        """Export the current recording to an NWB file.
+
+        Reads the finished plane0 + meta.json and writes a DANDI-style
+        ``.nwb`` via :mod:`calliope.core.nwb_export`. Runs on a worker
+        thread because writing F / Fneu / dF/F can be slow for long
+        recordings.
+        """
+        plane0 = self._final_plane0
+        if plane0 is None:
+            messagebox.showinfo(
+                "No data", "Run detection or 'Load existing panels' first.")
+            return
+        from ...core import nwb_export
+        if not nwb_export.nwb_available():
+            messagebox.showwarning(
+                "pynwb not installed",
+                "NWB export needs the optional [nwb] extra:\n\n"
+                "    pip install 'calliope[nwb]'\n\n"
+                "(or: pip install pynwb)",
+            )
+            return
+        default_name = f"{plane0.parents[3].name}.nwb" \
+            if len(plane0.parents) >= 4 else "recording.nwb"
+        out = filedialog.asksaveasfilename(
+            title="Export to NWB",
+            defaultextension=".nwb",
+            initialfile=default_name,
+            filetypes=[("NWB files", "*.nwb"), ("All files", "*.*")],
+        )
+        if not out:
+            return
+
+        self.nwb_btn.configure(state="disabled")
+        self.status_var.set("Exporting NWB...")
+
+        def worker():
+            try:
+                path = nwb_export.export_recording_to_nwb(plane0, Path(out))
+                self.status_var.set(f"NWB -> {path}")
+            except Exception as e:  # noqa: BLE001
+                self.status_var.set("NWB export failed")
+                messagebox.showerror("NWB export failed", str(e))
+            finally:
+                try:
+                    self.nwb_btn.configure(state="normal")
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_export_figures(self, quiet: bool = False) -> None:
         """Re-render the Tab 3 detection panels as PNG+SVG and drop a

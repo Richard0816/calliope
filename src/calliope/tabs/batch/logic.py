@@ -452,6 +452,20 @@ def mirror_sync_pass(scratch: Path, final: Path,
                     keep_registration=keep_registration,
                     keep_shifted=keep_shifted):
                 continue
+            # Defer the large registered binary to the row-end
+            # ``synchronous_final_sweep``. suite2p rewrites ``data.bin`` IN
+            # PLACE during registration (size stays fixed, mtime advances on
+            # every flush), so its ``(size, mtime)`` signature flips on each
+            # settle and the continuous mirror would re-copy the whole
+            # multi-GB file on every >stability_window lull -- exactly the
+            # bandwidth the single-drive throttle is trying to conserve. The
+            # final sweep copies it once, after registration is complete, via
+            # its missing/size-mismatch check, so this drops only redundant
+            # in-row bytes, never the final output. (When keep_registration is
+            # False, data.bin was already skipped above.) Not marked "seen",
+            # so nothing pretends it was handled -- the mirror just skips it.
+            if sp.name == "data.bin":
+                continue
             try:
                 st = sp.stat()
             except OSError:
@@ -628,6 +642,20 @@ def build_batch_param_spec() -> list:
         seen.add("gcamp_tau_custom")
     except Exception:
         pass
+
+    # NWB / DANDI export: write a .nwb per recording at the end of the
+    # pipeline (so it picks up the event windows). Pipeline-wide flag
+    # consumed by the batch orchestrator's per-row finalize, not a tab.
+    spec.append({
+        "name": "export_nwb",
+        "label": "Export NWB file",
+        "type": "bool",
+        "default": False,
+        "group": "8. Output",
+        "help": "write a Neurodata Without Borders <rec>.nwb after the run "
+                "(needs the optional [nwb] extra)",
+    })
+    seen.add("export_nwb")
 
     # 3. Low-pass: cutoff first (binds to the slider value), then the
     # Tab 4 PARAM_SPEC entries for filter / derivative / slider bounds.

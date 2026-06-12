@@ -507,6 +507,34 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
     # cellfilter dataset loader) see a complete view.
     np.save(final_plane0 / 'ops.npy',    final_ops, allow_pickle=True)
 
+    # Stamp the per-recording parameters known at extraction time into the
+    # meta.json sidecar (single source of truth for downstream consumers and
+    # the NWB exporter). The GCaMP variant *label* is a GUI/headless string
+    # stamped separately by the caller; here we record what is in scope.
+    # A metadata write must never break the pipeline.
+    try:
+        from . import recording_meta
+        recording_meta.update_meta(
+            final_plane0,
+            registration={
+                "block_size": final_ops.get("block_size"),
+                "smooth_sigma": final_ops.get("smooth_sigma"),
+                "nonrigid": final_ops.get("nonrigid"),
+            },
+            detection={
+                "threshold_scaling": final_ops.get("threshold_scaling"),
+                "sparse_mode": final_ops.get("sparse_mode"),
+            },
+            extraction={
+                "neuropil_coef": float(neucoeff),
+                "tau_seconds": float(tau),
+            },
+            spike_inference={"backend": "oasis"},
+        )
+    except Exception as _meta_exc:
+        if verbose:
+            print(f"    [meta] could not write meta.json: {_meta_exc}")
+
     if verbose:
         n_accept = (int((iscell[:, 0] > 0).sum())
                     if iscell.ndim == 2 else int((iscell > 0).sum()))

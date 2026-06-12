@@ -497,6 +497,32 @@ def compute_dff_memmaps(
     perc = int(params.get("perc", 10))
     win_sec = float(params.get("win_sec", 45.0))
 
+    # Record the dF/F + low-pass provenance in the meta.json sidecar before
+    # either the GPU or CPU branch returns, so the NWB exporter and the
+    # cross-correlation tooltips can read back which parameters produced
+    # these memmaps. A metadata write must never break the pipeline.
+    try:
+        from . import recording_meta
+        recording_meta.update_meta(
+            plane0,
+            dff={
+                "baseline_mode": baseline_mode,
+                "baseline_percentile": perc,
+                "baseline_window_sec": win_sec,
+                "baseline_min_sec": float(baseline_min),
+                "fps": fps,
+            },
+            lowpass={
+                "cutoff_hz": cutoff_hz,
+                "filter_kind": "iir_butter",
+                "order": 2,
+                "group_delay_samples": None,
+            },
+            extraction={"neuropil_coef": r},
+        )
+    except Exception as _meta_exc:
+        print(f"[meta] could not stamp dF/F params: {_meta_exc}")
+
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
@@ -875,6 +901,38 @@ def run_detection(
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")
     compute_filtered_dff(plane0)
+
+    # Stamp the GCaMP variant label into meta.json when the caller provided
+    # it (the extraction stage records tau/neuropil coef but not the label,
+    # which is a GUI/headless-supplied string). Best-effort.
+    gcamp_label = params.get("gcamp_variant")
+    if gcamp_label:
+        try:
+            from . import recording_meta
+            recording_meta.update_meta(
+                plane0, extraction={"gcamp_variant_label": str(gcamp_label)})
+        except Exception as e:
+            if progress_cb is not None:
+                progress_cb(f"[detection] meta gcamp stamp failed: {e}")
+
+    # Post-detection z-drift QC: PCA over ROI dF/F, flag PC1 step changes,
+    # write zdrift_pc1.csv + zdrift_qc.png and stamp meta.json. Detection
+    # only -- no frames are dropped. Best-effort.
+    if bool(params.get("zdrift_qc", True)):
+        try:
+            from . import zdrift
+            fps_override = float(params.get("fps_override", 0.0) or 0.0)
+            _zfps = (fps_override if fps_override > 0
+                     else float(utils.get_fps_from_notes(str(plane0))))
+            zinfo = zdrift.detect_zdrift(
+                plane0, fps=_zfps, progress_cb=progress_cb)
+            if progress_cb is not None and zinfo.get("detected"):
+                progress_cb(
+                    f"[detection] z-drift QC: {zinfo['n_steps']} step(s) "
+                    f"flagged -> zdrift_qc.png")
+        except Exception as e:
+            if progress_cb is not None:
+                progress_cb(f"[detection] z-drift QC failed: {e}")
 
     prune_detection_intermediates(save_folder, progress_cb=progress_cb)
 

@@ -50,7 +50,7 @@ The levers:
 - **`on_tab_hidden()`**: `_stop_playback()` + `_close_gif()` (drops the OS file lock). The last frame stays visible.
 - **`on_tab_shown()`**: if Animate is ON, reopen from `self._gif_path` and resume; otherwise leave the still in place.
 
-History: the original design eagerly decoded **every** frame into a `list[ImageTk.PhotoImage]` and the OFF toggle sliced that list to one frame + `gc.collect()`. Re-checking Animate then had to re-read the file from disk — which silently did nothing if the file had moved/been deleted or no recording was loaded, and froze the UI while re-decoding a long clip (and `ImageTk.PhotoImage` must be built on the Tk main thread, so off-thread decoding can't fix that). Replaced with frame-at-a-time streaming 2026-05-28 after an LLM-council audit; regression tests live in `tests/test_qc_gif_playback.py`.
+History: the original design eagerly decoded **every** frame into a `list[ImageTk.PhotoImage]` and the OFF toggle sliced that list to one frame + `gc.collect()`. Re-checking Animate then had to re-read the file from disk — which silently did nothing if the file had moved/been deleted or no recording was loaded, and froze the UI while re-decoding a long clip (and `ImageTk.PhotoImage` must be built on the Tk main thread, so off-thread decoding can't fix that). Replaced with frame-at-a-time streaming 2026-05-28; regression tests live in `tests/test_qc_gif_playback.py`.
 
 ### Step 3 — Mean image
 
