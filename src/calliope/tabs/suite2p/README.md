@@ -283,6 +283,29 @@ Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 
 
 **Re-detection cost.** Once archived, re-running detection costs an extra ~1 min for `load_existing_preprocess` to regenerate the shifted from the compressed raw, plus the usual ~5 min of registration + detection. The acceptable trade for ~13 GB/recording saved.
 
+### Step 7 — `meta.json` provenance sidecar
+
+Every processed recording writes `<plane0>/meta.json`, a single provenance file downstream tools read as the source of truth for how the recording was produced. It is filled across the detection/extraction and dF/F stages and groups its fields by stage:
+
+- **registration** — `block_size`, `smooth_sigma`, `nonrigid`
+- **detection** — `threshold_scaling`, `sparse_mode`
+- **extraction** — `neuropil_coef`, `tau_seconds`, `gcamp_variant_label` (stamped from the Tab 3 GCaMP dropdown)
+- **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec`, `fps`
+- **lowpass** — `cutoff_hz`, `filter_kind`, `order`
+- **spike_inference** — `backend` (`"oasis"`)
+- **qc** — the z-drift fields written by Step 8
+
+Writes are atomic (temp file + replace). Reads are always safe: a missing file or missing key falls back to defaults, so an older recording without a sidecar still loads.
+
+### Step 8 — Z-drift QC
+
+After detection, a quick check flags axial (z) drift. It computes the first principal component (PC1) across all ROIs' dF/F — the dominant shared mode — and marks abrupt step changes in PC1 (robust MAD threshold) as candidate z-drift. It writes:
+
+- `zdrift_qc.png` — the PC1 trace with flagged frames marked.
+- `zdrift_pc1.csv` — columns `frame, time_s, pc1, is_step`, so the figure is fully recreatable from a plain CSV.
+
+The result is also stamped into `meta.json`'s `qc` section (`zdrift_detected`, `zdrift_n_steps`, `zdrift_step_frames`, `zdrift_pc1_var_explained`). This is detection only — it flags frames for the user to judge and never drops them (dropping would require re-running registration). On by default.
+
 ---
 
 ## 3. Outputs (in `plane0/`)
@@ -302,6 +325,9 @@ Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 
 | `r0p7_filtered_dff.memmap.float32` | `(T, N_kept)` | dF/F restricted to kept ROIs |
 | `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | legacy duplicate of the keep mask |
 | `r0p7_filtered_dff.csv` | optional | per-frame CSV view of filtered dF/F |
+| `meta.json` | dict | provenance sidecar (registration / detection / extraction / dF/F / lowpass / spike-inference / qc); atomic write, safe read |
+| `zdrift_qc.png` | figure | PC1 trace with flagged z-drift frames marked |
+| `zdrift_pc1.csv` | `(T, 4)` | `frame, time_s, pc1, is_step` — recreates `zdrift_qc.png` |
 
 A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `ROIs` sheet is also written via `summary_writer.update_recording_meta` + `write_rois_sheet`. The GUI tab writes these from `_write_summary` (on demand / on export); the headless `core.detection_run.run_detection` writes the same two sheets at the tail of the run when `write_summary=True` (the default), so batch and external callers get the ROIs sheet too — previously it was GUI-only.
 
@@ -407,3 +433,5 @@ Tab 3 inherits the global customtkinter dark theme from `pipeline_gui`.
 - **Click an ROI** on the detected-ROIs panel to open the **CurationPopout** (`CurationPopout`) — resizable Toplevel that displays five per-ROI panels (locator + trace + four backgrounds) and lets the user re-label cells / retrain the cell-filter.
 - **Edit suite2p settings...** opens a second `AdvancedDialog`-style popout for arbitrary `ops` overrides; "Advanced..." opens the standard PARAM_SPEC form.
 - **Export figures.** Re-renders the detection ROI-overlay panels (`all_rois.{png,svg}`, `kept_rois.{png,svg}`) into `<save_folder>/calliope_figures/detection/` and drops a `manifest.json` next to the per-stage figures dirs at `<save_folder>/calliope_figures/manifest.json`. Manifest fields: `rec_id`, `created_at_iso`, `calliope_git_sha`, `gcamp_variant`, `tau`, `fs`, `n_cells_kept`, `n_cells_total`, `cellfilter_ckpt_path`, `cellfilter_ckpt_sha256`, and the full Tab 3 `params` dict. The button is enabled the moment `_final_plane0` is set (i.e. after "Run detection + cell filter" or "Load existing panels") and refuses to run while the CurationPopout has un-promoted flips (`CurationPopout.has_pending_promotion()`) — otherwise the exported figures would reflect a stale keep mask. For the full per-stage figure set (lowpass + events + clusters + xcorr + spatial), drive the recording through Tab 0 — `core/batch_pipeline.py::run_recording` produces the same `calliope_figures/<stage>/` tree plus manifest as part of the normal pipeline.
+
+- **Export NWB.** Writes a DANDI-style `.nwb` for the recording. Enabled once a run finishes or after "Load existing panels"; clicking it opens a save dialog. The file contains an ImagingPlane (frame rate, indicator, tau, neuropil coef, pixel size when known), a PlaneSegmentation with per-ROI image masks plus `iscell` probability and ROI source columns, Fluorescence / Neuropil / DfOverF `RoiResponseSeries`, an OASIS deconvolved spike-estimate series, and — when present — population event windows read from `calliope_summary.xlsx`. Imaging metadata is read from `meta.json`. Subject demographics are placeholders unless supplied. NWB support is an optional dependency (`pip install 'calliope[nwb]'`, which pulls in pynwb + nwbinspector); if pynwb is not installed the button shows a message and does nothing.

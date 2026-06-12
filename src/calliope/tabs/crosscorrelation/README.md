@@ -143,6 +143,8 @@ When the "+ partial corr" checkbox is on (default off), an additional column app
 
 - `partial_corr_zero_lag` — partial correlation between `roi_A` and `roi_B` conditioning on every other ROI in the union of all clusters. Computed once via `core/crosscorrelation.py::compute_partial_correlation` on the full population's z-scored dF/F (ridge `1e-6`), then sliced per cluster pair. The motivating use case: disambiguate "A and B drive each other" from "A and B are both driven by some other ROI C" — Pearson can't tell those apart but partial correlation can (Sutera et al. [arXiv:1406.7865](https://arxiv.org/abs/1406.7865); Stevenson [arXiv:1708.01888](https://arxiv.org/abs/1708.01888)). Requires `N_union < 0.5 * T` (precision-matrix conditioning); the run automatically skips and warns above that threshold. Entries are `nan` when a cluster ROI isn't in the keep mask.
 
+With partial correlation on, each cluster pair also gets a side-by-side heatmap PNG, `CAxCB_corr_heatmaps.png` (left: zero-lag Pearson r; right: partial correlation), written next to that pair's summary CSV. The `zero_lag_corr` column is always written into the summary CSV whenever partial correlation is on, so both matrices in the figure can be reconstructed from the CSV alone.
+
 > **Indicator-kinetics caveat.** Pearson r on filtered dF/F is biased by GCaMP rise + decay: every spike is convolved with a ~tens-to-hundreds-of-ms exponential, so the visible CCG peak is blurred by the indicator's autocorrelation. The apparent lag resolution is **indicator-limited, not frame-rate-limited**, and correlation magnitudes are inflated relative to spike-time correlations (Yatsenko/Mishne, eLife 2021, [doi:10.7554/eLife.68046](https://doi.org/10.7554/eLife.68046)). To get an indicator-independent CCG, compute on deconvolved/binned spike rates (Berens et al. 2018, 40 ms bins). Currently the input is `r0p7_filtered_dff.memmap.float32`; an "input signal" GUI dropdown is a planned upgrade (audit Tier 2 #10).
 
 ### Step 4 — Per-event mode (`run_cluster_xcorr_per_event_fast`)
@@ -236,7 +238,8 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 │   │   ├── C{i}xC{j}_summary.csv
 │   │   ├── C{i}xC{j}_best_lag.npy
 │   │   ├── C{i}xC{j}_max_corr.npy
-│   │   └── C{i}xC{j}_zero_lag.npy
+│   │   ├── C{i}xC{j}_zero_lag.npy
+│   │   └── C{i}xC{j}_corr_heatmaps.png   ← only with "+ partial corr": zero-lag Pearson | partial corr
 │   └── eventwise/
 │       └── event_NNNN/
 │           └── C{i}xC{j}/...
@@ -257,7 +260,7 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 | `also output zero-lag corr` | True | Track the lag-0 matrix during the per-lag loop. |
 | `use GPU if available` | True | Falls back to NumPy if CuPy is missing. |
 | `shuffles (0=off)` | 500 | Circular-shift null + BH-FDR. Adds `p_value` / `p_value_fdr` CSV columns; cost scales linearly with the value (each shuffle is one extra batched-matmul sweep). |
-| `+ partial corr (requires N < T/2)` | unchecked | Compute population-wide partial correlation across the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`), conditioning each pair on every other ROI. Adds `partial_corr_zero_lag` to each cluster pair's summary CSV. Automatically skipped when `N_union >= 0.5 * T` (precision matrix ill-conditioned). Only meaningful on the full-recording run — Tab 7 strips the flag on per-event runs and logs a notice. |
+| `+ partial corr (requires N < T/2)` | unchecked | Compute population-wide partial correlation across the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`), conditioning each pair on every other ROI. Adds `partial_corr_zero_lag` to each cluster pair's summary CSV, always writes the `zero_lag_corr` column, and emits a side-by-side `CAxCB_corr_heatmaps.png` (zero-lag Pearson r \| partial correlation) next to each pair's CSV. Automatically skipped when `N_union >= 0.5 * T` (precision matrix ill-conditioned). Only meaningful on the full-recording run — Tab 7 strips the flag on per-event runs and logs a notice. |
 
 For the violin permutation test: `n_perm=10000`, `chunk=256`, `seed=0`.
 

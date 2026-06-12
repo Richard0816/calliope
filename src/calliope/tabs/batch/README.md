@@ -67,6 +67,12 @@ The Run-all worker iterates rows in queue order. For each row:
    Each stage is wrapped in its own try/except. If a non-detection stage
    fails, the recording is marked **partial** and the worker moves on.
    Detection failure is fatal for that row only; the queue continues.
+
+   The detection stage produces the same per-recording artifacts as the
+   GUI: the `<plane0>/meta.json` provenance sidecar (with the
+   `gcamp_variant` label stamped for parity) and the z-drift QC outputs
+   (`zdrift_qc.png` / `zdrift_pc1.csv` plus the `qc` fields in
+   `meta.json`) are written headlessly on every batch row too.
 4. Update the row's status label (`queued` → `running` → `ok` / `partial` /
    `failed` / `aborted` / `no_rois`).
 
@@ -244,6 +250,10 @@ Mechanics & wiring:
   compression — the keep/drop of shifted + `data.bin` belongs solely to
   `prune_scratch_tree`, avoiding double-handling.
 - Toggles are session-only (not persisted), matching **Save figures**.
+
+### Export NWB file (optional)
+
+An **Export NWB file** parameter (Output group, default off) writes a DANDI-style `<recording_id>.nwb` for each recording. When set, the export runs at the end of the row's pipeline — after event detection, so population event windows are included — and is mirrored to the output drive with the rest of the outputs. The file carries the ImagingPlane, per-ROI PlaneSegmentation (with `iscell` probability and ROI source), Fluorescence / Neuropil / DfOverF series, the OASIS deconvolved spike estimate, and event windows; imaging metadata is read from each recording's `meta.json`. NWB support is an optional dependency (`pip install 'calliope[nwb]'`). The step is best-effort: a missing pynwb or a write error is logged and never stops the batch.
 
 ### Continuous mirror (both single-drive and two-drive scratch)
 
@@ -635,8 +645,9 @@ the slow output folder, matching pre-scratch behavior.
 ├── <raw.name>.tif                     ← Zstd-compressed raw (archive step)
 ├── _calliope_raw_paths.json           ← sidecar locating the originals
 ├── mean.npy, qc.gif                   ← Tab 1
-├── detection/final/suite2p/plane0/    ← Tab 3 (F/Fneu/stat/ops/iscell + dF/F memmaps + cellfilter; data.bin dropped)
+├── detection/final/suite2p/plane0/    ← Tab 3 (F/Fneu/stat/ops/iscell + dF/F memmaps + cellfilter + meta.json + zdrift_qc.png/zdrift_pc1.csv; data.bin dropped)
 ├── detection/_shared_reg/suite2p/plane0/   ← registration metadata only (no data.bin)
+├── <recording_id>.nwb                  ← optional (Export NWB file on)
 ├── calliope_summary.xlsx              ← Recording + ROIs (detection stage) + EventWindows/EventOnsets/RoiEventTimes/EventMonotonicity (event-detection stage) + Clusters (clustering stage) sheets. The `Recording` + `ROIs` sheets are written by `detection_run.run_detection(write_summary=True)`; before 2026-05-28 the batch detection stage wrote no sheets, so the workbook had no ROIs sheet and only got a Recording sheet if event detection ran.
 ├── calliope_figures/
 │   ├── manifest.json                  ← rec_id, calliope_git_sha, gcamp_variant, tau, fs, pix_to_um, n_cells_{kept,total}, cellfilter_ckpt_sha256, full params dict
