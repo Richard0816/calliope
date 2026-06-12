@@ -618,6 +618,9 @@ class EventDetectionTab(ctk.CTkFrame):
                                                  params.min_prominence)),
             on_apply=self._on_prominence_apply,
             null_pending=null_ready,
+            auto_on=bool(self._params.get("auto_min_prominence",
+                                          params.auto_min_prominence)),
+            auto_percentile=float(params.auto_min_prominence_percentile),
         )
 
         if null_ready:

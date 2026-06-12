@@ -25,10 +25,11 @@ time-shifting each ROI's onset train so any cross-cell coincidence is
 pure chance — and answers "how tall does a density bump get from
 random coincidence alone?". A real population event must clear that
 floor. By default (``auto_min_prominence``) the null p99 is applied
-automatically as the per-recording prominence floor; this popout lets
-the user inspect the distribution against the p95/p99 lines and, if
-desired, apply a manual ``min_prominence`` instead — applying a value
-here turns auto off. The null is computed off-thread by Tab 5 and
+automatically as the per-recording prominence floor, and this popout's
+live threshold line snaps onto that floor once it is computed — so what
+you see matches what detection applies. The user can still drag or type
+a manual ``min_prominence`` instead; that is an explicit override, and
+applying it turns auto off. The null is computed off-thread by Tab 5 and
 pushed in via :meth:`ProminencePopout.set_null_percentiles`.
 
 Wiring
@@ -81,6 +82,8 @@ class ProminencePopout(ctk.CTkToplevel):
         on_apply: Callable[[float], None],
         null_percentiles: Optional[dict] = None,
         null_pending: bool = False,
+        auto_on: bool = False,
+        auto_percentile: float = 99.0,
         title: str = "Prominence distribution",
     ) -> None:
         super().__init__(parent)
@@ -100,6 +103,14 @@ class ProminencePopout(ctk.CTkToplevel):
         self._null_pending = bool(null_pending)
         self._null_lines: list = []
         self._null_note = None
+        # When ``auto_min_prominence`` is on, detection applies the null
+        # p{auto_pct} floor (not the static ``min_prominence``). The popout
+        # snaps its live threshold onto that floor once it arrives so what's
+        # shown matches what detection uses. Dragging the slider / typing a
+        # value is an explicit manual override (Apply then turns auto off).
+        self._auto_on = bool(auto_on)
+        self._auto_pct = float(auto_percentile)
+        self._user_overriding = False
 
         slider_lo, slider_hi = _slider_range(self._prominences, current_value)
         self._slider_lo = slider_lo
@@ -208,6 +219,7 @@ class ProminencePopout(ctk.CTkToplevel):
     def _on_slider_move(self, _val: str) -> None:
         # CTkSlider's command passes the new value as a string; we
         # already have the live float via the linked ``value_var``.
+        self._mark_user_override()
         v = float(self.value_var.get())
         # Sync the entry box without retriggering its commit handler.
         self._entry.delete(0, tk.END)
@@ -224,16 +236,25 @@ class ProminencePopout(ctk.CTkToplevel):
             self._entry.delete(0, tk.END)
             self._entry.insert(0, f"{float(self.value_var.get()):.4f}")
             return
+        self._mark_user_override()
         v = max(self._slider_lo, min(self._slider_hi, v))
         self.value_var.set(v)
         self._update_threshold_line(v)
         self._refresh_count_label()
 
     def _on_reset(self) -> None:
+        # Reset clears any manual override and returns to the baseline (the
+        # auto floor when auto is on, else the value the popout opened with).
+        if self._auto_on:
+            self._user_overriding = False
+            if self._threshold_line is not None:
+                self._threshold_line.set_label(
+                    f"applied (auto · null p{int(self._auto_pct)})")
         self.value_var.set(self._initial_value)
         self._entry.delete(0, tk.END)
         self._entry.insert(0, f"{self._initial_value:.4f}")
         self._update_threshold_line(self._initial_value)
+        self._draw_null_lines()
         self._refresh_count_label()
 
     def _on_apply_click(self) -> None:
@@ -253,6 +274,37 @@ class ProminencePopout(ctk.CTkToplevel):
             return
         self._threshold_line.set_xdata([v, v])
         self.canvas.draw_idle()
+
+    def _apply_auto_floor(self, value: float) -> None:
+        """Snap the live threshold onto the auto (null-percentile) floor so
+        the popout reflects the value detection actually applies when
+        ``auto_min_prominence`` is on. Also makes this the Reset target."""
+        value = float(value)
+        # Grow the slider range if the floor sits outside the initial span.
+        if value > self._slider_hi:
+            self._slider_hi = value * 1.05
+            self._scale.configure(to=self._slider_hi)
+        if value < self._slider_lo:
+            self._slider_lo = min(0.0, value)
+            self._scale.configure(from_=self._slider_lo)
+        self._initial_value = value  # Reset returns to the auto floor
+        self.value_var.set(value)
+        self._entry.delete(0, tk.END)
+        self._entry.insert(0, f"{value:.4f}")
+        self._update_threshold_line(value)
+        if self._threshold_line is not None:
+            self._threshold_line.set_label(
+                f"applied (auto · null p{int(self._auto_pct)})")
+
+    def _mark_user_override(self) -> None:
+        """First manual slider/entry edit while auto is on: this value will
+        replace the auto floor on Apply, so relabel the threshold line and
+        restore the null p{auto_pct} reference line."""
+        if self._auto_on and not self._user_overriding:
+            self._user_overriding = True
+            if self._threshold_line is not None:
+                self._threshold_line.set_label("min_prominence (manual)")
+            self._draw_null_lines()
 
     # ---- Null-floor overlay ------------------------------------------------
 
@@ -274,6 +326,15 @@ class ProminencePopout(ctk.CTkToplevel):
         self._null_pending = False
         self._null_percentiles = dict(null_percentiles or {})
         if self.winfo_exists():
+            # If auto is driving the floor (and the user hasn't overridden),
+            # snap the live threshold onto the per-recording null p{auto_pct}
+            # -- the exact value detect_event_windows applies.
+            if self._auto_on and not self._user_overriding:
+                _v = self._null_percentiles.get(self._auto_pct)
+                if _v is None:  # configured pct absent -> fall back to p99
+                    _v = self._null_percentiles.get(99.0)
+                if _v is not None and np.isfinite(_v) and _v > 0:
+                    self._apply_auto_floor(float(_v))
             self._draw_null_lines()
             self._refresh_count_label()
 
@@ -300,6 +361,11 @@ class ProminencePopout(ctk.CTkToplevel):
                   if v is not None and np.isfinite(v)}
         if finite:
             for p in sorted(finite):
+                # When auto is driving the floor, the crimson "applied" line
+                # already marks p{auto_pct}; don't double-draw it.
+                if (self._auto_on and not self._user_overriding
+                        and float(p) == self._auto_pct):
+                    continue
                 style = self._NULL_STYLE.get(
                     float(p),
                     dict(color="#7f8c8d", linestyle=":", linewidth=1.4))
@@ -329,9 +395,27 @@ class ProminencePopout(ctk.CTkToplevel):
             self.count_var.set("No candidate peaks available.")
             return
         kept = int(np.sum(self._prominences >= v))
-        msg = (f"keeping {kept} / {N} candidate peaks at "
-               f"min_prominence = {v:.4f}")
+        auto_floor = None
+        if self._auto_on and not self._user_overriding:
+            _f = self._null_percentiles.get(
+                self._auto_pct, self._null_percentiles.get(99.0))
+            if _f is not None and np.isfinite(_f) and _f > 0:
+                auto_floor = float(_f)
+        # Auto is on but the per-recording floor is still being computed:
+        # say so rather than implying the static fallback value is the floor.
+        if (self._auto_on and not self._user_overriding
+                and auto_floor is None and self._null_pending):
+            self.count_var.set(
+                f"AUTO floor (null p{int(self._auto_pct)}): computing… "
+                f"({N} candidate peaks)")
+            return
+        label = (f"AUTO floor (null p{int(self._auto_pct)})"
+                 if auto_floor is not None else "min_prominence")
+        msg = f"keeping {kept} / {N} candidate peaks at {label} = {v:.4f}"
+        # Ratio-to-p99 is only informative for a manual value (when auto is
+        # applied the live value *is* the p99 floor, i.e. 1.00x).
         p99 = self._null_percentiles.get(99.0)
-        if p99 is not None and np.isfinite(p99) and p99 > 0:
+        if (auto_floor is None and p99 is not None
+                and np.isfinite(p99) and p99 > 0):
             msg += f"  ({v / p99:.2f}× null p99 floor)"
         self.count_var.set(msg)
