@@ -262,6 +262,8 @@ Per-pair p-values from a **circular-shift null distribution** (default 500 shuff
 
 Pearson r is computed on filtered dF/F. **GCaMP rise + decay convolve every spike with a ~tens-to-hundreds-of-ms exponential**, so the visible CCG peak is blurred by the indicator's autocorrelation and correlation magnitudes are inflated relative to spike-time correlations (Yatsenko/Mishne, eLife 2021, [doi:10.7554/eLife.68046](https://doi.org/10.7554/eLife.68046)). The apparent lag resolution is indicator- not frame-rate-limited.
 
+With the **+ partial corr** option on, each cluster pair also gets a side-by-side heatmap PNG (`CAxCB_corr_heatmaps.png`, zero-lag Pearson r next to partial correlation) saved beside that pair's summary CSV — the partial-correlation panel conditions out shared drivers, separating "A and B drive each other" from "A and B are both driven by some third cell." The zero-lag values are always written into the CSV in this mode, so both heatmaps can be rebuilt from the CSV alone.
+
 **Why it matters biologically.** Synchronisation is necessary but not sufficient. *Direction* matters:
 
 - Two cells firing together at lag = 0 may share an input.

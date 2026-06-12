@@ -206,13 +206,6 @@ class EventDetectionTab(ctk.CTkFrame):
          "type": "float", "default": 1.0,
          "group": "Population events - peaks",
          "help": "local window for find_peaks prominence"},
-        {"name": "min_active_rois",
-         "label": "Min active ROIs per event",
-         "type": "int", "default": 3,
-         "group": "Population events - peaks",
-         "help": "drop events with fewer than this many participating "
-                 "ROIs; default 3 excludes 2-ROI noise events. Raise "
-                 "to 4-5 to also exclude 3-4-ROI events."},
         {"name": "baseline_mode", "label": "Baseline mode",
          "type": "choice", "choices": ["rolling", "global"],
          "default": "rolling", "group": "Population events - baseline",

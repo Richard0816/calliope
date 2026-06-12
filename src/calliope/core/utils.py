@@ -242,7 +242,7 @@ def lowpass_causal_1d(x, fps, cutoff_hz=5.0, order=2, zi=None, sos=None):
     GCaMP8 transients the IIR's frequency-dependent group delay also
     starts to matter; the planned future upgrade is a linear-phase FIR
     so the constant-group-delay assumption holds exactly across all
-    frequencies (see ``docs/pipeline_audit_2026-05-25.md`` §2.8).
+    frequencies.
 
     "SOS" = second-order sections, the numerically stable
     representation of an IIR filter. SciPy's ``sosfilt`` runs the
@@ -902,16 +902,6 @@ class EventDetectionParams:
     # Overlap merging  (DISABLED in favour of watershed split below)
     merge_gap_s: float = 0.0  # OLD path: merge events closer than this
 
-    # Drop events whose population is below this many active ROIs.
-    # Default 3 = excludes 2-ROI "events" which are almost always noise
-    # on epileptiform recordings where real events recruit dozens to
-    # hundreds of cells. Raise to 4-5 to also exclude 3-4-ROI events.
-    # Applied AFTER boundary walking + watershed split, so the
-    # diagnostic arrays still describe the unfiltered detection (the
-    # returned event_windows / A / first_time are sliced by the
-    # population mask but ``diagnostics["prominence"]`` etc. are not).
-    min_active_rois: int = 3
-
     # NEW: watershed split + hard duration cap  ----------------------------
     enable_watershed_split: bool = True
         # If consecutive baseline-walk windows overlap, split them at the
@@ -1070,40 +1060,13 @@ def detect_event_windows(
     # cross-correlation cropping) and Tab 8 (activation-order maps).
     A, first_time = _activation_matrix_from_windows(onsets_by_roi, event_windows)
 
-    # 4b) Drop events whose population is below ``min_active_rois``.
-    # Computed from the activation matrix (sum across ROIs per event
-    # gives the number of cells that fired inside that window). Both
-    # the published event_windows / A / first_time AND the per-peak
-    # diagnostic arrays (peak_s / peak_height / prominence / mu_s /
-    # sigma_s / boundary_source_* / duration_s) are sliced so the
-    # diagnostic plot's red C3 peak markers only mark surviving
-    # events. Continuous-time diagnostic arrays (smoothed_density,
-    # baseline_trace, etc.) stay full-length so the density plot
-    # keeps its context.
-    if event_windows.shape[0] > 0 and params.min_active_rois > 0:
-        n_active_per_event = A.sum(axis=0).astype(int)
-        keep_mask = n_active_per_event >= int(params.min_active_rois)
-    else:
-        keep_mask = np.ones(event_windows.shape[0], dtype=bool)
-    if not keep_mask.all():
-        event_windows = event_windows[keep_mask]
-        A = A[:, keep_mask]
-        first_time = first_time[:, keep_mask]
-
     if not return_diagnostics:
         return event_windows, A, first_time
 
-    # Per-peak fields slice with keep_mask; continuous-time fields stay
-    # at full resolution so the smoothed-density curve still shows
-    # context around the dropped events.
-    def _slice_per_peak(arr):
-        if arr is None:
-            return arr
-        a = np.asarray(arr)
-        if a.size != keep_mask.size:
-            return a
-        return a[keep_mask]
-
+    # Every detected peak is a published event (the null-calibrated
+    # prominence floor already gates density bumps by chance-level
+    # coincidence), so the per-peak diagnostic arrays align 1:1 with
+    # event_windows; continuous-time fields stay full resolution.
     diagnostics = {
         "time_centers_s": centers,
         "binned_density": counts,
@@ -1111,16 +1074,14 @@ def detect_event_windows(
         "baseline_trace": boundaries["baseline_trace"],
         "end_threshold_trace": boundaries["end_threshold_trace"],
         "baseline_noise": boundaries["baseline_noise"],
-        "peak_s": _slice_per_peak(boundaries["peak_s"]),
-        "peak_height": _slice_per_peak(boundaries["peak_height"]),
-        "mu_s": _slice_per_peak(boundaries["mu_s"]),
-        "sigma_s": _slice_per_peak(boundaries["sigma_s"]),
-        "boundary_source_left": _slice_per_peak(
-            boundaries["boundary_source_left"]),
-        "boundary_source_right": _slice_per_peak(
-            boundaries["boundary_source_right"]),
-        "prominence": _slice_per_peak(boundaries["prominence"]),
-        "duration_s": _slice_per_peak(boundaries["duration_s"]),
+        "peak_s": boundaries["peak_s"],
+        "peak_height": boundaries["peak_height"],
+        "mu_s": boundaries["mu_s"],
+        "sigma_s": boundaries["sigma_s"],
+        "boundary_source_left": boundaries["boundary_source_left"],
+        "boundary_source_right": boundaries["boundary_source_right"],
+        "prominence": boundaries["prominence"],
+        "duration_s": boundaries["duration_s"],
         "min_prominence_used": effective_min_prominence,
     }
     return event_windows, A, first_time, diagnostics

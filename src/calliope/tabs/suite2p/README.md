@@ -119,12 +119,12 @@ The user can also set `hard_cap` — a safety abort that bails out if Sparsery r
 | `cellpose_flow_threshold` | 0.8 | Standard Cellpose flow threshold. |
 | `cellpose_cellprob_threshold` | -1.0 | More inclusive than the default 0. |
 
-**Optional Cellpose-SAM second pass on Vcorr (Tier 2 #13).** When `enable_sam_vcorr_pass` is checked, the runner additionally:
+**Optional Cellpose-SAM second pass on Vcorr.** When `enable_sam_vcorr_pass` is checked, the runner additionally:
 
 1. Reads (or stream-computes via `core/correlation_image.py::compute_vcorr`) the recording's correlation image `Vcorr` — per-pixel Pearson r with the 4-neighbour mean. Suite2p 1.0 produces this during detection (lives in `detect_outputs.npy`); the runner picks it up from the sparsery pass output and persists it next to the shared registration as `Vcorr.npy` so `run_cellpose_pass`'s filesystem fallback can find it.
 2. Runs Cellpose-SAM (`model_type='cpsam'`, cellpose ≥ 4.0) on `Vcorr` with the user-tunable `sam_flow_threshold` / `sam_cellprob_threshold`.
-3. Filters the result against the Sparsery mask *independently* (i.e. not against the cyto2 pass — the audit explicitly calls this out so SAM can recover silent cells the primary cellpose pass also flagged).
-4. Tags every ROI in the final `stat.npy` with `_source ∈ {sparsery, cellpose_cyto2, cellpose_sam}` for audit.
+3. Filters the result against the Sparsery mask *independently* (i.e. not against the cyto2 pass — intentional, so SAM can recover silent cells the primary cellpose pass also flagged).
+4. Tags every ROI in the final `stat.npy` with `_source ∈ {sparsery, cellpose_cyto2, cellpose_sam}` for provenance.
 
 Silently skips with a console warning when cellpose 3.x is installed (SAM is 4.x-only). The SAM checkpoint is ~1 GB; cellpose downloads it on first invocation. Reference: Pachitariu et al., Cellpose-SAM bioRxiv 2025 ([doi:10.1101/2025.04.28.651001](https://doi.org/10.1101/2025.04.28.651001)).
 

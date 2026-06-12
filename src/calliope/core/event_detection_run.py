@@ -44,7 +44,7 @@ from . import utils as core_utils
 _EVENT_DETECTION_FIELDS = (
     "bin_sec", "smooth_sigma_bins", "normalize_by_num_rois",
     "min_prominence", "min_width_bins", "min_distance_bins",
-    "prominence_wlen_s", "min_active_rois",
+    "prominence_wlen_s",
     "auto_min_prominence", "auto_min_prominence_percentile",
     "auto_min_prominence_n_shuffles", "auto_min_prominence_seed",
     "baseline_mode", "baseline_percentile",
