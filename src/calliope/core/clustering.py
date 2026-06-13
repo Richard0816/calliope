@@ -430,10 +430,7 @@ def plot_spatial(
 
 
 # Cluster .npy files are written directly into
-# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder. Tab 7
-# accepts ``cluster_folder=""`` and skips the join, so reads stay
-# symmetric with this writer.
-EXPORT_SUBDIR = ""
+# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder.
 
 
 def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
@@ -501,10 +498,6 @@ def _ward_linkage(dff: np.ndarray,
     dff_z = (dff - np.mean(dff, axis=0)) / (np.std(dff, axis=0) + 1e-8)
     dist = pdist(dff_z.T, metric="euclidean")
     return linkage(dist, method=method)
-
-
-# Backward-compat alias for any caller that still imports the old name.
-_correlation_linkage = _ward_linkage
 
 
 def _visual_cluster_map(Z: np.ndarray, T: float) -> dict[int, int]:
@@ -582,8 +575,6 @@ def run_clustering(
     n_clusters = len(visual_to_label)
 
     export_dir = plane0 / f"{prefix}cluster_results"
-    if EXPORT_SUBDIR:
-        export_dir = export_dir / EXPORT_SUBDIR
     export_dir.mkdir(parents=True, exist_ok=True)
 
     filtered_to_suite2p: Optional[np.ndarray] = None

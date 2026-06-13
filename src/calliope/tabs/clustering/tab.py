@@ -126,10 +126,7 @@ from ...gui_common import (
 # imported from ``.logic`` above so ``ReclusterWindow`` and
 # ``ClusteringTab`` share the same constants.
 # Cluster ROI .npy files are written directly into
-# ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster"
-# subfolder. Tab 7 + the headless ``crosscorrelation_run`` already
-# accept an empty ``cluster_folder`` and skip the join in that case.
-EXPORT_SUBDIR = ""
+# ``<plane0>/<prefix>cluster_results/`` -- no extra "gui_recluster" subfolder.
 POLL_MS = 80
 
 
@@ -540,8 +537,7 @@ class ClusteringTab(ctk.CTkFrame):
         return True
 
     def _existing_cluster_dir(self, plane0: Path, prefix: str) -> Path:
-        base = plane0 / f"{prefix}cluster_results"
-        return base / EXPORT_SUBDIR if EXPORT_SUBDIR else base
+        return plane0 / f"{prefix}cluster_results"
 
     def _has_existing_clusters(self, plane0: Path, prefix: str) -> bool:
         d = self._existing_cluster_dir(plane0, prefix)

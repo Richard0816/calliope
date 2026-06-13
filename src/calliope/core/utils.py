@@ -50,7 +50,7 @@ Population events (Tab 5 + Tab 8)
         Diagnostic-plot helpers used by Tab 5.
 
 Suite2p / cellfilter helpers
-    s2p_infer_orientation, s2p_load_raw, s2p_open_memmaps
+    s2p_open_memmaps
         Read Suite2p outputs (``F.npy`` / ``Fneu.npy`` / dF/F memmaps)
         with shape inference so the rest of the code never has to
         worry about ``(T, N)`` vs ``(N, T)`` orientation.
@@ -2602,51 +2602,6 @@ def change_nbinned_according_to_free_ram(tiff_folder: str,
     return capped
 
 
-def s2p_infer_orientation(F: np.ndarray) -> tuple[int, int, bool]:
-    """Look at the shape of an ``F.npy`` array and pull out
-    ``(num_frames, num_rois, time_major)``.
-
-    Suite2p's ``F.npy`` is canonically saved as ``(N_ROIs, T)`` --
-    so a row per cell. We trust that layout; the third return value
-    is a vestigial flag from older versions of this code that
-    auto-detected the orientation.
-
-    Raises ``ValueError`` if the array isn't 2D (defensive against
-    accidentally loading the wrong file).
-    """
-    if F.ndim != 2:
-        raise ValueError(f"Expected 2D array, got {F.shape}")
-    n_rois, n_frames = F.shape
-    return n_frames, n_rois, False
-
-
-def s2p_load_raw(root: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, int, int, bool]:
-    """Load ``F.npy`` + ``Fneu.npy`` from a Suite2p plane0 folder.
-
-    Returns
-    -------
-    F : (N_ROIs, T) ndarray
-        Raw cell fluorescence trace per ROI.
-    Fneu : (N_ROIs, T) ndarray
-        Surrounding-neuropil trace per ROI.
-    num_frames, num_rois : int
-    time_major : bool
-        Always False for canonical Suite2p output (rows = ROIs).
-
-    Raises ``ValueError`` if F and Fneu have mismatched shapes
-    (which would mean the folder is corrupted).
-    """
-    root = Path(root)
-    # ``allow_pickle=False`` is the safe default -- prevents
-    # arbitrary code execution if someone hands us a malicious .npy.
-    F = np.load(root / "F.npy", allow_pickle=False)
-    Fneu = np.load(root / "Fneu.npy", allow_pickle=False)
-    if F.shape != Fneu.shape:
-        raise ValueError(f"F and Fneu shapes differ: {F.shape} vs {Fneu.shape}")
-    num_frames, num_rois, time_major = s2p_infer_orientation(F)
-    return F, Fneu, num_frames, num_rois, time_major
-
-
 def s2p_load_spks(plane0: Union[str, Path],
                   kept_idx: np.ndarray) -> np.ndarray:
     """Read Suite2p's ``spks.npy`` and subset it to a chosen set of
@@ -2746,8 +2701,8 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     # We only need the (N_ROIs, T) shape to size the memmap views below --
     # never the F/Fneu data itself. Read just the .npy shape header via mmap
     # instead of np.load-ing both full (N_ROIs, T) float32 arrays (hundreds
-    # of MB each) into RAM. F.npy is canonically (N_ROIs, T) (see
-    # s2p_infer_orientation), so unpack accordingly.
+    # of MB each) into RAM. F.npy is canonically (N_ROIs, T), so unpack
+    # accordingly.
     _F = np.load(root / "F.npy", mmap_mode="r", allow_pickle=False)
     num_rois, num_frames = _F.shape
     del _F  # drop the header mmap handle
