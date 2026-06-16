@@ -104,14 +104,25 @@ The `PreprocessResult` dataclass that gets passed to other tabs records:
 
 ---
 
-## 5. Parameters (from `PreprocessTab.PARAM_SPEC`)
+## 5. Advanced settings (Advanced... dialog)
 
-| Param | Default | Effect |
-|---|---|---|
-| `downsample_t` | 4 | Keep every Nth frame for the QC GIF. |
-| `max_size_px` | 512 | Long-edge cap for GIF spatial size. |
-| `playback_fps` | 15 | GIF playback speed. |
-| `clip_low` / `clip_high` | 1 / 99.5 | Percentile clip range for GIF normalisation. |
+The **Advanced...** button opens a modal `AdvancedDialog` auto-built from `PreprocessTab.PARAM_SPEC` (`tab.py:100`). Edits mutate `self._params` in place; they take effect on the **next** Run (the snapshot in `_start_run` is taken when you click Run, so re-opening Advanced mid-run is ignored — `tab.py:493`).
+
+**Scope: these five knobs only touch the `qc.gif`.** None of them affect the shifted TIFF, `mean.npy`, the dF/F baseline, or anything Suite2p / detection consumes downstream. The GIF is a *visual QC artifact* (played back on Tab 2) — tuning these changes only what you see, never the science. So getting them "wrong" costs you nothing but a less-readable preview.
+
+### QC gif
+
+All five are consumed by `make_qc_gif` (`core/preprocessing.py:623`), except that `downsample_t` is actually applied one step earlier — during the shift read loop (`shift_tiff_to_uint16(..., qc_downsample_t=...)`, `core/preprocessing.py:178`), so the heavy stack is never re-read just to sample frames. `make_qc_gif` is then called with `downsample_t=1` on the already-sampled frames (`core/preprocessing.py:771`, `:936`).
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `downsample_t` | `4` | Keep every Nth frame: `movie[::max(1, int(downsample_t))]` (`:650`); in the real pipeline the stride is applied during the shift pass (`:178`). Clamped to ≥1, so `0`/negative ⇒ keep every frame. A 9000-frame 10-min @ 15 fps movie ÷ 4 ≈ 2250 GIF frames. | Higher = fewer frames = smaller, faster-to-write GIF that **skips more of the recording** (fast transients can fall between kept frames). Lower (toward 1) = every frame, smooth but huge file and slow encode. Raise it for long recordings; lower it if you're hunting brief events in the preview. |
+| `max_size_px` | `512` | Long-edge cap. If `max(im.size) > max_size_px`, each frame is bilinear-resized so its longest side equals the cap (`:673`). At/below the cap (512×512 raw) it's a no-op. | Higher = sharper preview, bigger file. Lower = coarser, smaller file — useful if you're scanning many recordings and only need to spot gross motion/drift/focus. Set it ≥ your raw frame size to keep full resolution. |
+| `playback_fps` | `15` | Per-frame display duration: `duration_ms = max(1, round(1000 / playback_fps))` written into the GIF header (`:683`). 15 fps ⇒ ~67 ms/frame. Does **not** resample — it only sets playback speed. | Purely cosmetic playback speed. Raise to skim long recordings faster; lower to slow-motion through a region. Note it pairs with `downsample_t`: at `downsample_t=4` the GIF plays 4× wall-clock speed regardless of this value, since 3 of every 4 frames are gone. |
+| `clip_low` | `1.0` | Lower percentile for the display window. `lo = np.percentile(sample, clip_low)` over a strided ≤200-frame subsample (`:654`–`:656`); pixels ≤ `lo` map to black. Keep in `0`–`100` and below `clip_high`. | Raise to crush more dark background to black (higher contrast, but you may clip dim cells); lower (toward 0) to preserve faint signal at the cost of a washed-out, noisy-looking floor. |
+| `clip_high` | `99.5` | Upper percentile. `hi = np.percentile(sample, clip_high)`; pixels ≥ `hi` saturate to white (`:657`). Window `[lo, hi]` is rescaled to `[0, 255]` per frame. Keep in `0`–`100` and above `clip_low`. | Lower it (toward, say, 98) to brighten and reveal dim structure when bright outliers are washing out the frame; raise toward 100 to keep bright peaks from saturating. This is the main knob if the GIF looks all-black or all-white. Percentiles are robust to a few hot pixels — that's why they're used instead of min/max. |
+
+> The dialog only type-casts your entries (`gui_common.AdvancedDialog._coerce`) — it does **not** validate ranges or ordering. A percentile outside `0`–`100` makes `np.percentile` raise and the run aborts; `clip_low ≥ clip_high` doesn't crash but yields a degenerate (uniform/garbage) GIF.
 
 ---
 

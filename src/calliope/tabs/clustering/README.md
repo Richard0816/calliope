@@ -22,7 +22,7 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 > **Headless entry point.** `core/clustering.py:run_clustering(plane0,
 > params, *, figures_dir=None, write_summary=True)` runs the linkage,
 > picks a threshold (auto via `clustering.auto_choose_threshold` when
-> `params['threshold']` is `None` or 0), cuts to flat clusters, exports
+> `params['threshold']` is `None`), cuts to flat clusters, exports
 > `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `threshold_used.npy` +
 > `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
 > `spatial_clusters.png`. Tab 6 still owns the interactive recluster /
@@ -50,7 +50,7 @@ The output `dist` is a condensed `(N·(N−1)/2,)` array fed straight to `scipy.
 - **Average (UPGMA)** merges by mean pairwise distance. On unbalanced data (one big mode + several small ones) it tends toward "1 huge cluster + a few tiny outliers". The earlier per-event xcorr fragmentation guard was a workaround for exactly this failure mode.
 - **Ward** minimises within-cluster sum-of-squares (Lance-Williams). Produces compact, balanced clusters — the "4–5 modes" shape lab members find useful. Z-scoring removes the only objection to Ward (its Euclidean requirement); previous reluctance was based on a misreading of the math.
 
-(Switched from average + correlation → Ward + Euclidean on 2026-05-11 after user pointed out that z-scoring already kills amplitude differences. Backward-compat alias `_correlation_linkage` still exists to avoid breaking importers.)
+(Switched from average + correlation → Ward + Euclidean on 2026-05-11 after user pointed out that z-scoring already kills amplitude differences. The function is now named `ward_linkage` / `_ward_linkage`; there is no `_correlation_linkage`.)
 
 ### Step 2 — Auto-pick a cut
 
@@ -156,7 +156,7 @@ target_labels = [visual_to_label[v] for v in visual_picked]
 mask          = isin(labels, target_labels)
 global_idx    = where(mask)[0]
 dff_subset    = self._dff[:, global_idx]
-Z_sub         = _correlation_linkage(dff_subset)
+Z_sub         = ward_linkage(dff_subset)
 ```
 
 A separate `ReclusterWindow` opens with its own dendrogram + slider + spatial map. The parent state is untouched. Recluster windows pick a different palette (cycling through `CATEGORICAL_PALETTES`) so their colours visibly differ from the parent.
@@ -168,8 +168,8 @@ A "Reload clusters" button next to "Run analysis" restores a previous Export run
 The button is enabled only when both files exist for the active prefix:
 
 ```
-<plane0>/{prefix}cluster_results/gui_recluster/linkage.npy
-<plane0>/{prefix}cluster_results/gui_recluster/threshold_used.npy
+<plane0>/{prefix}cluster_results/linkage.npy
+<plane0>/{prefix}cluster_results/threshold_used.npy
 ```
 
 `_reload_compute(plane0, prefix)`:
@@ -195,7 +195,7 @@ The button is enabled only when both files exist for the active prefix:
 `_export_clusters()` writes, per cluster:
 
 ```
-<plane0>/r0p7_filtered_cluster_results/gui_recluster/
+<plane0>/r0p7_filtered_cluster_results/
 ├── C1_rois.npy           ← Suite2p ROI indices (NOT filtered-list positions)
 ├── C2_rois.npy
 ├── ...
@@ -214,26 +214,41 @@ Stale `C*_rois.npy` files are deleted before writing, so re-export with fewer cl
 
 ## 3. Outputs (on disk)
 
-`<plane0>/r0p7_filtered_cluster_results/gui_recluster/` as listed above.
+`<plane0>/r0p7_filtered_cluster_results/` as listed above.
 
-Plus the summary workbook's `Clusters` sheet via `summary_writer.write_clusters_sheet`, with `cluster_id, roi (Suite2p), color_hex, threshold, method, metric` columns.
+Plus the summary workbook's `Clusters` sheet via `summary_writer.write_clusters_sheet`, with `roi (Suite2p), cluster_id, cluster_color, threshold_used, method, metric` columns.
 
 ---
 
-## 4. UI knobs
+## 4. UI knobs (actions)
+
+Buttons that *do* something but carry no tunable value:
 
 - **Run analysis** — fresh linkage compute from the dF/F memmap.
 - **Reload clusters** — restore a previously exported run from `linkage.npy` + `threshold_used.npy`. Skips the linkage compute; lands in manual-threshold mode at the saved cut.
-- **Manual threshold checkbox** — toggle to enable the slider; OFF returns to the auto threshold.
-- **Vertical cut slider** — `from_=zmax, to=0`, resolution = `zmax/1000`. Drag to reshape clusters.
-- **Palette dropdown** — choose any palette in `AVAILABLE_PALETTES`.
-- **Per-cluster colors…** — custom hex per cluster (overrides palette).
-- **Reset palette** — drop custom colours.
-- **Recluster branch(es)** — drill into a subset of the current clustering at a finer threshold in a separate window.
+- **Per-cluster colors…** — custom hex per cluster (overrides the palette dropdown until reset).
+- **Reset palette** — drop custom colours, fall back to the dropdown palette.
+- **Recluster (new window)** — drill into the ticked branch(es) at a finer cut in a separate window (see the `recluster threshold` setting below).
 - **ROIs in picked clusters (Suite2p ids)** — read-only entry that auto-fills with the Suite2p ROI ids of every cluster ticked in the picker, in compact range form. **Copy** button puts the string on the system clipboard (paste into Tab 4 / Tab 5 manual entries or external scripts).
-- **prefix entry** — change which dF/F memmap to cluster on (default `r0p7_filtered_`).
-- **Export *_rois.npy** — write to disk.
+- **Export *_rois.npy** — write per-cluster ROI lists to disk.
+- **Export figures** — save the current dendrogram + spatial map.
 - **Save summary** — write/refresh the Clusters sheet.
+
+---
+
+## Advanced settings (inline knobs)
+
+Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-var on the tab itself, defined in `tabs/clustering/tab.py`. Defaults are the literal `tk.*Var(value=…)` defaults. The headless equivalents (the `params` dict consumed by `core/clustering.py:run_clustering`, [clustering.py:520](../../core/clustering.py)) are noted per row so a batch/script run reproduces the GUI.
+
+| Setting (`var`) | GUI label | Default | What it does | What it means to you |
+| --- | --- | --- | --- | --- |
+| `prefix_var` ([tab.py:424](tab.py)) | `prefix:` | `r0p7_filtered_` | Names the dF/F memmap to cluster: `<plane0>/<prefix>dff.memmap.float32`. Drives `load_filtered_dff` (loads the `(T, N_kept)` columns), `stat_for_prefix` (matching ROI stats), and `filtered_to_suite2p_indices` (export id translation). When the prefix contains `filtered`, the keep mask is resolved via `utils.resolve_filtered_mask` **anchored to the memmap file size** so leaf count, `stat`, and the export translator stay the same length. Headless: `params['prefix']`. | Leave it at `r0p7_filtered_` for the normal pipeline — that's the curated, cell-filtered, baseline-corrected dF/F. Switch to `r0p7_` (unfiltered) only to cluster *every* detected source including rejected ROIs; the export then writes filtered-list positions, not Suite2p ids, and Tab 7 alignment is your problem. A prefix with no matching memmap disables **Run analysis** (status bar says "Missing dF/F memmaps"). |
+| `manual_var` ([tab.py:405](tab.py)) | `Manual threshold` (checkbox) | `False` (auto) | Switches `_current_threshold()` between **auto** (`auto_frac × zmax`, from `auto_choose_threshold` targeting 4–5 clusters) and **manual** (the slider's absolute value). Turning it ON enables the slider and snaps it to the current auto value as a starting point; OFF disables the slider and reverts to auto. Headless: pass `threshold=None` for auto, or a float for manual. | Keep it OFF (auto) for a sane first look — auto lands ~4–5 clusters, good for ~100–500 cells. Tick it ON the moment the auto cut looks wrong (one giant blob, or shattered into 30 specks) so you can drag the slider. **Reload clusters** also forces this ON at the saved cut. |
+| `threshold_scale` ([tab.py:368](tab.py)) | `cut` (vertical slider) | range `zmax → 0`, resolution `zmax/1000` (~1000 steps) | The cut **height in absolute Ward distance** (sum-of-squares units, *not* the "1 − r" the header text implies). Feeds `fcluster(Z, t=T, criterion='distance')` on every settled drag; the dashed line on the dendrogram tracks it and the spatial map recolours. Renders are debounced (~120 ms) so a drag doesn't freeze the GUI. Only live when `manual_var` is ON. | This is your main shaping control. **Lower** the cut → finer split → **more, smaller** clusters; **raise** it → coarser → **fewer, larger** clusters. Drag until the spatial map shows ensembles that match your anatomy/physiology, then Export. The absolute scale is recording-specific (it depends on `zmax`), so a value that works on one recording won't transfer to another — re-judge by eye each time. |
+| `palette_var` ([tab.py:411](tab.py)) | `palette:` (dropdown) | `tab10` | Picks the colour scheme from `AVAILABLE_PALETTES` (categorical `tab10/tab20/Set1/Set2/Set3/Paired/Accent/Pastel1/Pastel2/Dark2`; continuous `viridis/plasma/inferno/magma/cividis/coolwarm/RdBu/RdYlBu/Spectral/turbo/rainbow/hsv`). `resolve_palette(name, n_clusters)` returns one hex per cluster, spread across the full range so C1 and Cn are maximally distinct. Picking a palette **clears** any per-cluster custom colours. Headless: `params['palette']`. | Cosmetic — it has **zero** effect on which ROIs cluster together, only on the colours in the dendrogram, spatial map, and the `cluster_color` column of the Clusters sheet. Use a **categorical** palette (`tab10`) when clusters are nominal (the default, almost always right); use a **continuous** one (`viridis`) only if you want C1→Cn to read as an ordered ramp. If you have >10 clusters with a 10-colour categorical palette, colours cycle/repeat — switch to `tab20` or a continuous map for distinct colours. |
+| `recluster_thr_var` ([tab.py:306](tab.py)) | `new threshold (1 - r):` (entry) | `""` (seeded to `manual_T / 2` after a run/reload) | The cut for the **Recluster (new window)** sub-tree. Despite the "1 − r" label it is parsed as a plain float and used as an **absolute Ward-distance** cut: the ticked branches' ROIs are sliced out, `ward_linkage` re-runs on just that subset, and the new window cuts its own dendrogram at this value. The parent clustering is untouched. | Use this to sub-divide one fat ensemble without disturbing the rest. It's pre-filled with half the main cut as a reasonable "go finer" starting point; **lower** it for a tighter split of the branch, **raise** it toward the parent cut for a coarser one. Tick at least one cluster in **Pick clusters…** first, and the selection must contain ≥2 ROIs or the recluster is refused. Sub-windows pick a *different* palette than the parent on purpose so the two don't visually collide. |
+
+> **Naming caveat.** The header label, the slider, and the recluster entry all say "correlation / 1 − r", but since the 2026-05-11 switch to Ward + Euclidean the cut is in **absolute Ward (sum-of-squares) distance**. The z-scoring makes pair *ranking* identical to `1 − r` (§2 Step 1), so the labels are not *wrong* about ordering — but the numeric value on the slider is a Ward distance, not a correlation. Calibrate by eye, not by an expected `1 − r` number.
 
 ---
 
@@ -254,38 +269,41 @@ The popout reuses Tab 6's already-loaded `_dff` and `_stat`, so no extra disk re
 ## 5. Auto-threshold heuristic (`auto_choose_threshold`)
 
 ```python
-fractions   = linspace(0.05, 0.95, 91)         # candidate cuts as fraction of zmax
-best_frac   = fractions[0]
-for f in fractions:
-    n = unique(fcluster(Z, t=f*zmax, criterion='distance')).size
-    if target_counts[0] <= n <= target_counts[1]:
-        best_frac = f
-        break       # pick the smallest fraction (highest cut) that hits the band
-return best_frac
+grid = arange(start=0.90, stop=0.05 - 1e-9, step=-0.01)   # descending cut fractions of zmax
+# count_clusters (fcluster) is monotone non-decreasing down the grid, so:
+i   = bisect grid for the first index whose count_clusters(Z, grid[i]) >= min(target_counts)
+# then a short forward scan from i lands the first count actually in target_counts
+for f in grid[i:]:
+    n = count_clusters(Z, f)                # == unique(fcluster(Z, t=f*zmax, 'distance')).size
+    if n in target_counts:
+        return f
+    if n > max(target_counts):
+        break
+return start                                  # nothing hit the band → fall back to 0.90
 ```
 
-(See `core/clustering.py` for the exact implementation.) Defaults aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
+(See `core/clustering.py:217` for the exact implementation.) Defaults `target_counts=(4, 5)` aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
 
 ---
 
 ## 6. Re-implementation checklist
 
 1. **Distance + linkage:**
-   - z-score each column of dF/F (defensive; `correlation` metric is mean/scale-invariant anyway).
+   - z-score each column of dF/F (so squared Euclidean ranks pairs identically to `1 − r`; see §2 Step 1).
    - `dist = scipy.spatial.distance.pdist(X.T, metric='euclidean')`.
    - `Z = scipy.cluster.hierarchy.linkage(dist, method='ward')`.
 2. **Pick a threshold** (auto or slider). `labels = scipy.cluster.hierarchy.fcluster(Z, t=T, criterion='distance')`.
 3. **Stable cluster numbering:** walk dendrogram leaves left-to-right, map first-seen label → C1, etc. Don't trust scipy's label ordering for visual cluster ids.
 4. **Stable colours:** build a `{raw_label: hex_color}` dict from your palette in visual-id order, then pass a `link_color_func` to `dendrogram` that paints each link with its descendant's colour. Bypass scipy's palette cycling.
 5. **Spatial paint:** `paint_spatial(values, stat, Ly, Lx)` accumulates `value × lam` weighted by `lam` per pixel and divides by accumulated weights. Run separately for R, G, B channels; `NaN` outside ROI coverage.
-6. **Recluster:** for selected branches, slice dF/F to those ROIs, re-run `_correlation_linkage`, open a sub-window with its own slider and palette.
+6. **Recluster:** for selected branches, slice dF/F to those ROIs, re-run `ward_linkage`, open a sub-window with its own slider and palette.
 7. **Export format:**
    - One `C{i}_rois.npy` per cluster, indices = Suite2p ROI indices.
    - `linkage.npy` (full `Z`), `threshold_used.npy` (single-element float).
    - Marker file `_indices_are_suite2p` to disambiguate from the legacy filtered-position layout.
 8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
 9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate filtered-list positions to Suite2p ROI ids using the keep mask if the prefix is filtered, sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
-10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `_correlation_linkage` call entirely.
+10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
 
 
 ## UI affordances

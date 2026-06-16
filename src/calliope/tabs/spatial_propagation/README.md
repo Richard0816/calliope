@@ -87,6 +87,38 @@ The published payload contains:
 The matrices' first dimension matches `kept_idx` exactly, so Tab 8 can
 translate ROI rows back to Suite2p ids without any extra bookkeeping.
 
+## Advanced settings
+
+**Tab 8 has no Advanced dialog and no `PARAM_SPEC`.** It is a pure
+*consumer* of Tab 5's last `event_results` publish — it runs no
+detection of its own. Every knob that shapes what you see here lives on
+**Tab 5 (Event detection)**: the dF/F filtering, the hysteresis
+on/off thresholds, the population-event windowing, and the manual ROI
+subset. Whatever Tab 5 detected with those parameters is exactly the
+`A` / `first_time` / `event_windows` matrices Tab 8 paints. To change
+the events, the participating ROIs, or the onset times, re-render on
+Tab 5; Tab 8 re-paints automatically. See
+[`tabs/event_detection/README.md`](../event_detection/README.md) for
+that tab's full parameter reference.
+
+The directional-monotonicity test's internals (`n_angles=360`,
+`n_shuffles=10000`, `seed=0`, passed to
+`spatial_helpers.directional_monotonicity_spearman` at
+[`tab.py:945`](tab.py)) are **hardcoded**, not user-tunable — they are
+fixed so the permutation p-value is reproducible across recordings.
+(`spatial_helpers` is `logic.py`'s re-export shim for `core.spatial`,
+so this is the same helper as the `core.spatial` one named above.)
+
+The only user-tunable control on Tab 8 itself is one inline toggle:
+
+| Setting (`key`) | Default | What it does | What it means to you |
+| --- | --- | --- | --- |
+| Use Suite2p spks (`_use_spks_var`) | `False` (unchecked) | **What it does.** A `BooleanVar` checkbox ([`tab.py:184`](tab.py)). Unchecked, the per-ROI first-activation time is Tab 5's hysteresis-onset estimate (the published `first_time` / `A`). Checked, `_apply_spks_override` ([`tab.py:535`](tab.py)) loads `spks.npy` via `core.utils.s2p_load_spks` (auto-orients to `(T, N_kept)`, subset to `kept_idx`), and `_first_time_from_spks` ([`tab.py:600`](tab.py)) recomputes activation per event window `[t0, t1]`: it slices frames `[floor(t0·fps), ceil(t1·fps))`, finds the **first frame with `spks > 0`** per ROI (`argmax` over a boolean mask), and writes that as `first_time`; ROIs with no deconvolved spike in the window are marked inactive (`A=False`, `first_time=NaN`). It mutates `self._data["A"]` / `["first_time"]` in place; unchecking restores the stashed Tab 5 matrices from `_last_results`. Requires a valid `fps` and an on-disk `spks.npy`, or it silently reverts. | Flip this when you trust Suite2p's OASIS deconvolution more than the hysteresis-onset detector — e.g. when dF/F is noisy and the Schmitt-trigger onset times look jittery, or to sanity-check that the propagation direction is robust to the activation-time definition. Spks onsets are typically **sparser and crisper** (one frame per spike), so expect fewer participating ROIs per event and a cleaner cyan→red gradient; the monotonicity ρ and p-value will shift accordingly. Gotchas: it only redefines *timing within already-detected windows* — it does **not** re-detect events, so the event count and `[t0, t1]` bounds are unchanged; it needs `spks.npy` in the plane0 folder and a known `fps` (the toggle auto-unchecks with a status-bar message if either is missing); and the override is what gets written when you **Export figures**, recorded as `use_spks_override` in the export manifest. Parallels the `spks` signal-kind radio on Tab 5 (set both the same way if you want both tabs reading the deconvolved signal), but the activation rule differs: Tab 5 reruns MAD-z + hysteresis on `spks.npy`, whereas Tab 8 here just takes the first non-zero spks frame in the window — so the two won't produce identical onset times even with both set to spks.
+
+Event navigation (Prev / Next buttons, the `ttk.Spinbox` bound to
+`event_var`) is not a setting — it only selects which already-computed
+event window to display.
+
 ## Plane0 metadata loaded locally
 
 Tab 5 doesn't ship `stat`/`ops` (they're large and the consumer can

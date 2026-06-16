@@ -81,6 +81,21 @@ History: the tab was migrated to customtkinter dark mode in May 2026 along with 
 
 ---
 
+## Advanced settings
+
+**This tab has none.** Tab 2 is a read-only QC *viewer* — it renders artefacts Tab 1 already wrote (`qc.gif`, `mean.npy`) and publishes nothing downstream (see [§3 Outputs](#3-outputs)). There is no `PARAM_SPEC`, no "Advanced..." dialog, and no inline numeric control that changes a result. The only two widgets are presentation-only:
+
+| Control | Default | What it does | What it means to you |
+| --- | --- | --- | --- |
+| **Animate** checkbox (`_gif_animate_var`, `tab.py:109`) | `True` (playing) | A `tk.BooleanVar` play/pause switch. ON calls `_start_playback()` (`tab.py:298`), which arms the `self.after(self.FRAME_MS, ...)` frame clock (`tab.py:306`; `FRAME_MS = 66` ≈ 15 fps); OFF calls `_stop_playback()` and freezes the current frame. It only starts/stops the Tk timer — it never re-reads the file or alters any pixel. | Pure viewing convenience. Pause to inspect a single frame (motion artefact, a bright transient) or to stop the clock while you work in another panel. No effect on any output, so toggle freely. Resuming reopens the handle lazily if it was released on tab-hide. |
+| **Reload from folder...** button (`_reload_from_folder`, `tab.py:180`) | — | Opens a directory picker, calls `load_existing_preprocess(path)`, and re-publishes the returned `PreprocessResult` on `AppState`. Takes no parameter. | Use it to view an already-processed recording without re-running Tab 1. If the folder was archived by Tab 3 (shifted TIFF removed), the reload transparently regenerates the shifted movie first — expect a brief stall (~1 min for a 9 GB recording). |
+
+**One hardcoded display constant, not user-tunable.** The mean-image `vmax` clamp uses `DISPLAY_CLIP_HIGH_PCT = 99.5` (`core/utils.py:639`, applied at `tab.py:369` as `np.quantile(mean, 99.5/100)`). This caps the grayscale at the 99.5th percentile so a few hot pixels can't wash out the mean image. It is a shared module constant — the same one used by `detection_run.py:785` and `event_detection_run.py:379` for their background/mean displays — and is *not* surfaced as a setting on any tab. Editing it would require a code change in `core/utils.py`. If you need a different contrast for inspection, use the matplotlib toolbar (pan/zoom) on the right panel instead.
+
+**Where the real knobs live.** Everything that actually shapes the artefacts you are eyeballing here is set upstream in **Tab 1 (Preprocess)** — registration, the QC-GIF frame sampling, and the mean-image computation. If the movie looks wrong or the mean is off, change parameters there and re-run, then re-view here.
+
+---
+
 ## 5. Re-implementation checklist
 
 1. A loop that streams a multi-frame GIF one frame at a time from an open `PIL.Image` handle (seek → one `PhotoImage` → `Tk.after`), holding only the current frame in memory.

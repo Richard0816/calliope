@@ -129,7 +129,7 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 
 ## 4. UI behaviour
 
-- **Slider** spans `[CUTOFF_MIN, CUTOFF_MAX]` (default `0.01 – 10 Hz`, configurable via Advanced). The default starting cutoff is 1.0 Hz.
+- **Slider** spans `[CUTOFF_MIN, CUTOFF_MAX]` (default `0.01 – 7 Hz`, configurable via Advanced — see §5). The default starting cutoff is 1.0 Hz.
 - **Slider debounce.** `_on_slider` uses `after(80, self._apply_cutoff)` so dragging fires at most every 80 ms, otherwise re-rendering would lag behind the slider.
 - **Cutoff entry box.** `_on_entry` clamps to bounds and snaps the slider to the typed value; Enter applies it.
 - **Source change.** Reloads the chosen trace, recomputes FFT, redraws all three panels.
@@ -138,15 +138,46 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 
 ---
 
-## 5. Parameters (`PARAM_SPEC`)
+## 5. Advanced settings (`PARAM_SPEC`)
 
-| Param | Default |
-|---|---|
-| `filter_order` | 2 (Butterworth order) |
-| `sg_win_ms` | 333 ms |
-| `sg_poly` | 2 |
-| `cutoff_min` | 0.01 Hz (slider lower bound) |
-| `cutoff_max` | 10.0 Hz (slider upper bound) |
+Five tunables open in the standard `AdvancedDialog` (the gear / "Advanced…"
+button → `_on_advanced`, `tab.py:699`). The cutoff itself is *not* here — it
+lives on the live slider/entry; these only set the slider's **bounds** plus
+the fixed filter/derivative knobs that the next **Compute** click bakes into
+the on-disk memmaps. The same five flow through `apply_batch_row`
+(`tab.py:157`) so Tab 0 batch rows can override them per recording, then on to
+`core/lowpass_run.compute_lowpass_and_dt` (`filter_order`, `sg_win_ms`,
+`sg_poly` at `lowpass_run.py:64-66`).
+
+### Low-pass filter
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| Butterworth order (`filter_order`) | `2` | Passed as `order` to `butter(order, cutoff/nyq, btype='low', output='sos')` in `utils.lowpass_causal_1d` (`utils.py:295`). Sets how many biquad second-order sections the SOS filter has: a Butterworth of order *n* rolls off at ≈ `6·n` dB/octave above the cutoff. The same `sos` is designed once and reused for every ROI in the Compute loop. | Raise it (3–4) for a sharper signal/noise split — frequencies just above the cutoff are attenuated harder, so high-frequency shot noise leaks through less. The cost: a steeper IIR has **longer group delay** and more ringing, so causal onset times shift later (the ≈ half-impulse-response lag in §3 grows) and sharp GCaMP8 transients can develop a small overshoot. Lower it to `1` for a very gentle, near-lag-free roll-off at the expense of letting more noise through. Order `2` is the validated default; only change it if the FFT elbow is unusually steep/shallow. Interacts with the cutoff: a higher order makes the cutoff *location* matter more. |
+
+### Derivative
+
+These govern the Savitzky–Golay first derivative written to
+`r0p7_filtered_dff_dt.memmap.float32`, which **is** the signal Tab 5
+thresholds for onset detection (`utils.sg_first_derivative_1d`,
+`utils.py:347`). Loosening or tightening them directly changes how many
+events Tab 5 finds.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| SG derivative window (ms) (`sg_win_ms`) | `333` | Converted to an **odd** sample count `win = max(3, int((sg_win_ms/1000)*fps) | 1)` (`utils.py:363`), then used as `savgol_filter(..., window_length=win, deriv=1, delta=1/fps)`. SG fits a `sg_poly`-degree polynomial across `win` samples and reports its analytic slope at the centre. At the default 15.07 fps, 333 ms ≈ a 5-sample window. If `win` ≥ trace length it shrinks to the largest odd window that fits; if still < 3 it falls back to a one-sample finite difference. | The single most impactful derivative knob. **Widen** it (e.g. 500–800 ms) to average over more samples → a smoother, less noisy `dt` trace and fewer spurious Tab 5 onsets, but slow real onsets get blurred and time-smeared (more lag, fused close events). **Narrow** it (e.g. 150–200 ms) to track fast transients crisply at the price of a noisier derivative and more false onsets. Always specified in **milliseconds**, so it self-adjusts when `fps` changes — you don't have to recompute sample counts. Re-Compute after changing it, then re-check Tab 5. |
+| SG polynomial order (`sg_poly`) | `2` | The `polyorder` of the fitted polynomial (`utils.py:377`). Degree 2 (quadratic) lets the local fit follow curvature — a rising/peaking transient — rather than assuming a straight line. SciPy requires `sg_poly < window_length`, so it must stay below the effective `sg_win_ms` sample count. | Leave at `2` for almost all data. Raising to `3`–`4` makes the fit hug sharp inflections more faithfully (useful only for very fast GCaMP8 kinetics with a wide window) but also lets the polynomial chase noise, partly undoing the smoothing `sg_win_ms` buys you. Lowering to `1` makes the derivative a plain moving-slope estimate — very smooth, but it underestimates the steepness of fast onsets. Gotcha: a high `sg_poly` with a **narrow** `sg_win_ms` can violate `poly < window` and error out; widen the window if you raise the order. |
+
+### Slider bounds
+
+These only reshape the **live cutoff slider** in the GUI; they are not written
+to disk and have no effect in headless/batch runs (which take an explicit
+`cutoff_hz`). Applied in `_on_advanced` (`tab.py:704-711`).
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| Slider min (Hz) (`cutoff_min`) | `0.01` | Becomes the slider's `from_` and `self.CUTOFF_MIN`. After the dialog closes the current cutoff is re-clamped into `[cutoff_min, cutoff_max]`. | Raise it if you never want to drag below some floor; lower it to explore very aggressive smoothing (a sub-0.1 Hz cutoff flattens almost everything but the slowest envelope). Cosmetic/convenience only — it constrains the slider, not the math. |
+| Slider max (Hz) (`cutoff_max`) | `7.0` | Becomes the slider's `to` and `self.CUTOFF_MAX`. | Raise it (toward but below Nyquist, `fps/2`) to audition near-passthrough cutoffs; the filter core independently clamps any cutoff to `0.95·Nyquist` (`utils.py:291`), so a `cutoff_max` above Nyquist just can't take effect. **Gotcha:** the whole bounds update is silently ignored unless `cutoff_min < cutoff_max` (`tab.py:706`) — set them in the right order. |
 
 ---
 

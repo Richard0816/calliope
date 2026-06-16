@@ -8,20 +8,21 @@ event detected by Tab 5, this tab paints the field of view as an
 activation-order map: each cell coloured by *when it fired within
 that event* on a continuous cyan -> blue -> red scale.
 
-Four panels per event
----------------------
+Three panels per event
+----------------------
 1. **Top-left** - plain activation-order map. ROIs that didn't
    participate in this event stay grey.
 2. **Top-right** - same map with white frame-to-frame propagation
    arrows overlaid. Each arrow connects the centroid of the ROIs
    activating in one frame to the centroid for the next active
    frame, so the wavefront's trajectory reads off directly.
-3. **Middle (centred)** - vectors-only view: the same arrow chain
-   on a blank FOV, with each frame group drawn as a coloured circle
-   whose radius is the 2-D standard deviation of contributing ROIs.
-4. **Bottom** - one violin per Δframe of pairwise distance,
-   aggregated over every active ROI used as a seed (last-frame ROIs
-   excluded).
+3. **Bottom** - directional-monotonicity test (``_render_monotonicity_panel``):
+   sweep a propagation axis over theta, rank-correlate each ROI's
+   projected position against its activation time, and report the
+   best angle, its Spearman rho, and a permutation p-value. Three
+   sub-plots: ROI positions coloured by activation time with the
+   theta* arrow, the rho(theta) curve, and the permutation null
+   histogram with the observed rho overlaid.
 
 Pure consumer of Tab 5
 ----------------------
@@ -47,7 +48,7 @@ Lifecycle
 ``_render_event(ev_idx)``
     The painting workhorse. Computes the order rank, the
     paint_order_map image, and the frame-grouped centroids; rebuilds
-    all four figures from scratch (so colorbars don't stack).
+    all three figures from scratch (so colorbars don't stack).
 """
 
 from __future__ import annotations

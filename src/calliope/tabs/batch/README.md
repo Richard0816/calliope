@@ -703,35 +703,220 @@ queue).
 
 ---
 
-## Per-row params dialog
+## Advanced settings (Edit params… / Apply settings to selected)
 
-`BatchTab.PARAM_SPEC` is a unified list assembled by `_build_batch_param_spec`
-from:
+**The batch tab has almost no advanced settings of its own.** Its
+`Edit params…` dialog (per row) and `Apply settings to selected`
+dialog (defaults → checked rows) are the *same* `AdvancedDialog`
+every stage tab uses — they just open it against a **union**
+PARAM_SPEC, `BatchTab.PARAM_SPEC = build_batch_param_spec()`
+(`tabs/batch/logic.py:540`), that concatenates each stage tab's own
+PARAM_SPEC. So most knobs in this dialog are documented in the
+per-tab READMEs; only a handful of keys are genuinely batch-owned
+(synthesized in `build_batch_param_spec` because they have no native
+PARAM_SPEC entry on their tab).
 
-- `PreprocessTab.PARAM_SPEC` — 5 knobs (QC GIF).
-- `Suite2pTab.PARAM_SPEC` — 24 knobs (Sparsery / Cellpose / Merge / dF/F /
-  Default low-pass / Pixel scale [`scope_zoom`, `fov_um_reference`,
-  `um_per_pixel`] / GPU).
-- Hand-built detection keys `gcamp_variant` (choice; sets the suite2p
-  deconvolution τ, drawn from `Suite2pTab.GCAMP_OPTIONS`) and
-  `gcamp_tau_custom` (float; a positive value overrides the variant τ,
-  `0` = use the dropdown). These live as Tk vars on Tab 3, not in its
-  PARAM_SPEC, so they're surfaced here and applied onto `gcamp_var` /
-  `custom_tau_var` by `Suite2pTab.apply_batch_row` (the public per-tab
-  seam the batch runner calls — it no longer pokes tab internals
-  directly; `_apply_row_params_to_tabs` just dispatches to each tab's
-  `apply_batch_row`).
-- `LowpassTab.PARAM_SPEC` — 5 knobs + an injected `cutoff_hz` (which Tab 4
-  binds to its slider rather than a PARAM_SPEC entry).
-- `EventDetectionTab.PARAM_SPEC` — 26 knobs (per-ROI hysteresis + display +
-  population events density / peaks / baseline / boundaries / Gaussian fit).
-- Hand-built clustering keys (`prefix`, `threshold`, `palette`).
-- Hand-built xcorr keys (`max_lag_seconds`, `zero_lag`, `use_gpu`).
-- Pipeline-wide (`baseline_mode`, `baseline_min`).
+### How per-row editing works (mechanism)
 
-Each source group's label is rewritten with a numbered stage prefix
-(`1. Preprocess - QC GIF`, `3. Low-pass - Butterworth`, …) so the
-Advanced dialog reads top-to-bottom in operation order.
+- A row's `Edit params…` button calls `BatchRow._on_edit_params`
+  (`tab.py:161`): it layers `row.params` on top of
+  `BatchTab.default_params`, opens `open_advanced(...,
+  self.tab.PARAM_SPEC, merged)`, and on OK stores the edited dict
+  back as `row.params`. The dict is **deltas, not a full snapshot** —
+  it round-trips through `calliope_batch.json` as `"params": {…
+  overrides only …}`.
+- `Apply settings to selected` calls `BatchTab._on_edit_defaults`
+  (`tab.py:954`): it opens the dialog against a copy of
+  `default_params`, then writes the result into `default_params` and
+  `merge_defaults(...)` onto every **checked** row. Use `Select all`
+  first to hit every row.
+- Edited values only take effect at run time because
+  `_apply_row_params_to_tabs` (`tab.py:1704`) dispatches `row.params`
+  to each tab's public `apply_batch_row(params, log=…)` seam right
+  before that tab's `_on_run` fires. Keys a row didn't override leave
+  that tab's live state untouched. The batch runner never pokes tab
+  internals — a rename inside a tab surfaces as a loud error there,
+  not a silent no-op here.
+- Group labels are renamed with a numbered stage prefix
+  (`1. Preprocess - QC GIF`, `2. Detection - dF/F`,
+  `3. Low-pass - Butterworth`, …) so the dialog reads top-to-bottom
+  in pipeline order.
+
+### Reused per-tab knobs (documented elsewhere)
+
+These come straight from each stage tab's PARAM_SPEC; edit them here
+exactly as you would on the tab itself. **For "what it does / what it
+means to you" on each, see the linked tab README's Advanced settings
+section** — they are not duplicated here.
+
+| Dialog group prefix | Source PARAM_SPEC | Count | Per-tab reference |
+|---|---|---|---|
+| `1. Preprocess -` | `PreprocessTab.PARAM_SPEC` | 5 | [Tab 1 — Preprocess](../preprocess/README.md) |
+| `2. Detection -` | `Suite2pTab.PARAM_SPEC` | 27 (Sparsery / Cellpose / Merge / Cellpose-SAM (Tier 2) / dF/F / Default low-pass / Pixel scale / GPU) | [Tab 3 — Suite2p detection](../suite2p/README.md) |
+| `3. Low-pass -` | `LowpassTab.PARAM_SPEC` | 5 | [Tab 4 — Low-pass](../lowpass/README.md) |
+| `4. Events -` | `EventDetectionTab.PARAM_SPEC` | 30 (per-ROI hysteresis / display / population density / peaks / baseline / boundaries / Gaussian fit) | [Tab 5 — Event detection](../event_detection/README.md) |
+
+### Batch-owned settings (synthesized here)
+
+The keys below exist **only** in the batch union spec (they have no
+PARAM_SPEC entry on their source tab — they live as Tk vars, slider
+values, or `run_*()` kwargs that the batch runner has no other way to
+expose). Defaults are exactly as in `build_batch_param_spec`.
+
+#### 2. Detection — dF/F (GCaMP τ)
+
+These two surface Tab 3's GCaMP τ controls, which are Tk vars
+(`gcamp_var` / `custom_tau_var`) on the suite2p tab, not PARAM_SPEC
+entries. `Suite2pTab.apply_batch_row` writes them back onto those
+vars at run time.
+
+- **`gcamp_variant`** — *choice*, default = first entry of
+  `Suite2pTab.GCAMP_OPTIONS`.
+  - **What it does:** picks a calcium-decay time constant τ from the
+    preset GECI table; that τ is handed to suite2p's OASIS
+    deconvolution (the `tau` op) when spikes are estimated. The choice
+    list is imported from `Suite2pTab.GCAMP_OPTIONS` so it stays in
+    lockstep with the tab.
+  - **What it means to you:** set it to the indicator you actually
+    injected (e.g. GCaMP6f vs 6s vs jGCaMP8). A too-fast τ over-splits
+    a slow transient into multiple inferred spikes; a too-slow τ
+    smears fast events together. Only affects the deconvolved
+    `spks.npy`; raw F / dF/F are unchanged.
+- **`gcamp_tau_custom`** — *float*, default = `0.0`.
+  - **What it does:** a positive value overrides the variant dropdown
+    and is passed verbatim as suite2p's τ (seconds). `0` means "use
+    the `gcamp_variant` τ".
+  - **What it means to you:** use it for an indicator not in the
+    preset list, or a rig-calibrated τ from your own decay fits.
+    Interacts with `gcamp_variant`: a non-zero custom τ wins, so the
+    dropdown is ignored while this is set. Leave at `0` unless you
+    have a measured number.
+
+#### 5. Clustering
+
+No clustering tab contributes a PARAM_SPEC, so these three are
+hand-built and flow into `core.clustering.run_clustering`
+(`clustering.py:520`).
+
+- **`prefix`** — *str*, default = `"r0p7_filtered_"`.
+  - **What it does:** selects which dF/F memmap clustering reads
+    (`<prefix>dff.memmap.float32`). `r0p7_filtered_` uses the
+    cell-filter–masked traces (kept ROIs only); `r0p7_` would use all
+    ROIs.
+  - **What it means to you:** leave it at the filtered default —
+    that's the population the rest of the pipeline analyses. Change
+    it only if you deliberately want to cluster the unfiltered ROI
+    set (debugging the cell filter).
+- **`threshold`** — *float*, default = `0.0` (= auto).
+  - **What it does:** the Ward-linkage cut height. `0` (passed as
+    `None`) routes to `auto_choose_threshold(Z, target_counts=(4,5))`
+    (`clustering.py:566-569`), which picks the fraction-of-max-height
+    cut that lands the cluster count near the target band; any
+    positive value is used directly as the `fcluster` distance
+    threshold.
+  - **What it means to you:** keep `0` for the data-driven cut.
+    Raising a manual threshold merges clusters (fewer, larger);
+    lowering it splits them (more, smaller). Only override when the
+    auto-cut consistently gives you a count you disagree with on your
+    recordings.
+- **`palette`** — *str*, default = `"tab10"`.
+  - **What it does:** the matplotlib colormap name used to color
+    clusters in the dendrogram / spatial-cluster figures.
+  - **What it means to you:** cosmetic only. Switch to a
+    higher-cardinality palette (e.g. `tab20`) if you routinely get
+    more clusters than `tab10`'s 10 distinct colors.
+
+#### 6. Cross-correlation
+
+Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`,
+`crosscorrelation.py:193`).
+
+- **`max_lag_seconds`** — *float*, default = `2.0`.
+  - **What it does:** the lag search-window radius. Converted to
+    frames as `L = floor(max_lag_seconds * fps)`
+    (`crosscorrelation.py:266`); the best-lag scan runs over
+    `[-L, +L]`.
+  - **What it means to you:** raise it if you expect slow propagation
+    across the FOV (larger lags will be found); lower it to restrict
+    the search and speed it up. Too large wastes compute and can pick
+    up spurious far-lag peaks.
+- **`zero_lag`** — *bool*, default = `True`.
+  - **What it does:** also computes the Pearson r at lag 0
+    (`zero_lag_corr`) alongside the best-lag correlation.
+  - **What it means to you:** leave on if you want synchrony at zero
+    lag reported separately from the lag-shifted max. Turning it off
+    skips that extra matrix (marginally faster, one fewer output).
+- **`use_gpu`** — *bool*, default = `True`.
+  - **What it does:** runs the correlation on CuPy when available
+    (`use_gpu = bool(use_gpu and cp is not None)`,
+    `crosscorrelation.py:238`); falls back to NumPy otherwise.
+  - **What it means to you:** keep on for speed on a CUDA box; the
+    code silently falls back to CPU if CuPy is missing, so it's safe
+    to leave True. The OOM auto-retry path forces this off on the
+    conservative pass.
+
+#### 7. Pipeline-wide — dF/F baseline (suite2p detection)
+
+Hand-built; passed to `core.detection_run` (`baseline_mode` /
+`baseline_min`, `detection_run.py:425` / `:465`). Named
+`dff_baseline_mode` / `dff_baseline_min` (not `baseline_mode`) so they
+never collide with Tab 5's population-event `baseline_mode`.
+
+- **`dff_baseline_mode`** — *choice* `["first_n", "rolling"]`,
+  default = `"first_n"`.
+  - **What it does:** chooses the F₀ for dF/F. `first_n` = mean of the
+    first `dff_baseline_min` minutes per ROI; `rolling` = a 45 s
+    window, 10th-percentile baseline. `first_n` is also the only mode
+    the GPU dF/F fast path supports (`detection_run.py:436` — `rolling`
+    forces the per-ROI CPU path).
+  - **What it means to you:** use `first_n` when the recording starts
+    quiet (clean pre-stimulus epoch). Switch to `rolling` if there's no
+    clean baseline window or slow drift over the recording — at the
+    cost of dropping off the GPU path (slower).
+- **`dff_baseline_min`** — *float*, default = `2.0` (minutes).
+  - **What it does:** the length of the `first_n` baseline window
+    (`baseline_sec = baseline_min * 60`, `detection_run.py:451`).
+    Ignored when `dff_baseline_mode == "rolling"`.
+  - **What it means to you:** raise it to average over a longer quiet
+    epoch (steadier F₀, but only valid if the recording really is
+    quiet that long); lower it if activity starts early. Interacts
+    with `dff_baseline_mode` — only meaningful under `first_n`.
+
+#### 8. Output
+
+- **`export_nwb`** — *bool*, default = `False`.
+  - **What it does:** writes a DANDI-style `<rec>.nwb` at the end of
+    each row (after event detection, so event windows are included)
+    via `core.nwb_export`; the file is mirrored to the output drive
+    with the rest of the outputs. Best-effort: a missing `pynwb` or a
+    write error is logged and never stops the batch.
+  - **What it means to you:** turn on if you need a standards-compliant
+    archive for sharing/DANDI. Requires the optional extra
+    (`pip install 'calliope[nwb]'`). Leave off otherwise — it's pure
+    overhead. See **Export NWB file** above for the file contents.
+
+#### Low-pass cutoff (slider-backed)
+
+- **`cutoff_hz`** — *float*, default = `1.0` (Hz).
+  - **What it does:** the Butterworth low-pass cutoff applied to every
+    kept ROI when batch runs Tab 4. It's synthesized here because Tab 4
+    binds the cutoff to a **slider**, not a PARAM_SPEC entry, so the
+    batch dialog needs its own key.
+  - **What it means to you:** lower it for heavier smoothing (kills
+    high-frequency noise but can blur fast event edges); raise it to
+    preserve sharper transients at the cost of more noise. Interacts
+    with the Tab 4 slider-bounds knobs (in `3. Low-pass`) if you've
+    moved the slider range.
+
+### Inline "What to save" toggles (not in the dialog)
+
+Separate from the Advanced dialog, the **What to save** group in the
+tab body (three `BooleanVar` checkboxes + preset) tunes the output
+footprint. These are session-only (not persisted) and documented in
+full under [**What to save**](#what-to-save-user-selectable-output-footprint)
+above: *Keep suite2p registration (`data.bin`)*, *Keep shifted /
+motion-corrected TIFF*, and *Archive raw TIFF (compressed)*, plus the
+**Keep everything** / **Bare minimum** presets.
 
 ---
 

@@ -103,25 +103,26 @@ A single `cp.asarray` move at the top, all matmuls on GPU, one `cp.asnumpy` at t
 ### Step 3 — Full-recording mode (`run_cluster_xcorr_full_fast`)
 
 ```python
-for (i, A_rois) in enumerate(clusters):
-    for (j, B_rois) in enumerate(clusters):
-        X_A = dff[:, A_rois]
-        X_B = dff[:, B_rois]
+cluster_names = sorted(clusters)          # e.g. "C1", "C2", ...
+for iA, cA in enumerate(cluster_names):
+    for cB in cluster_names[iA:]:         # upper triangle only (incl. self-pairs)
+        X_A = dff[:, clusters[cA]]
+        X_B = dff[:, clusters[cB]]
         best_lag, best_corr, zero_corr = batch_xcorr_clusters(
             X_A, X_B, fps, max_lag_seconds, use_gpu=use_gpu)
-        write_pair_summary_csv(out_root / f"C{i+1}xC{j+1}", ...)
+        write_pair_summary_csv(out_root / f"{cA}x{cB}", ...)
         progress_cb(...)
 ```
+
+Only the upper triangle (`cluster_names[iA:]`) is written, so a pair appears
+once as `CAxCB` (never the mirror `CBxCA`); self-pairs `CAxCA` are included.
 
 The output layout is:
 
 ```
 <plane0>/r0p7_filtered_cluster_results/gui_recluster/cross_correlation_full/
 ├── C1xC1/
-│   ├── C1xC1_summary.csv          ← per-pair best_lag_sec, max_corr, zero_lag_corr
-│   ├── C1xC1_best_lag.npy         ← (nA, nB) array
-│   ├── C1xC1_max_corr.npy
-│   └── C1xC1_zero_lag.npy
+│   └── C1xC1_summary.csv          ← per-pair best_lag_sec, max_corr, zero_lag_corr
 ├── C1xC2/
 ├── ...
 ```
@@ -129,10 +130,10 @@ The output layout is:
 The summary CSV has columns:
 
 ```
-roi_A, roi_B, best_lag_sec, max_corr, zero_lag_corr [, p_value, p_value_fdr, partial_corr_zero_lag]
+roiA, roiB, best_lag_sec, max_corr, zero_lag_corr [, p_value, p_value_fdr, partial_corr_zero_lag]
 ```
 
-`roi_A` and `roi_B` are **Suite2p ROI indices**. When the "shuffles" GUI field is > 0 (default 500), the per-pair circular-shift null adds two more columns:
+`roiA` and `roiB` are **Suite2p ROI indices**. When the "shuffles" GUI field is > 0 (default 500), the per-pair circular-shift null adds two more columns:
 
 - `p_value` — fraction of circular-shift draws (jittered alignment, preserving each ROI's autocorrelation) whose max-correlation ≥ the observed max, with the Phipson-Smyth +1/+1 correction so a pair that beats every shuffle still gets a non-zero p capped at `1/(n_shuffles+1)`.
 - `p_value_fdr` — Benjamini-Hochberg-adjusted q-value across the (nA × nB) matrix. Compare against your target FDR (typically 0.05) to flag significant pairs.
@@ -141,7 +142,7 @@ The circular-shift null is the field-standard fix for the autocorrelation-inflat
 
 When the "+ partial corr" checkbox is on (default off), an additional column appears:
 
-- `partial_corr_zero_lag` — partial correlation between `roi_A` and `roi_B` conditioning on every other ROI in the union of all clusters. Computed once via `core/crosscorrelation.py::compute_partial_correlation` on the full population's z-scored dF/F (ridge `1e-6`), then sliced per cluster pair. The motivating use case: disambiguate "A and B drive each other" from "A and B are both driven by some other ROI C" — Pearson can't tell those apart but partial correlation can (Sutera et al. [arXiv:1406.7865](https://arxiv.org/abs/1406.7865); Stevenson [arXiv:1708.01888](https://arxiv.org/abs/1708.01888)). Requires `N_union < 0.5 * T` (precision-matrix conditioning); the run automatically skips and warns above that threshold. Entries are `nan` when a cluster ROI isn't in the keep mask.
+- `partial_corr_zero_lag` — partial correlation between `roiA` and `roiB` conditioning on every other ROI in the union of all clusters. Computed once via `core/crosscorrelation.py::compute_partial_correlation` on the full population's z-scored dF/F (ridge `1e-6`), then sliced per cluster pair. The motivating use case: disambiguate "A and B drive each other" from "A and B are both driven by some other ROI C" — Pearson can't tell those apart but partial correlation can (Sutera et al. [arXiv:1406.7865](https://arxiv.org/abs/1406.7865); Stevenson [arXiv:1708.01888](https://arxiv.org/abs/1708.01888)). Requires `N_union < 0.5 * T` (precision-matrix conditioning); the run automatically skips and warns above that threshold. Entries are `nan` when a cluster ROI isn't in the keep mask.
 
 With partial correlation on, each cluster pair also gets a side-by-side heatmap PNG, `CAxCB_corr_heatmaps.png` (left: zero-lag Pearson r; right: partial correlation), written next to that pair's summary CSV. The `zero_lag_corr` column is always written into the summary CSV whenever partial correlation is on, so both matrices in the figure can be reconstructed from the CSV alone.
 
@@ -159,15 +160,16 @@ X_B    = dff[f0:f1, B_rois]
 batch_xcorr_clusters(X_A, X_B, ...)
 ```
 
-Output layout adds an event subdirectory:
+Output layout writes one directory per event, directly under
+`cross_correlation_per_event/`, named `event{NNNN}_{start}s_{end}s` with dots
+replaced by `p`:
 
 ```
-.../cross_correlation_full/
-├── eventwise/
-│   ├── event_0000/
-│   │   ├── C1xC2/...
-│   ├── event_0001/
-│   ├── ...
+.../cross_correlation_per_event/
+├── event0000_0p0s_0p8s/
+│   ├── C1xC2/...
+├── event0007_12p3s_13p1s/
+├── ...
 ```
 
 `max_lag` is automatically capped to the available window length so a 0.4 s event with default `max_lag = 2 s` won't crash — it gets clamped down.
@@ -194,7 +196,7 @@ Plotted with the peak marked in red and the zero-lag value marked in green. The 
 
 ### Step 6 — Violin plots
 
-`ViolinWindow` reads every `*_summary.csv` in `cross_correlation_full/` (or per-event) and renders two violins per cluster pair:
+`ViolinWindow` reads every `*_summary.csv` in `cross_correlation_full/` (or `cross_correlation_per_event/`) and renders two violins per cluster pair:
 
 1. **Top panel — zero-lag correlation** distribution (`zero_lag_corr` column): one violin per pair, ordered by natural pair key (`C1xC2`, `C1xC10` correctly ordered).
 2. **Bottom panel — best-lag distribution** (`best_lag_sec` column), coloured by sign and significance:
@@ -236,33 +238,62 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 ├── cross_correlation_full/
 │   ├── C{i}xC{j}/
 │   │   ├── C{i}xC{j}_summary.csv
-│   │   ├── C{i}xC{j}_best_lag.npy
-│   │   ├── C{i}xC{j}_max_corr.npy
-│   │   ├── C{i}xC{j}_zero_lag.npy
 │   │   └── C{i}xC{j}_corr_heatmaps.png   ← only with "+ partial corr": zero-lag Pearson | partial corr
-│   └── eventwise/
-│       └── event_NNNN/
-│           └── C{i}xC{j}/...
+│   └── ...
+├── cross_correlation_per_event/
+│   └── event{NNNN}_{start}s_{end}s/
+│       └── C{i}xC{j}/
+│           └── C{i}xC{j}_summary.csv
 ```
+
+The violin PNG/SVG is rendered separately into the `calliope_figures`
+tree (`full.png` / `per_event.png`), not into the cluster-results tree above.
 
 (See `core/crosscorrelation.py: _write_pair_summary_csv` and the two `run_*_fast` functions for the exact layout.)
 
 ---
 
-## 4. Parameters
+## 4. Advanced settings
 
-| Param | Default | Notes |
-|---|---|---|
-| `prefix` | `r0p7_filtered_` | dF/F memmap prefix (must match Tab 6 export). |
-| `cluster_folder` | `gui_recluster` | Subfolder under `r0p7_filtered_cluster_results/`. |
-| `fps` | Tab 3 FPS override, else fallback 15.07 | Editable at runtime. |
-| `max_lag_seconds` | 2.0 | Search range ±L = ±round(max_lag · fps). |
-| `also output zero-lag corr` | True | Track the lag-0 matrix during the per-lag loop. |
-| `use GPU if available` | True | Falls back to NumPy if CuPy is missing. |
-| `shuffles (0=off)` | 500 | Circular-shift null + BH-FDR. Adds `p_value` / `p_value_fdr` CSV columns; cost scales linearly with the value (each shuffle is one extra batched-matmul sweep). |
-| `+ partial corr (requires N < T/2)` | unchecked | Compute population-wide partial correlation across the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`), conditioning each pair on every other ROI. Adds `partial_corr_zero_lag` to each cluster pair's summary CSV, always writes the `zero_lag_corr` column, and emits a side-by-side `CAxCB_corr_heatmaps.png` (zero-lag Pearson r \| partial correlation) next to each pair's CSV. Automatically skipped when `N_union >= 0.5 * T` (precision matrix ill-conditioned). Only meaningful on the full-recording run — Tab 7 strips the flag on per-event runs and logs a notice. |
+Tab 7 has **no `PARAM_SPEC` and no Advanced dialog** — every tunable knob is an
+inline Tk-var widget in the header (`tab.py` ~700–772) plus the single-pair
+preview controls (`tab.py` ~862–885). The run params dict is assembled by
+`_gather_params` (`tab.py:1339–1361`) and passed straight to
+`core/crosscorrelation.py::run_cluster_xcorr_full_fast` /
+`run_cluster_xcorr_per_event_fast`. Defaults below are exactly the widget
+`value=` literals; do not assume an Advanced popout exists.
 
-For the violin permutation test: `n_perm=10000`, `chunk=256`, `seed=0`.
+### Inputs (header rows 1–2)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `prefix` | `r0p7_filtered_` (`tab.py:100`) | Filename prefix of the dF/F memmap and cluster-results tree to open (`_open_dff_memmap`). When the prefix contains `filtered`, the loader also applies the keep mask so `N_kept = mask.sum()`. | Must match what Tab 6 actually exported. Change it only if you reclustered an unfiltered or differently-prefixed export; a wrong prefix means "file not found" or a shape mismatch, not a silent fallback. |
+| `cluster_folder` | `""` (`tab.py:105`) | Subfolder under `<plane0>/r0p7_filtered_cluster_results/` holding the `C*_rois.npy` cluster files. Empty string ⇒ read straight from the cluster-results root. Blank input falls back to this default (`tab.py:1341`). | Set it to e.g. `gui_recluster` only if your Tab 6 run wrote clusters into a named subdirectory. If you point it at the wrong folder you'll cross-correlate the wrong (or zero) clusters. |
+| `fps` | `15.07` (`utils.DEFAULT_FPS`, `utils.py:628`) | Frame rate used to convert lag indices to seconds and `max_lag` seconds to a frame radius `L = floor(max_lag·fps)` (`core` :266/:430/:512). On plane0 load it is auto-filled from the recording's notes via `utils.get_fps_from_notes(plane0, default_fps=DEFAULT_FPS)` (`tab.py:1106–1109`); a non-numeric entry silently reverts to the last good value (`tab.py:1343–1345`). | Get this right — every reported `best_lag_sec` scales linearly with `fps`. Too high and lags read short; too low and they read long. The 15.07 fallback is a lab-legacy default, not a universal truth; override it for your rig. |
+
+### Search parameters (header row 3)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `max_lag_seconds` | `2.0` (`DEFAULT_MAX_LAG_S`, `tab.py:106`) | Half-width of the lag search window in seconds. Sets `L = floor(max_lag·fps)`; the loop runs `2L+1` lag-matmuls, so `best_lag_sec ∈ [−max_lag, +max_lag]`. In per-event mode it is auto-clamped to `win_len − 1/fps` so a short event never zero-pads itself to death (`core:1139`). Bad input reverts to `2.0` (`tab.py:1349`). | Raise it if you expect long lead/lag delays between clusters (slow propagation); a peak pinned at the edge means the window is too narrow. Lower it for tight, fast coupling — cost and zero-padding both grow with `L`, and a too-wide window invites spurious far-lag peaks. |
+| `zero_lag` ("also output zero-lag corr") | `True` (`tab.py:742`) | Captures the lag-0 Pearson matrix during the per-lag sweep (`core:298–311`) and adds a `zero_lag_corr` column to every summary CSV (`core:1024`). Forced on whenever `compute_partial` is set, since the heatmap needs it. | Leave on — it's nearly free (the lag-0 matmul happens anyway) and zero-lag r is what the violin top panel and the partial-corr heatmap read. Turn it off only to drop the extra CSV column when you care solely about the best-lag peak. (Output is CSV-only; no dense `.npy` matrices are written.) |
+| `use_gpu` ("use GPU if available") | `True` (`tab.py:747`) | Runs the z-scoring + lag matmuls on CuPy when importable: one `cp.asarray` in, all GEMMs on-device, one `cp.asnumpy` out — no per-lag host↔device copies. Silently falls back to NumPy if CuPy is absent. | Keep on; on large cluster sets the GEMM sweep is the whole cost and the GPU pulverises it. Turn it off only to debug a CuPy/driver issue or to free the GPU for another process — results are numerically identical, just slower. |
+| `n_shuffles` ("shuffles (0=off)") | `500` (`tab.py:757`) | Number of circular-shift null draws per ROI pair (`core:366–470`). Each draw jitters one signal's alignment (preserving its autocorrelation) and recomputes the max correlation; `p_value = (hits+1)/(n_shuffles+1)` (Phipson–Smyth +1/+1), then a Benjamini–Hochberg `p_value_fdr` across the matrix. Adds both columns to the CSV. `0` disables the test. The widget reads `max(0, int(...))`, so a negative integer clamps to `0` (test disabled); only non-integer input falls back to `500` (`tab.py:1351–1353`). | This is the field-standard fix for autocorrelation-inflated false positives on calcium data (Cheng et al., eLife 2023). The smallest p you can report is `1/(n_shuffles+1)`, so 500 ⇒ p ≥ 0.002 — raise it (e.g. 1000–5000) for finer resolution at strictly linear time cost; set 0 for a fast exploratory pass with no significance. Per-event runs ignore it (the GUI strips the flag and logs a note). |
+| `compute_partial` ("+ partial corr (requires N < T/2)") | `False`/unchecked (`tab.py:768`) | Computes the population-wide partial-correlation matrix once over the union of all cluster ROIs (`core/crosscorrelation.py::compute_partial_correlation`, ridge `1e-6`), conditioning each pair on every other ROI, then slices it per cluster pair. Adds `partial_corr_zero_lag` to each pair's CSV, forces the `zero_lag_corr` column on, and writes a side-by-side `CAxCB_corr_heatmaps.png` (zero-lag Pearson \| partial). Auto-skipped with a warning when `N_union ≥ 0.5·T` (precision matrix ill-conditioned). | Turn it on to tell "A and B drive each other" apart from "A and B are both driven by some third ROI C" — plain Pearson can't, partial correlation can. Costs one extra precision-matrix solve plus a heatmap per pair. Only meaningful on the full-recording run (Tab 7 strips it on per-event and logs a notice); entries are `nan` for ROIs outside the keep mask. |
+
+### Single-pair preview (right pane)
+
+These four inline controls only drive the interactive curve plot — they do not
+touch the batch CSV outputs.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `sp_roiA` / `sp_roiB` ("ROI A" / "ROI B") | `0` / `1` (`tab.py:865/869`) | The two **Suite2p ROI indices** fed to `single_pair_xcorr_curve`, which returns the full `(2L+1)` lag curve for that one pair (not just the peak). | Use the same Suite2p numbers you see in the summary CSVs to eyeball any specific pair's CCG shape, peak lag, and zero-lag value before trusting the aggregate violins. |
+| `sp_lag` ("lag window (s)") | `2.0` (`DEFAULT_MAX_LAG_S`, `tab.py:873`) | Independent `max_lag_seconds` for the preview curve only. | Widen it to confirm a peak isn't being clipped, or narrow it to zoom the central lobe. Does not affect any batch run. |
+| `sp_event` ("event") | `full recording` (`tab.py:876`) | Crops the preview to a single event window (rebuilt from EventWindows on refresh) or the whole trace. | Switch to a specific event to inspect lead/lag during one seizure rather than the whole recording. |
+
+For the violin permutation test (not user-exposed; fixed in code): `n_perm=10000`,
+`chunk=256`, `seed=0`.
 
 ---
 
@@ -287,7 +318,7 @@ For the violin permutation test: `n_perm=10000`, `chunk=256`, `seed=0`.
 5. **Per-event windowing:** prefer Tab 5's in-memory `event_results` for the current plane0; fall back to the EventWindows sheet of `<rec>_summary.xlsx`. Convert seconds to `(f0, f1)` frame indices and clamp `max_lag` to the window length so zero-pad doesn't dominate.
 6. **Sign-flip permutation:** random ±1 signs over the values array, recompute mean, count `|permuted| ≥ |observed|`. Chunk the random-sign matrix to bound memory.
 7. **Single-pair full curve:** same z-scoring, but use `numpy.lib.stride_tricks.sliding_window_view` and one `(2L+1, T) · (T,)` matmul to get all lags in one shot.
-8. **Output schema:** per-pair `{summary.csv, best_lag.npy, max_corr.npy, zero_lag.npy}` so downstream analyses can read the CSV summaries or the dense matrices as needed.
+8. **Output schema:** one per-pair `C{i}xC{j}_summary.csv` (via `np.savetxt`) holding `roiA, roiB, best_lag_sec, max_corr [, zero_lag_corr, …]` so downstream analyses can read the summaries. No dense `.npy` matrices are written.
 
 
 ## UI affordances

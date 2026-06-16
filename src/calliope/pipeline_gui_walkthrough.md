@@ -290,7 +290,7 @@ V1 ships only the activation-order map. Future view modes (planned, ported from 
 
 **Biological output.** A click-through atlas of "who fired first, who fired last" for every detected population event in the recording.
 
-→ See `tabs/spatial_propagation/README.md` for the inputs, the order-rank → painted-image pipeline (two helpers in `core/spatial.py`), the PARAM_SPEC defaults, and the planned roadmap of additional view modes.
+→ See `tabs/spatial_propagation/README.md` for the inputs, the order-rank → painted-image pipeline (two helpers in `core/spatial.py`), the single inline `Use Suite2p spks` toggle (this tab has no Advanced dialog of its own), and the planned roadmap of additional view modes.
 
 ---
 
@@ -309,6 +309,24 @@ You record a 10-minute, 15 fps calcium movie of a brain slice in low-magnesium a
 | 8 | Clicking through the 23 per-event activation-order maps, the upper-left quadrant lights up cyan in 19/23 events with red trailing toward the lower-right — a stereotyped propagation pattern that visualises the C1 → C2 → C3 lead/lag found in Tab 7. |
 
 **Biological story.** The slice has a focal seizure-initiation zone (C1, upper-left), which recruits a peri-focal ring (C2), which then drives a more distributed downstream cluster (C3), while a fourth cluster (C4) participates passively. **This is the kind of result that justifies a paper.**
+
+---
+
+## Advanced settings — quick reference
+
+Most tabs hide their fine-tuning behind an **Advanced...** button (a modal form auto-built from that tab's `PARAM_SPEC`); a couple expose the knobs inline instead, and a few have none of their own. Edits are snapshotted on the **next** Run/Render — closing the dialog never re-runs anything. Defaults are tuned for the sub-second epileptiform regime; you rarely need to touch them. The table below is the map; each tab's `README.md` has a full **Advanced settings** section giving, per knob, *what it does* (the mechanism + default) and *what it means to you* (when and why to change it).
+
+| Tab | Where the knobs live | What you can tune (and why you'd bother) |
+|---|---|---|
+| **0 — Batch** | `Edit params…` (per row) / `Apply settings to selected` — the *same* dialog, over a union of every stage's `PARAM_SPEC` | Override any stage knob per queued recording (stored as deltas). A few batch-only keys: `gcamp_variant`/`gcamp_tau_custom`, `dff_baseline_mode`, `cutoff_hz`, `export_nwb`. See each stage tab for the knob meanings. |
+| **1 — Preprocess** | Advanced... (5 knobs) | **QC GIF only** — `downsample_t`, `max_size_px`, `playback_fps`, `clip_low/high`. Tune preview readability; *nothing* downstream (shifted TIFF, mean, dF/F) is affected. |
+| **2 — QC Preview** | none | Read-only viewer. `Animate` and `Reload from folder…` are presentation-only; the real knobs are on Tab 1. |
+| **3 — Suite2p** | Advanced... (27-knob `PARAM_SPEC`) **+** `Edit suite2p settings…` (raw-ops escape hatch) | Detection sensitivity (`threshold_scaling` ↓ = more ROIs), Cellpose/Cellpose-SAM thresholds, ROI merge overlap, dF/F (`neuropil_coef`, baseline `perc`/`win_sec`, `fps_override`), pixel-scale, GPU. The escape hatch forwards arbitrary suite2p `db`/`settings` (registration block size, nonrigid, …) for a session. |
+| **4 — Low-pass** | Advanced... (5 knobs) — cutoff itself is the live slider | `filter_order` (Butterworth roll-off vs lag), `sg_win_ms` (SG derivative window — the most impactful: wide = smoother/fused, narrow = crisp/noisy), `sg_poly`, and the slider bounds `cutoff_min/max`. |
+| **5 — Event detection** | Advanced... (30-knob `PARAM_SPEC`, grouped) | The deepest dialog. Per-ROI hysteresis (`z_enter/z_exit/min_sep_s`), onset-density binning/smoothing, peak-prominence (`auto_min_prominence` drives the floor from the per-recording circular-shift null p99), baseline/noise, event boundaries (`max_event_duration_s`, watershed split), and an off-by-default Gaussian-fit boundary. |
+| **6 — Clustering** | inline (no dialog) | `prefix` (which dF/F memmap), `Manual threshold` + the `cut` slider (lower = more/smaller clusters; absolute Ward distance, recording-specific — judge by eye), `palette` (cosmetic), and `Recluster` threshold to sub-divide one ensemble. |
+| **7 — Cross-correlation** | inline (no dialog) | `prefix`/`cluster_folder`, `fps`, `max_lag_seconds`, `zero_lag`, `use_gpu`, `n_shuffles` (circular-shift null vs autocorrelation-inflated p-values), `compute_partial` (separate direct coupling from common drive), plus single-pair preview controls. |
+| **8 — Spatial propagation** | none of its own | Pure consumer of Tab 5 — re-render Tab 5 to change what's painted. One inline `Use Suite2p spks` toggle swaps hysteresis onsets for first-spike timing; monotonicity internals (`n_angles=360`, `n_shuffles=10000`) are hardcoded. |
 
 ---
 

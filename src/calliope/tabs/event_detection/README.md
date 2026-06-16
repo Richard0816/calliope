@@ -142,7 +142,7 @@ if normalize_by_num_rois:
 smooth     = gaussian_filter1d(counts, sigma=smooth_sigma_bins)
 ```
 
-`bin_sec = 0.025` (25 ms) and `smooth_sigma_bins = 1.5` are tuned for events <0.5 s. Larger bins blur out short events; smaller bins make `find_peaks` choke on every single onset.
+`bin_sec = 0.05` (50 ms) and `smooth_sigma_bins = 1.5` are tuned for short (sub-second) events. Larger bins blur out short events; smaller bins make `find_peaks` choke on every single onset.
 
 `normalize_by_num_rois` makes density an "average onsets per ROI per bin," comparable across recordings with different ROI counts.
 
@@ -154,7 +154,7 @@ peaks, _ = find_peaks(
     smooth,
     prominence  = min_prominence,        # 0.002 (NEW; OLD was 0.007)
     width       = min_width_bins,        # 1.0 bin (NEW; OLD was 2.0)
-    distance    = min_distance_bins,     # 4.0 bins ≈ 100 ms at bin_sec=0.025
+    distance    = min_distance_bins,     # 4.0 bins ≈ 200 ms at bin_sec=0.05
     wlen        = wlen_bins,             # 1 s window for prominence calc
 )
 ```
@@ -179,8 +179,8 @@ For each peak `p`:
 After all `(start_s, end_s)` pairs are walked:
 
 - **Watershed split** (`enable_watershed_split=True`): if `end_s[k] > start_s[k+1]`, find the bin of minimum smoothed density between `peak[k]` and `peak[k+1]` and set both windows' boundary there. Splits two real events that were "swallowed" into one wide window.
-- **Hard duration cap** (`max_event_duration_s = 0.5 s`): if `end_s − start_s > 0.5`, clamp it to centred-on-peak ±0.25 s.
-- **Symmetric clamp** (`enforce_symmetric_clamp=False` by default): if true, *every* window becomes peak ± 0.25 s, not just the ones that exceed the cap. Useful for stereotyping but loses the natural boundaries.
+- **Hard duration cap** (`max_event_duration_s = 1.3 s`): if `end_s − start_s > 1.3`, clamp it to centred-on-peak ±0.65 s.
+- **Symmetric clamp** (`enforce_symmetric_clamp=False` by default): if true, *every* window becomes peak ± `max_event_duration_s/2` (0.65 s at the default cap), not just the ones that exceed the cap. Useful for stereotyping but loses the natural boundaries.
 
 The `merge_gap_s` parameter is kept for compatibility but is **disabled** when `enable_watershed_split=True` (the new logic supersedes it).
 
@@ -220,51 +220,311 @@ The `summary_writer.write_events_sheets` writes:
 
 ---
 
-## 4. Parameter reference (`EventDetectionParams`)
+## 4. Advanced settings (`Advanced…` dialog)
 
-Defaults are tuned for **<0.5 s epileptiform events**. Every entry below is editable from the *Advanced…* dialog.
+Every knob below lives in the 30-entry `PARAM_SPEC` at `tab.py:136`. The
+*Advanced…* button opens a generated dialog (`gui_common.open_advanced`);
+defaults are primed via `spec_defaults(PARAM_SPEC)` into `self._params`.
+Twenty-six of these map 1:1 to `core.utils.EventDetectionParams` (the
+`_EVENT_DETECTION_FIELDS` tuple, `event_detection_run.py:44`); the other four
+(`z_enter`, `z_exit`, `min_sep_s`, `time_cols_target`) are consumed directly
+by the run worker. **Defaults below are exactly the GUI `PARAM_SPEC` values**,
+which `_build_event_params` (`event_detection_run.py:192`) writes over the
+dataclass defaults before detection — so they are the source of truth. In a
+couple of cases the GUI value differs from the *live* `EventDetectionParams`
+default: GUI `bin_sec=0.05` vs dataclass `0.025`, and GUI
+`max_event_duration_s=1.3` vs dataclass `0.5`. The dataclass keeps the
+pre-short-event values commented next to each field, but the numbers below
+(the live GUI defaults) are what actually runs.
 
-| Field | Default | Purpose |
-|---|---|---|
-| `bin_sec` | 0.025 | Density histogram bin width. |
-| `smooth_sigma_bins` | 1.5 | Gaussian smoothing of the density. |
-| `normalize_by_num_rois` | True | Normalise to onsets/ROI/bin. |
-| `auto_min_prominence` | True | When on, the prominence floor is estimated **per recording** from the circular-shift null instead of the fixed `min_prominence` below — see the note under the table. |
-| `auto_min_prominence_percentile` | 99.0 | Null percentile used as the floor when `auto_min_prominence` is on. |
-| `auto_min_prominence_n_shuffles` | 200 | Circular-shift count for the null estimate (higher = steadier, slower). |
-| `auto_min_prominence_seed` | 0 | RNG seed for the null estimate. |
-| `min_prominence` | 0.002 | Fixed `find_peaks` prominence floor, used **only when `auto_min_prominence` is off**. Also editable visually via the *Prominence distribution...* popout (applying a value there turns auto off). |
-| `min_width_bins` | 1.0 | Peak min width. |
-| `min_distance_bins` | 4.0 | Min separation between peaks (~100 ms). |
-| `prominence_wlen_s` | 1.0 | Local window for prominence. |
-| `baseline_mode` | `rolling` | `rolling` (per-bin) or `global` (scalar). |
-| `baseline_percentile` | 5.0 | Percentile for baseline estimate. |
-| `baseline_window_s` | 5.0 | Rolling window length. |
-| `noise_quiet_percentile` | 40.0 | Threshold below which density values feed the MAD noise estimate. |
-| `noise_mad_factor` | 1.4826 | MAD → σ factor. |
-| `end_threshold_k` | 1.5 | `end = baseline + k·noise`. |
-| `max_walk_duration_s` | 2.0 | Cap on one-sided walk. |
-| `max_event_duration_s` | 0.5 | Hard cap on **final** event duration. |
-| `enable_watershed_split` | True | Split overlapping windows at the local minimum between peaks. |
-| `enforce_symmetric_clamp` | False | Force every window to peak ± max/2. |
-| `merge_gap_s` | 0.0 | Legacy overlap-merge gap; ignored when watershed-split is on. |
-| `use_gaussian_boundary` | False | Fit a Gaussian to each peak and use its quantile cut as the boundary. |
-| `gaussian_quantile` | 0.99 | Quantile of the Gaussian fit used to set the boundary. |
-| `gaussian_fit_pad_s` | 0.5 | Padding around each peak included in the Gaussian fit. |
-| `gaussian_min_sigma_s` | 0.05 | Lower bound on the Gaussian fit's sigma. |
+Defaults are tuned for **short epileptiform events** (sub-second). Headings
+match the `PARAM_SPEC` `group` field.
 
-**Auto prominence floor.** By default the prominence floor is no longer a single fixed number. With `auto_min_prominence` on, detection derives the floor for *each recording* from that recording's circular-shift null — the p99 (by default) of the prominences a random-coincidence onset pattern produces. This is a deliberately **weak, per-recording estimate**: it tracks the recording's own noise level rather than imposing one global cut, and it errs slightly permissive (the floor lands just under where a careful human would place it, so borderline events survive to curation rather than being silently dropped). The percentile was fitted against nine hand-tuned recordings, where null p99 matched the manual median to within a few percent while p95 ran ~50 % too low. It is only an estimate, so it stays fully overridable: untick `auto_min_prominence` (or apply a value in the prominence popout) to fall back to the fixed `min_prominence`, or nudge `auto_min_prominence_percentile` within the 95–99 range. The trade-off is cost — each detection now runs `auto_min_prominence_n_shuffles` circular shifts, adding a few seconds per render; lower the shuffle count if that matters.
+### Per-ROI hysteresis
 
-The last five rows (the legacy merge gap and the Gaussian-fit refinement) are inactive in the default short-event configuration but remain editable so a user can revert to the older boundary heuristics by flipping `use_gaussian_boundary` (and disabling `enable_watershed_split`) without leaving the GUI.
+The Schmitt-trigger onset detector. Per kept ROI the worker computes
+`z = mad_z(derivative)` (`utils.py:380`) then
+`hysteresis_onsets(z, z_enter, z_exit, fps, min_sep_s)`
+(`utils.py:405`, called at `event_detection_run.py:359`). Operates in robust-z
+units on the SG derivative, so values are comparable across cells regardless of
+raw dF/F scale.
 
-Per-ROI hysteresis params (`PARAM_SPEC`):
-- `z_enter = 3.5`, `z_exit = 1.5`, `min_sep_s = 0.1`.
+- **Hysteresis enter (`z_enter`) — default `3.5`.**
+  - *What it does:* the up-crossing threshold. An onset is emitted the frame `z`
+    first rises ≥ `z_enter` while the cell is "inactive". Units = robust σ
+    (`1.4826·MAD` of the derivative). Sensible range ~2.5–5.
+  - *What it means to you:* the main sensitivity knob for per-cell firing.
+    Lower it to catch weaker transients (more onsets, more false positives from
+    noise); raise it to keep only sharp, confident rises (fewer onsets). Must
+    stay above `z_exit` or the trigger never re-arms.
+- **Hysteresis exit (`z_exit`) — default `1.5`.**
+  - *What it does:* the down-crossing threshold. After an onset the cell stays
+    "active" (suppressing new onsets) until `z` falls ≤ `z_exit`. The gap
+    between enter and exit is what prevents flicker.
+  - *What it means to you:* controls how fully a cell must de-activate before it
+    can fire again. Raise it (toward `z_enter`) to re-arm sooner — more onsets on
+    sustained activity, risk of double-counting one event. Lower it to demand a
+    full return to baseline — fewer, cleaner onsets, but a cell riding an
+    elevated baseline may never re-arm.
+- **Min separation (`min_sep_s`) — default `0.1`.**
+  - *What it does:* post-merge dead-time, seconds. Onsets within
+    `min_sep_s · fps` frames of the previously kept onset are dropped
+    (`utils.py:446`). `0` disables merging.
+  - *What it means to you:* the refractory floor on a single cell. Raise it to
+    collapse onset bursts into one event (fewer onsets); lower it toward 0 to
+    keep every up-crossing. Interacts with `z_exit`: both gate how fast one cell
+    can re-fire.
 
-Display: `time_cols_target = 1200` columns.
+### Display
 
-Manual subset (UI-only, not in `PARAM_SPEC`):
-- `manual_subset_var` — checkbox; when on, the entry box is parsed as a Suite2p ROI id spec and intersected with the keep mask.
-- `manual_roi_var` — text entry; format `0,3,5-9` (same as Tab 4).
+- **Heatmap time columns (`time_cols_target`) — default `1200`.**
+  - *What it does:* target column count for the downsampled heatmap and raster.
+    The worker sets `downsample = max(1, T // time_cols_target)` and bin-means
+    the low-pass into `T // downsample` columns (`event_detection_run.py:317`).
+    Display-only — does **not** touch detection or the full-resolution CSV
+    export.
+  - *What it means to you:* purely cosmetic/performance. Raise it for finer
+    time resolution on long recordings (bigger figure, slower redraw); lower it
+    if the panels feel sluggish. Detected events and onset times are unchanged.
+
+### Population events — density
+
+The smoothed onset-density curve (`_build_density`, `utils.py:1185`) that
+peak-picking runs on.
+
+- **Density bin (`bin_sec`) — default `0.05`.**
+  - *What it does:* histogram bin width in seconds for pooled onsets across all
+    ROIs. Sets the density's time resolution; also the unit for every
+    `*_bins`/`wlen` conversion downstream.
+  - *What it means to you:* the master time scale. Smaller bins resolve closely
+    spaced events but make `find_peaks` choke on single-onset spikes; larger
+    bins blur short events together. Changing it implicitly rescales
+    `min_width_bins`, `min_distance_bins`, and `prominence_wlen_s` (all defined
+    relative to seconds via `/ bin_sec`).
+- **Smoothing sigma (`smooth_sigma_bins`) — default `1.5`.**
+  - *What it does:* Gaussian-filter σ (in bins) applied to the binned density
+    (`gaussian_filter1d`, `mode="nearest"`). Turns the spiky histogram into a
+    continuous curve.
+  - *What it means to you:* the smoothness/noise trade-off. Raise it for a
+    cleaner curve and fewer spurious peaks (but real short events smear and can
+    merge); lower it for sharper peaks at the cost of jitter that `find_peaks`
+    may mistake for events.
+- **Normalize by ROI count (`normalize_by_num_rois`) — default `True`.**
+  - *What it does:* divides counts by the number of ROIs, turning the density
+    into "fraction of cells firing per bin" (`utils.py:1234`).
+  - *What it means to you:* keep on so a fixed `min_prominence` means the same
+    thing across recordings with different cell counts. Turn off only if you
+    deliberately want raw counts — then prominence/baseline thresholds become
+    recording-size-dependent.
+
+### Population events — peaks
+
+Peak detection on the smoothed density (`_detect_density_peaks` →
+`scipy.signal.find_peaks`, `utils.py:1411`). The prominence floor is either
+auto-derived from the per-recording circular-shift null or fixed — see below.
+
+- **Auto min prominence (`auto_min_prominence`) — default `True`.**
+  - *What it does:* when on, the effective prominence floor is the
+    `auto_min_prominence_percentile` of that recording's circular-shift null
+    (`null_prominence_percentiles` → `circular_shift_null_prominences`,
+    `utils.py:1319`; applied at `utils.py:1008`). Each ROI's onset train is
+    independently circular-shifted to destroy cross-cell coincidence, the
+    density is rebuilt with the *same* pipeline, and every candidate peak's
+    prominence is pooled. A degenerate/empty null falls back to the fixed
+    `min_prominence`. The value actually used is reported in
+    `diagnostics["min_prominence_used"]`.
+  - *What it means to you:* the recommended default — the floor tracks each
+    recording's own coincidence-noise level instead of one global guess. It
+    errs slightly permissive (borderline events survive to curation rather than
+    being silently dropped). Untick it (or apply a value in the *Prominence
+    distribution…* popout, which auto-unchecks it) to pin the fixed
+    `min_prominence` instead. Cost: it runs `auto_min_prominence_n_shuffles`
+    shuffles per render.
+- **Auto prominence percentile (`auto_min_prominence_percentile`) — default `99.0`.**
+  - *What it does:* which percentile of the null prominence distribution becomes
+    the floor when auto is on.
+  - *What it means to you:* fitted to ~99 against nine hand-tuned recordings
+    (null p99 matched the manual median within a few percent; p95 ran ~50 % too
+    low). Lower it (toward 95) to admit more borderline events; raise it for a
+    stricter floor. Useful range ~95–99.
+- **Auto prominence shuffles (`auto_min_prominence_n_shuffles`) — default `200`.**
+  - *What it does:* number of circular-shift iterations building the null.
+  - *What it means to you:* more shuffles = steadier floor, slower render (a few
+    seconds at 200). Drop it (e.g. 50–100) for faster interactive iteration; the
+    floor gets noisier between renders.
+- **Auto prominence seed (`auto_min_prominence_seed`) — default `0`.**
+  - *What it does:* RNG seed for the shuffles (`np.random.default_rng(seed)`).
+  - *What it means to you:* fix it for reproducible event sets across re-renders
+    and batch reruns; change it only to check the floor's run-to-run stability.
+- **Min peak prominence (`min_prominence`) — default `0.002`.**
+  - *What it does:* the fixed `find_peaks` prominence floor on the smoothed
+    density. **Used only when `auto_min_prominence` is off.** Also the value the
+    *Prominence distribution…* slider edits (applying there turns auto off).
+  - *What it means to you:* with auto off, this is the single most important
+    sensitivity knob — drop it into the valley between the noise hump and the
+    real-event lobe in the prominence histogram. Raising it = fewer, more
+    confident events; lowering it = more events including noise. With auto on it
+    is inert (and only the fallback if the null degenerates).
+- **Min peak width (`min_width_bins`) — default `1.0`.**
+  - *What it does:* `find_peaks` minimum width at half-prominence, in density
+    bins.
+  - *What it means to you:* rejects single-bin spikes. At default `bin_sec=0.05`
+    one bin = 50 ms. Raise it to demand broader population bumps (fewer events);
+    leave low for fine bins where real peaks are narrow.
+- **Min peak separation (`min_distance_bins`) — default `4.0`.**
+  - *What it does:* minimum bin distance between accepted peaks (`distance=` in
+    `find_peaks`); the lower of two too-close peaks is dropped. ≈ 200 ms at
+    `bin_sec=0.05`.
+  - *What it means to you:* the population-level refractory. Raise it to stop one
+    event being split into two; lower it to resolve rapid back-to-back bursts.
+    Scales with `bin_sec`.
+- **Prominence window (`prominence_wlen_s`) — default `1.0`.**
+  - *What it does:* local window (seconds → odd bin count via
+    `prominence_wlen_s/bin_sec | 1`, `utils.py:1028`) for the `wlen=` prominence
+    calculation, so a small peak next to a big one is measured against the
+    nearby valley, not the big peak's full descent.
+  - *What it means to you:* raise it toward whole-trace behaviour if you want
+    global prominence; lower it so closely spaced events of differing height are
+    each judged on local contrast. Mostly leave at 1 s.
+
+### Population events — baseline
+
+Baseline + noise estimation that sets the boundary-walk threshold
+(`_estimate_rolling_baseline` / `_estimate_noise_from_quiet`, `utils.py:1473`).
+
+- **Baseline mode (`baseline_mode`) — default `rolling`** (choices: `rolling`, `global`).
+  - *What it does:* `rolling` = per-bin `baseline_percentile` over a
+    `baseline_window_s` window (`percentile_filter`); `global` = one scalar
+    percentile of the whole density, broadcast.
+  - *What it means to you:* keep `rolling` when baselines drift within a burst
+    (events sitting on an elevated floor still get walked correctly). Switch to
+    `global` for short, stable recordings where a flat baseline is cleaner and
+    cheaper.
+- **Baseline percentile (`baseline_percentile`) — default `5.0`.**
+  - *What it does:* the percentile taken as "baseline" (rolling per-window or
+    global).
+  - *What it means to you:* lower = baseline hugs the troughs (wider event
+    windows, since the trace stays above threshold longer); higher = baseline
+    rides up into activity (tighter windows). 5 keeps it near the quiet floor.
+- **Rolling window (`baseline_window_s`) — default `5.0`.**
+  - *What it does:* window length (seconds) for the rolling baseline; converted
+    to bins via `1/bin_sec` and forced odd. Ignored in `global` mode.
+  - *What it means to you:* short windows track within-burst drift (the intent
+    here); too short and the baseline climbs into events (truncating them); too
+    long and it over-smooths through bursts (windows balloon).
+- **Quiet percentile (noise) (`noise_quiet_percentile`) — default `40.0`.**
+  - *What it does:* only density residuals below this percentile feed the MAD
+    noise estimate (`utils.py:1512`) — the "what does dispersion look like when
+    nothing is happening" set.
+  - *What it means to you:* lower it if active bins are leaking into the noise
+    estimate (inflating it, shrinking windows); raise it if too few quiet bins
+    make the estimate unstable. 40 is a lenient cutoff that still excludes
+    obvious peaks.
+- **MAD → sigma factor (`noise_mad_factor`) — default `1.4826`.**
+  - *What it does:* scales the quiet-region MAD toward a Gaussian σ.
+  - *What it means to you:* the textbook constant — leave it. It only sets the
+    absolute scale of `noise`, which `end_threshold_k` already tunes, so adjust
+    `end_threshold_k` instead.
+
+### Population events — boundaries
+
+Walking each peak outward to a window, then splitting/clamping
+(`_boundaries_from_peaks`, `utils.py:1647`).
+
+- **End threshold k (`end_threshold_k`) — default `1.5`.**
+  - *What it does:* boundary level = `baseline + k · noise`
+    (`utils.py:1695`); the walk stops when the density drops below it.
+  - *What it means to you:* the width knob for individual events. Lower it →
+    walk continues further down toward baseline → wider windows; raise it →
+    windows clip closer to the peak. Pairs with `baseline_percentile`/noise.
+- **Max walk duration (`max_walk_duration_s`) — default `2.0`.**
+  - *What it does:* hard cap (seconds) on how far each one-sided walk may travel
+    from the peak before stopping (`walk_steps`, `utils.py:1715`). A search
+    radius, not the final duration.
+  - *What it means to you:* a safety rail so a never-crossing threshold can't
+    run a window to the recording edge. Keep it comfortably above
+    `max_event_duration_s`; lower it only if windows occasionally over-extend
+    before the hard cap kicks in.
+- **Max event duration (`max_event_duration_s`) — default `1.3`.**
+  - *What it does:* the physiological hard cap on the **final** window. Any
+    window longer than this is clamped to peak ± `max_event_duration_s/2`
+    (`utils.py:1810`; 0.65 s each side at the default).
+  - *What it means to you:* the dominant duration constraint — set it to the
+    longest event you consider one event. Too small and genuine long events get
+    truncated; too large and merged/runaway windows survive. Interacts with
+    `enforce_symmetric_clamp`.
+- **Watershed-split overlaps (`enable_watershed_split`) — default `True`.**
+  - *What it does:* when two walked windows overlap, cut both at the
+    minimum-density valley between their peaks (`utils.py:1748`), so close events
+    stay separate. When on, the legacy `merge_gap_s` path is disabled.
+  - *What it means to you:* keep on for distinct back-to-back epileptiform
+    events. Turn off only to fall back to the old merge-overlapping behaviour
+    (then `merge_gap_s` applies).
+- **Force symmetric clamp (`enforce_symmetric_clamp`) — default `False`.**
+  - *What it does:* when on, **every** window is forced to peak ±
+    `max_event_duration_s/2`, not just the ones exceeding the cap
+    (`utils.py:1816`).
+  - *What it means to you:* turn on to stereotype all events to a fixed width
+    (handy for averaging/alignment) at the cost of each event's natural
+    boundaries. Leave off to keep walked widths up to the cap.
+- **Merge gap (`merge_gap_s`) — default `0.0`.**
+  - *What it does:* legacy overlap-merge gap (seconds). **Ignored while
+    `enable_watershed_split` is on** (the watershed logic supersedes it,
+    `utils.py:1728`).
+  - *What it means to you:* only relevant if you disable watershed split — then
+    windows closer than this gap merge. Left at 0 / inert by default.
+
+### Population events — gaussian fit
+
+Optional boundary refinement (disabled by default; the watershed + hard cap
+replace it). Kept editable for reverting to the older heuristic.
+
+- **Use Gaussian-fit boundary (`use_gaussian_boundary`) — default `False`.**
+  - *What it does:* when on, fits a moments-based Gaussian to each peak and uses
+    its `gaussian_quantile` cut as the boundary, intersected with the walked
+    window (`utils.py:1775`).
+  - *What it means to you:* an alternative to baseline-walk boundaries for
+    smooth, well-isolated peaks. Off in short-event mode; flip on (and consider
+    disabling watershed split) only to reproduce the legacy boundary behaviour.
+    The next three knobs do nothing while this is off.
+- **Gaussian quantile (`gaussian_quantile`) — default `0.99`.**
+  - *What it does:* the Gaussian quantile (→ z-score) defining the cut; 0.99 ≈
+    ±2.33 σ.
+  - *What it means to you:* higher = wider windows (more of the tail);
+    lower = tighter. Only active with `use_gaussian_boundary`.
+- **Gaussian fit pad (`gaussian_fit_pad_s`) — default `0.5`.**
+  - *What it does:* seconds of padding around each peak included in the fit
+    window.
+  - *What it means to you:* more pad gives the fit more shoulder to estimate σ
+    from (steadier on broad peaks, but risks pulling in neighbours). Only active
+    with `use_gaussian_boundary`.
+- **Gaussian min sigma (`gaussian_min_sigma_s`) — default `0.05`.**
+  - *What it does:* lower bound (seconds) on the fitted σ, so a near-degenerate
+    fit can't collapse to a zero-width window.
+  - *What it means to you:* raise it if Gaussian-mode windows come out
+    implausibly narrow. Only active with `use_gaussian_boundary`.
+
+**Auto prominence floor (summary).** By default the prominence floor is not a
+single fixed number: with `auto_min_prominence` on, detection derives it for
+*each recording* from that recording's circular-shift null (p99 by default). It
+is a deliberately weak, per-recording estimate that tracks the recording's own
+noise level and errs slightly permissive. Fully overridable — untick
+`auto_min_prominence` (or apply a value in the *Prominence distribution…*
+popout) to fall back to fixed `min_prominence`, or nudge
+`auto_min_prominence_percentile` within ~95–99. The `min_prominence_used` value
+is recorded in the diagnostics dict.
+
+The Gaussian-fit group and `merge_gap_s` are inactive in the default
+short-event configuration but stay editable so you can revert to the older
+boundary heuristics (set `use_gaussian_boundary` on and/or `enable_watershed_split`
+off) without leaving the GUI.
+
+**Manual subset (UI-only, not in `PARAM_SPEC`).** A header checkbox
+(`manual_subset_var`) + text entry (`manual_roi_var`, format `0,3,5-9`) restrict
+the heatmap / raster / detection to a Suite2p ROI id list intersected with the
+keep mask. The **Onset source** radios (`onset_source_var`) pick `derivative`
+(default) vs Suite2p `spks`. These are snapshotted by `_on_render`, not edited
+in the *Advanced…* dialog.
 
 ---
 

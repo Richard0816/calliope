@@ -96,30 +96,19 @@ settings…" popout if you want the regDX/regPC numbers.
 
 A union of two complementary detectors. Sparsery is bright-and-bursty; Cellpose is a generalist segmenter that catches morphologically obvious cells which never fired enough during the recording for Sparsery to spot.
 
-**Sparsery (Suite2p built-in detector).** Driven by the ops dict:
+**Sparsery (Suite2p built-in detector).** Driven by the ops dict
+(`threshold_scaling`, `high_pass`, `smooth_sigma`, `max_iterations`,
+`spatial_scale`, `preclassify`, plus the `hard_cap` safety abort). `sparse_mode`
+is fixed `True` (use Sparsery, not the legacy anatomical pipeline). All of these
+are documented with defaults and tuning guidance in [§5.1](#51-sparsery-suite2p-built-in-detector).
 
-| ops key | Default | What it does |
-|---|---|---|
-| `threshold_scaling` | 0.85 | Lower = more ROIs (less stringent). |
-| `high_pass` | 100 frames | Frame-domain high-pass to suppress slow drift before detection. |
-| `smooth_sigma` | 1.0 | Spatial Gaussian smoothing applied during detection. |
-| `max_iterations` | 1500 | Detection loop iteration cap. |
-| `spatial_scale` | 0 (auto) | Suite2p's coarse-to-fine scale parameter. |
-| `preclassify` | 0.0 | Pre-detection classifier threshold (off by default). |
-| `sparse_mode` | True | Use Sparsery (vs the older Cellpose/anatomical pipeline). |
+**Cellpose pass.** Run on the **mean image** (input channel fixed at
+`cellpose_channel_input='meanImg'`). Tunables — `cellpose_model_type`,
+`cellpose_diameter`, `cellpose_flow_threshold`, `cellpose_cellprob_threshold` —
+are documented in [§5.2](#52-cellpose-generalist-segmenter-primary-pass-on-meanimg).
 
-The user can also set `hard_cap` — a safety abort that bails out if Sparsery returns more ROIs than this (default 60,000), since runaway detection usually means the parameters are wrong.
-
-**Cellpose pass.** Run on the **mean image** (default `cellpose_channel_input='meanImg'`). Parameters:
-
-| Param | Default | Notes |
-|---|---|---|
-| `cellpose_model_type` | `cyto2` | Generalist cytoplasm model. On cellpose 4.x the `model_type` axis is ignored (only the unified `cpsam` model exists), so this is effectively a label for audit. |
-| `cellpose_diameter` | 0 | 0 = let Cellpose auto-estimate. |
-| `cellpose_flow_threshold` | 0.8 | Standard Cellpose flow threshold. |
-| `cellpose_cellprob_threshold` | -1.0 | More inclusive than the default 0. |
-
-**Optional Cellpose-SAM second pass on Vcorr.** When `enable_sam_vcorr_pass` is checked, the runner additionally:
+**Optional Cellpose-SAM second pass on Vcorr.** When `enable_sam_vcorr_pass`
+([§5.4](#54-cellpose-sam-tier-2--optional-second-pass-on-vcorr)) is checked, the runner additionally:
 
 1. Reads (or stream-computes via `core/correlation_image.py::compute_vcorr`) the recording's correlation image `Vcorr` — per-pixel Pearson r with the 4-neighbour mean. Suite2p 1.0 produces this during detection (lives in `detect_outputs.npy`); the runner picks it up from the sparsery pass output and persists it next to the shared registration as `Vcorr.npy` so `run_cellpose_pass`'s filesystem fallback can find it.
 2. Runs Cellpose-SAM (`model_type='cpsam'`, cellpose ≥ 4.0) on `Vcorr` with the user-tunable `sam_flow_threshold` / `sam_cellprob_threshold`.
@@ -128,7 +117,7 @@ The user can also set `hard_cap` — a safety abort that bails out if Sparsery r
 
 Silently skips with a console warning when cellpose 3.x is installed (SAM is 4.x-only). The SAM checkpoint is ~1 GB; cellpose downloads it on first invocation. Reference: Pachitariu et al., Cellpose-SAM bioRxiv 2025 ([doi:10.1101/2025.04.28.651001](https://doi.org/10.1101/2025.04.28.651001)).
 
-**Merge.** Each Cellpose pass (primary + optional SAM) is independently filtered against Sparsery: a Cellpose ROI is dropped if `max_overlap` (default `0.3`, i.e. 30% of the Cellpose ROI's pixels covered by a Sparsery ROI). The surviving ROIs from every pass are appended to Sparsery's output to form the final `stat.npy`, with the `_source` field preserving provenance.
+**Merge.** Each Cellpose pass (primary + optional SAM) is independently filtered against Sparsery: a Cellpose ROI is dropped if more than `max_overlap` ([§5.3](#53-merge-cellpose--sparsery-overlap-drop), default `0.3`) of the Cellpose ROI's pixels are covered by a Sparsery ROI. The surviving ROIs from every pass are appended to Sparsery's output to form the final `stat.npy`, with the `_source` field preserving provenance.
 
 **dF/F per Suite2p convention** is computed downstream (Step 2). Suite2p also produces:
 - `F.npy` — `(N_total, T)` per-ROI raw fluorescence (sum over `xpix/ypix` weighted by `lam`).
@@ -347,6 +336,145 @@ A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `RO
 
 ---
 
+## 5. Advanced settings
+
+Two separate dialogs sit in the Tab 3 header:
+
+- **Advanced...** opens the curated `PARAM_SPEC` form (`tab.py:236`,
+  `open_advanced(self, ..., self.PARAM_SPEC, self._params)` at `tab.py:691`).
+  These are the knobs CalLIOPE actually owns — Sparsery / Cellpose / merge /
+  dF/F / low-pass / pixel-scale / GPU. Documented in full below. Each field's
+  value lands in `self._params` and re-runs nothing on close: it applies on the
+  **next** "Run detection + cell filter".
+- **Edit suite2p settings...** opens a second, deeper popout
+  (`_on_edit_suite2p_settings`, `tab.py:697`) that flattens the *entire*
+  suite2p 1.0 nested settings tree and lets you override any leaf. This is the
+  raw escape hatch — see [§5.8](#58-raw-suite2p-settings-escape-hatch).
+
+The radio buttons (**baseline mode**), the **GCaMP variant** dropdown, the
+**custom τ (s)** field, and the two **filtered-dF/F CSV** / **archive**
+checkboxes are not in `PARAM_SPEC`; they are separate Tk vars read in `_on_run`
+and covered in §1–§2.
+
+Defaults below are exactly those in `PARAM_SPEC`. Every key is the `name` field
+(also the on-disk `params`/`meta.json` key).
+
+### 5.1 Sparsery (Suite2p built-in detector)
+
+These map 1:1 onto Suite2p ops and are passed through to the sparsery pass
+(`sparse_plus_cellpose.run` → `run_one_pass`, defaults at
+`sparse_plus_cellpose.py:120-126`). Sparsery is the bright-and-bursty detector;
+it finds anything that fired enough to stand out from a high-pass-filtered movie.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `threshold_scaling` | `0.85` | Scales Suite2p's per-iteration detection threshold; an ROI's peak must clear `threshold_scaling × noise` to be accepted. | The master sensitivity dial. **Lower → more ROIs** (more permissive, more junk/dim cells); **raise → fewer, higher-confidence ROIs.** First thing to touch if you are over- or under-detecting. The cell-filter CNN cleans up false positives downstream, so erring low is usually safe. |
+| `high_pass` | `100` (frames) | Frame-domain rolling-mean subtraction window applied before detection to flatten slow drift (photobleaching, swelling). | Leave at 100 for typical recordings. **Shorten** if slow baseline waves are masking events; **lengthen** for very short recordings where a 100-frame window eats real slow signal. Too small a window on a long recording is what blew up the temporal high-pass with an OOM in the 2026-06-09 sparsery crash — keep it sane. |
+| `smooth_sigma` | `1.0` | Gaussian spatial smoothing (σ in pixels) applied during detection. | **Raise** for noisy / low-zoom FOVs to merge speckle into coherent blobs; **lower** toward 0 on high-mag data with small, tightly packed somata you don't want bleeding together. |
+| `max_iterations` | `1500` | Hard cap on Sparsery's iterative peel-off detection loop. | Rarely touched. Each iteration extracts one ROI, so this is an upper bound on ROI count from the loop itself. Lower only to force an early stop for speed on a quick look. |
+| `spatial_scale` | `0` (auto) | Suite2p's coarse-to-fine cell-size scale (0 = auto-estimate; 1–4 ≈ 6/12/24/48 px). | Leave at 0 unless auto-estimation is clearly wrong (e.g. detecting at the wrong size). Set 1–4 to pin the expected soma scale. |
+| `preclassify` | `0.0` | Probability threshold for Suite2p's built-in pre-detection classifier; 0 disables it. | Keep at 0 — CalLIOPE does its own classification with the cell-filter CNN, so the built-in preclassifier is redundant and would silently drop ROIs before our filter ever sees them. |
+| `hard_cap` | `60000` | Safety abort: if Sparsery returns more ROIs than this, `run_one_pass` raises rather than proceeding into a multi-GB extraction. | A guardrail, not a tuning knob. A run that hits 60k ROIs almost always means `threshold_scaling` is far too low or `high_pass` is wrong. **Raise** only if you have a genuine high-density FOV and the abort fires on a legitimate run; **lower** to fail fast while sweeping parameters. |
+
+### 5.2 Cellpose (generalist segmenter, primary pass on `meanImg`)
+
+Run on the mean image after Sparsery to recover morphologically obvious cells
+that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults at
+`sparse_plus_cellpose.py:131-135`). The pass input channel is fixed at
+`cellpose_channel_input='meanImg'` (not exposed in the form).
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `cellpose_model_type` | `cyto2` | Selects the Cellpose model (`cyto` / `cyto2` / `nuclei`). | `cyto2` is the right generalist cytoplasm model for somatic GCaMP. **Note:** on Cellpose 4.x the model axis is ignored (only the unified `cpsam` model exists), so this becomes an audit label rather than a live switch. Use `nuclei` only for nuclear-localised indicators. |
+| `cellpose_diameter` | `0` (auto) | Expected cell diameter in pixels; 0 lets Cellpose auto-estimate per-image. | Leave at 0 unless auto-estimation drifts. **Set explicitly** (in px) if you know your soma size and Cellpose is over/under-segmenting — pinning the diameter is the single most effective Cellpose fix. |
+| `cellpose_flow_threshold` | `0.8` | Max allowed flow-field error for a mask to be kept; higher = more permissive. | **Raise toward 1.0** to keep more (possibly malformed) masks; **lower** to reject ragged segmentations. 0.8 is already slightly permissive. |
+| `cellpose_cellprob_threshold` | `-1.0` | Pixel cell-probability cutoff for inclusion in a mask; lower = more inclusive (default Cellpose is 0). | At −1.0 this is deliberately more inclusive than stock Cellpose, so dim cells get masks. **Raise toward 0 or above** if Cellpose is producing bloated/merged blobs; **lower** to grab even fainter cells (the merge step and CNN filter both backstop the extra junk). |
+
+### 5.3 Merge (Cellpose → Sparsery overlap drop)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `max_overlap` | `0.3` | A Cellpose ROI is **dropped** if more than this fraction of *its* pixels are already covered by a Sparsery ROI (`merge` at `sparse_plus_cellpose.py:197,227`). | This is the de-duplication aggressiveness between the two detectors. **Lower (e.g. 0.1)** = drop Cellpose ROIs at the slightest Sparsery overlap (favour Sparsery, fewer duplicates); **raise (e.g. 0.5)** = keep Cellpose ROIs that substantially overlap a Sparsery cell (more ROIs, risk of near-duplicates). 0.3 keeps a Cellpose cell unless it's mostly the same footprint as one Sparsery already found. |
+
+### 5.4 Cellpose-SAM (Tier 2) — optional second pass on `Vcorr`
+
+Off by default. When enabled, after the Sparsery + cyto2 passes the runner runs
+Cellpose-SAM (`model_type='cpsam'`, **requires cellpose ≥ 4.0**) on the
+correlation image `Vcorr` to recover *silent* cells, then filters that pass
+against Sparsery independently and tags survivors `_source='cellpose_sam'`
+(`sparse_plus_cellpose.py:714-766`). See §2 Step 1 for the full mechanism.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `enable_sam_vcorr_pass` | `False` | Master switch for the SAM pass on `Vcorr`. | Turn on to recover cells that are morphologically real but were too quiet for Sparsery and too dim on the mean image for cyto2 — `Vcorr` highlights pixels that co-fluctuate, so even rare-firing cells show up. **Costs 1–2× detection time** and downloads a ~1 GB checkpoint on first use. **Silently no-ops on cellpose 3.x.** |
+| `sam_flow_threshold` | `0.8` | Same as `cellpose_flow_threshold` but for the SAM pass. | Tune only if the SAM pass over/under-segments `Vcorr`; defaults inherit from the primary pass. |
+| `sam_cellprob_threshold` | `-1.0` | Same as `cellpose_cellprob_threshold` but for the SAM pass. | Lower to grab fainter correlation blobs; raise if SAM is hallucinating cells out of correlated neuropil. |
+
+### 5.5 dF/F (neuropil correction + baseline)
+
+Consumed in `_run_dff` (`tab.py:1022-1117`). The baseline-mode radio and the
+first-N-minutes value are separate Tk vars (§2 Step 2); the knobs here are the
+`PARAM_SPEC` portion.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `fps_override` | `0.0` | Frame rate. **0 = use the 15.07 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** propagates to suite2p's `fs`/deconvolution `tau` timing. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, the low-pass cutoff, and the SG derivative's `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
+| `neuropil_coef` | `0.7` | The `r` in `F_corr = F − r·Fneu`; fraction of the neuropil trace subtracted (Chen et al. 2013). | 0.7 removes ~70% of out-of-focus contamination, the field standard. **Raise** if traces still show obvious neuropil bleed-through (shared slow waves across all cells); **lower** if subtraction is over-correcting bright cells into negative dF/F. Note the on-disk `r0p7_` filename prefix is hardcoded by downstream tools and does **not** change when you change `r` — only the math does. |
+| `perc` | `10` | Baseline percentile of the sliding `percentile_filter` in **rolling** mode. **Ignored in first-N mode** — `first_n_min_df_over_f_1d` always uses the *mean* of the baseline window and accepts `perc` only for call-site symmetry. | The "what counts as baseline" knob for rolling mode. **Lower (e.g. 5)** chases the trough of the trace (good if cells are active most of the time and the 10th pct is still riding events); **raise** for very quiet cells where a low percentile sits in noise. Switch to first-N mode if you want a plain mean baseline instead. |
+| `win_sec` | `45.0` | Rolling-mode only: width (s) of the sliding percentile window for `F0[t]` (`utils.robust_df_over_f_1d`). | **Ignored in first-N mode.** Window must be wider than your longest real event or it will track the event and flatten it. **Shorten** to follow faster baseline drift (bleaching, swelling); **lengthen** if long events are being eaten by the baseline. |
+
+### 5.6 Default low-pass / derivative
+
+Written once here for the whole recording (Tab 4 can overwrite the
+`filtered_*` variants later). Consumed in the per-ROI loop at `tab.py:1103-1107`
+(`utils.lowpass_causal_1d`, `utils.sg_first_derivative_1d`) and mirrored on the
+GPU path.
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `default_lowpass_hz` | `1.0` | Cutoff (Hz) of the order-2 causal Butterworth applied to dF/F → `r0p7_dff_lowpass`. | Sets the smoothness of the default low-pass trace. **Lower** for slower indicators / heavier denoising; **raise** to preserve fast kinetics. Must stay below Nyquist (`fps/2`); the derivative is computed from this trace, so lowering it also smooths the derivative. |
+| `default_sg_win_ms` | `333` | Savitzky-Golay window (ms) for the first derivative `r0p7_dff_dt` (converted to an odd sample count via fps). | Wider window = smoother, more lagged derivative; narrower = noisier but more responsive. Pair with `default_lowpass_hz` — over-smoothing both stacks the lag. |
+| `default_sg_poly` | `2` | Polynomial order of the SG fit. | Leave at 2 (quadratic) for a standard first derivative. Order must be < the window's sample length; raising it tracks curvature more closely at the cost of noise. |
+
+### 5.7 Pixel-scale (µm calibration) and GPU
+
+Pixel-scale knobs are resolved by `core.scale.resolve_pix_to_um`
+(`scale.py:82`) after detection and stamped onto `plane0/ops.npy['pix_to_um']`,
+so Tabs 6 (spatial cluster map) and 8 (per-event order maps) and the detection
+scale bar render in µm with no further input. **Priority: `um_per_pixel` >
+`scope_zoom` > any pre-existing `ops['pix_to_um']`.** Leave both at 0 to skip
+calibration and render in raw pixels (no scale bar).
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `scope_zoom` | `0.0` (skip) | Microscope zoom factor. Computes `pix_to_um = (fov_um_reference / zoom) / Lx`. | Use this if you log the scope's zoom but not a direct µm/px. Needs `fov_um_reference` set correctly for your rig. Ignored if `um_per_pixel` is set. |
+| `fov_um_reference` | `3080.90169` | FOV width (µm) at 1× zoom, used only by the `scope_zoom` path. | **Rig-specific — the default is the lab's two-photon scope.** If you use the zoom path on a different microscope you *must* set this to your own 1× FOV width, or every µm axis and scale bar will be wrong. No effect when using `um_per_pixel`. |
+| `um_per_pixel` | `0.0` (skip) | Direct calibration in µm per pixel; **wins over `scope_zoom`**. | The cleanest option if you've measured it (e.g. from a calibration slide). Set this and you can ignore the zoom/FOV pair entirely. Must be > 0. |
+| `use_gpu_dff` | `True` | Route the dF/F + low-pass + derivative through the CuPy GPU path (`_maybe_run_dff_gpu`, `tab.py:1119`). | Leave on for speed. **Auto-falls back to CPU** if CuPy is missing, the import fails, or the baseline mode is `rolling` (GPU only implements the first-N-min mean baseline). Results are identical to CPU; this is purely a speed switch. |
+| `gpu_roi_chunk` | `0` (all) | Split ROIs into chunks of this size on the GPU to bound VRAM (0 = process all ROIs at once). | Only touch if the GPU path OOMs on a large recording. **Set a positive chunk** (e.g. 500) to trade a little speed for a smaller peak VRAM footprint. No effect on the CPU path. |
+
+### 5.8 Raw suite2p settings (escape hatch)
+
+The **Edit suite2p settings...** button (`_on_edit_suite2p_settings`,
+`tab.py:697`) is *not* part of `PARAM_SPEC`. It flattens the full
+`calliope_settings.build_base_settings()` tree into a spec, shows **every leaf**
+of suite2p 1.0's nested `db`/`settings` schema, and deep-merges your edits on
+top of the in-source defaults for the session (`self._settings_override`, passed
+to `spc.run(..., settings_override=...)`). It forwards **arbitrary suite2p ops**
+— anything suite2p accepts (registration block size, `nonrigid`, `nbins`,
+`do_regmetrics`, etc.) you can set here.
+
+Use it for the registration/extraction knobs CalLIOPE does not curate above:
+e.g. re-enable the PC registration-quality metrics (`run.do_regmetrics`, off by
+default to avoid a ~5 GB transient — see §2) or adjust non-rigid block size.
+**Gotchas:** these are raw suite2p fields with no CalLIOPE validation, the
+overrides are **session-only** (lost on app restart, not written to a row's
+`params`), and they apply at the `run_s2p` boundary only — they do **not**
+override the curated `PARAM_SPEC` knobs above, which are applied separately. An
+empty dialog (no changes) resets to the in-source defaults.
+
+---
+
 ## 6. Curation popout (click an ROI on panel 2)
 
 Module: `tabs/suite2p/curation_popout.py`. Mirrors the standalone reference UI in `Calcium_imaging_suite2p/roi_curation_app.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
@@ -369,54 +497,13 @@ Keybinds: `1` = cell, `0` = not a cell, `Esc` = close.
 
 ---
 
-## 5. Parameters (full list)
-
-```
-Sparsery:
-  threshold_scaling=0.85, high_pass=100, smooth_sigma=1.0,
-  max_iterations=1500, spatial_scale=0, preclassify=0.0,
-  hard_cap=60000
-
-Cellpose:
-  model=cyto2, diameter=0, flow_threshold=0.8,
-  cellprob_threshold=-1.0
-Merge:
-  max_overlap=0.3
-
-dF/F:
-  fps_override=0 (0 = use the default fallback 15.07 Hz + a one-time warning;
-                  non-zero sets fps for the dF/F AND suite2p's fs/deconvolution),
-  neuropil_coef r = 0.7, baseline_pct = 10, win_sec = 45 (rolling)
-
-Default lowpass / derivative:
-  cutoff = 1.0 Hz, sg_win_ms = 333, sg_poly = 2
-
-GPU:
-  use_gpu_dff = True, gpu_roi_chunk = 0 (0=all)
-
-Pixel scale (µm calibration written to ops['pix_to_um']):
-  scope_zoom = 0.0         (0 = skip; pix_to_um = (FOV_um / zoom) / Lx)
-  fov_um_reference = 3080.90169  (FOV width µm at 1×; default = lab rig;
-                                  only used by the scope_zoom path)
-  um_per_pixel = 0.0       (0 = skip; explicit calibration; wins over zoom)
-```
-
-Baseline mode (radio): `rolling` (45 s rolling 10th pct) or `first_n` (first N minutes mean of 10th pct).
-
-The pixel-scale knobs are resolved through `core.scale.resolve_pix_to_um`
-after detection and stamped onto `plane0/ops.npy['pix_to_um']` so Tabs 6
-(spatial cluster map) and 8 (per-event order maps) render axes in µm
-without any further user input.
-
----
-
-## 6. Re-implementation checklist
+## 7. Re-implementation checklist
 
 1. Wire up Suite2p (https://github.com/MouseLand/suite2p) and Cellpose (https://github.com/MouseLand/cellpose). The merge needs a per-ROI footprint set (each cell knows its `xpix`, `ypix`, `lam`).
 2. Compute the union with the overlap drop: for each Cellpose ROI, if any Sparsery ROI shares >`max_overlap` of its pixels, discard the Cellpose ROI; otherwise append it to the final ROI list.
 3. Implement both dF/F baselines:
    - **Rolling**: `scipy.ndimage.percentile_filter(F_corr, size=(45·fps)|1, percentile=10, mode='nearest')`, eps = `max(percentile(F0, 1), 1e-9)`.
-   - **First-N-minute**: scalar `F0 = percentile(F_corr[:N_baseline], 10)` where `N_baseline = round(baseline_min · 60 · fps)`; eps = `max(F0, 1e-9)`.
+   - **First-N-minute**: scalar `F0 = mean(F_corr[:N_baseline])` (not a percentile — `perc` is ignored here) where `N_baseline = round(baseline_min · 60 · fps)`; eps = `max(F0, 1e-9)`.
 4. Implement the causal Butterworth low-pass via `scipy.signal.butter(order=2, btype='low', output='sos')` + `sosfilt`, initialising `zi` to the first sample to avoid a startup transient.
 5. Implement the SG derivative via `scipy.signal.savgol_filter(x, window_length=odd, polyorder=2, deriv=1, delta=1/fps)`.
 6. Train (or load) a small CNN that takes the dF/F + footprint of an ROI and outputs `P(real cell)`. Save mask and prob to `predicted_cell_mask.npy`, `predicted_cell_prob.npy`. Fall back to `iscell.npy[:,0] > 0` if no model.
