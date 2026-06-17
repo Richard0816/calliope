@@ -28,6 +28,9 @@ From `plane0/`:
 > event_windows=None, figures_dir=None, progress_cb=None)`) that drives
 > both the full-recording and per-event runs and saves `full.png` /
 > `per_event.png` violin plots (same layout the GUI shows in Tab 7).
+> `per_event.png` shows one **representative** event window (the one with
+> the most cluster-pair data); per-window CSVs for every event are written
+> under the cluster-results tree.
 > Tab 0's batch worker uses this; Tab 7 still spawns its own worker
 > threads + interactive filters.
 

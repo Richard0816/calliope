@@ -795,7 +795,9 @@ def _render_detection_panels(plane0: Path, figures_dir: Path, *,
                 ax.scatter(xs, ys, s=0.4, c=color, alpha=0.5,
                            linewidths=0)
         suffix = "" if draw_overlay else "  (background only)"
-        ax.set_title(f"{label}  (n={int(mask.sum())}){suffix}")
+        nice = ("Detected ROIs" if label == "all_rois"
+                else "Kept ROIs · cell filter ≥ 0.5")
+        ax.set_title(f"{nice}  (n={int(mask.sum())}){suffix}")
         ax.set_axis_off()
         add_scale_bar(ax, pix_to_um, axes_in_um=False,
                       span_um=(Lx * pix_to_um if pix_to_um else None),

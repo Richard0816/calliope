@@ -225,7 +225,10 @@ class LowpassTab(ctk.CTkFrame):
         row.pack(fill="x", padx=8, pady=(4, 6))
         ctk.CTkLabel(row, text="Trace source:", width=90,
                      anchor="w").pack(side="left")
-        self.source_var = tk.StringVar(value="mean")
+        # Default to median: an arithmetic mean across ROIs is dominated by a
+        # few near-zero-baseline ROIs whose dF/F runs to ~1e9, which blows up
+        # the live preview (and matches the headless figure default).
+        self.source_var = tk.StringVar(value="median")
         ctk.CTkRadioButton(
             row, text="Mean across kept ROIs",
             value="mean", variable=self.source_var,

@@ -36,7 +36,7 @@ The tab subscribes to the AppState `plane0` broadcast so it auto-loads when Tab 
 The "Trace source" radio + entry chooses what to compute the FFT and live previews on:
 
 - **Mean across kept ROIs**: `mean(dff, axis=1)`
-- **Median across kept ROIs**: `median(dff, axis=1)`
+- **Median across kept ROIs** (default): `median(dff, axis=1)` — robust to the handful of near-zero-baseline ROIs whose dF/F runs to ~1e9 and would otherwise dominate the mean (and blow up the y-axis). The headless batch figure (`render_lowpass_figures`) uses the median for the same reason.
 - **Best-scoring ROI**: ROI with the largest `predicted_cell_prob`.
 - **Manual ROI(s)**: user-supplied ROI ids/ranges (e.g. `0,3,5-9`) using `gui_common.parse_manual_roi_spec`. If multiple are given, aggregated by `mean` or `median` (combobox).
 

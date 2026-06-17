@@ -174,7 +174,7 @@ The cell-filter step gives you a reproducible "is this really a cell?" decision 
 
 **What it does.** Lets you interactively pick a **low-pass cutoff** (in Hz) and watch three panels update:
 
-1. The **FFT power spectrum** of the chosen trace (mean across cells, median, best cell, or a manual subset). The cutoff line is a vertical dashed marker.
+1. The **FFT power spectrum** of the chosen trace (median across cells by default — robust to baseline-blowup ROIs; or mean, best cell, or a manual subset). The cutoff line is a vertical dashed marker.
 2. The **raw** dF/F trace.
 3. The **low-pass-filtered** dF/F trace at the chosen cutoff.
 

@@ -1302,6 +1302,30 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
     plt.close(fig)
 
 
+def _pick_representative_event_dir(per_event_root: Path) -> Optional[Path]:
+    """Per-event cross-correlation CSVs nest one level deeper than the full
+    run: ``cross_correlation_per_event/event0000_*/CxxCy/*_summary.csv``.
+    ``_load_pair_data`` only globs immediate subdirs, so handing it the
+    per-event ROOT finds no pair folders and the violin renders "No pair
+    data". The batch figure shows ONE representative event -- the one with the
+    most cluster-pair CSVs (tie-break: largest total CSV size, a cheap proxy
+    for the most pair data). Returns None if no event subfolder carries pairs.
+    """
+    per_event_root = Path(per_event_root)
+    best: Optional[Path] = None
+    best_key = (-1, -1)
+    for d in sorted(per_event_root.iterdir()):
+        if not d.is_dir():
+            continue
+        csvs = list(d.glob("*/*_summary.csv"))
+        if not csvs:
+            continue
+        key = (len(csvs), sum(c.stat().st_size for c in csvs))
+        if key > best_key:
+            best_key, best = key, d
+    return best
+
+
 def run_crosscorrelation(
     plane0: Path,
     params: dict,
@@ -1391,11 +1415,13 @@ def run_crosscorrelation(
                 title_suffix="full recording",
             )
         if per_event_outdir is not None and per_event_outdir.exists():
-            pair_data = _load_pair_data(per_event_outdir)
-            _save_violin_pair(
-                pair_data, save_path=figures_dir / "per_event.png",
-                title_suffix="per event",
-            )
+            event_dir = _pick_representative_event_dir(per_event_outdir)
+            if event_dir is not None:
+                pair_data = _load_pair_data(event_dir)
+                _save_violin_pair(
+                    pair_data, save_path=figures_dir / "per_event.png",
+                    title_suffix=f"per event: {event_dir.name}",
+                )
 
     return {
         "full_outdir": str(full_outdir) if full_outdir.exists() else None,

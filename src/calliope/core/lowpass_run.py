@@ -150,9 +150,15 @@ def compute_lowpass_offload(plane0_str: str, *, fps: float, cutoff_hz: float,
     return float(cutoff_hz)
 
 
-def _population_mean_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
-    """Compute the population-mean trace from ``r0p7_filtered_dff`` in
+def _population_median_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
+    """Compute the population-*median* trace from ``r0p7_filtered_dff`` in
     chunks so very long recordings don't blow memory.
+
+    Median (not mean) across ROIs: a few ROIs with near-zero baselines have
+    dF/F in the billions (dF/F = (F - F0) / max(F0, 1e-9)), so an arithmetic
+    mean-of-ratios is dominated by those outliers and the trace blows up to
+    ~1e9. The median is robust to them and reflects the typical cell, which is
+    what this diagnostic trace (and its FFT) is meant to show.
     """
     src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
     src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
@@ -160,7 +166,7 @@ def _population_mean_filtered_dff(plane0: Path, T: int, N: int) -> np.ndarray:
     chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)
-        out[t0:t1] = np.mean(np.asarray(src[t0:t1, :]), axis=1)
+        out[t0:t1] = np.median(np.asarray(src[t0:t1, :]), axis=1)
     del src
     return out
 
@@ -187,20 +193,20 @@ def render_lowpass_figures(
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
     T, N = _load_kept_count_and_T(plane0)
-    mean_dff = _population_mean_filtered_dff(plane0, T, N)
-    label = f"mean across {N} kept ROIs"
+    pop_dff = _population_median_filtered_dff(plane0, T, N)
+    label = f"median across {N} kept ROIs"
 
-    yf = np.fft.rfft(mean_dff)
-    xf = np.fft.rfftfreq(mean_dff.size, 1.0 / fps)
+    yf = np.fft.rfft(pop_dff)
+    xf = np.fft.rfftfreq(pop_dff.size, 1.0 / fps)
     power = np.abs(yf) ** 2
     # Diagnostic figure only — zero-phase preview so the overlay
     # aligns with the raw mean-dF/F trace in time. The on-disk lowpass
     # memmap that feeds event detection is still built with the causal
     # filter in ``write_lowpass_dt_memmaps`` above.
     lp, _ = utils.lowpass_zero_phase_1d(
-        mean_dff, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
+        pop_dff, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
         sos=None)
-    t = np.arange(mean_dff.size, dtype=np.float32) / fps
+    t = np.arange(pop_dff.size, dtype=np.float32) / fps
 
     written = []
 
@@ -222,7 +228,7 @@ def render_lowpass_figures(
 
     fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
     ax = fig.add_subplot(111)
-    ax.plot(t, mean_dff, lw=0.6, color="black")
+    ax.plot(t, pop_dff, lw=0.6, color="black")
     ax.set_xlim(0, t[-1] if t.size else 1.0)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("dF/F")
