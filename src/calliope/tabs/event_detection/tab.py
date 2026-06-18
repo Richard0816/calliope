@@ -144,6 +144,18 @@ class EventDetectionTab(ctk.CTkFrame):
         {"name": "min_sep_s", "label": "Min separation (s)",
          "type": "float", "default": 0.1, "group": "Per-ROI hysteresis",
          "help": "merge onsets closer than this into one event"},
+        {"name": "min_rise_dff", "label": "Min onset rise (dF/F)",
+         "type": "float", "default": 0.0, "group": "Per-ROI hysteresis",
+         "help": "drop onsets whose foot->peak rise on the low-pass dF/F is "
+                 "below this many ABSOLUTE dF/F units; removes noise-amplitude "
+                 "excursions on low-SNR ROIs (0 = off; ~0.2 is a typical "
+                 "starting point, but the right value is recording-dependent)"},
+        {"name": "onset_backtrack_s", "label": "Onset backtrack (s)",
+         "type": "float", "default": 0.0, "group": "Per-ROI hysteresis",
+         "help": "max window to walk an onset back to the foot of its rise. "
+                 "0 = auto: max(indicator tau, 0.8/lowpass-cutoff) per "
+                 "recording (~0.8s for fast GCaMP at 1Hz); set a positive "
+                 "value to override"},
         # Display
         {"name": "time_cols_target", "label": "Heatmap time columns",
          "type": "int", "default": 1200, "group": "Display",

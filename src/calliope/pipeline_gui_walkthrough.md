@@ -214,7 +214,7 @@ The defaults are tuned for **short epileptiform events** (<0.5 s). If you're stu
 
 **Biological output.** (a) Per-cell spike-train-like onset times, (b) population event windows in seconds, (c) for every event × cell combination, did that cell participate?
 
-→ See `tabs/event_detection/README.md` for the full mathematical specification of MAD-z, hysteresis, the density-based detector, and every parameter in `EventDetectionParams`.
+→ See `tabs/event_detection/README.md` for the full mathematical specification of MAD-z, hysteresis, the rise-foot onset refinement (`refine_onsets`: backtrack to the foot of the rise + an off-by-default absolute-dF/F `min_rise_dff` gate), the density-based detector, and every parameter in `EventDetectionParams`.
 
 ---
 
@@ -323,7 +323,7 @@ Most tabs hide their fine-tuning behind an **Advanced...** button (a modal form 
 | **2 — QC Preview** | none | Read-only viewer. `Animate` and `Reload from folder…` are presentation-only; the real knobs are on Tab 1. |
 | **3 — Suite2p** | Advanced... (27-knob `PARAM_SPEC`) **+** `Edit suite2p settings…` (raw-ops escape hatch) | Detection sensitivity (`threshold_scaling` ↓ = more ROIs), Cellpose/Cellpose-SAM thresholds, ROI merge overlap, dF/F (`neuropil_coef`, baseline `perc`/`win_sec`, `fps_override`), pixel-scale, GPU. The escape hatch forwards arbitrary suite2p `db`/`settings` (registration block size, nonrigid, …) for a session. |
 | **4 — Low-pass** | Advanced... (5 knobs) — cutoff itself is the live slider | `filter_order` (Butterworth roll-off vs lag), `sg_win_ms` (SG derivative window — the most impactful: wide = smoother/fused, narrow = crisp/noisy), `sg_poly`, and the slider bounds `cutoff_min/max`. |
-| **5 — Event detection** | Advanced... (30-knob `PARAM_SPEC`, grouped) | The deepest dialog. Per-ROI hysteresis (`z_enter/z_exit/min_sep_s`), onset-density binning/smoothing, peak-prominence (`auto_min_prominence` drives the floor from the per-recording circular-shift null p99), baseline/noise, event boundaries (`max_event_duration_s`, watershed split), and an off-by-default Gaussian-fit boundary. |
+| **5 — Event detection** | Advanced... (32-knob `PARAM_SPEC`, grouped) | The deepest dialog. Per-ROI hysteresis (`z_enter/z_exit/min_sep_s`) + onset refinement (`min_rise_dff/onset_backtrack_s`: rise-foot backtrack and an off-by-default absolute-dF/F rise floor), onset-density binning/smoothing, peak-prominence (`auto_min_prominence` drives the floor from the per-recording circular-shift null p99), baseline/noise, event boundaries (`max_event_duration_s`, watershed split), and an off-by-default Gaussian-fit boundary. |
 | **6 — Clustering** | inline (no dialog) | `prefix` (which dF/F memmap), `Manual threshold` + the `cut` slider (lower = more/smaller clusters; absolute Ward distance, recording-specific — judge by eye), `palette` (cosmetic), and `Recluster` threshold to sub-divide one ensemble. |
 | **7 — Cross-correlation** | inline (no dialog) | `prefix`/`cluster_folder`, `fps`, `max_lag_seconds`, `zero_lag`, `use_gpu`, `n_shuffles` (circular-shift null vs autocorrelation-inflated p-values), `compute_partial` (separate direct coupling from common drive), plus single-pair preview controls. |
 | **8 — Spatial propagation** | none of its own | Pure consumer of Tab 5 — re-render Tab 5 to change what's painted. One inline `Use Suite2p spks` toggle swaps hysteresis onsets for first-spike timing; monotonicity internals (`n_angles=360`, `n_shuffles=10000`) are hardcoded. |

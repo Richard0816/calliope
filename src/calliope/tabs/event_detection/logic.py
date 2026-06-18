@@ -30,6 +30,7 @@ from ...core.utils import (
     hysteresis_onsets,
     mad_z,
     plot_event_detection,
+    refine_onsets,
     shade_event_windows,
 )
 
@@ -40,6 +41,7 @@ __all__ = [
     "hysteresis_onsets",
     "mad_z",
     "plot_event_detection",
+    "refine_onsets",
     "shade_event_windows",
     "summary_writer",
 ]

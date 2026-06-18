@@ -105,6 +105,24 @@ Then merge onsets closer than `min_sep_s · fps` frames into the earliest of the
 
 **Why on the derivative.** GCaMP fluorescence rises fast (~50–200 ms) and decays slowly (hundreds of ms to seconds). The derivative peaks at the moment of fastest rise, which is the closest you can get to spike onset without doing model-based deconvolution.
 
+#### `refine_onsets(onsets, lp, fps, min_rise_dff, backtrack_s)` — foot backtrack + optional rise gate
+
+The Schmitt trigger fires partway *up* the rise (where the derivative robust-z
+crosses `z_enter`), not at its foot. `refine_onsets` (`utils.py:458`, called at
+`event_detection_run.py:366`) walks each crossing back along the low-pass dF/F
+to the local minimum that starts the rise, so the reported frame lands at event
+**onset**. Two crossings on one rise collapse to a single foot.
+
+If `min_rise_dff > 0` it additionally drops onsets whose foot→peak rise on the
+low-pass dF/F is below `min_rise_dff` **absolute dF/F**. The floor is absolute
+on purpose: a per-ROI robust-z floor cannot separate a flat noisy ROI from a
+real one (the trigger already pre-selects the steepest excursions, which sit
+several robust-σ above their feet on noise and signal alike), whereas an
+absolute dF/F floor removes noise-*amplitude* excursions everywhere — which is
+what zeroes out flat, low-SNR ROIs. It is **off by default** (a sensible value
+is recording/indicator dependent); the principal defense against chance onsets
+remains the population-level null-prominence floor (§ population peaks below).
+
 `onsets_by_roi[i]` ends up as `frame_idx / fps`, i.e. onset times in **seconds**.
 
 ### Step 2 — Display arrays
@@ -222,13 +240,13 @@ The `summary_writer.write_events_sheets` writes:
 
 ## 4. Advanced settings (`Advanced…` dialog)
 
-Every knob below lives in the 30-entry `PARAM_SPEC` at `tab.py:136`. The
+Every knob below lives in the 32-entry `PARAM_SPEC` at `tab.py:136`. The
 *Advanced…* button opens a generated dialog (`gui_common.open_advanced`);
 defaults are primed via `spec_defaults(PARAM_SPEC)` into `self._params`.
 Twenty-six of these map 1:1 to `core.utils.EventDetectionParams` (the
-`_EVENT_DETECTION_FIELDS` tuple, `event_detection_run.py:44`); the other four
-(`z_enter`, `z_exit`, `min_sep_s`, `time_cols_target`) are consumed directly
-by the run worker. **Defaults below are exactly the GUI `PARAM_SPEC` values**,
+`_EVENT_DETECTION_FIELDS` tuple, `event_detection_run.py:44`); the other six
+(`z_enter`, `z_exit`, `min_sep_s`, `min_rise_dff`, `onset_backtrack_s`,
+`time_cols_target`) are consumed directly by the run worker. **Defaults below are exactly the GUI `PARAM_SPEC` values**,
 which `_build_event_params` (`event_detection_run.py:192`) writes over the
 dataclass defaults before detection — so they are the source of truth. In a
 couple of cases the GUI value differs from the *live* `EventDetectionParams`
@@ -274,6 +292,27 @@ raw dF/F scale.
     collapse onset bursts into one event (fewer onsets); lower it toward 0 to
     keep every up-crossing. Interacts with `z_exit`: both gate how fast one cell
     can re-fire.
+- **Min onset rise (`min_rise_dff`) — default `0.0` (off).**
+  - *What it does:* after the foot backtrack, drops any onset whose foot→peak
+    rise on the low-pass dF/F is below this many **absolute dF/F** units
+    (`refine_onsets`, `utils.py:458`). `0` disables the gate (backtrack only).
+  - *What it means to you:* an opt-in floor that removes noise-amplitude onsets
+    on flat / low-SNR cells. It is absolute (not robust-z) by design — a per-ROI
+    normalised floor can't tell a phantom cell from a real one. A typical
+    starting value is ~`0.2`, but the right number depends on your dF/F scale
+    and indicator, so it ships off. Phantom suppression is primarily the job of
+    the population null-prominence floor; this is a per-cell sanity gate.
+- **Onset backtrack (`onset_backtrack_s`) — default `0.0` (auto).**
+  - *What it does:* cap (seconds) on how far `refine_onsets` walks an onset back
+    to the foot of its rise (and forward to the peak for the rise gate). The
+    foot is the `argmin` over the look-back, but the walk never crosses a sample
+    already as high as the onset itself, so it can't reach back into a separate
+    earlier bump. `0` = **auto**: `max(tau, 0.8/cutoff_hz)` per recording.
+  - *What it means to you:* the foot lives on the **low-pass** dF/F, so the rise
+    timescale is the *slower* of the indicator decay `tau` and the low-pass
+    period `1/cutoff` — not the (sub-second) spike. Fast indicator → the
+    low-pass floor wins (jGCaMP8m tau 0.25 s at 1 Hz → 0.8 s); slow indicator →
+    `tau` wins (GCaMP6s → 1.5 s). Set a positive value to override.
 
 ### Display
 

@@ -455,6 +455,88 @@ def hysteresis_onsets(z, z_hi, z_lo, fps, min_sep_s=0.0):
     return onsets
 
 
+def refine_onsets(onsets, lp, fps, min_rise_dff=0.0, backtrack_s=0.8):
+    """Backtrack onsets to the foot of their rise; optionally drop small rises.
+
+    :func:`hysteresis_onsets` fires the instant the SG-derivative robust-z
+    crosses ``z_hi`` -- i.e. partway up the steepest part of the rise, not at
+    its foot. This step walks each onset back along the (already smooth,
+    low-pass) dF/F to the local minimum where the rise began, so the reported
+    frame lands at event *onset* rather than mid-rise.
+
+    If ``min_rise_dff > 0`` it also drops onsets whose foot->peak rise on the
+    low-pass dF/F is below ``min_rise_dff`` **absolute dF/F**. The floor is
+    deliberately absolute, not a per-ROI robust-z: ``hysteresis_onsets``
+    pre-selects the steepest excursions, and on a flat noisy ROI those sit
+    just as many robust-SD above their feet as a real transient does on a
+    bright ROI -- so a per-ROI normalised floor cannot tell a phantom ROI from
+    a real one (it rescales away the very SNR difference). An absolute dF/F
+    floor instead removes noise-*amplitude* excursions everywhere, which is
+    what zeroes out flat, low-SNR ROIs (empirically noise rises cluster well
+    below real-event rises). It is OFF by default (``0.0``) -- a sensible
+    value is recording/indicator dependent, so it is an opt-in per-ROI sanity
+    floor. The principal defense against chance onsets remains the
+    population-level null-prominence floor in :func:`detect_event_windows`.
+
+    Parameters
+    ----------
+    onsets : 1-D int array
+        Frame indices from :func:`hysteresis_onsets`.
+    lp : 1-D array
+        Low-pass dF/F trace for this ROI (full recording length). Using the
+        low-pass (not the raw) trace keeps the foot/peak walks well-behaved.
+    fps : float
+        Frame rate, for the ``backtrack_s`` -> frames conversion.
+    min_rise_dff : float
+        Minimum foot->peak rise in absolute dF/F. ``<= 0`` disables the gate
+        (onsets are still backtracked to the rise foot).
+    backtrack_s : float
+        Cap (seconds) on how far to walk back to the foot / forward to the
+        peak. Match it to the indicator's dF/F rise time (default 0.8 s suits a
+        GCaMP transient through the 1 Hz low-pass); the crossing-level bound
+        above usually stops the walk well before this cap anyway.
+
+    Returns
+    -------
+    onsets : 1-D int array
+        Rise-foot frame indices that survive the gate, unique and sorted.
+        Two crossings on one rise collapse to a single foot.
+    """
+    onsets = np.asarray(onsets, dtype=int)
+    if onsets.size == 0:
+        return onsets
+    n = lp.size
+    win = max(1, int(round(backtrack_s * fps)))
+    out = []
+    for c in onsets:
+        # Clamp so a stray out-of-range index can't IndexError (the wired path
+        # never produces one, but the function shouldn't assume it).
+        c = min(max(int(c), 0), n - 1)
+        lo = max(0, c - win)
+        # Foot = the trough the rise climbs out of. Walk back from the crossing
+        # only while the trace stays *below* the crossing level, then take the
+        # argmin of that span. The two halves matter:
+        #  - argmin (not the first local min) reaches the real foot, so a second
+        #    crossing part-way up one event isn't left stranded ("late").
+        #  - stopping at the most recent sample already >= the crossing level
+        #    keeps it from backtracking across a *separate, earlier* bump into
+        #    that bump's trough ("too far back"). ``backtrack_s`` still caps it.
+        cv = lp[c]
+        b = c
+        while b > lo and lp[b - 1] < cv:
+            b -= 1
+        foot = b + int(np.argmin(lp[b:c + 1]))
+        if min_rise_dff > 0.0:
+            hi = min(n, c + win + 1)
+            peak = c + int(np.argmax(lp[c:hi]))
+            if (lp[peak] - lp[foot]) < min_rise_dff:
+                continue
+        out.append(foot)
+    if not out:
+        return np.array([], dtype=int)
+    return np.unique(np.asarray(out, dtype=int))
+
+
 def paint_spatial(values_per_roi, stat_list, Ly, Lx):
     """Paint per-ROI scalar values onto the imaging plane.
 

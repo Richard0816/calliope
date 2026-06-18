@@ -205,6 +205,44 @@ def _build_event_params(params: dict):
     return obj
 
 
+def _read_tau(plane0: Path) -> float:
+    """Indicator OASIS decay tau (s) for this recording, or 0.0 if unknown.
+
+    Prefers the meta.json sidecar, falls back to suite2p's ``ops.npy`` (which
+    always carries ``tau``); both behind defensive reads so a missing/corrupt
+    file just yields 0.0.
+    """
+    try:
+        from .recording_meta import read_meta
+        t = (read_meta(plane0).get("extraction") or {}).get("tau_seconds")
+        if t:
+            return float(t)
+    except Exception:
+        pass
+    try:
+        ops = np.load(plane0 / "ops.npy", allow_pickle=True).item()
+        return float(ops.get("tau") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _resolve_backtrack_s(value: float, plane0: Path, params: dict) -> float:
+    """Onset-backtrack window (s). ``value > 0`` is an explicit override;
+    otherwise derive it from the recording.
+
+    The foot is found on the low-pass dF/F, so the rise timescale is set by the
+    *slower* of the indicator decay (``tau``) and the low-pass period
+    (``1/cutoff_hz``) -- not the (sub-second) spike. For a fast indicator the
+    low-pass floor dominates (e.g. tau 0.25 s at 1 Hz -> 0.8 s); for a slow one
+    tau dominates (e.g. GCaMP6s 1.5 s -> 1.5 s). The 0.8 coefficient is the
+    empirically-checked foot reach of the 1 Hz low-pass + SG-derivative stage.
+    """
+    if value > 0.0:
+        return value
+    cutoff = float(params.get("cutoff_hz", 1.0)) or 1.0
+    return max(_read_tau(plane0), 0.8 / cutoff)
+
+
 def run_event_detection(
     plane0: Path,
     params: dict,
@@ -314,6 +352,9 @@ def run_event_detection(
     z_enter = float(params.get("z_enter", 3.5))
     z_exit = float(params.get("z_exit", 1.5))
     min_sep_s = float(params.get("min_sep_s", 0.1))
+    min_rise_dff = float(params.get("min_rise_dff", 0.0))
+    onset_backtrack_s = _resolve_backtrack_s(
+        float(params.get("onset_backtrack_s", 0.0)), plane0, params)
     time_cols_target = int(params.get("time_cols_target", 1200))
 
     downsample = max(1, T // time_cols_target)
@@ -358,6 +399,12 @@ def run_event_detection(
             z, _, _ = ed_utils.mad_z(src_i)
             onsets = ed_utils.hysteresis_onsets(
                 z, z_enter, z_exit, fps, min_sep_s=min_sep_s)
+            # Backtrack each crossing to the foot of its rise on the low-pass
+            # dF/F (fixes mid-rise timing); optionally drop sub-``min_rise_dff``
+            # excursions (absolute dF/F floor, off by default).
+            onsets = ed_utils.refine_onsets(
+                onsets, lp_i, fps, min_rise_dff=min_rise_dff,
+                backtrack_s=onset_backtrack_s)
             event_counts[i] = onsets.size
             onsets_by_roi.append(np.asarray(onsets, dtype=np.float64) / fps)
 
