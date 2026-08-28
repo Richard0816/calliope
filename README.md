@@ -1,6 +1,6 @@
 # CalLIOPE
 
-**Cal**cium **L**ive-imaging **O**utput **P**ipeline for **E**piletiform-recordings.
+**Cal**cium **L**ive-imaging **O**utput **P**ipeline for **E**pileptiform-recordings.
 
 A self-contained GUI for the Suite2p-based 2-photon calcium imaging
 analysis pipeline. Each pipeline stage lives on its own tab; shared
