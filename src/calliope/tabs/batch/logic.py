@@ -297,6 +297,8 @@ def is_scratch_mirror_skippable(
     if not parts:
         return False
     name = parts[-1]
+    if name == SCRATCH_OWNER_MARKER:
+        return True
     if name in ("data_raw.bin", "data_raw_chan2.bin"):
         return True
     if name.endswith(".tmp") or name.endswith(".lock"):
@@ -312,6 +314,73 @@ def is_scratch_mirror_skippable(
             and "shifted_" in name:
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Scratch ownership guard
+# ---------------------------------------------------------------------------
+
+#: Dropped into every per-recording scratch dir the batch runner
+#: creates. The scratch janitor only deletes directories that carry it
+#: (or that this session created itself), so pointing the scratch field
+#: at a folder that already holds other data can never wipe that data.
+SCRATCH_OWNER_MARKER = ".calliope_scratch"
+
+# Any of these directly inside a candidate scratch root means it is a
+# source checkout / project folder, not a scratch area.
+_PROJECT_ROOT_SENTINELS = (".git", "pyproject.toml", "setup.py",
+                           "setup.cfg", "requirements.txt")
+
+
+def mark_scratch_owned(rec_dir: Path) -> None:
+    """Tag ``rec_dir`` as a Calliope-created scratch dir."""
+    try:
+        (Path(rec_dir) / SCRATCH_OWNER_MARKER).touch(exist_ok=True)
+    except OSError:
+        pass
+
+
+def is_scratch_owned(rec_dir: Path) -> bool:
+    """True iff ``rec_dir`` is a directory carrying the owner marker."""
+    p = Path(rec_dir)
+    return p.is_dir() and (p / SCRATCH_OWNER_MARKER).is_file()
+
+
+def scratch_root_problem(scratch_root: Path,
+                         *, protected: tuple = ()) -> Optional[str]:
+    """Return a reason ``scratch_root`` is unsafe to use, else ``None``.
+
+    Rejects filesystem/drive roots, the home directory, source
+    checkouts (a folder with ``.git`` / ``pyproject.toml`` / ...),
+    and any folder that is, or contains, one of ``protected`` (the
+    installed Calliope package, the output folder, the working dir).
+    """
+    try:
+        root = Path(scratch_root).expanduser().resolve()
+    except OSError as e:
+        return f"cannot resolve path: {e}"
+    if root.parent == root:
+        return "it is a drive / filesystem root"
+    try:
+        if root == Path.home().resolve():
+            return "it is your home folder"
+    except (OSError, RuntimeError):
+        pass
+    if root.is_dir():
+        for name in _PROJECT_ROOT_SENTINELS:
+            if (root / name).exists():
+                return (f"it looks like a project folder (contains "
+                        f"'{name}')")
+    for other in protected:
+        if not other:
+            continue
+        try:
+            o = Path(other).expanduser().resolve()
+        except OSError:
+            continue
+        if o == root or root in o.parents:
+            return f"it contains {o}"
+    return None
 
 
 def measure_tree(root: Path) -> tuple[int, int]:

@@ -68,8 +68,9 @@ from .logic import (
     SCRATCH_PRUNE_FILE_PATTERNS, SCRATCH_RECORDING_INTERMEDIATE_DIRS,
     SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC, TIFF_GLOBS,
     build_batch_param_spec, copy_one_dedup, is_scratch_mirror_skippable,
-    measure_tree, mirror_sync_pass, prune_scratch_tree,
-    synchronous_final_sweep, throttled_copy2,
+    is_scratch_owned, mark_scratch_owned, measure_tree, mirror_sync_pass,
+    prune_scratch_tree, scratch_root_problem, synchronous_final_sweep,
+    throttled_copy2,
 )
 
 
@@ -211,6 +212,11 @@ class BatchTab(ctk.CTkFrame):
         self._cleanup_queue_lock = threading.Lock()
         self._cleanup_queue: list[Path] = []
         self._cleanup_row_map: dict[Path, tuple] = {}
+        # Scratch dirs this session created. The janitor deletes only
+        # these or dirs carrying ``SCRATCH_OWNER_MARKER``; the finalize
+        # rmtree can remove the marker before a locked file stops it,
+        # so the in-memory set covers the deferred retries.
+        self._owned_scratch_dirs: set[Path] = set()
         self._cleanup_thread = threading.Thread(
             target=self._scratch_janitor_loop,
             name="calliope-scratch-janitor",
@@ -381,7 +387,8 @@ class BatchTab(ctk.CTkFrame):
             children = [c for c in scratch_root.iterdir() if c.is_dir()]
         except OSError:
             return
-        orphans = [c for c in children if c.name not in active_idents]
+        orphans = [c for c in children
+                   if c.name not in active_idents and self._owns_scratch(c)]
         for p in orphans:
             self._enqueue_scratch_cleanup(p)
         if orphans:
@@ -413,6 +420,13 @@ class BatchTab(ctk.CTkFrame):
         except Exception:
             pass
 
+    def _owns_scratch(self, path: Path) -> bool:
+        """True iff the janitor may delete ``path``: this session
+        created it, or it carries the Calliope scratch marker. Anything
+        else in the scratch root is user data and is never touched.
+        """
+        return path in self._owned_scratch_dirs or is_scratch_owned(path)
+
     def _enqueue_scratch_cleanup(self, scratch_rec: Path,
                                  *, row=None,
                                  base_status: str = "") -> None:
@@ -427,6 +441,12 @@ class BatchTab(ctk.CTkFrame):
         ``"<base_status> (done)"`` once rmtree succeeds, so the
         Tab 0 status column reflects real cleanup progress.
         """
+        if not self._owns_scratch(scratch_rec):
+            self._log_queue.put((
+                "log",
+                f"  [batch] scratch janitor: NOT deleting {scratch_rec} "
+                f"(not created by Calliope)"))
+            return
         with self._cleanup_queue_lock:
             if scratch_rec not in self._cleanup_queue:
                 self._cleanup_queue.append(scratch_rec)
@@ -1431,6 +1451,21 @@ class BatchTab(ctk.CTkFrame):
         self._batch_scratch_root: Optional[Path] = None
         if scratch:
             scratch_root = Path(scratch)
+            problem = scratch_root_problem(
+                scratch_root,
+                protected=(Path(__file__).resolve().parents[2],
+                           self._batch_final_out_root,
+                           self.workdir_var.get().strip()))
+            if problem:
+                messagebox.showerror(
+                    "Bad scratch dir",
+                    f"Refusing to use {scratch_root} as the scratch "
+                    f"dir: {problem}.\n\nScratch folders are cleaned "
+                    f"up automatically, so pick an empty folder "
+                    f"dedicated to Calliope scratch (e.g. "
+                    f"D:\\calliope_scratch).")
+                self._abort_batch_startup()
+                return
             try:
                 same = (scratch_root.resolve()
                         == self._batch_final_out_root.resolve())
@@ -1632,8 +1667,15 @@ class BatchTab(ctk.CTkFrame):
             # downstream caching (suite2p's _find_existing_binaries
             # would match on the partial folder).
             if self._batch_scratch_root is not None and rec_save.exists():
+                if not self._owns_scratch(rec_save):
+                    raise RuntimeError(
+                        f"{rec_save} already exists and was not created "
+                        f"by Calliope; refusing to overwrite it")
                 shutil.rmtree(rec_save, ignore_errors=True)
             rec_save.mkdir(parents=True, exist_ok=True)
+            if self._batch_scratch_root is not None:
+                self._owned_scratch_dirs.add(rec_save)
+                mark_scratch_owned(rec_save)
         except Exception as e:
             self._append_log(
                 f"[{ident}] FAILED to create output folder: {e}")
@@ -3141,7 +3183,8 @@ class BatchTab(ctk.CTkFrame):
             leftover_subdirs: list[Path] = []
             try:
                 for entry in scratch_root.iterdir():
-                    leftover_subdirs.append(entry)
+                    if self._owns_scratch(entry):
+                        leftover_subdirs.append(entry)
             except OSError as e:
                 self._append_log(
                     f"[batch] scratch root unreadable at end of "
