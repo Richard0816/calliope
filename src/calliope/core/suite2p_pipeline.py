@@ -44,6 +44,7 @@ Two monkey-patches are installed: :func:`_install_sparsery_roi_cap`
 from __future__ import annotations
 
 import copy
+import gc
 import os
 import re
 import shutil
@@ -390,6 +391,24 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return False
 
 
+def _is_ram_oom(exc: BaseException) -> bool:
+    """True if ``exc`` is a system-RAM allocation failure.
+
+    Covers Python/numpy ``MemoryError`` and torch's CPU allocator,
+    which raises a plain ``RuntimeError`` reading ``[enforce fail at
+    alloc_cpu.cpp] ... DefaultCPUAllocator: not enough memory`` when
+    suite2p's registration runs on CPU torch.
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return ("defaultcpuallocator" in msg
+                or "not enough memory" in msg
+                or "cannot allocate memory" in msg)
+    return False
+
+
 def _clear_cuda_arena() -> None:
     """Best-effort release of every GPU resource torch is willing to
     let go of.
@@ -482,7 +501,8 @@ def _invoke_run_s2p(db: dict, settings: dict):
     observed peak back to :class:`utils.AdaptiveBatchSizer` so the next
     recording's batch_size converges on the target RAM fraction.
 
-    CUDA OOM safety net: if registration blows the GPU, halve
+    OOM safety net: if registration blows the GPU (or system RAM, when
+    torch registers on the CPU), halve
     ``settings['registration']['batch_size']``, clear the CUDA arena,
     and retry. First OOM uses a gentle //2 halve (marginal miss).
     Subsequent OOMs use //4 (we're badly mis-estimated, accelerate
@@ -504,29 +524,38 @@ def _invoke_run_s2p(db: dict, settings: dict):
     _clear_cuda_arena()
 
     for attempt in range(max_oom_retries + 1):
+        if attempt:
+            # Free the failed attempt's buffers (pinned by its now
+            # released traceback) before the retry allocates again.
+            gc.collect()
         mon = utils.PeakMemoryMonitor()
         mon.__enter__()
         try:
             result = suite2p.run_s2p(db=db, settings=settings)
         except BaseException as exc:
             mon.__exit__(type(exc), exc, exc.__traceback__)
-            if _is_cuda_oom(exc) and attempt < max_oom_retries:
+            is_cuda = _is_cuda_oom(exc)
+            is_ram = not is_cuda and _is_ram_oom(exc)
+            if (is_cuda or is_ram) and attempt < max_oom_retries \
+                    and used_bs > 64:
                 # First OOM: gentle halve. After that: quartering --
                 # halving alone wasn't enough, so converge faster.
                 divisor = 2 if attempt == 0 else 4
                 new_bs = max(64, used_bs // divisor)
-                print(f"[adaptive] CUDA OOM at batch_size={used_bs} "
+                kind = "CUDA" if is_cuda else "RAM"
+                print(f"[adaptive] {kind} OOM at batch_size={used_bs} "
                       f"(attempt {attempt + 1}/{max_oom_retries + 1}); "
                       f"cutting to {new_bs} (/{divisor}) and retrying")
                 set_setting(settings, 'batch_size', new_bs)
-                # Record the OOM as a "100% GPU peak" data point so
+                # Record the OOM as a 100% peak on the resource that
+                # blew (GPU or system RAM) so
                 # the closed loop knows this batch_size was too big
                 # even though we recover via retry. Use the just-
                 # cut value as the batch_size we'll actually run
                 # at on the retry.
                 sizer.update_from_peak(
-                    cpu_peak=mon.cpu_peak_fraction,
-                    gpu_peak=1.0,
+                    cpu_peak=1.0 if is_ram else mon.cpu_peak_fraction,
+                    gpu_peak=1.0 if is_cuda else mon.gpu_peak_fraction,
                     batch_size=new_bs)
                 used_bs = new_bs
                 _clear_cuda_arena()

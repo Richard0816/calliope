@@ -2359,6 +2359,9 @@ class BatchTab(ctk.CTkFrame):
         "out of memory",
         "outofmemoryerror",
         "cannot allocate memory",
+        # torch CPU tensors: "DefaultCPUAllocator: not enough memory"
+        "defaultcpuallocator",
+        "not enough memory",
         "bad_alloc",
         "bad alloc",
         "cuda_error_out_of_memory",

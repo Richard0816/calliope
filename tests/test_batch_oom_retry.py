@@ -28,6 +28,8 @@ def test_is_oom_error_matches_ram_signatures():
         "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB",
         "cudaErrorMemoryAllocation",
         "std::bad_alloc",
+        "[enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: "
+        "not enough memory: you tried to allocate 36753113088 bytes.",
     ]:
         assert f(stub, msg) is True, msg
 
@@ -212,3 +214,15 @@ def test_fail_stage_oom_not_retried_when_aborting():
                          MemoryError("Unable to allocate 4 GiB"))
     assert stub.retried == []
     assert stub.row_done == 1
+
+
+# --- suite2p in-call RAM OOM classifier ------------------------------------
+
+def test_is_ram_oom_matches_torch_cpu_allocator():
+    from calliope.core.suite2p_pipeline import _is_ram_oom
+    assert _is_ram_oom(RuntimeError(
+        "[enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: "
+        "not enough memory: you tried to allocate 36753113088 bytes."))
+    assert _is_ram_oom(MemoryError())
+    assert not _is_ram_oom(RuntimeError("shape mismatch"))
+    assert not _is_ram_oom(OSError(28, "No space left on device"))

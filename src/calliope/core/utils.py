@@ -2034,6 +2034,16 @@ RAM_HEADROOM_GIB = 4.0
 # against the legacy ``20*GiB - 170`` fit on 512x512 recordings.
 RAM_OVERHEAD_MULTIPLIER = 8.0
 
+# Bytes per pixel per frame in system RAM when suite2p 1.0's torch
+# registration runs on the CPU (no CUDA device). ``rigid.phasecorr``
+# then allocates its ``batch_size * Ly * Lx`` complex64 FFT buffer
+# (8 B/px) in system RAM, on top of the int16 batch, float32 copies and
+# a second FFT/product buffer. The 16 B/px legacy model above misses
+# this: a 7789-frame 768x768 batch asked for one 36.75 GB complex64
+# block and died in ``DefaultCPUAllocator``. 32 B/px budgets ~4
+# complex64-sized buffers per frame.
+RAM_BYTES_PER_PIXEL_CPU_REGISTRATION = 32.0
+
 # ---- GPU equivalents -----------------------------------------------
 #
 # suite2p 1.0's registration runs on torch.cuda when available, and
@@ -2194,6 +2204,19 @@ def pick_batch_size(
     if per_frame_bytes <= 0:
         return change_batch_according_to_free_ram()
 
+    # suite2p 1.0's GPU clamp (below). With no CUDA device, registration
+    # runs on CPU torch and its complex64 FFT buffers land in system RAM,
+    # so budget those here instead.
+    bs_gpu = pick_batch_size_gpu(Ly, Lx, floor=floor, ceiling=ceiling)
+    if bs_gpu is None and overhead_multiplier is None:
+        cpu_reg_bytes = (float(Ly) * float(Lx)
+                         * RAM_BYTES_PER_PIXEL_CPU_REGISTRATION)
+        if cpu_reg_bytes > per_frame_bytes:
+            print(f"[batch_size] no CUDA: registration runs on CPU, "
+                  f"budgeting {RAM_BYTES_PER_PIXEL_CPU_REGISTRATION:g} "
+                  f"B/px for its complex64 FFT buffers")
+            per_frame_bytes = cpu_reg_bytes
+
     bs_cpu = int(budget // per_frame_bytes)
     cpu_capped = max(floor, min(ceiling, bs_cpu))
     total_gib = total_bytes / (1024 ** 3)
@@ -2206,7 +2229,6 @@ def pick_batch_size(
     # GPU's memory budget is usually much tighter than system RAM on
     # workstations with a small GPU + plenty of CPU memory (e.g. RTX
     # 3050 6 GiB + 32 GiB system). Whichever is tighter wins.
-    bs_gpu = pick_batch_size_gpu(Ly, Lx, floor=floor, ceiling=ceiling)
     if bs_gpu is not None and bs_gpu < cpu_capped:
         print(f"[batch_size] GPU clamp wins: {bs_gpu} < CPU {cpu_capped}")
         return bs_gpu
