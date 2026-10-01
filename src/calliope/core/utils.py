@@ -2038,11 +2038,12 @@ RAM_OVERHEAD_MULTIPLIER = 8.0
 # registration runs on the CPU (no CUDA device). ``rigid.phasecorr``
 # then allocates its ``batch_size * Ly * Lx`` complex64 FFT buffer
 # (8 B/px) in system RAM, on top of the int16 batch, float32 copies and
-# a second FFT/product buffer. The 16 B/px legacy model above misses
-# this: a 7789-frame 768x768 batch asked for one 36.75 GB complex64
-# block and died in ``DefaultCPUAllocator``. 32 B/px budgets ~4
-# complex64-sized buffers per frame.
-RAM_BYTES_PER_PIXEL_CPU_REGISTRATION = 32.0
+# other FFT/product buffers. The 16 B/px legacy model above misses this.
+# Observed on a 128 GiB machine with nothing else running: a 7789-frame
+# 768x768 batch already held ~80% of RAM (~102 GiB) when it asked for
+# one more 36.75 GB complex64 block, i.e. >= ~30 B/px total. 40 B/px
+# keeps margin over that (the peak monitor polls, so it under-reads).
+RAM_BYTES_PER_PIXEL_CPU_REGISTRATION = 40.0
 
 # ---- GPU equivalents -----------------------------------------------
 #
