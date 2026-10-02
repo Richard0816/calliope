@@ -114,6 +114,11 @@ EARLY_STOP_PATIENCE = 8      # stop if validation AUROC doesn't improve.
 
 # --- Inference ---
 THRESHOLD = 0.5              # >= THRESHOLD => cell, < => not cell.
+# Hard size gate applied AFTER the CNN: a kept ROI whose robust z of
+# log(npix) (median/MAD over the kept ROIs) exceeds this is dropped as a
+# sparsery blob artifact. 0 disables. Tab 3 / Tab 0 expose it as
+# ``size_outlier_z``.
+SIZE_OUTLIER_Z = 4.0
 # Filenames the predict step writes into <plane0>/. Tab 3 reads these
 # back; downstream tabs key off ``predicted_cell_mask.npy``.
 PREDICTED_PROB_NAME = "predicted_cell_prob.npy"

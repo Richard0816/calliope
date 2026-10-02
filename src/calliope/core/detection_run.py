@@ -88,6 +88,7 @@ def prune_detection_intermediates(
     save_folder,
     *,
     progress_cb: Optional[Callable[[str], None]] = None,
+    keep_registration: bool = False,
 ) -> tuple[int, int]:
     """Delete the redundant detection binaries left under
     ``<save_folder>/detection/`` after the final extraction has been
@@ -99,6 +100,14 @@ def prune_detection_intermediates(
     drops stray ``data_raw*.bin`` / ``*.tmp`` / ``*.lock`` artefacts.
     Keeps ``_shared_reg/ops.npy`` + the rest of the registration
     metadata for audit, and keeps everything under ``final/``.
+
+    ``keep_registration=True`` skips the ``_shared_reg/.../data.bin``
+    deletion so a subsequent re-detect of the same recording reuses
+    the registered movie (``_get_or_create_shared_registration`` gates
+    on that file + ``ops.npy``, both then present) and skips the
+    expensive re-registration. Costs the ~13 GB on disk. Use it when
+    iterating on detection params (e.g. forcing ``spatial_scale`` to
+    fix blobby ROIs). Default False = the space-saving behaviour.
 
     Returns ``(n_paths, bytes_freed)`` for logging. Errors on
     individual paths are caught + reported via ``progress_cb`` so a
@@ -136,7 +145,13 @@ def prune_detection_intermediates(
             bytes_freed += sz
 
     shared_bin = det / "_shared_reg" / "suite2p" / "plane0" / "data.bin"
-    if shared_bin.is_file():
+    if keep_registration:
+        if progress_cb is not None and shared_bin.is_file():
+            progress_cb(
+                "[detection] keep_registration=True: retaining "
+                f"{shared_bin} (~{shared_bin.stat().st_size / 1e9:.1f} GB) "
+                "so a re-detect skips re-registration")
+    elif shared_bin.is_file():
         try:
             sz = shared_bin.stat().st_size
             shared_bin.unlink()
@@ -599,7 +614,8 @@ def compute_dff_memmaps(
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 
-def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
+def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
+                        size_outlier_z: float = 4.0) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
@@ -614,7 +630,8 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str) -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
     try:
-        predict_recording(rec_id, model, device, plane0=plane0)
+        predict_recording(rec_id, model, device, plane0=plane0,
+                          size_outlier_z=size_outlier_z)
     finally:
         # Drop model + checkpoint before flushing the allocator so the
         # weights actually return to the driver. Without this, every
@@ -712,7 +729,9 @@ def archive_offload(save_folder_str: str, params: dict, *,
     from .offload import make_progress_cb
     cb = make_progress_cb(progress_q)
     save_folder = Path(save_folder_str)
-    prune_detection_intermediates(save_folder, progress_cb=cb)
+    prune_detection_intermediates(
+        save_folder, progress_cb=cb,
+        keep_registration=bool(params.get("keep_registration_cache", False)))
     if not bool(params.get("archive_post_detection", True)):
         return {"archived": False}
     archive_recording_post_detection(
@@ -898,7 +917,9 @@ def run_detection(
     if ckpt_path:
         if progress_cb is not None:
             progress_cb("[detection] running cell-filter prediction...")
-        predict_cell_filter(plane0, ckpt_path, rec_id or plane0.parent.name)
+        predict_cell_filter(
+            plane0, ckpt_path, rec_id or plane0.parent.name,
+            size_outlier_z=float(params.get("size_outlier_z", 4.0)))
 
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")
@@ -936,7 +957,9 @@ def run_detection(
             if progress_cb is not None:
                 progress_cb(f"[detection] z-drift QC failed: {e}")
 
-    prune_detection_intermediates(save_folder, progress_cb=progress_cb)
+    prune_detection_intermediates(
+        save_folder, progress_cb=progress_cb,
+        keep_registration=bool(params.get("keep_registration_cache", False)))
 
     # Post-detection archive: compress raws into the recording folder
     # (as <rec>/<raw.name>.tif), then drop the redundant shifted TIFFs

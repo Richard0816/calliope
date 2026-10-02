@@ -33,7 +33,7 @@ Steps performed
 
 Usage
 -----
-    python -m cellfilter.train
+    python -m src.calliope.core.cellfilter.train
 
 Outputs
 -------
@@ -53,6 +53,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import csv
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -184,8 +185,52 @@ def _run_epoch(model, loader, device, optim=None, pos_weight=None):
     return total_loss / max(1, total_n), acc, auc
 
 
-def main():
+def _drop_missing_recordings(df):
+    """Drop label rows whose recording is no longer on disk.
+
+    A row is usable only if its ``plane0_path`` still holds a
+    ``stat.npy`` (what ``_RecordingCache`` needs to slice patches).
+    Returns the filtered DataFrame and warns -- loudly -- about every
+    recording it dropped, so a partial retrain after data has moved or
+    been deleted fails gracefully instead of crashing in the loader.
+    """
+    paths = df["plane0_path"].unique()
+    missing = {p for p in paths if not (Path(p) / "stat.npy").exists()}
+    if missing:
+        n_rows = int(df["plane0_path"].isin(missing).sum())
+        print(f"WARNING: {len(missing)} of {len(paths)} recording(s) "
+              f"not found on disk -- dropping {n_rows} labelled ROI(s):")
+        for p in sorted(missing):
+            print(f"  missing: {p}")
+        df = df[~df["plane0_path"].isin(missing)].reset_index(drop=True)
+    return df
+
+
+def main(warm_start: "Path | str | None" = None,
+         lr: "float | None" = None,
+         ckpt_dir: "Path | None" = None,
+         skip_missing: bool = True):
     """Top-level training driver.
+
+    Parameters
+    ----------
+    warm_start : path or None
+        If given, load this checkpoint's weights into the model before
+        training (fine-tuning / transfer learning) instead of training
+        from random init. Public users with none of the original data
+        pass the bundled ``calliope/data/cellfilter_best.pt`` here to
+        adapt the shipped model to their own labelled ROIs.
+    lr : float or None
+        Adam learning rate. Defaults to ``config.LR``; pass something
+        smaller (e.g. 1e-4) when warm-starting so fine-tuning doesn't
+        blow away the pretrained weights.
+    ckpt_dir : Path or None
+        Where to write ``best.pt`` / ``last.pt`` / ``train_log.csv``.
+        Defaults to ``config.CHECKPOINT_DIR``. Override to compare runs
+        without clobbering the live checkpoint.
+    skip_missing : bool
+        Drop label rows whose recording is gone from disk (default
+        True). Lets a retrain proceed on the surviving subset.
 
     Steps:
         1. Seed RNGs + select GPU/CPU device.
@@ -195,7 +240,13 @@ def main():
            positive-class weight.
         5. For each epoch: train, validate, log to CSV, save
            checkpoints, early-stop if val AUROC stops improving.
+
+    Returns the best validation AUROC seen (NaN if val never had both
+    classes), so a comparison driver can pick the better of two runs.
     """
+    ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else C.CHECKPOINT_DIR
+    lr = C.LR if lr is None else float(lr)
+
     # Seed both PyTorch and NumPy so train/val splits and weight
     # init are reproducible.
     torch.manual_seed(C.RANDOM_SEED)
@@ -204,10 +255,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    C.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # --- data ---
     df = load_labels(C.LABELS_CSV)
+    if skip_missing:
+        df = _drop_missing_recordings(df)
+    if len(df) == 0:
+        raise RuntimeError(
+            "No labelled ROIs with recordings present on disk -- nothing "
+            "to train on. Check cellfilter_labels.csv and the plane0_path "
+            "column.")
     print(f"Loaded {len(df)} labeled ROIs across {df['recording_ID'].nunique()} recordings.")
     print(f"  positives: {(df['user_defined_cell']==1).sum()}   "
           f"negatives: {(df['user_defined_cell']==0).sum()}")
@@ -257,6 +315,15 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model params: {n_params:,}")
 
+    # Warm start: initialise from an existing checkpoint instead of
+    # random weights. The model is fixed-architecture, so a plain
+    # ``load_state_dict`` is all transfer learning needs here.
+    if warm_start is not None:
+        ckpt = torch.load(Path(warm_start), map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        print(f"warm-started from {warm_start} "
+              f"(val_auc={ckpt.get('val_auc')}, lr={lr:g})")
+
     # Class imbalance: pos_weight = (n_negatives / n_positives) tells
     # BCEWithLogitsLoss "treat each positive sample as if it were
     # this many positives". That cancels out the bias toward the
@@ -268,9 +335,9 @@ def main():
 
     # Adam: adaptive-learning-rate optimiser; weight_decay = small
     # L2 regulariser to discourage huge weights.
-    optim = torch.optim.Adam(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
+    optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=C.WEIGHT_DECAY)
 
-    log_path = C.CHECKPOINT_DIR / "train_log.csv"
+    log_path = ckpt_dir / "train_log.csv"
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(
             ["epoch", "train_loss", "train_acc", "train_auc",
@@ -305,7 +372,7 @@ def main():
         # serialisation form.
         torch.save(
             {"model": model.state_dict(), "epoch": epoch, "val_auc": va_auc},
-            C.CHECKPOINT_DIR / "last.pt",
+            ckpt_dir / "last.pt",
         )
 
         # Track the best validation AUROC seen so far. ``best.pt``
@@ -316,7 +383,7 @@ def main():
             bad_epochs = 0
             torch.save(
                 {"model": model.state_dict(), "epoch": epoch, "val_auc": va_auc},
-                C.CHECKPOINT_DIR / "best.pt",
+                ckpt_dir / "best.pt",
             )
             print(f"  -> new best (val_auc={va_auc:.3f}), checkpoint saved")
         else:
@@ -329,8 +396,26 @@ def main():
                 break
 
     print(f"best val auc: {best_auc:.3f}")
-    print(f"checkpoints in {C.CHECKPOINT_DIR}")
+    print(f"checkpoints in {ckpt_dir}")
+    return best_auc
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--warm-start", metavar="CKPT", default=None,
+                    help="checkpoint to initialise from (fine-tune) instead "
+                         "of random init; e.g. the bundled cellfilter_best.pt")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="Adam learning rate (default config.LR; use ~1e-4 "
+                         "when warm-starting)")
+    ap.add_argument("--ckpt-dir", default=None,
+                    help="output dir for best/last/log (default "
+                         "config.CHECKPOINT_DIR)")
+    ap.add_argument("--keep-missing", action="store_true",
+                    help="do NOT drop label rows whose recording is gone "
+                         "(default is to skip them)")
+    args = ap.parse_args()
+    main(warm_start=args.warm_start, lr=args.lr, ckpt_dir=args.ckpt_dir,
+         skip_missing=not args.keep_missing)

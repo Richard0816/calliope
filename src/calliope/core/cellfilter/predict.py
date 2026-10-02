@@ -11,7 +11,8 @@ checkpoint and applies it to every ROI in a recording, then writes:
     suite2p/plane0/predicted_cell_prob.npy   float32 (N,)
         Sigmoid-of-logit probabilities, one per ROI.
     suite2p/plane0/predicted_cell_mask.npy   bool (N,)
-        ``probs >= THRESHOLD`` -- the actual keep mask Tabs 4-8 use.
+        ``probs >= THRESHOLD`` minus large-area outliers
+        (``size_outlier_mask``) -- the actual keep mask Tabs 4-8 use.
 
 The GUI calls ``predict_recording`` after Tab 3's detection finishes;
 the CLI in ``main()`` is for batch-running over many recordings on a
@@ -50,9 +51,29 @@ from .dataset import _RecordingCache
 from .model import CellFilter
 
 
+def size_outlier_mask(stat, keep, z_thresh: float) -> np.ndarray:
+    """True where a KEPT ROI is a large-area outlier: robust z of
+    log(npix) over the kept ROIs > ``z_thresh`` (one-sided -- only
+    too-big ROIs). All-False when disabled (``z_thresh <= 0``), with
+    < 10 kept ROIs, or when the kept sizes have zero spread.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    out = np.zeros_like(keep)
+    if not z_thresh or z_thresh <= 0 or keep.sum() < 10:
+        return out
+    k = np.log(np.array([s["npix"] for s in stat], dtype=float))[keep]
+    med = np.median(k)
+    mad = 1.4826 * np.median(np.abs(k - med))
+    if mad == 0:
+        return out
+    out[keep] = (k - med) / mad > z_thresh
+    return out
+
+
 @torch.no_grad()                                                  # See model.py
 def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
-                      plane0: Path | None = None) -> Path:
+                      plane0: Path | None = None,
+                      size_outlier_z: float = C.SIZE_OUTLIER_Z) -> Path:
     """Score every ROI in one recording and write the keep-mask.
 
     Parameters
@@ -119,9 +140,13 @@ def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
     # Boolean mask: NumPy treats ``probs >= C.THRESHOLD`` as a
     # vectorised comparison returning a bool array of the same
     # shape.
-    np.save(out_mask, probs >= C.THRESHOLD)
-    print(f"{rec_id}: {(probs >= C.THRESHOLD).sum()}/{N} kept   "
-          f"-> {out_prob.name}, {out_mask.name}")
+    mask = probs >= C.THRESHOLD
+    big = size_outlier_mask(rec.stat, mask, size_outlier_z)
+    mask &= ~big
+    np.save(out_mask, mask)
+    print(f"{rec_id}: {mask.sum()}/{N} kept "
+          f"({int(big.sum())} dropped as size outliers, z>{size_outlier_z})"
+          f"   -> {out_prob.name}, {out_mask.name}")
     return out_prob
 
 

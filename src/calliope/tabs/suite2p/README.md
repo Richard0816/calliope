@@ -216,7 +216,7 @@ predict_recording(rec_id, model, device, plane0=plane0)
 
 `predict_recording` walks every ROI in the recording and writes:
 - `predicted_cell_prob.npy` — float, length `N_total`, the model's score in `[0, 1]`.
-- `predicted_cell_mask.npy` — boolean, length `N_total`, `True` iff `prob >= 0.5`.
+- `predicted_cell_mask.npy` — boolean, length `N_total`, `True` iff `prob >= 0.5`, then minus large-area outliers: a kept ROI whose robust z of `log(npix)` (median/MAD over the kept ROIs, one-sided) exceeds `size_outlier_z` (default `4.0`, `0` = off) is dropped as a sparsery blob artifact (`cellfilter.predict.size_outlier_mask`; the log line reports how many).
 
 If the checkpoint is missing, the tab logs a warning and the third panel falls back to Suite2p's `iscell.npy[:, 0] > 0`.
 
@@ -227,6 +227,8 @@ If the checkpoint is missing, the tab logs a warning and the third panel falls b
 `_run_filtered_dff(plane0)`: load `r0p7_dff.memmap.float32` of shape `(T, N_total)`, slice columns by the keep mask, write `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)`. Done in 4096-frame chunks to bound memory.
 
 Also writes `r0p7_cell_mask_bool.npy` (a copy of the keep mask under the legacy filename) so older downstream tools (clustering scripts, paper figures) that hardcode that name keep working.
+
+**Keep-mask drift.** Panel 3 paints the *live* mask (`resolve_live_mask`: `predicted_cell_mask.npy` → `iscell.npy`), i.e. what the filter would keep right now. Every downstream stage instead reads the filtered memmaps, which are frozen to the mask written here. Re-running the cell filter (new checkpoint, retrain) rewrites `predicted_cell_mask.npy` but *not* the memmaps, so the two counts diverge — this is why a reloaded run could show a different kept-ROI count on Tab 3 than in Tabs 4-8. `utils.pipeline_mask_count(plane0, n_total)` reports the frozen count; Panel 3's title appends `[!] downstream tabs use n = …` when it disagrees, and **Open run folder…** raises the same mismatch as a load warning. Re-run this step (and the stages after it) to resync.
 
 If the **Also write filtered dF/F as CSV** checkbox is on, `_write_filtered_dff_csv` mirrors the memmap into `r0p7_filtered_dff.csv` with one column per kept ROI, headed `roi_<i>` (the Suite2p index), in 4096-frame chunks. The frame index is preserved as the CSV index.
 
@@ -239,6 +241,8 @@ The shared helper `core.detection_run.prune_detection_intermediates(save_folder,
 - drops `<save>/detection/_shared_reg/suite2p/plane0/data.bin` (registered-movie binary; regeneratable from the shifted TIFF in ~5 min for a manual re-detect),
 - drops `data_raw*.bin` / `*.tmp` / `*.lock` anywhere under `detection/`,
 - **keeps** `_shared_reg/ops.npy` + the rest of the registration metadata for audit, and **keeps** everything under `final/`.
+
+**Re-detect override.** Setting `keep_registration_cache = True` (Tab 3 Advanced → "Re-detect" group, or the per-recording params dict) skips the `_shared_reg/.../data.bin` deletion. A subsequent re-detect of the same recording then reuses the registered movie (`_get_or_create_shared_registration` gates on `data.bin` + `ops.npy`, both present) and skips the ~5 min re-registration — the cheap path for iterating on detection params (e.g. forcing `spatial_scale` to break up blobby ROIs that the cell filter can't reject). Costs the ~13 GB on disk; default `False` keeps the space-saving behaviour. The chosen `spatial_scale` (0 = suite2p auto, or a forced 1–4) is stamped into `meta.json`'s `detection` block so a re-run is reproducible.
 
 The same helper is called from `core.detection_run.run_detection` so headless drivers (`batch_pipeline.run_recording`, any external agent that calls `run_detection` in a loop) get the cleanup unconditionally — not just GUI runs. This mirrors `BatchTab._prune_scratch_tree`'s policy but runs at the tail of every detection. Without it, an agent that runs detection over many recordings will fill the save drive (12 recordings ≈ 312 GB; observed disk-full at recording 13 in the 2026-05-12 batch).
 
@@ -389,6 +393,12 @@ that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults at
 | `cellpose_diameter` | `0` (auto) | Expected cell diameter in pixels; 0 lets Cellpose auto-estimate per-image. | Leave at 0 unless auto-estimation drifts. **Set explicitly** (in px) if you know your soma size and Cellpose is over/under-segmenting — pinning the diameter is the single most effective Cellpose fix. |
 | `cellpose_flow_threshold` | `0.8` | Max allowed flow-field error for a mask to be kept; higher = more permissive. | **Raise toward 1.0** to keep more (possibly malformed) masks; **lower** to reject ragged segmentations. 0.8 is already slightly permissive. |
 | `cellpose_cellprob_threshold` | `-1.0` | Pixel cell-probability cutoff for inclusion in a mask; lower = more inclusive (default Cellpose is 0). | At −1.0 this is deliberately more inclusive than stock Cellpose, so dim cells get masks. **Raise toward 0 or above** if Cellpose is producing bloated/merged blobs; **lower** to grab even fainter cells (the merge step and CNN filter both backstop the extra junk). |
+
+### 5.2b Cell filter (size gate)
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `size_outlier_z` | `4.0` | After the CNN, drop kept ROIs whose robust z of `log(npix)` (median/MAD over kept ROIs) exceeds this. One-sided: only too-big ROIs. Skipped with < 10 kept ROIs. `0` disables. Also in Tab 0 under "2. Detection - Cell filter". | Catches huge sparsery blobs the CNN lets through. At 4.0 an ROI must be roughly 5-6x the median area (depends on spread) to be cut. **Lower (3)** = more aggressive; **0** = opt out. The root fix for blobs is still `spatial_scale` (§5.1); this is the backstop. |
 
 ### 5.3 Merge (Cellpose → Sparsery overlap drop)
 

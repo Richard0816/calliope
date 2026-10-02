@@ -626,6 +626,7 @@ def build_batch_param_spec() -> list:
         "Sparsery": "2. Detection - Sparsery",
         "Cellpose": "2. Detection - Cellpose",
         "Merge": "2. Detection - Merge",
+        "Cell filter": "2. Detection - Cell filter",
         "dF/F": "2. Detection - dF/F",
         "Default low-pass": "2. Detection - Default low-pass",
         "Pixel scale": "2. Detection - Pixel scale",

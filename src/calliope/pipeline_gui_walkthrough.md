@@ -150,7 +150,7 @@ Whether scratch and output share a physical drive (detected via `os.stat(...).st
 - **Too few ROIs**: real cells get excluded, lowering statistical power.
 - **dF/F mis-baselined**: a slow drift gets read as a sustained event.
 
-The cell-filter step gives you a reproducible "is this really a cell?" decision instead of relying on Suite2p's built-in `iscell.npy` (which is noisy across recordings).
+The cell-filter step gives you a reproducible "is this really a cell?" decision instead of relying on Suite2p's built-in `iscell.npy` (which is noisy across recordings). After the CNN, a hard **size gate** drops any kept ROI that is an extreme area outlier (robust z of log-area > 4) — real somata have a fairly tight size distribution, so a footprint many times the median is almost always a sparsery blob over neuropil or a bright sheet, not a cell. Opt out with `size_outlier_z = 0` in Tab 3 or Tab 0 settings.
 
 **Biological output.** A clean per-cell trace of *relative firing-related fluorescence* over the whole recording, for every cell that the classifier thinks is real.
 

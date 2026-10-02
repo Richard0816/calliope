@@ -284,6 +284,28 @@ Each `.pt` is `{model: state_dict, epoch: int, val_auc: float}`.
 
 `torch.manual_seed(0)` and `np.random.seed(0)` at the top of `main()`. Splits use `RANDOM_SEED = 0` too. Re-running `train.py` from the same labels produces (modulo CUDA non-determinism) the same `best.pt`.
 
+### 4.6b Warm-start, missing data, and the compare driver
+
+`main()` takes four optional args so you can retrain when the original data is partly or fully gone:
+
+- `skip_missing=True` (default) drops any label row whose `plane0_path` no longer holds a `stat.npy`, with a loud warning listing the dropped recordings. A retrain after data has moved/been deleted proceeds on the surviving subset instead of crashing in the loader. Pass `--keep-missing` on the CLI to disable.
+- `warm_start=<ckpt>` initialises the model from an existing checkpoint (fine-tuning / transfer learning) instead of random init. **A public user with none of the original training data points this at the bundled `src/calliope/data/cellfilter_best.pt` and trains on their own labelled ROIs** — the shipped model adapts to their rig.
+- `lr` overrides `config.LR`; use something small (~1e-4) when warm-starting so fine-tuning doesn't wipe the pretrained weights.
+- `ckpt_dir` redirects the `best.pt`/`last.pt`/`train_log.csv` outputs so a run doesn't clobber the live checkpoint.
+
+`main()` returns the best val AUROC, so a driver can compare two runs. CLI:
+
+```bash
+# fine-tune the bundled model onto whatever labels exist on disk
+python -m src.calliope.core.cellfilter.train --warm-start src/calliope/data/cellfilter_best.pt --lr 1e-4
+```
+
+`scripts/retrain_cellfilter_compare.py` runs scratch vs warm-start side by side (each into its own `CHECKPOINT_DIR/compare_*` folder) and copies the higher-AUROC `best.pt` to `CHECKPOINT_DIR/best.pt`:
+
+```bash
+python -m scripts.retrain_cellfilter_compare        # default warm-from = bundled ckpt, warm-lr = 1e-4
+```
+
 ### 4.7 Windows OpenMP shim
 
 ```python
@@ -346,7 +368,7 @@ The 2026-05-12 refactor removed the old `--rec ID` mode and the no-arg "scan `DA
 
 In each `plane0/`:
 - `predicted_cell_prob.npy` — `(N,) float32`, sigmoid score in `[0, 1]`.
-- `predicted_cell_mask.npy` — `(N,) bool`, `prob >= 0.5`.
+- `predicted_cell_mask.npy` — `(N,) bool`, `prob >= 0.5`, then minus large-area outliers: a kept ROI whose robust z of `log(npix)` (median/MAD over the kept ROIs, one-sided) exceeds `size_outlier_z` (default `4.0`, `0` = off) is dropped as a sparsery blob artifact.
 
 Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`utils._load_keep_mask`), with `iscell.npy` as a final fallback if the predicted files are missing.
 
@@ -376,6 +398,7 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 | `EARLY_STOP_PATIENCE` | 8 | Epochs without val-AUROC improvement before stopping. |
 | `NUM_WORKERS` | 0 | DataLoader workers (0 on Windows to dodge multiproc bugs). |
 | `THRESHOLD` | 0.5 | Probability threshold for the boolean mask. |
+| `SIZE_OUTLIER_Z` | 4.0 | Default post-CNN size gate (robust z of log npix over kept ROIs); 0 disables. Tab 3/Tab 0 override via `size_outlier_z`. |
 
 ---
 

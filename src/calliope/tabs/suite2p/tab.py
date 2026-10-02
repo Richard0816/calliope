@@ -250,6 +250,11 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "hard_cap", "label": "ROI hard cap",
          "type": "int", "default": 60000, "group": "Sparsery",
          "help": "abort sparsery if it exceeds this many ROIs"},
+        # Cell filter: hard size gate after the CNN
+        {"name": "size_outlier_z", "label": "Size-outlier z (0=off)",
+         "type": "float", "default": 4.0, "group": "Cell filter",
+         "help": "drop kept ROIs whose robust z of log(area) exceeds "
+                 "this (sparsery blob artifacts); 0 disables"},
         # Cellpose
         {"name": "cellpose_model_type", "label": "model_type",
          "type": "choice", "choices": ["cyto", "cyto2", "nuclei"],
@@ -949,7 +954,9 @@ class Suite2pTab(ctk.CTkFrame):
 
             if ckpt_path:
                 print("[GUI] running cell-filter prediction...")
-                self._run_cellfilter(final_plane0, ckpt_path, rec_id)
+                self._run_cellfilter(
+                    final_plane0, ckpt_path, rec_id,
+                    size_outlier_z=float(params.get("size_outlier_z", 4.0)))
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
@@ -1247,6 +1254,7 @@ class Suite2pTab(ctk.CTkFrame):
 
     def _run_cellfilter(
         self, plane0: Path, ckpt_path: str, rec_id: str,
+        size_outlier_z: float = 4.0,
     ) -> None:
         import torch
         from ...core.cellfilter.model import CellFilter
@@ -1258,7 +1266,8 @@ class Suite2pTab(ctk.CTkFrame):
         model = CellFilter().to(device)
         model.load_state_dict(ckpt["model"])
         model.eval()
-        predict_recording(rec_id, model, device, plane0=plane0)
+        predict_recording(rec_id, model, device, plane0=plane0,
+                          size_outlier_z=size_outlier_z)
 
     # -- Log queue + completion --------------------------------------------
 
