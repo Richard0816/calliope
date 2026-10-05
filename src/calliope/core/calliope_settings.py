@@ -54,7 +54,7 @@ from typing import Any
 CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
     # Top-level
     "tau":     0.25,   # jGCaMP8m fallback; per-recording tau set by Tab 3 dropdown.
-    "fs":      15.07,
+    "fs":      15.08,
 
     # Run-control overrides
     "run": {

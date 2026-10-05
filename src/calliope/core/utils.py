@@ -707,7 +707,7 @@ def save_folder_for_plane0(plane0) -> Path:
 # kept here as the single literal so the ~6 scattered ``15.07`` fallbacks
 # reference one source. (Defined here rather than imported from
 # calliope_settings to avoid an import cycle.)
-DEFAULT_FPS: float = 15.07
+DEFAULT_FPS: float = 15.08
 
 
 # Canonical display contrast window (percentiles) for showing
@@ -831,6 +831,17 @@ def safe_recording_id(plane0) -> str:
 _FPS_FALLBACK_WARNED = False
 
 
+def ops_fs(path) -> Optional[float]:
+    """Frame rate detection ran at (FPS override or default), as saved in
+    ``path/ops.npy['fs']``; ``None`` if absent or not a positive number."""
+    try:
+        fs = float(np.load(Path(path) / "ops.npy",
+                           allow_pickle=True).item().get("fs", 0))
+    except Exception:
+        return None
+    return fs if np.isfinite(fs) and fs > 0 else None
+
+
 def get_fps_from_notes(
         path: str,
         notes_root: Optional[str] = None,
@@ -859,15 +870,9 @@ def get_fps_from_notes(
     # is a rig-specific fallback, so warn once that it's being used -- a user
     # on a different scope would otherwise be silently mis-scaled.
     if not notes_root:
-        # Detection saves the rate it actually used (FPS override or default)
-        # as plane0/ops.npy['fs']; prefer that so downstream tabs match it.
-        try:
-            fs = float(np.load(Path(path) / "ops.npy",
-                               allow_pickle=True).item().get("fs", 0))
-            if np.isfinite(fs) and fs > 0:
-                return fs
-        except Exception:
-            pass
+        fs = ops_fs(path)
+        if fs is not None:
+            return fs
         global _FPS_FALLBACK_WARNED
         if not _FPS_FALLBACK_WARNED:
             _FPS_FALLBACK_WARNED = True

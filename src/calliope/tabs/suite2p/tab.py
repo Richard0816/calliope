@@ -292,7 +292,7 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "fps_override", "label": "FPS override (0=auto)",
          "type": "float", "default": 0.0, "group": "dF/F",
          "help": "non-zero sets the frame rate explicitly; "
-                 "0 uses the default (15.07 Hz)"},
+                 "0 uses the default (15.08 Hz)"},
         {"name": "neuropil_coef", "label": "Neuropil coefficient (r)",
          "type": "float", "default": 0.7, "group": "dF/F"},
         {"name": "perc", "label": "Baseline percentile",

@@ -8,8 +8,9 @@ from calliope.tabs.suite2p.curation_popout import CurationPopout
 
 def test_fps_prefers_ops_fs(tmp_path):
     assert utils.get_fps_from_notes(str(tmp_path)) == utils.DEFAULT_FPS
-    np.save(tmp_path / "ops.npy", {"fs": 15.08}, allow_pickle=True)
-    assert utils.get_fps_from_notes(str(tmp_path)) == 15.08
+    assert utils.ops_fs(tmp_path) is None
+    np.save(tmp_path / "ops.npy", {"fs": 30.0}, allow_pickle=True)
+    assert utils.get_fps_from_notes(str(tmp_path)) == 30.0
     np.save(tmp_path / "ops.npy", {"fs": 0.0}, allow_pickle=True)
     assert utils.get_fps_from_notes(str(tmp_path)) == utils.DEFAULT_FPS
 

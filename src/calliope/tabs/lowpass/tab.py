@@ -126,6 +126,7 @@ class LowpassTab(ctk.CTkFrame):
         self.state = state
         self._plane0: Optional[Path] = None
         self._fps: float = 15.0
+        self._fps_src: str = "default"
         self._mean_dff: Optional[np.ndarray] = None
         self._trace_label: str = "mean"
         self._fft_xf: Optional[np.ndarray] = None
@@ -402,7 +403,8 @@ class LowpassTab(ctk.CTkFrame):
         self._draw_lowpass()
         self.status_var.set(
             f"Loaded T={self._mean_dff.size}  N_kept={self._n_kept}  "
-            f"fps={self._fps:.2f}  cutoff={self.cutoff_var.get():.3f} Hz")
+            f"fps={self._fps:.2f} ({self._fps_src})  "
+            f"cutoff={self.cutoff_var.get():.3f} Hz")
         self.compute_btn.configure(state="normal")
         self.export_btn.configure(state="normal")
 
@@ -534,6 +536,7 @@ class LowpassTab(ctk.CTkFrame):
             self._trace_label = f"{source} across {N_kept} kept ROIs"
 
         self._fps = float(utils.get_fps_from_notes(str(plane0)))
+        self._fps_src = "ops" if utils.ops_fs(plane0) is not None else "default"
 
         N = self._mean_dff.size
         yf = np.fft.rfft(self._mean_dff)
@@ -686,7 +689,7 @@ class LowpassTab(ctk.CTkFrame):
         self._draw_fft(); self._draw_raw(); self._draw_lowpass()
         self.status_var.set(
             f"Source: {self._trace_label}  "
-            f"T={self._mean_dff.size}  fps={self._fps:.2f}  "
+            f"T={self._mean_dff.size}  fps={self._fps:.2f} ({self._fps_src})  "
             f"cutoff={self.cutoff_var.get():.3f} Hz")
 
     def _on_manual_entry(self, _event=None) -> None:
