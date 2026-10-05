@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from ...core.utils import (
     get_fps_from_notes,
+    ops_fs,
     lowpass_causal_1d,
     lowpass_zero_phase_1d,
     resolve_filtered_mask,
@@ -24,6 +25,7 @@ from ...core.utils import (
 
 __all__ = [
     "get_fps_from_notes",
+    "ops_fs",
     "lowpass_causal_1d",
     "lowpass_zero_phase_1d",
     "resolve_filtered_mask",
