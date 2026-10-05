@@ -612,9 +612,12 @@ class CurationPopout(ctk.CTkToplevel):
         if self._roi_idx is None:
             return
         if self._iscell is None:
+            # Retry: a reused popout may predate a fixed/re-written file.
+            self._iscell = self._load_iscell()
+        if self._iscell is None:
             messagebox.showwarning(
-                "iscell.npy missing",
-                f"No iscell.npy in {self._plane0}; cannot persist flip.")
+                "iscell.npy unavailable",
+                f"{self._iscell_err} in {self._plane0}; cannot persist flip.")
             return
         prev = int(self._iscell[self._roi_idx, 0])
         # Update iscell.npy on disk regardless. When ``prev ==
@@ -669,9 +672,12 @@ class CurationPopout(ctk.CTkToplevel):
         if not self._flipped:
             return
         if self._iscell is None:
+            # Retry: a reused popout may predate a fixed/re-written file.
+            self._iscell = self._load_iscell()
+        if self._iscell is None:
             messagebox.showwarning(
-                "iscell.npy missing",
-                f"No iscell.npy in {self._plane0}; cannot promote.")
+                "iscell.npy unavailable",
+                f"{self._iscell_err} in {self._plane0}; cannot promote.")
             return
         n_flipped = len(self._flipped)
         from ...core.cellfilter import config as _cf_cfg
@@ -896,6 +902,7 @@ class CurationPopout(ctk.CTkToplevel):
     def _load_iscell(self) -> Optional[np.ndarray]:
         path = self._plane0 / "iscell.npy"
         if not path.exists():
+            self._iscell_err = "No iscell.npy"
             return None
         try:
             arr = np.load(path)
@@ -910,9 +917,13 @@ class CurationPopout(ctk.CTkToplevel):
                 # Stale / partially-written file (e.g. re-detection changed
                 # the ROI count). Treat as absent rather than indexing past
                 # the end in _refresh_status (self._iscell[self._roi_idx]).
+                self._iscell_err = (
+                    f"iscell.npy has {arr.shape[0]} ROIs but stat.npy has "
+                    f"{self._n_total} (stale file from another detection run?)")
                 return None
             return arr.astype(float)
-        except Exception:
+        except Exception as e:
+            self._iscell_err = f"iscell.npy could not be read ({e})"
             return None
 
     def _load_probs(self) -> Optional[np.ndarray]:

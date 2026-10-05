@@ -17,7 +17,7 @@ From `plane0/`:
 
 The tab subscribes to the AppState `plane0` broadcast so it auto-loads when Tab 3 finishes; "Reload from folder…" lets the user point at any `plane0`.
 
-`fps` comes from Tab 3's **FPS override** (which drives both the dF/F frame rate and suite2p's `fs`); when it is left at 0 the pipeline falls back to `utils.DEFAULT_FPS` (15.07 Hz) and logs a one-time warning to verify it matches your acquisition. The legacy notes-XLSX lookup in `utils.get_fps_from_notes` is now opt-in (pass an explicit `notes_root`); it expects the YYYY-MM-DD_NNN folder-name convention documented in `utils.py`.
+`fps` comes from Tab 3's **FPS override** (which drives both the dF/F frame rate and suite2p's `fs`). Detection saves the rate it used as `plane0/ops.npy['fs']`, and `utils.get_fps_from_notes` reads it back, so this tab and every later stage use the same rate as detection. Only when `ops.npy` has no usable `fs` does the pipeline fall back to `utils.DEFAULT_FPS` (15.07 Hz) and logs a one-time warning to verify it matches your acquisition. The legacy notes-XLSX lookup in `utils.get_fps_from_notes` is now opt-in (pass an explicit `notes_root`); it expects the YYYY-MM-DD_NNN folder-name convention documented in `utils.py`.
 
 ---
 

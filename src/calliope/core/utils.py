@@ -841,7 +841,9 @@ def get_fps_from_notes(
     Frame rate is a user-facing parameter (set per-run in the GUI / passed
     through the pipeline params), so this notes-XLSX lookup is now an
     **opt-in legacy convenience**, disabled by default. When ``notes_root``
-    is ``None`` (the default) the function simply returns ``default_fps``.
+    is ``None`` (the default) the function returns ``ops.npy['fs']`` from
+    ``path`` (the rate detection ran at, incl. Tab 3's FPS override) when
+    present, else ``default_fps``.
 
     If a caller passes an explicit ``notes_root``, it is treated as a folder
     of per-date notes XLSX files; each contains a "2P settings" sheet whose
@@ -857,6 +859,15 @@ def get_fps_from_notes(
     # is a rig-specific fallback, so warn once that it's being used -- a user
     # on a different scope would otherwise be silently mis-scaled.
     if not notes_root:
+        # Detection saves the rate it actually used (FPS override or default)
+        # as plane0/ops.npy['fs']; prefer that so downstream tabs match it.
+        try:
+            fs = float(np.load(Path(path) / "ops.npy",
+                               allow_pickle=True).item().get("fs", 0))
+            if np.isfinite(fs) and fs > 0:
+                return fs
+        except Exception:
+            pass
         global _FPS_FALLBACK_WARNED
         if not _FPS_FALLBACK_WARNED:
             _FPS_FALLBACK_WARNED = True
