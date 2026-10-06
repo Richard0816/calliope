@@ -646,7 +646,6 @@ def build_batch_param_spec() -> list:
         "Re-detect": "2. Detection - Re-detect",
         "QC": "2. Detection - QC",
         "dF/F": "2. Detection - dF/F",
-        "Default low-pass": "2. Detection - Default low-pass",
         "Pixel scale": "2. Detection - Pixel scale",
         "GPU": "2. Detection - GPU",
         # 3. Low-pass + derivative (Tab 4). The cutoff entry is

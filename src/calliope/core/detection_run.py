@@ -455,8 +455,7 @@ def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
 
 def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
                       baseline_mode: str, baseline_min: float,
-                      fps: float, cutoff_hz: float, sg_win_ms: int,
-                      sg_poly: int, r: float,
+                      fps: float, r: float,
                       F: Optional[np.ndarray] = None,
                       Fneu: Optional[np.ndarray] = None,
                       progress_cb: Optional[Callable[[str], None]] = None,
@@ -501,7 +500,6 @@ def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
         gpu.process_suite2p_traces_gpu(
             F, Fneu, fps=fps, r=r,
             baseline_sec=float(baseline_min) * 60.0,
-            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
             out_dir=str(plane0), prefix="r0p7_",
             roi_chunk=roi_chunk,
         )
@@ -519,12 +517,13 @@ def compute_dff_memmaps(
     baseline_min: float = 2.0,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """Compute neuropil-corrected dF/F + low-pass + SG derivative for
-    every Suite2p ROI. Writes::
+    """Compute neuropil-corrected dF/F for every Suite2p ROI. Writes::
 
         plane0/r0p7_dff.memmap.float32          (T, N)
-        plane0/r0p7_dff_lowpass.memmap.float32  (T, N)
-        plane0/r0p7_dff_dt.memmap.float32       (T, N)
+
+    No low-pass or derivative is computed here: Tab 4
+    (:mod:`core.lowpass_run`) writes the ``r0p7_filtered_dff_lowpass`` /
+    ``_dt`` memmaps that event detection reads, from the filtered dF/F.
 
     Tries the GPU path first when ``params.use_gpu_dff`` is enabled
     and the baseline is ``first_n``. Falls back to per-ROI CPU.
@@ -543,14 +542,11 @@ def compute_dff_memmaps(
     fps = (fps_override if fps_override > 0
            else float(utils.get_fps_from_notes(str(plane0))))
 
-    cutoff_hz = float(params.get("default_lowpass_hz", 1.0))
-    sg_win_ms = int(params.get("default_sg_win_ms", 333))
-    sg_poly = int(params.get("default_sg_poly", 2))
     r = float(params.get("neuropil_coef", 0.7))
     perc = int(params.get("perc", 10))
     win_sec = float(params.get("win_sec", 45.0))
 
-    # Record the dF/F + low-pass provenance in the meta.json sidecar before
+    # Record the dF/F provenance in the meta.json sidecar before
     # either the GPU or CPU branch returns, so the NWB exporter and the
     # cross-correlation tooltips can read back which parameters produced
     # these memmaps. A metadata write must never break the pipeline.
@@ -566,12 +562,6 @@ def compute_dff_memmaps(
                 "baseline_min_sec": float(baseline_min) * 60.0,
                 "fps": fps,
             },
-            lowpass={
-                "cutoff_hz": cutoff_hz,
-                "filter_kind": "iir_butter",
-                "order": 2,
-                "group_delay_samples": None,
-            },
             extraction={"neuropil_coef": r},
         )
     except Exception as _meta_exc:
@@ -580,26 +570,19 @@ def compute_dff_memmaps(
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
-            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms,
-            sg_poly=sg_poly, r=r, F=F, Fneu=Fneu,
+            r=r, F=F, Fneu=Fneu,
             progress_cb=progress_cb):
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
     dff_path = plane0 / "r0p7_dff.memmap.float32"
-    lp_path = plane0 / "r0p7_dff_lowpass.memmap.float32"
-    dt_path = plane0 / "r0p7_dff_dt.memmap.float32"
     dff_mm = np.memmap(str(dff_path), mode="w+", dtype="float32", shape=shape)
-    lp_mm = np.memmap(str(lp_path), mode="w+", dtype="float32", shape=shape)
-    dt_mm = np.memmap(str(dt_path), mode="w+", dtype="float32", shape=shape)
 
-    # 2D-vectorized chunk size: caps transient memory at ~3 * CHUNK * T
+    # 2D-vectorized chunk size: caps transient memory at ~2 * CHUNK * T
     # float32 buffers regardless of how generous the outer ``batch`` is.
     DFF_CHUNK = 256
     batch = max(8, utils.change_batch_according_to_free_ram() * 20)
-    sos = None
     t0 = time.time()
-    from scipy.signal import savgol_filter
     for i0 in range(0, N, batch):
         i1 = min(N, i0 + batch)
         for j0 in range(i0, i1, DFF_CHUNK):
@@ -608,49 +591,24 @@ def compute_dff_memmaps(
             # float32, so this stays float32 without an extra astype).
             traces_chunk = F[j0:j1] - r * Fneu[j0:j1]
             dff_chunk = np.empty_like(traces_chunk)
-            lp_chunk = np.empty_like(traces_chunk)
             for k in range(j1 - j0):
                 trace = traces_chunk[k]
                 if baseline_mode == "first_n":
-                    dff = utils.first_n_min_df_over_f_1d(
+                    dff_chunk[k] = utils.first_n_min_df_over_f_1d(
                         trace, baseline_min=baseline_min,
                         perc=perc, fps=fps)
                 else:
-                    dff = utils.robust_df_over_f_1d(
+                    dff_chunk[k] = utils.robust_df_over_f_1d(
                         trace, win_sec=win_sec, perc=perc, fps=fps)
-                lp, _, sos = utils.lowpass_causal_1d(
-                    dff, fps=fps, cutoff_hz=cutoff_hz,
-                    order=2, zi=None, sos=sos)
-                dff_chunk[k] = dff
-                lp_chunk[k] = lp
-            # Batched Savitzky-Golay derivative along the time axis:
-            # one savgol_filter call per chunk replaces CHUNK per-ROI
-            # calls. ``savgol_filter`` with ``axis=1`` is mathematically
-            # identical to per-row, just amortizes the Python overhead.
-            T_len = lp_chunk.shape[1]
-            win = max(3, int((sg_win_ms / 1000.0) * fps) | 1)
-            if win >= T_len:
-                win = max(3, (T_len - (1 - T_len % 2)))
-            if win < 3 or T_len < 3:
-                dt_chunk = np.empty_like(lp_chunk)
-                dt_chunk[:, 0] = 0.0
-                dt_chunk[:, 1:] = (lp_chunk[:, 1:] - lp_chunk[:, :-1]) * fps
-            else:
-                dt_chunk = savgol_filter(
-                    lp_chunk, window_length=win, polyorder=sg_poly,
-                    deriv=1, delta=1.0 / fps, axis=1,
-                ).astype(np.float32)
-            # Slab writes (one contiguous transposed block per buffer
-            # per chunk) replace CHUNK column-by-column updates.
+            # One contiguous transposed slab write per chunk replaces
+            # CHUNK column-by-column updates.
             dff_mm[:, j0:j1] = dff_chunk.T
-            lp_mm[:, j0:j1] = lp_chunk.T
-            dt_mm[:, j0:j1] = dt_chunk.T
-        dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
+        dff_mm.flush()
         if progress_cb is not None:
             progress_cb(
                 f"dF/F batch {i0}-{i1 - 1}/{N - 1} "
                 f"({time.time() - t0:.1f}s)")
-    del dff_mm, lp_mm, dt_mm
+    del dff_mm
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 

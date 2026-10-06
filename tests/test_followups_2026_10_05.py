@@ -76,8 +76,7 @@ def test_xcorr_apply_batch_row_parses_string_bools():
 def test_gpu_dff_reports_why_it_used_cpu(tmp_path):
     from calliope.core import detection_run
     msgs = []
-    kw = dict(baseline_min=2.0, fps=15.0, cutoff_hz=1.0, sg_win_ms=333,
-              sg_poly=2, r=0.7, progress_cb=msgs.append)
+    kw = dict(baseline_min=2.0, fps=15.0, r=0.7, progress_cb=msgs.append)
     assert not detection_run._maybe_run_dff_gpu(
         tmp_path, {"use_gpu_dff": False}, baseline_mode="first_n", **kw)
     assert not detection_run._maybe_run_dff_gpu(
@@ -99,8 +98,8 @@ def test_gpu_dff_failure_reason_is_reported(tmp_path, monkeypatch):
     F = np.ones((2, 10), dtype=np.float32)
     assert not detection_run._maybe_run_dff_gpu(
         tmp_path, {"use_gpu_dff": True}, baseline_mode="first_n",
-        baseline_min=2.0, fps=15.0, cutoff_hz=1.0, sg_win_ms=333,
-        sg_poly=2, r=0.7, F=F, Fneu=F, progress_cb=msgs.append)
+        baseline_min=2.0, fps=15.0, r=0.7, F=F, Fneu=F,
+        progress_cb=msgs.append)
     assert any("cuda kaput" in m for m in msgs)
 
 

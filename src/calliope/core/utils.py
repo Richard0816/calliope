@@ -50,10 +50,10 @@ Population events (Tab 5 + Tab 8)
         Diagnostic-plot helpers used by Tab 5.
 
 Suite2p / cellfilter helpers
-    s2p_open_memmaps
-        Read Suite2p outputs (``F.npy`` / ``Fneu.npy`` / dF/F memmaps)
-        with shape inference so the rest of the code never has to
-        worry about ``(T, N)`` vs ``(N, T)`` orientation.
+    s2p_open_dff_memmap
+        Open the ``(T, N)`` dF/F memmap read-only, sized from the
+        ``F.npy`` header (and, for filtered prefixes, the persisted
+        keep mask) so callers never infer the shape themselves.
     robust_df_over_f_1d, first_n_min_df_over_f_1d
         Two dF/F baselines: a rolling 10th-percentile window (for
         long recordings with slow drift) or the mean of the first
@@ -2833,31 +2833,24 @@ def s2p_load_spks(plane0: Union[str, Path],
     return np.ascontiguousarray(spks, dtype=np.float32)
 
 
-def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.memmap, np.memmap, np.memmap, int, int]:
-    """Open the three dF/F memmaps written by Tab 3 / Tab 4.
+def s2p_open_dff_memmap(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.memmap, int, int]:
+    """Open the ``<prefix>dff.memmap.float32`` dF/F memmap read-only.
 
-    On disk we keep three parallel ``(T, N)`` float32 memmaps:
-        ``<prefix>dff.memmap.float32``
-            Neuropil-corrected dF/F.
-        ``<prefix>dff_lowpass.memmap.float32``
-            ``dff`` after the user-chosen Butterworth low-pass.
-        ``<prefix>dff_dt.memmap.float32``
-            Savitzky-Golay first derivative of the low-passed
-            trace.
-
-    We use ``np.memmap`` rather than ``np.load`` because each file
-    can be hundreds of MB; mmap'ing them lets us slice columns /
-    frames without ever loading the whole array into RAM.
+    The file is a ``(T, N)`` float32 memmap: the neuropil-corrected dF/F
+    written by Tab 3 (``r0p7_``) or its cell-filtered slice
+    (``r0p7_filtered_``). We use ``np.memmap`` rather than ``np.load``
+    because the file can be hundreds of MB; mmap'ing it lets us slice
+    columns / frames without loading the whole array into RAM.
 
     For filtered prefixes (e.g. ``r0p7_filtered_``), the column count
     is resolved via :func:`resolve_filtered_mask`, which anchors to the
     memmap's on-disk size and prefers the persisted
     ``r0p7_cell_mask_bool.npy`` over a (possibly drifted) live mask.
 
-    Returns ``(dff, low, dt, T, N_kept)``.
+    Returns ``(dff, T, N)``.
     """
     root = Path(root)
-    # We only need the (N_ROIs, T) shape to size the memmap views below --
+    # We only need the (N_ROIs, T) shape to size the memmap view below --
     # never the F/Fneu data itself. Read just the .npy shape header via mmap
     # instead of np.load-ing both full (N_ROIs, T) float32 arrays (hundreds
     # of MB each) into RAM. F.npy is canonically (N_ROIs, T), so unpack
@@ -2867,7 +2860,7 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     del _F  # drop the header mmap handle
 
     if is_filtered_prefix(prefix):
-        # Size against the mask the memmaps were written with (persisted
+        # Size against the mask the memmap was written with (persisted
         # as r0p7_cell_mask_bool.npy), cross-checked against the file size,
         # so a drifted live mask can't request a wrong-shaped mapping
         # ([WinError 8]). See resolve_filtered_mask.
@@ -2876,10 +2869,7 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
             root, num_rois, memmap_path=dff_path, T=num_frames)
 
     dff = np.memmap(root / f"{prefix}dff.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
-    low = np.memmap(root / f"{prefix}dff_lowpass.memmap.float32", dtype="float32", mode="r",
-                    shape=(num_frames, num_rois))
-    dt = np.memmap(root / f"{prefix}dff_dt.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
-    return dff, low, dt, num_frames, num_rois
+    return dff, num_frames, num_rois
 
 
 # ============================================================================

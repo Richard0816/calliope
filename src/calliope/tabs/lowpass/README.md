@@ -140,10 +140,9 @@ Tabs 5–7 listen for.
 | `r0p7_filtered_dff_dt.memmap.float32` | `(T, N_kept)` | float32 |
 | `meta.json` → `lowpass_filtered` | — | JSON section |
 
-Only Tab 4 (or the batch lowpass stage) writes these two filtered memmaps —
-Tab 3 writes the unfiltered `r0p7_dff_lowpass` / `r0p7_dff_dt` at its default
-cutoff, whose contents no later stage reads. Re-running Tab 4 at, say, 0.5 Hz
-overwrites them and changes Tab 5's onsets accordingly.
+Only Tab 4 (or the batch lowpass stage) writes these two filtered memmaps;
+Tab 3 writes no low-pass or derivative of its own. Re-running Tab 4 at, say,
+0.5 Hz overwrites them and changes Tab 5's onsets accordingly.
 
 ---
 

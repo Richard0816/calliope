@@ -179,3 +179,112 @@ def test_dff_meta_baseline_is_seconds(tmp_path):
         baseline_mode="first_n", baseline_min=0.1)
     meta = recording_meta.read_meta(tmp_path)
     assert meta["dff"]["baseline_min_sec"] == pytest.approx(6.0)
+
+
+# --- #130: detection writes only the unfiltered r0p7_dff memmap ---
+
+_OLD_TAB3_KEYS = {"default_lowpass_hz": 0.5, "default_sg_win_ms": 200,
+                  "default_sg_poly": 3}
+
+
+def _write_f(plane0, T=200, N=3):
+    rng = np.random.default_rng(1)
+    F = (100 + 5 * rng.random((N, T))).astype(np.float32)
+    np.save(plane0 / "F.npy", F)
+    np.save(plane0 / "Fneu.npy", (F * 0.1).astype(np.float32))
+    return F, T, N
+
+
+def _assert_only_dff_written(plane0, T, N):
+    assert (plane0 / "r0p7_dff.memmap.float32").stat().st_size == T * N * 4
+    assert not (plane0 / "r0p7_dff_lowpass.memmap.float32").exists()
+    assert not (plane0 / "r0p7_dff_dt.memmap.float32").exists()
+    # the filtered Tab 4 outputs are not this stage's job either
+    assert not (plane0 / "r0p7_filtered_dff_lowpass.memmap.float32").exists()
+
+
+def test_cpu_dff_writes_only_r0p7_dff(tmp_path):
+    F, T, N = _write_f(tmp_path)
+    info = dr.compute_dff_memmaps(
+        tmp_path, {"fps_override": 10.0, "use_gpu_dff": False,
+                   **_OLD_TAB3_KEYS},       # stale keys are ignored
+        baseline_mode="first_n", baseline_min=0.1)
+    assert info["path"] == "cpu"
+    _assert_only_dff_written(tmp_path, T, N)
+    dff = np.memmap(tmp_path / "r0p7_dff.memmap.float32", dtype="float32",
+                    mode="r", shape=(T, N))
+    from calliope.core import utils
+    ref = utils.first_n_min_df_over_f_1d(
+        F[1] - 0.7 * F[1] * 0.1, baseline_min=0.1, perc=10, fps=10.0)
+    np.testing.assert_allclose(dff[:, 1], ref, rtol=1e-5, atol=1e-6)
+    # no detection-time low-pass stamp any more
+    assert recording_meta.read_meta(tmp_path)["lowpass"]["cutoff_hz"] is None
+
+
+def _numpy_cupy():
+    """A numpy-backed stand-in for the CuPy calls _gpu_process_all makes."""
+    import types
+
+    pool = types.SimpleNamespace(free_all_blocks=lambda: None)
+    return types.SimpleNamespace(
+        asarray=lambda x, dtype=None: np.asarray(x, dtype=dtype),
+        asnumpy=np.asarray, float32=np.float32, isfinite=np.isfinite,
+        mean=np.mean, maximum=np.maximum, full_like=np.full_like,
+        get_default_memory_pool=lambda: pool,
+        get_default_pinned_memory_pool=lambda: pool,
+        cuda=types.SimpleNamespace(Stream=types.SimpleNamespace(
+            null=types.SimpleNamespace(synchronize=lambda: None))),
+    )
+
+
+def test_gpu_dff_writes_only_r0p7_dff_and_matches_cpu(tmp_path, monkeypatch):
+    from calliope.core import analyze_output_gpu as gpu
+    monkeypatch.setattr(gpu, "cp", _numpy_cupy(), raising=False)
+    monkeypatch.setattr(gpu, "_CUPY_OK", True, raising=False)
+    gpu_dir = tmp_path / "gpu"
+    cpu_dir = tmp_path / "cpu"
+    gpu_dir.mkdir()
+    cpu_dir.mkdir()
+    _, T, N = _write_f(gpu_dir)
+    _write_f(cpu_dir)
+    params = {"fps_override": 10.0, **_OLD_TAB3_KEYS}
+    info = dr.compute_dff_memmaps(gpu_dir, {**params, "use_gpu_dff": True},
+                                  baseline_mode="first_n", baseline_min=0.1)
+    assert info["path"] == "gpu"
+    _assert_only_dff_written(gpu_dir, T, N)
+    dr.compute_dff_memmaps(cpu_dir, {**params, "use_gpu_dff": False},
+                           baseline_mode="first_n", baseline_min=0.1)
+    a, b = (np.memmap(d / "r0p7_dff.memmap.float32", dtype="float32",
+                      mode="r", shape=(T, N)) for d in (gpu_dir, cpu_dir))
+    np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
+
+def test_removed_tab3_lowpass_keys_are_gone_and_load_harmlessly():
+    import types
+    from calliope.gui_common import spec_defaults
+    from calliope.tabs.batch.logic import build_batch_param_spec
+    from calliope.tabs.suite2p.tab import Suite2pTab
+
+    removed = set(_OLD_TAB3_KEYS)
+    assert not removed & {e["name"] for e in Suite2pTab.PARAM_SPEC}
+    assert not removed & {e["name"] for e in build_batch_param_spec()}
+    # an old batch row / saved queue still carrying the keys applies
+    # cleanly: they are simply not picked up
+    stub = types.SimpleNamespace(
+        PARAM_SPEC=Suite2pTab.PARAM_SPEC,
+        _params=spec_defaults(Suite2pTab.PARAM_SPEC),
+        custom_tau_var=types.SimpleNamespace(set=lambda v: None))
+    Suite2pTab.apply_batch_row(stub, {**_OLD_TAB3_KEYS, "perc": 20})
+    assert stub._params["perc"] == 20
+    assert not removed & set(stub._params)
+
+
+def test_s2p_open_dff_memmap_needs_only_the_dff_file(tmp_path):
+    from calliope.core import utils
+    T, N = 7, 4
+    np.save(tmp_path / "F.npy", np.zeros((N, T), np.float32))
+    data = np.arange(T * N, dtype=np.float32).reshape(T, N)
+    data.tofile(tmp_path / "r0p7_dff.memmap.float32")
+    dff, t, n = utils.s2p_open_dff_memmap(tmp_path, prefix="r0p7_")
+    assert (t, n) == (T, N)
+    np.testing.assert_array_equal(np.asarray(dff), data)

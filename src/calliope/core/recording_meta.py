@@ -96,6 +96,10 @@ def default_meta() -> Dict[str, Any]:
             "baseline_min_sec": None,
             "fps": None,
         },
+        # RESERVED: detection used to stamp the cutoff of the unfiltered
+        # r0p7_dff_lowpass memmap here; that memmap is no longer written,
+        # so nothing stamps or reads this section. Tab 4's filter settings
+        # live under ``lowpass_filtered``. Kept for schema stability.
         "lowpass": {
             "cutoff_hz": None,
             "filter_kind": None,

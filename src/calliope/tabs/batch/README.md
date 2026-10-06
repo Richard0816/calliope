@@ -736,7 +736,7 @@ section** — they are not duplicated here.
 | Dialog group prefix | Source PARAM_SPEC | Count | Per-tab reference |
 |---|---|---|---|
 | `1. Preprocess -` | `PreprocessTab.PARAM_SPEC` | 5 | [Tab 1 — Preprocess](../preprocess/README.md) |
-| `2. Detection -` | `Suite2pTab.PARAM_SPEC` | 30 (Sparsery / Cell filter / Cellpose / Merge / Cellpose-SAM / dF/F / Default low-pass / Pixel scale / GPU / QC / Re-detect) | [Tab 3 — Suite2p detection](../suite2p/README.md) |
+| `2. Detection -` | `Suite2pTab.PARAM_SPEC` | 27 (Sparsery / Cell filter / Cellpose / Merge / Cellpose-SAM / dF/F / Pixel scale / GPU / QC / Re-detect) | [Tab 3 — Suite2p detection](../suite2p/README.md) |
 | `3. Low-pass -` | `LowpassTab.PARAM_SPEC` | 3 (Butterworth / SG derivative; the two slider-bound entries `cutoff_min` / `cutoff_max` are left out because only Tab 4's own dialog applies them) | [Tab 4 — Low-pass](../lowpass/README.md) |
 | `4. Events -` | `EventDetectionTab.PARAM_SPEC` | 32 (per-ROI hysteresis + onset refinement / display / population density / peaks / baseline / boundaries / Gaussian fit) | [Tab 5 — Event detection](../event_detection/README.md) |
 

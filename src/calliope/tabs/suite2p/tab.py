@@ -312,23 +312,6 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "win_sec", "label": "Rolling window (s)",
          "type": "float", "default": 45.0, "group": "dF/F",
          "help": "only used in 'rolling' baseline mode"},
-        # Default low-pass: shapes ONLY the unfiltered (T, N_total)
-        # r0p7_dff_lowpass / r0p7_dff_dt memmaps written here. No stage
-        # reads their contents (the cell-filter dataset loader only needs
-        # them to exist); every downstream stage reads the r0p7_filtered_*
-        # low-pass / derivative memmaps that Tab 4 writes with its own
-        # cutoff. Tune the low-pass in Tab 4, not here.
-        {"name": "default_lowpass_hz", "label": "Default low-pass (Hz)",
-         "type": "float", "default": 1.0, "group": "Default low-pass",
-         "help": "only shapes the unfiltered r0p7_dff_lowpass memmap, "
-                 "which no stage reads; set the analysis cutoff in Tab 4"},
-        {"name": "default_sg_win_ms", "label": "SG derivative window (ms)",
-         "type": "int", "default": 333, "group": "Default low-pass",
-         "help": "only shapes the unfiltered r0p7_dff_dt memmap; "
-                 "Tab 4 writes the derivative downstream stages use"},
-        {"name": "default_sg_poly", "label": "SG polynomial order",
-         "type": "int", "default": 2, "group": "Default low-pass",
-         "help": "only shapes the unfiltered r0p7_dff_dt memmap"},
         # Pixel <-> micrometre calibration (written to
         # <plane0>/calliope_calibration.npy after detection so Tabs 6 & 7
         # render spatial plots in µm).
@@ -1083,16 +1066,14 @@ class Suite2pTab(ctk.CTkFrame):
         self, plane0: Path, baseline_mode: str, baseline_min: float,
         params: Optional[dict] = None,
     ) -> None:
-        """dF/F + default low-pass + derivative for every Suite2p ROI.
+        """dF/F for every Suite2p ROI.
 
         Delegates to :func:`calliope.core.detection_run.compute_dff_memmaps`
         so the GUI and headless paths share one implementation, including
-        the ``meta.json`` ``dff`` / ``lowpass`` / ``extraction`` provenance
-        stamp that the NWB exporter reads. Writes::
+        the ``meta.json`` ``dff`` / ``extraction`` provenance stamp that
+        the NWB exporter reads. Writes::
 
             plane0/r0p7_dff.memmap.float32          (T, N)
-            plane0/r0p7_dff_lowpass.memmap.float32  (T, N)
-            plane0/r0p7_dff_dt.memmap.float32       (T, N)
 
         Tries the GPU path first when ``use_gpu_dff`` is on and the
         baseline mode is 'first_n'; otherwise (or on GPU failure) CPU.
@@ -1115,7 +1096,7 @@ class Suite2pTab(ctk.CTkFrame):
             baseline_mode=baseline_mode, baseline_min=baseline_min,
             progress_cb=lambda msg: print(f"[GUI] {msg}"),
         )
-        print(f"[GUI] r0p7_dff / r0p7_dff_lowpass / r0p7_dff_dt memmaps "
+        print(f"[GUI] r0p7_dff memmap "
               f"written via {info.get('path', '?').upper()} "
               f"(fps={float(info.get('fps', 0.0)):g} Hz, "
               f"{time.time() - t0:.1f}s)")

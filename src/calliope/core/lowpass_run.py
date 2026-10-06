@@ -81,9 +81,8 @@ def compute_lowpass_and_dt(
     (``cutoff_hz``, ``filter_kind``, ``order``, ``sg_win_ms``,
     ``sg_poly``, ``fps``). Tab 5 (:mod:`core.event_detection_run`) reads
     it so its auto onset-backtrack window and frame rate match what was
-    actually baked into these memmaps. The pre-existing ``lowpass``
-    section describes the detection-time ``r0p7_dff_lowpass`` and is left
-    untouched. The stamp is best-effort: a metadata failure never fails
+    actually baked into these memmaps. The older ``lowpass`` section
+    (reserved; detection no longer stamps it) is left untouched. The stamp is best-effort: a metadata failure never fails
     the compute.
 
     ``progress_cb`` (if provided) is called with status strings such

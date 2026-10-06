@@ -72,7 +72,7 @@ Module index
                              ``_kept_roi_count``). The GUI's Tab 0 does
                              NOT call ``run_recording``; it drives the
                              stages itself.
-- ``analyze_output_gpu``  - CuPy dF/F / low-pass / derivative path
+- ``analyze_output_gpu``  - CuPy dF/F path
                              (GPU twin of the CPU dF/F writer).
 - ``_cuda_import``        - the single place the optional CuPy
                              dependency is imported (and probed).

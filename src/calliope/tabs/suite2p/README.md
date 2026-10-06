@@ -5,7 +5,6 @@
 - a fluorescence trace `F[t]` over time,
 - a neuropil trace `Fneu[t]` (out-of-focus contamination),
 - a relative-change-from-baseline trace `dF/F[t]`,
-- a default low-pass dF/F and its first time-derivative,
 - a learned "is this really a cell?" classifier verdict.
 
 This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computation (CPU or CuPy GPU), the cell-filter CNN inference, and finally rasterises everything onto the mean image for visual review.
@@ -29,7 +28,7 @@ The tab worker (`Suite2pTab._run_pipeline`) is roughly:
 final_plane0 = sparse_plus_cellpose.run(..., fps_override=...)  # ROI detection
 self._stamp_run_meta(final_plane0, ...)        # meta.json: spatial_scale + GCaMP label
 self._stamp_pix_to_um(final_plane0, params)    # calliope_calibration.npy from zoom or direct
-_run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative + meta.json stamp
+_run_dff(final_plane0, baseline_mode, ...)     # dF/F + meta.json stamp
 if ckpt_path:
     _run_cellfilter(final_plane0, ckpt_path)   # PyTorch keep/drop
 _run_filtered_dff(final_plane0)                # slice dF/F to kept ROIs
@@ -141,7 +140,7 @@ Silently skips with a console warning when cellpose 3.x is installed (SAM is 4.x
 
 The result lives at `<out_dir>/detection/final/suite2p/plane0/`. From here on we call this `plane0`.
 
-### Step 2 — dF/F, low-pass, derivative
+### Step 2 — dF/F
 
 The neuropil-corrected, baselined trace per ROI is:
 
@@ -158,22 +157,13 @@ Two **baseline modes** controlled by the radio buttons:
 
 `r = 0.7` is the **neuropil correction coefficient** (Chen et al. 2013). Subtracting `0.7×Fneu` removes ~70% of out-of-focus contamination on average; the residual is what's actually from the soma.
 
-After dF/F, the tab pre-computes:
-
-- **Low-pass dF/F** at `default_lowpass_hz = 1.0 Hz`, order-2 causal Butterworth via `utils.lowpass_causal_1d` (see `tabs/lowpass/README.md` for the SOS state-space details).
-- **Savitzky-Golay first derivative** of the low-pass trace, window `default_sg_win_ms = 333 ms`, polynomial order `2`, via `utils.sg_first_derivative_1d`. The output dimension is `dF/F per second`.
-
-These three arrays are written as `(T, N_total)` `float32` memmaps in `plane0/`:
-
-- `r0p7_dff.memmap.float32`
-- `r0p7_dff_lowpass.memmap.float32`
-- `r0p7_dff_dt.memmap.float32`
+The result is written as a `(T, N_total)` `float32` memmap, `plane0/r0p7_dff.memmap.float32`.
 
 The `r0p7_` prefix encodes "neuropil coefficient r=0.7" and is hardcoded by older downstream tools (clustering, crosscorr, paper figures); changing it would require updating those.
 
-Only `r0p7_dff` is read downstream (cell filter, filtered dF/F, the curation popout). No stage reads the contents of the unfiltered `r0p7_dff_lowpass` / `r0p7_dff_dt` files: Tab 4 writes the `r0p7_filtered_*` low-pass and derivative that event detection and later tabs use, with its own cutoff. The two unfiltered files are still written because the cell-filter dataset loader (`utils.s2p_open_memmaps`) requires them to exist.
+`r0p7_dff` is read by the cell filter (`utils.s2p_open_dff_memmap`), the filtered dF/F slice and the curation popout. Detection computes no low-pass or derivative: Tab 4 writes the `r0p7_filtered_dff_lowpass` / `_dt` memmaps that event detection and later tabs use, from the filtered dF/F and at its own cutoff. Older versions also wrote unfiltered `r0p7_dff_lowpass.memmap.float32` / `r0p7_dff_dt.memmap.float32` here; nothing read them, and copies left in old `plane0` folders can be deleted.
 
-The computation is `core.detection_run.compute_dff_memmaps`; Tab 3's `_run_dff` wraps it and logs the GPU/CPU choice. Before writing the memmaps it stamps the `dff`, `lowpass` and `extraction.neuropil_coef` sections of `meta.json` (Step 7).
+The computation is `core.detection_run.compute_dff_memmaps`; Tab 3's `_run_dff` wraps it and logs the GPU/CPU choice. Before writing the memmap it stamps the `dff` and `extraction.neuropil_coef` sections of `meta.json` (Step 7).
 
 #### CPU loop
 
@@ -182,12 +172,8 @@ for each chunk of up to 256 ROIs:
     traces = F[chunk] − r·Fneu[chunk]
     for each ROI in the chunk:
         dff = first_n_min_df_over_f_1d(trace, ...)  or  robust_df_over_f_1d(trace, ...)
-        lp, _, sos = lowpass_causal_1d(dff, fps, cutoff_hz, order=2, sos=cached)
-    dt = savgol_filter(lp_chunk, win, polyorder=sg_poly, deriv=1, delta=1/fps, axis=1)
-    write dff / lp / dt columns for the chunk
+    write the chunk's dff columns in one slab
 ```
-
-The Butterworth `sos` is computed once and reused across ROIs. The batched Savitzky-Golay call gives the same result as `utils.sg_first_derivative_1d` run per ROI.
 
 #### GPU path (`detection_run._maybe_run_dff_gpu`)
 
@@ -196,12 +182,11 @@ If `use_gpu_dff` is true **and** `baseline_mode == 'first_n'` **and** `analyze_o
 ```python
 gpu.process_suite2p_traces_gpu(
     F, Fneu, fps=fps, r=r, baseline_sec=baseline_min*60,
-    cutoff_hz=cutoff_hz, sg_win_ms=..., sg_poly=...,
     out_dir=plane0, prefix='r0p7_', roi_chunk=None_or_int,
 )
 ```
 
-Vectorises the per-ROI loop on GPU and writes the same three memmaps. The rolling baseline is **not** supported on GPU because it requires a windowed percentile filter that doesn't have a clean CuPy implementation.
+Vectorises the per-ROI loop on GPU and writes the same `r0p7_dff` memmap. The rolling baseline is **not** supported on GPU because it requires a windowed percentile filter that doesn't have a clean CuPy implementation.
 
 `gpu_roi_chunk` lets the user split into smaller VRAM chunks if a recording overflows.
 
@@ -290,7 +275,7 @@ Every processed recording writes `<plane0>/meta.json`, a single provenance file 
 - **detection** — `threshold_scaling`, `sparse_mode`, `spatial_scale`, `highpass_time` (the values the sparsery pass ran with, not the base settings), plus `spatscale_pix` when available (the schema also carries `cellpose_enabled`, `cellpose_model`, `cellpose_flow_threshold`, `enable_sam_vcorr_pass`, but these are reserved: no stage stamps them yet, so they stay `null`)
 - **extraction** — `neuropil_coef`, `tau_seconds`, `gcamp_variant_label` (stamped from the Tab 3 GCaMP dropdown)
 - **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec` (the first-N baseline length in seconds, i.e. `baseline_min · 60`), `fps`
-- **lowpass** — `cutoff_hz`, `filter_kind`, `order` (from Tab 3's `default_lowpass_hz`; Tab 4 does not update this section, so it does not record the cutoff event detection used)
+- **lowpass** — reserved and no longer stamped (`null` on new recordings; older `meta.json` files may still hold the cutoff of the unfiltered low-pass memmap detection used to write). Nothing reads it. Tab 4 records the filter event detection actually uses under `lowpass_filtered` (see the Tab 4 README)
 - **spike_inference** — `backend` (always `"oasis"`, the only backend)
 - **denoising** — reserved stub (`applied: false`, `model: null`); nothing writes it yet
 - **qc** — the z-drift fields written by Step 8
@@ -318,15 +303,13 @@ The result is also stamped into `meta.json`'s `qc` section (`zdrift_detected`, `
 | `Fneu.npy` | `(N_total, T)` | neuropil trace |
 | `iscell.npy` | `(N_total, 2)` | Suite2p classifier (binary + confidence) |
 | `r0p7_dff.memmap.float32` | `(T, N_total)` | dF/F (note: time-major) |
-| `r0p7_dff_lowpass.memmap.float32` | `(T, N_total)` | low-pass at `default_lowpass_hz`; contents unused downstream (see Step 2) |
-| `r0p7_dff_dt.memmap.float32` | `(T, N_total)` | SG first derivative; contents unused downstream |
 | `predicted_cell_mask.npy` | `(N_total,)` bool | cell-filter keep mask |
 | `predicted_cell_prob.npy` | `(N_total,)` float | cell-filter confidence |
 | `r0p7_filtered_dff.memmap.float32` | `(T, N_kept)` | dF/F restricted to kept ROIs |
 | `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | mask the filtered memmaps were sliced with; authoritative for every `r0p7_filtered_*` reader |
 | `r0p7_filtered_dff.csv` | optional | per-frame CSV view of filtered dF/F |
 | `calliope_calibration.npy` | scalar | µm per pixel (only when a Pixel-scale param is set) |
-| `meta.json` | dict | provenance sidecar (registration / detection / extraction / dF/F / lowpass / spike-inference / qc); atomic write, safe read |
+| `meta.json` | dict | provenance sidecar (registration / detection / extraction / dF/F / spike-inference / qc, plus Tab 4's `lowpass_filtered`); atomic write, safe read |
 | `zdrift_qc.png` | figure | PC1 trace with flagged z-drift frames marked |
 | `zdrift_pc1.csv` | `(T, 4)` | `frame, time_s, pc1, is_step` — recreates `zdrift_qc.png` |
 
@@ -355,13 +338,13 @@ Two separate dialogs sit in the Tab 3 header:
 - **Advanced...** opens the curated `Suite2pTab.PARAM_SPEC` form
   (`_on_advanced` → `open_advanced(self, ..., self.PARAM_SPEC, self._params)`).
   These are the knobs CalLIOPE actually owns — Sparsery / Cellpose / merge /
-  dF/F / low-pass / pixel-scale / GPU / QC / Re-detect. Documented in full below. Each field's
+  dF/F / pixel-scale / GPU / QC / Re-detect. Documented in full below. Each field's
   value lands in `self._params` and re-runs nothing on close: it applies on the
   **next** "Run detection + cell filter".
 - **Edit suite2p settings...** opens a second, deeper popout
   (`_on_edit_suite2p_settings`) that flattens the *entire*
   suite2p 1.0 nested settings tree and lets you override any leaf. This is the
-  raw escape hatch — see [§5.8](#58-raw-suite2p-settings-escape-hatch).
+  raw escape hatch — see [§5.7](#57-raw-suite2p-settings-escape-hatch).
 
 The radio buttons (**baseline mode**; the rolling option's window and percentile are the `win_sec` / `perc` params in §5.5), the **GCaMP variant** dropdown, the
 **custom τ (s)** field, and the two **filtered-dF/F CSV** / **archive**
@@ -438,28 +421,12 @@ first-N-minutes value are separate Tk vars (§2 Step 2); the knobs here are the
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| `fps_override` | `0.0` | Frame rate. **0 = use the 15.08 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** is passed to `sparse_plus_cellpose.run(fps_override=...)`, so suite2p's `fs` (deconvolution timing) and `ops.npy['fs']`, which Tabs 4-8 read, use it too. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, the low-pass cutoff, and the SG derivative's `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
+| `fps_override` | `0.0` | Frame rate. **0 = use the 15.08 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** is passed to `sparse_plus_cellpose.run(fps_override=...)`, so suite2p's `fs` (deconvolution timing) and `ops.npy['fs']`, which Tabs 4-8 read, use it too. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, and (via `ops.npy['fs']`) Tab 4's low-pass cutoff and SG derivative `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
 | `neuropil_coef` | `0.7` | The `r` in `F_corr = F − r·Fneu`; fraction of the neuropil trace subtracted (Chen et al. 2013). | 0.7 removes ~70% of out-of-focus contamination, the field standard. **Raise** if traces still show obvious neuropil bleed-through (shared slow waves across all cells); **lower** if subtraction is over-correcting bright cells into negative dF/F. Note the on-disk `r0p7_` filename prefix is hardcoded by downstream tools and does **not** change when you change `r` — only the math does. |
 | `perc` | `10` | Baseline percentile of the sliding `percentile_filter` in **rolling** mode. **Ignored in first-N mode** — `first_n_min_df_over_f_1d` always uses the *mean* of the baseline window and accepts `perc` only for call-site symmetry. | The "what counts as baseline" knob for rolling mode. **Lower (e.g. 5)** chases the trough of the trace (good if cells are active most of the time and the 10th pct is still riding events); **raise** for very quiet cells where a low percentile sits in noise. Switch to first-N mode if you want a plain mean baseline instead. |
 | `win_sec` | `45.0` | Rolling-mode only: width (s) of the sliding percentile window for `F0[t]` (`utils.robust_df_over_f_1d`). | **Ignored in first-N mode.** Window must be wider than your longest real event or it will track the event and flatten it. **Shorten** to follow faster baseline drift (bleaching, swelling); **lengthen** if long events are being eaten by the baseline. |
 
-### 5.6 Default low-pass / derivative
-
-These shape only the unfiltered `r0p7_dff_lowpass` / `r0p7_dff_dt` memmaps
-(`compute_dff_memmaps`: `utils.lowpass_causal_1d` plus a batched Savitzky-Golay
-derivative, mirrored on the GPU path). **No stage reads those memmaps'
-contents** (see §2 Step 2). The low-pass and derivative that event detection
-and later tabs use are the `r0p7_filtered_*` files Tab 4 writes with its own
-cutoff, so tune the low-pass in Tab 4. `default_lowpass_hz` is also the value
-`meta.json`'s `lowpass` section records.
-
-| Setting (`key`) | Default | What it does | What it means to you |
-|---|---|---|---|
-| `default_lowpass_hz` | `1.0` | Cutoff (Hz) of the order-2 causal Butterworth applied to dF/F → `r0p7_dff_lowpass`. | No effect on analysis results. Must stay below Nyquist (`fps/2`). Leave at the default. |
-| `default_sg_win_ms` | `333` | Savitzky-Golay window (ms) for the first derivative `r0p7_dff_dt` (converted to an odd sample count via fps). | No effect on analysis results; Tab 4 has its own derivative settings. |
-| `default_sg_poly` | `2` | Polynomial order of the SG fit for `r0p7_dff_dt`. | No effect on analysis results. Order must be < the window's sample length. |
-
-### 5.7 Pixel-scale (µm calibration) and GPU
+### 5.6 Pixel-scale (µm calibration) and GPU
 
 Pixel-scale knobs are resolved by `core.scale.resolve_pix_to_um`
 after detection (`core.detection_run.stamp_pix_to_um`, via `core.scale.resolve_pix_to_um`) and written to
@@ -477,17 +444,17 @@ calibration and render in raw pixels (no scale bar).
 | `scope_zoom` | `0.0` (skip) | Microscope zoom factor. Computes `pix_to_um = (fov_um_reference / zoom) / Lx`. | Use this if you log the scope's zoom but not a direct µm/px. Needs `fov_um_reference` set correctly for your rig. Ignored if `um_per_pixel` is set. |
 | `fov_um_reference` | `3080.90169` | FOV width (µm) at 1× zoom, used only by the `scope_zoom` path. | **Rig-specific — the default is the lab's two-photon scope.** If you use the zoom path on a different microscope you *must* set this to your own 1× FOV width, or every µm axis and scale bar will be wrong. No effect when using `um_per_pixel`. |
 | `um_per_pixel` | `0.0` (skip) | Direct calibration in µm per pixel; **wins over `scope_zoom`**. | The cleanest option if you've measured it (e.g. from a calibration slide). Set this and you can ignore the zoom/FOV pair entirely. Must be > 0. |
-| `use_gpu_dff` | `True` | Route the dF/F + low-pass + derivative through the CuPy GPU path (`detection_run._maybe_run_dff_gpu`; Tab 3 logs why it fell back). | Leave on for speed. **Auto-falls back to CPU** if CuPy is missing, the import fails, or the baseline mode is `rolling` (GPU only implements the first-N-min mean baseline). Results are identical to CPU; this is purely a speed switch. |
+| `use_gpu_dff` | `True` | Route the dF/F through the CuPy GPU path (`detection_run._maybe_run_dff_gpu`; Tab 3 logs why it fell back). | Leave on for speed. **Auto-falls back to CPU** if CuPy is missing, the import fails, or the baseline mode is `rolling` (GPU only implements the first-N-min mean baseline). Results are identical to CPU; this is purely a speed switch. |
 | `gpu_roi_chunk` | `0` (all) | Split ROIs into chunks of this size on the GPU to bound VRAM (0 = process all ROIs at once). | Only touch if the GPU path OOMs on a large recording. **Set a positive chunk** (e.g. 500) to trade a little speed for a smaller peak VRAM footprint. No effect on the CPU path. |
 
-### 5.7b QC and Re-detect
+### 5.6b QC and Re-detect
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
 | `zdrift_qc` | `True` | Runs the post-detection z-drift QC (§2 Step 8). | Turn off to skip the PCA pass on very large recordings. Existing `zdrift_*` files are left in place. |
 | `keep_registration_cache` | `False` | Keeps `_shared_reg/.../data.bin` after detection (§2 Step 5). | Turn on while iterating on detection params (e.g. a forced `spatial_scale`) so each re-detect skips the ~5 min re-registration. Costs ~13 GB of disk per recording. |
 
-### 5.8 Raw suite2p settings (escape hatch)
+### 5.7 Raw suite2p settings (escape hatch)
 
 The **Edit suite2p settings...** button (`_on_edit_suite2p_settings`) is *not*
 part of `PARAM_SPEC`. It flattens the full
@@ -537,11 +504,9 @@ Keybinds: `1` = cell, `0` = not a cell, `Esc` = close.
 3. Implement both dF/F baselines:
    - **Rolling**: `scipy.ndimage.percentile_filter(F_corr, size=(45·fps)|1, percentile=10, mode='nearest')`, eps = `max(percentile(F0, 1), 1e-9)`.
    - **First-N-minute**: scalar `F0 = mean(F_corr[:N_baseline])` (not a percentile — `perc` is ignored here) where `N_baseline = round(baseline_min · 60 · fps)`; eps = `max(F0, 1e-9)`.
-4. Implement the causal Butterworth low-pass via `scipy.signal.butter(order=2, btype='low', output='sos')` + `sosfilt`, initialising `zi` to the first sample to avoid a startup transient.
-5. Implement the SG derivative via `scipy.signal.savgol_filter(x, window_length=odd, polyorder=2, deriv=1, delta=1/fps)`.
-6. Train (or load) a small CNN that takes the dF/F + footprint of an ROI and outputs `P(real cell)`. Save mask and prob to `predicted_cell_mask.npy`, `predicted_cell_prob.npy`. Fall back to `iscell.npy[:,0] > 0` if no model.
-7. Slice the dF/F memmap by the keep mask in chunks (≤ 4096 frames at a time) to write `r0p7_filtered_dff.memmap.float32`.
-8. Honour the on-disk filename conventions exactly — every later tab and figure script reads `r0p7_filtered_dff.memmap.float32` and `predicted_cell_mask.npy` by name.
+4. Train (or load) a small CNN that takes the dF/F + footprint of an ROI and outputs `P(real cell)`. Save mask and prob to `predicted_cell_mask.npy`, `predicted_cell_prob.npy`. Fall back to `iscell.npy[:,0] > 0` if no model.
+5. Slice the dF/F memmap by the keep mask in chunks (≤ 4096 frames at a time) to write `r0p7_filtered_dff.memmap.float32`.
+6. Honour the on-disk filename conventions exactly — every later tab and figure script reads `r0p7_filtered_dff.memmap.float32` and `predicted_cell_mask.npy` by name.
 
 
 ## UI affordances

@@ -90,6 +90,14 @@ Changes that affect existing outputs, scripts or batch files:
   Reload and Export refuse when the kept ROIs have changed since.
 - **`meta.json`.** `dff.baseline_min_sec` is now in seconds (it held
   minutes under a seconds name).
+- **Detection outputs.** Detection no longer writes the unfiltered
+  `r0p7_dff_lowpass.memmap.float32` / `r0p7_dff_dt.memmap.float32`
+  (nothing read them; Tab 4's `r0p7_filtered_dff_lowpass` / `_dt` are
+  unchanged). The three Tab 3 settings that only shaped them,
+  `default_lowpass_hz`, `default_sg_win_ms` and `default_sg_poly`, are
+  removed; old settings or batch files that still carry them load and
+  ignore them. Copies of the two files already on disk are unused and
+  can be deleted. `meta.json`'s `lowpass` section is no longer stamped.
 - **Dependencies.** `seaborn` and `scikit-image` are no longer
   required.
 

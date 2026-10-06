@@ -143,7 +143,7 @@ class _RecordingCache:
             max_img = padded
 
         # dF/F memmap
-        dff, _, _, T, N = utils.s2p_open_memmaps(self.plane0, prefix=C.DFF_PREFIX)
+        dff, T, N = utils.s2p_open_dff_memmap(self.plane0, prefix=C.DFF_PREFIX)
 
         self.stat = stat
         self.mean_img_z = _znorm(mean_img)

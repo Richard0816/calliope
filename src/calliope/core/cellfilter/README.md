@@ -174,7 +174,7 @@ mean_img    = view.get('meanImgE') or view.get('meanImg')
 max_img     = view.get('max_proj') or view.get('maxImg') or mean_img
 mean_img_z  = (mean_img - mean) / std                    # z-score
 max_img_z   = (max_img  - mean) / std
-dff, _, _, T, N = utils.s2p_open_memmaps(plane0, prefix='r0p7_')
+dff, T, N = utils.s2p_open_dff_memmap(plane0, prefix='r0p7_')
 ```
 
 If `max_proj` is cropped to Suite2p's `yrange/xrange` (a common quirk), it's padded back to full FOV using those ranges so it spatially aligns with `mean_img`.
