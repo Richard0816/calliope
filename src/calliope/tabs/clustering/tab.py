@@ -1116,8 +1116,11 @@ class ClusteringTab(ctk.CTkFrame):
                 and self._plane0 is not None):
             translator = filtered_to_suite2p_indices(
                 self._plane0, self._prefix)
-            if translator is not None and translator.size == len(labels):
-                return sorted(int(i) for i in translator[local_idx])
+            if translator is None or translator.size != len(labels):
+                # Stale linkage vs the rewritten memmap: positions can't be
+                # mapped to Suite2p ids, so offer none rather than wrong ids.
+                return []
+            return sorted(int(i) for i in translator[local_idx])
         return sorted(int(i) for i in local_idx)
 
     def _refresh_roi_list_var(self) -> None:
@@ -1385,8 +1388,16 @@ class ClusteringTab(ctk.CTkFrame):
         if utils.is_filtered_prefix(self._prefix):
             translator = filtered_to_suite2p_indices(
                 self._plane0, self._prefix)
-            if translator is not None and translator.size == len(labels):
-                filtered_to_suite2p = translator
+            if translator is None or translator.size != len(labels):
+                # Same rule as core.clustering.run_clustering: never write
+                # filtered positions under the Suite2p-id marker. Only a
+                # linkage from before the memmap was rewritten gets here.
+                got = None if translator is None else translator.size
+                raise ValueError(
+                    f"The keep mask selects {got} ROIs but the linkage has "
+                    f"{len(labels)} leaves (the filtered dF/F changed since "
+                    f"this clustering ran). Re-run clustering, then export.")
+            filtered_to_suite2p = translator
 
         out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)

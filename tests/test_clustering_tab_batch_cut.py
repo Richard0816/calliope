@@ -110,3 +110,21 @@ def test_run_clustering_refuses_untranslatable_ids(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="cannot be translated"):
         clustering.run_clustering(tmp_path, {"threshold": 1.0},
                                   write_summary=False)
+
+
+def test_gui_export_refuses_mismatched_translator(monkeypatch, tmp_path):
+    import numpy as np
+    import pytest
+    from scipy.cluster.hierarchy import linkage
+    from calliope.tabs.clustering import tab as ctab
+
+    s = _stub()
+    s._Z = linkage(np.random.default_rng(0).normal(size=(4, 3)), "ward")
+    s._plane0 = tmp_path
+    s._prefix = "r0p7_filtered_"
+    s._current_threshold = lambda: 1.0
+    monkeypatch.setattr(ctab, "filtered_to_suite2p_indices",
+                        lambda p0, pre: np.arange(3))   # 3 != 4 leaves
+    with pytest.raises(ValueError, match="Re-run clustering"):
+        ctab.ClusteringTab._export_clusters(s)
+    assert not list(tmp_path.glob("**/C*_rois.npy"))
