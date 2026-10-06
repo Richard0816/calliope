@@ -286,11 +286,11 @@ This tab is a **pure consumer of Tab 5**: it doesn't re-detect anything. Tab 5 p
 
 **Why it matters biologically.** Tab 7 tells you "cluster A consistently leads cluster B by 47 ms". Tab 8 tells you what that *looks like* in space — the very thing that's missing from the violin plots. If event after event lights up cyan in the upper-left and progresses to red in the lower-right, you're seeing a stereotyped propagation wave: the kind of result that lets you point at a specific anatomical region as the seizure-initiation zone. Per-event maps also expose **heterogeneity**: maybe most events propagate left-to-right, but a few flip direction — that's a meaningful biological observation that gets averaged away in a single summary plot. The directional monotonicity test on the bottom panel makes that "direction or no direction?" question quantitative per event: a `ρ_obs ≈ 1` event has a sharp, reproducible propagation axis; a `ρ_obs ≈ 0` event is spatially synchronous or chaotic, and the high p-value tells you not to read tea-leaves into the centroid arrows above.
 
-V1 ships only the activation-order map. Future view modes (planned, ported from the legacy `spatial_heatmap_updated.py` reference): per-event propagation arrows + speed/angle CSV, per-ROI relative-lag violin plots, and scalar feature maps (event rate, peak ΔF/F, peak derivative-z) painted on the same canvas.
+**Export figures** writes the order-map-with-arrows panel for every event as PNG + SVG (`event_001.png`, …) into `<save_folder>/calliope_figures/spatial_propagation/` and refreshes the export manifest; Tab 0's batch pipeline writes the same figures headlessly. Not implemented: a per-ROI timing CSV, per-ROI relative-lag violin plots, and scalar feature maps (event rate, peak ΔF/F, peak derivative-z) painted on the same canvas.
 
 **Biological output.** A click-through atlas of "who fired first, who fired last" for every detected population event in the recording.
 
-→ See `tabs/spatial_propagation/README.md` for the inputs, the order-rank → painted-image pipeline (two helpers in `core/spatial.py`), the single inline `Use Suite2p spks` toggle (this tab has no Advanced dialog of its own), and the planned roadmap of additional view modes.
+→ See `tabs/spatial_propagation/README.md` for the inputs, the order-rank → painted-image pipeline (two helpers in `core/spatial.py`), the single inline `Use Suite2p spks` toggle (this tab has no Advanced dialog of its own), and the Export-figures outputs.
 
 ---
 
