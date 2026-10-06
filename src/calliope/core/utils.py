@@ -628,8 +628,8 @@ def paint_spatial(values_per_roi, stat_list, Ly, Lx):
     return img
 
 
-# Pre-compile a regex matching folder names like ``2024-07-01_00018``
-# **and** ``+``-joined groups like ``2024-07-01_00018+2024-07-01_00019``
+# Pre-compile a regex matching folder names like ``2025-01-15_00001``
+# **and** ``+``-joined groups like ``2025-01-15_00001+2025-01-15_00002``
 # (preprocess_tiff_group merges multiple TIFFs into one recording named
 # by joining the source stems with ``+``). The ``(?:...)`` wraps a
 # non-capturing optional repetition: any number of ``+YYYY-MM-DD_NNN``
@@ -941,8 +941,8 @@ def get_fps_from_notes(
         if rec_root is None:
             return default_fps
 
-        # Folder name "2024-07-01_00018" -> date_str="2024-07-01",
-        # rec_str="00018". ``split("_", 1)`` splits at most once,
+        # Folder name "2025-01-15_00001" -> date_str="2025-01-15",
+        # rec_str="00001". ``split("_", 1)`` splits at most once,
         # leaving any trailing underscores in the second piece.
         date_str, rec_str = rec_root.name.split("_", 1)
         target = f"{date_str}-{rec_str}"

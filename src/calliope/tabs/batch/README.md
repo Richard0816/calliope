@@ -662,8 +662,8 @@ retries" suffix).
   "scratch_dir": "C:/calliope_scratch",
   "rows": [
     {
-      "identifier": "2024-07-01_00018",
-      "tiffs": ["D:/data/.../00018.tif"],
+      "identifier": "2025-01-15_00001",
+      "tiffs": ["/data/experiment/00001.tif"],
       "params": { ... overrides only — usually empty ... }
     },
     ...

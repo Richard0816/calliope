@@ -37,6 +37,6 @@ def test_recording_folder_itself(tmp_path):
 
 
 def test_date_pattern_still_wins(tmp_path):
-    p = tmp_path / "2024-07-01_00018" / "detection" / "final" / "suite2p" / "plane0"
+    p = tmp_path / "2025-01-15_00001" / "detection" / "final" / "suite2p" / "plane0"
     p.mkdir(parents=True)
-    assert utils.infer_recording_id(p / "sub") == "2024-07-01_00018"
+    assert utils.infer_recording_id(p / "sub") == "2025-01-15_00001"

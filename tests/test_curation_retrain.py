@@ -166,7 +166,7 @@ def test_open_dff_ignores_unprefixed_memmap(tmp_path):
 
 def test_recording_id_matches_utils(tmp_path):
     from calliope.core import utils
-    plane0 = tmp_path / "2024-07-01_00018" / "detection" / "final" / "suite2p" / "plane0"
+    plane0 = tmp_path / "2025-01-15_00001" / "detection" / "final" / "suite2p" / "plane0"
     plane0.mkdir(parents=True)
     assert (CP.CurationPopout._derive_recording_id(plane0)
             == utils.infer_recording_id(plane0))

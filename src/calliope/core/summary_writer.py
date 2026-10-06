@@ -191,8 +191,8 @@ def update_recording_meta(
     """
     plane0 = Path(plane0)
     # If the caller didn't pass a recording id, infer it from the
-    # path (``F:/data/Cx/2024-07-01_00018/suite2p/plane0`` ->
-    # ``2024-07-01_00018``).
+    # path (``/data/experiment/2025-01-15_00001/suite2p/plane0`` ->
+    # ``2025-01-15_00001``).
     rid = recording_id or _infer_recording_id(plane0)
     # List of (key, value) tuples becomes the two-column "Recording"
     # sheet. Empty strings (rather than NaN) when a value wasn't
