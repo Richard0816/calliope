@@ -158,3 +158,27 @@ def test_curation_app_does_not_advance_on_sentinel():
     assert steps == []
     app.CurationApp._on_flipped(stub, 3, 1)
     assert steps == [1]
+
+
+# ---- Tab 5 export button recovers when the export can't be dispatched ----
+
+def test_tab5_export_dispatch_failure_reenables_button(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+    from calliope.core import offload
+    from calliope.tabs.event_detection import tab as ed_tab
+
+    def boom(*a, **k):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(offload, "run_offloaded", boom)
+    monkeypatch.setattr(ed_tab.messagebox, "showerror", lambda *a, **k: None)
+    s = MagicMock()
+    s._plane0 = tmp_path
+    s._render_job = None
+    s._export_job = None
+    s._params = {}
+    s._on_export_error = (
+        lambda msg: ed_tab.EventDetectionTab._on_export_error(s, msg))
+    ed_tab.EventDetectionTab._on_export_figures(s)
+    s.export_btn.configure.assert_called_with(state="normal")
+    assert s._export_job is None

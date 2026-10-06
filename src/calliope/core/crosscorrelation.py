@@ -677,7 +677,7 @@ def _cluster_columns(clusters: dict, keep_mask: Optional[np.ndarray],
                 # Some Suite2p ROIs are not in the keep mask the memmap was
                 # written with; skip them so the slicing stays in range.
                 print(f"[xcorr] {name}: {int((~valid).sum())} ROI(s) not in "
-                      f"current filter, skipped.")
+                      f"the filtered dF/F (frozen keep mask), skipped.")
                 s2p = s2p[valid]
                 pos = pos[valid]
         else:

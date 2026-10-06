@@ -178,7 +178,7 @@ The cell-filter step gives you a reproducible "is this really a cell?" decision 
 2. The **raw** dF/F trace.
 3. The **low-pass-filtered** dF/F trace at the chosen cutoff.
 
-When you click *Compute*, it writes per-cell low-pass and derivative arrays to disk for Tab 5, and records the cutoff, filter order, derivative window and frame rate it used in the recording's `meta.json` (`lowpass_filtered`). Tab 5 reads that record, so its onset timing and onset-backtrack window match the filter you actually applied. *Compute* needs Tab 3's filtered dF/F; if only the unfiltered trace is on disk the panels still preview it, but *Compute* stays disabled and the status line says why.
+When you click *Compute*, it writes per-cell low-pass and derivative arrays to disk for Tab 5, and records the cutoff, filter order, derivative window and frame rate it used in the recording's `meta.json` (`lowpass_filtered`). Tab 5 reads that record, so its onset timing and onset-backtrack window match the filter you actually applied. Recordings low-passed before this record existed fall back to a 1 Hz cutoff; re-run *Compute* on them once to stamp it. *Compute* needs Tab 3's filtered dF/F; if only the unfiltered trace is on disk the panels still preview it, but *Compute* stays disabled and the status line says why.
 
 **Why it matters biologically.** GCaMP has slow kinetics (rise ~50–200 ms, decay ~hundreds of ms to seconds), so calcium events look like smoothed bumps regardless of how briefly the underlying spikes fired. We want to:
 

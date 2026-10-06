@@ -849,7 +849,11 @@ class EventDetectionTab(ctk.CTkFrame):
         self._last_data = data
         self.summary_btn.configure(state="normal")
         self.prominence_btn.configure(state="normal")
-        self.export_btn.configure(state="normal")
+        # An interactive export still running keeps its button disabled;
+        # _on_export_done / _on_export_error re-enable it.
+        job = getattr(self, "_export_job", None)
+        if job is None or not job.running():
+            self.export_btn.configure(state="normal")
 
         # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
         # propagation) can render the same events without re-detecting.
@@ -1001,14 +1005,20 @@ class EventDetectionTab(ctk.CTkFrame):
         if not quiet:
             from ...core.offload import run_offloaded
             self.export_btn.configure(state="disabled")
-            self._export_job = run_offloaded(
-                self, self._render_queue,
-                edr.export_event_figures_offload,
-                args=(str(plane0), params, str(figures_root)),
-                done_kind="export_done", error_kind="export_error",
-                progress_kind="status",
-                poll_ms=self.POLL_MS,
-            )
+            try:
+                self._export_job = run_offloaded(
+                    self, self._render_queue,
+                    edr.export_event_figures_offload,
+                    args=(str(plane0), params, str(figures_root)),
+                    done_kind="export_done", error_kind="export_error",
+                    progress_kind="status",
+                    poll_ms=self.POLL_MS,
+                )
+            except Exception as e:
+                # Dispatch itself failed (spawn / pickling): no job will
+                # ever post export_error, so recover the button here.
+                self._export_job = None
+                self._on_export_error(f"could not start export: {e}")
             return
 
         self.update_idletasks()

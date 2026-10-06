@@ -23,6 +23,9 @@ From `plane0/` (after Tabs 3 + 4):
 - `meta.json` `lowpass_filtered` (stamped by Tab 4 when it wrote the two
   memmaps above): the cutoff that drives the auto onset-backtrack window and
   the frame rate onsets are timed at (see `onset_backtrack_s` in §4).
+  Recordings low-passed before this stamp existed have no such section, so
+  Tab 5 falls back to a 1 Hz cutoff and `ops.npy` `fs`; re-run Tab 4
+  *Compute* on them to record the real cutoff.
 
 ---
 
