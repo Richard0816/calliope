@@ -3,7 +3,7 @@ pipeline_gui tab module.
 
 Why this file exists
 --------------------
-The eight tabs of CalLIOPE need to know about each other -- e.g. when
+The nine tabs of CalLIOPE (0-8) need to know about each other -- e.g. when
 Tab 1 finishes preprocessing, Tab 2 should pick up the result; when
 Tab 5 detects events, Tabs 7 and 8 should redraw with those events.
 Rather than wiring every tab to every other tab, all of them subscribe
@@ -11,28 +11,35 @@ to a single ``AppState`` object and that object broadcasts state
 changes. Tabs publish via ``set_*`` methods and listen via
 ``subscribe_*`` methods; nobody calls into a sibling tab directly.
 
-Three other reusable Tk helpers also live here:
+Other reusable Tk helpers also live here, notably:
 
-- ``AdvancedDialog`` / ``open_advanced``: an auto-built parameter form
-  (one Entry / Checkbutton / Combobox per parameter spec) that any tab
-  can pop up to let the user tweak its hyper-parameters.
+- ``AdvancedDialog`` / ``open_advanced`` / ``spec_defaults``: an
+  auto-built parameter form (one CTkEntry / CTkCheckBox / CTkComboBox
+  per parameter spec) that any tab can pop up to let the user tweak its
+  hyper-parameters.
 - ``parse_manual_roi_spec`` / ``format_roi_indices``: convert between
-  user-typed strings like "1-3,7,10-12" and Python lists of ints. Used
-  by Tabs 4, 5 and 6 for the manual ROI subset feature.
+  user-typed strings like "1-3,7,10-12" and Python lists of ints.
+  ``parse_manual_roi_spec`` is used by Tabs 4 and 5 (and
+  ``core.event_detection_run``) for the manual ROI subset feature;
+  Tab 6 uses only ``format_roi_indices``.
 - ``attach_fig_toolbar``: wraps every matplotlib figure with a
   pan / zoom / save toolbar plus a "Save data..." button that writes
   the underlying numerics to CSV.
 - ``QueueWriter``: a file-like object that captures ``print(...)``
   output from a worker thread and puts each line onto a ``queue.Queue``
   so the main thread can fold it into the GUI's log panel.
+- Layout / plumbing helpers: ``install_scroll_router``,
+  ``attach_resize_handle``, ``drain_queue``, ``report_stage_error``,
+  ``apply_ttk_dark_theme``, ``pick_tiffs_dialog`` and
+  ``restyle_matplotlib_toolbar``.
 
 Kept separate from ``pipeline_gui.py`` so each tab can be its own
 importable module without pulling in the rest of the GUI.
 """
 
-# Turns every type hint in this file into a string at parse time. Used
-# here so the ``Optional[PreprocessResult]`` annotation on AppState
-# stays cheap even if ``PreprocessResult`` import gets expensive later.
+# Turns every type hint in this file into a string at parse time, so
+# annotations never cost anything at import. (The ``PreprocessResult``
+# import below is still an ordinary runtime import.)
 from __future__ import annotations
 
 # Standard-library bits we'll need.
@@ -56,8 +63,9 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 
-# Imported only so the type hint ``Optional[PreprocessResult]`` below
-# works -- this file never instantiates PreprocessResult itself.
+# Used for the ``Optional[PreprocessResult]`` hints on AppState; this
+# file never instantiates PreprocessResult itself. It is a plain
+# (eager) runtime import, not a ``TYPE_CHECKING``-only one.
 from .core.preprocessing import PreprocessResult
 
 
@@ -498,7 +506,9 @@ class AppState:
     """Mutable state shared across tabs.
 
     Each "channel" (preprocess result, plane0 path, lowpass-ready flag,
-    event-detection results) follows the same simple recipe:
+    event-detection results, clusters-ready, xcorr-ready, stage error,
+    release-memmaps) follows the same simple recipe (release-memmaps
+    is a pure signal with no stored value):
 
         1. A public attribute holds the latest value (or ``None``).
         2. A private list holds the subscriber callbacks.
@@ -514,8 +524,11 @@ class AppState:
     """
 
     def __init__(self) -> None:
-        # Channels: each is the *latest* published value, or None until
-        # the producer publishes one.
+        # Informational only: Tab 1 writes these three (its working
+        # folder, the data root and the first selected TIFF), but no tab
+        # currently reads them -- downstream tabs use the ``plane0`` /
+        # ``result`` channels instead. Kept as plain attributes (no
+        # subscribe/set pair) and cleared by ``reset()``.
         self.working_dir: Optional[Path] = None
         self.data_root: Optional[Path] = None
         self.selected_tiff: Optional[Path] = None
@@ -526,7 +539,8 @@ class AppState:
         # Tab 6 + Tab 7 broadcast a "stage finished" signal that the
         # batch runner subscribes to so it can advance to the next
         # stage. Payloads carry the plane0 / output path the producer
-        # tab just wrote.
+        # tab just wrote. Consumers use the listener payload; the stored
+        # value is only the latest payload, nothing reads it back.
         self.clusters_ready: Optional[Path] = None
         self.xcorr_ready: Optional[Path] = None
         # Latest stage-error string (transient; not reset across runs --
@@ -618,7 +632,7 @@ class AppState:
 
     # ---- event-detection results channel (Tab 5 -> Tabs 7 + 8) ----
 
-    def subscribe_event_results(self, fn) -> None:
+    def subscribe_event_results(self, fn) -> Callable[[], None]:
         """Subscribe to Tab 5 event-detection result publications.
 
         Listener receives a dict with keys: ``plane0``, ``event_windows``,
@@ -636,7 +650,7 @@ class AppState:
 
     # ---- clustering-ready channel (Tab 6 -> batch runner) ----
 
-    def subscribe_clusters_ready(self, fn) -> None:
+    def subscribe_clusters_ready(self, fn) -> Callable[[], None]:
         """Subscribe to Tab 6's "clustering analysis finished" signal.
 
         Listener receives the plane0 path the clustering ran on so
@@ -655,7 +669,7 @@ class AppState:
 
     # ---- crosscorrelation-ready channel (Tab 7 -> batch runner) ----
 
-    def subscribe_xcorr_ready(self, fn) -> None:
+    def subscribe_xcorr_ready(self, fn) -> Callable[[], None]:
         """Subscribe to Tab 7's "xcorr finished" signal.
 
         Listener receives the output directory Tab 7 wrote into. Returns
@@ -673,7 +687,7 @@ class AppState:
 
     # ---- stage-error channel (any tab's worker failure -> batch runner) ----
 
-    def subscribe_stage_error(self, fn) -> None:
+    def subscribe_stage_error(self, fn) -> Callable[[], None]:
         """Subscribe to "an analysis tab's worker thread failed" signals.
 
         Each pipeline tab publishes here from its ``_on_error`` handler
@@ -731,6 +745,9 @@ class AppState:
         stage absent from the new run will leave the prior tab's view in
         place; that's a known limitation of the additive reload.
         """
+        self.working_dir = None
+        self.data_root = None
+        self.selected_tiff = None
         self.result = None
         self.plane0 = None
         self.lowpass_plane0 = None
@@ -744,8 +761,8 @@ class AppState:
 # ---------------------------------------------------------------------------
 
 class AdvancedDialog(ctk.CTkToplevel):
-    """Modal Toplevel that auto-builds an Entry/Combobox form from a
-    list of parameter specs and writes accepted values into ``current``.
+    """Modal ``CTkToplevel`` that auto-builds a CTkEntry / CTkComboBox /
+    CTkCheckBox form from a list of parameter specs and writes accepted values into ``current``.
 
     A "spec list" is just a Python list of dicts, where each dict
     describes one parameter:
@@ -763,12 +780,13 @@ class AdvancedDialog(ctk.CTkToplevel):
         name    : str              - the dict key in ``current``
         label   : str              - field label shown to the user
         type    : 'float' | 'int' | 'str' | 'bool' | 'choice'
-        group   : str              - LabelFrame heading for grouping
+        group   : str              - heading of the CTkFrame section
+                                     the field is grouped under
         choices : list[str]        - required iff type == 'choice'
         help    : str              - optional one-line tooltip text
 
-    Subclassing ``tk.Toplevel`` makes an instance behave like a modal
-    pop-up window. The dialog mutates the caller's ``current`` dict in
+    Subclassing ``ctk.CTkToplevel`` makes an instance behave like a
+    modal pop-up window. The dialog mutates the caller's ``current`` dict in
     place when the user clicks OK; the caller checks the returned bool
     to know whether anything actually changed.
     """
