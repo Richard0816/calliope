@@ -29,6 +29,7 @@ __all__ = [
     "build_score_image",
     "load_keep_mask",
     "render_panel",
+    "render_background_panel",
     "render_score_panel",
 ]
 

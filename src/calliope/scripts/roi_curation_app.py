@@ -32,6 +32,10 @@ Options
     --repredict         Force a re-predict pass even if
                         ``predicted_cell_prob.npy`` already exists
                         in plane0.
+    --size-outlier-z Z  Post-CNN size gate for every re-predict
+                        (default ``config.SIZE_OUTLIER_Z``; 0 = off).
+                        Use the value the recordings were detected
+                        with so the mask matches Tab 3's.
 
 What it does
 ------------
@@ -103,7 +107,7 @@ class _Plane0State:
         self.loaded = False
 
     def load(self, ckpt_arg: str | None, force_predict: bool,
-             sort_mode: str) -> None:
+             sort_mode: str, size_outlier_z: float | None = None) -> None:
         """Resolve probs (running predict if needed), load stat +
         ops, build the ``sorted_idx`` order. Idempotent: ``load(...)``
         on an already-loaded state re-sorts but doesn't reload arrays
@@ -117,7 +121,7 @@ class _Plane0State:
         from ..core.cellfilter import config as C
         prob_path = self.plane0 / C.PREDICTED_PROB_NAME
         if force_predict or not prob_path.exists():
-            self._run_predict(ckpt_arg)
+            self._run_predict(ckpt_arg, size_outlier_z)
         # Load arrays + recompute sort.
         if not self.loaded:
             self.stat = np.load(self.plane0 / "stat.npy",
@@ -133,7 +137,8 @@ class _Plane0State:
         self.sorted_idx = _sort_order(
             int(len(self.stat)), self.probs, sort_mode)
 
-    def _run_predict(self, ckpt_arg: str | None) -> None:
+    def _run_predict(self, ckpt_arg: str | None,
+                     size_outlier_z: float | None = None) -> None:
         from ..core.cellfilter import config as C
         from ..core.cellfilter.predict import (
             load_model_from_checkpoint,
@@ -158,7 +163,10 @@ class _Plane0State:
             rec_id = _u.infer_recording_id(self.plane0)
         except Exception:
             rec_id = self.plane0.parent.name
-        predict_recording(rec_id, model, device, plane0=self.plane0)
+        if size_outlier_z is None:
+            size_outlier_z = C.SIZE_OUTLIER_Z
+        predict_recording(rec_id, model, device, plane0=self.plane0,
+                          size_outlier_z=size_outlier_z)
 
 
 def _sort_order(n_total: int, probs: np.ndarray | None,
@@ -196,8 +204,10 @@ class CurationApp:
     def __init__(self, plane0_paths: list[Path],
                  *, ckpt_arg: str | None,
                  sort_mode: str,
-                 force_predict_initial: bool) -> None:
+                 force_predict_initial: bool,
+                 size_outlier_z: float | None = None) -> None:
         self._ckpt_arg = ckpt_arg
+        self._size_outlier_z = size_outlier_z
         self._sort_mode = sort_mode
         self._force_predict_initial = force_predict_initial
 
@@ -430,7 +440,8 @@ class CurationApp:
         st = self._states[key]
         try:
             st.load(self._ckpt_arg, force_predict=True,
-                    sort_mode=self._sort_mode)
+                    sort_mode=self._sort_mode,
+                    size_outlier_z=self._size_outlier_z)
         except Exception as e:
             messagebox.showerror("Predict failed", str(e))
             return
@@ -455,7 +466,8 @@ class CurationApp:
         try:
             st.load(self._ckpt_arg,
                     force_predict=self._force_predict_initial,
-                    sort_mode=self._sort_mode)
+                    sort_mode=self._sort_mode,
+                    size_outlier_z=self._size_outlier_z)
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
             return
@@ -479,7 +491,10 @@ class CurationApp:
         from ..tabs.suite2p.curation_popout import CurationPopout
         self._popout = CurationPopout(
             self._root, st.plane0, st.stat, st.ops,
-            on_iscell_changed=self._on_flipped)
+            on_iscell_changed=self._on_flipped,
+            get_size_outlier_z=(
+                None if self._size_outlier_z is None
+                else lambda: self._size_outlier_z))
         self._popout_plane0 = st.plane0
         self._cur_pos = 0
         # Bind Prev / Next ROI navigation. Bound on the popout
@@ -583,6 +598,10 @@ def main(argv: list[str] | None = None) -> None:
         "--repredict", action="store_true",
         help="Force re-predict even if predicted_cell_prob.npy "
              "exists for plane0s opened from this session.")
+    ap.add_argument(
+        "--size-outlier-z", type=float, default=None,
+        help="Post-CNN size gate for re-predicts (default "
+             "cellfilter.config.SIZE_OUTLIER_Z; 0 = off).")
     args = ap.parse_args(argv)
 
     plane0_paths: list[Path] = []
@@ -603,6 +622,7 @@ def main(argv: list[str] | None = None) -> None:
         ckpt_arg=args.ckpt,
         sort_mode=args.sort,
         force_predict_initial=args.repredict,
+        size_outlier_z=args.size_outlier_z,
     )
     app.mainloop()
 

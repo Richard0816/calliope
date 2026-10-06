@@ -21,9 +21,12 @@ GPU box.
 Usage
 -----
     python -m calliope.core.cellfilter.predict --plane0 PATH [PATH ...]
+            [--ckpt PATH] [--size-outlier-z Z]
         --- predicts for the listed plane0 directories. Multiple
             paths are batched in one Python process so the model
-            checkpoint is loaded only once.
+            checkpoint is loaded only once. ``--size-outlier-z 0``
+            turns the post-CNN size gate off, matching Tab 3's
+            ``size_outlier_z`` setting.
 
 Accepts full traces at inference (no random crop).
 """
@@ -166,7 +169,7 @@ def load_model_from_checkpoint(ckpt_path: Path,
     return model
 
 
-def main():
+def main(argv: list[str] | None = None):
     """CLI entry: predict cell-mask for one recording (or many).
 
     Argument structure (parsed via ``argparse``)
@@ -177,6 +180,10 @@ def main():
     --ckpt PATH
         Override checkpoint path (defaults to
         ``CHECKPOINT_DIR/best.pt``).
+    --size-outlier-z Z
+        Post-CNN size gate (defaults to ``config.SIZE_OUTLIER_Z``;
+        ``0`` disables). Pass the same value the recording was
+        detected with so the mask matches Tab 3's.
 
     Steps
     -----
@@ -199,7 +206,11 @@ def main():
     ap.add_argument(
         "--ckpt", type=str, default=None,
         help="Path to checkpoint. Defaults to CHECKPOINT_DIR/best.pt")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--size-outlier-z", type=float, default=C.SIZE_OUTLIER_Z,
+        help="Post-CNN size gate: drop kept ROIs whose robust z of "
+             "log(npix) exceeds this (default %(default)s; 0 = off).")
+    args = ap.parse_args(argv)
 
     ckpt_path = Path(args.ckpt) if args.ckpt else (C.CHECKPOINT_DIR / "best.pt")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -217,7 +228,8 @@ def main():
         except Exception:
             rec_id = plane0.parent.name
         try:
-            predict_recording(rec_id, model, device, plane0=plane0)
+            predict_recording(rec_id, model, device, plane0=plane0,
+                              size_outlier_z=args.size_outlier_z)
         except Exception as ex:
             print(f"[skip] {plane0}: {ex}")
 
