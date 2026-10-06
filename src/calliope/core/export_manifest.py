@@ -6,7 +6,7 @@ which CalLIOPE commit produced these, what params were used, what's the
 indicator + tau + fs, and how many cells survived the cellfilter pass.
 
 Intentionally small surface. Reads only what already lives on disk
-(``ops.npy``, ``stat.npy``, ``predicted_cell_mask.npy``); never
+(``ops.npy``, ``stat.npy``, the keep-mask files); never
 re-derives anything that costs compute. Safe to call even on partial
 pipelines — every field is optional and falls back to ``None``.
 """
@@ -28,8 +28,8 @@ def _git_sha(repo_hint: Path) -> Optional[str]:
     """HEAD SHA of the calliope checkout, or None when unavailable.
 
     ``repo_hint`` should point at a directory inside the calliope
-    source tree. Returns ``None`` when there's no ``.git`` (e.g. a
-    packaged/exported copy) or the ``git`` binary isn't on PATH.
+    source tree. Returns ``None`` when the source isn't a git checkout
+    (e.g. an unpacked source archive) or the ``git`` binary isn't on PATH.
     """
     try:
         out = subprocess.check_output(
@@ -41,7 +41,7 @@ def _git_sha(repo_hint: Path) -> Optional[str]:
         )
         return out.strip() or None
     except (OSError, subprocess.SubprocessError):
-        # git binary absent (frozen build / not on PATH) or the call
+        # git binary not on PATH, not a git checkout, or the call
         # failed/timed out -- all expected; the SHA is optional provenance.
         return None
 
@@ -92,9 +92,13 @@ def write_export_manifest(
     ``<save_folder>/calliope_figures``); the manifest sits next to the
     per-stage subdirectories so all stages share one receipt.
 
-    Reads ``ops.npy`` / ``stat.npy`` / ``predicted_cell_mask.npy`` when
-    ``plane0`` is supplied. Pulls ``tau`` / ``fs`` from ``ops`` first,
-    leaving them ``None`` when ops are missing.
+    Reads ``ops.npy`` / ``stat.npy`` / the keep mask when ``plane0`` is
+    supplied. Pulls ``tau`` / ``fs`` from ``ops`` first, leaving them
+    ``None`` when ops are missing. ``n_cells_kept`` is the count the
+    exported figures were built from: the frozen
+    ``r0p7_cell_mask_bool.npy`` written alongside the filtered dF/F
+    memmaps, falling back to ``predicted_cell_mask.npy`` -> ``iscell.npy``
+    -> the filtered memmap's column count (``utils.kept_roi_count``).
 
     Each call *merges* into any existing manifest rather than
     overwriting it: ``params`` accumulates into the union of every
@@ -181,13 +185,17 @@ def write_export_manifest(
                 manifest["n_cells_total"] = int(len(stat))
             except (OSError, ValueError, pickle.UnpicklingError) as e:
                 print(f"[manifest] could not read stat.npy at {stat_p}: {e}")
-        mask_p = plane0 / "predicted_cell_mask.npy"
-        if mask_p.is_file():
-            try:
-                mask = np.load(mask_p)
-                manifest["n_cells_kept"] = int(np.asarray(mask).sum())
-            except (OSError, ValueError, pickle.UnpicklingError) as e:
-                print(f"[manifest] could not read mask at {mask_p}: {e}")
+        # Kept count as the downstream stages see it: the FROZEN mask the
+        # filtered memmaps were written with, not the live
+        # predicted_cell_mask.npy (which curation can change afterwards).
+        from .utils import kept_roi_count
+        n_kept = kept_roi_count(
+            plane0,
+            on_error=lambda e: print(
+                f"[manifest] could not read keep mask in {plane0}: {e}"),
+        )
+        if n_kept is not None:
+            manifest["n_cells_kept"] = int(n_kept)
 
     out.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
