@@ -66,6 +66,33 @@ cellpose model (~1 GB, one time).
 
 A **Batch runner** tab queues recordings and chains all eight stages.
 
+## Changes in this release
+
+Changes that affect existing outputs, scripts or batch files:
+
+- **NWB export.** `iscell_prob` now holds the Suite2p classifier
+  probability (`iscell.npy` column 1). The 0/1 accept label moved to a
+  new `iscell` column. New columns: `cellfilter_prob` (CalLIOPE
+  cell-filter probability) and `kept` (1 = ROI kept for downstream
+  analysis).
+- **GPU fallback.** On a machine with CuPy installed but no reachable
+  CUDA device, GPU stages now fall back to the CPU path instead of
+  failing at the first GPU operation.
+- **Batch report.** `batch_report.csv` has a row-level `error` column
+  with the failing stage's message.
+- **Batch parameters.** New per-row keys: `zdrift_qc`,
+  `keep_registration_cache`, `n_shuffles`, `compute_partial`. Removed:
+  `cutoff_min` / `cutoff_max` (they only set Tab 4's slider range and
+  had no effect in a batch run). A blank or missing batch cell now means
+  the batch default, not the value the previous row left in the tab.
+- **Clustering export.** `cluster_results/` also saves
+  `linkage_roi_ids.npy` (the Suite2p ids the linkage was built on);
+  Reload and Export refuse when the kept ROIs have changed since.
+- **`meta.json`.** `dff.baseline_min_sec` is now in seconds (it held
+  minutes under a seconds name).
+- **Dependencies.** `seaborn` and `scikit-image` are no longer
+  required.
+
 ## License
 
 MIT.
