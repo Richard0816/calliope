@@ -834,6 +834,21 @@ Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`,
     code silently falls back to CPU if CuPy is missing, so it's safe
     to leave True. The OOM auto-retry path forces this off on the
     conservative pass.
+- **`n_shuffles`** — *int*, default = `500`.
+  - **What it does:** number of circular-shift null draws per ROI
+    pair; adds `p_value` / `p_value_fdr` columns to the summary CSVs.
+    `0` skips the test. Ignored by per-event runs.
+  - **What it means to you:** the smallest reportable p is
+    `1/(n_shuffles+1)`; raise it for finer p-values at linear time
+    cost, or set 0 for a fast exploratory batch.
+- **`compute_partial`** — *bool*, default = `False`.
+  - **What it does:** computes the population partial-correlation
+    matrix once and adds `partial_corr_zero_lag` plus a
+    `CAxCB_corr_heatmaps.png` per cluster pair (full-recording run
+    only; auto-skipped when `N_union >= 0.5*T`).
+  - **What it means to you:** turn on to separate direct coupling
+    from a shared driver; costs one precision-matrix solve plus a
+    heatmap per pair.
 
 #### 7. Pipeline-wide — dF/F baseline (suite2p detection)
 

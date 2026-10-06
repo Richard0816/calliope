@@ -799,6 +799,16 @@ def build_batch_param_spec() -> list:
         {"name": "use_gpu", "label": "Use GPU for xcorr",
          "type": "bool", "default": True,
          "group": "6. Cross-correlation"},
+        {"name": "n_shuffles", "label": "xcorr shuffles (0 = off)",
+         "type": "int", "default": 500,
+         "group": "6. Cross-correlation",
+         "help": "circular-shift null draws per ROI pair; 0 skips the "
+                 "p-value columns"},
+        {"name": "compute_partial", "label": "xcorr partial correlation",
+         "type": "bool", "default": False,
+         "group": "6. Cross-correlation",
+         "help": "population partial-correlation column + heatmap "
+                 "(full-recording run; needs N < T/2)"},
     ])
 
     # 7. Pipeline-wide -- Tab 3's dF/F baseline (suite2p detection).

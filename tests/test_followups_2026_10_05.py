@@ -38,3 +38,34 @@ def test_pipeline_mask_count_anchors_to_memmap_size(tmp_path):
     np.zeros((T, 2), dtype=np.float32).tofile(
         p0 / "r0p7_filtered_dff.memmap.float32")
     assert utils.pipeline_mask_count(p0, 3) == 2
+
+
+# ---- batch spec carries the xcorr shuffle / partial knobs ----
+
+def test_batch_spec_has_xcorr_shuffle_and_partial():
+    from calliope.tabs.batch.logic import build_batch_param_spec
+    spec = {e["name"]: e for e in build_batch_param_spec()}
+    assert spec["n_shuffles"]["default"] == 500
+    assert spec["compute_partial"]["default"] is False
+    assert spec["n_shuffles"]["group"] == "6. Cross-correlation"
+
+
+def test_xcorr_apply_batch_row_parses_string_bools():
+    import types
+    from calliope.tabs.crosscorrelation.tab import CrossCorrelationTab
+
+    class _V:
+        def __init__(self):
+            self.v = None
+
+        def set(self, v):
+            self.v = v
+
+    s = types.SimpleNamespace(maxlag_var=_V(), zero_lag_var=_V(),
+                              gpu_var=_V(), n_shuffles_var=_V(),
+                              partial_corr_var=_V())
+    CrossCorrelationTab.apply_batch_row(
+        s, {"zero_lag": "false", "use_gpu": "False",
+            "compute_partial": "true"})
+    assert s.zero_lag_var.v is False and s.gpu_var.v is False
+    assert s.partial_corr_var.v is True

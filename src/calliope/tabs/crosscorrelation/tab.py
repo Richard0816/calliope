@@ -684,9 +684,9 @@ class CrossCorrelationTab(ctk.CTkFrame):
         if "max_lag_seconds" in p:
             self.maxlag_var.set(str(p["max_lag_seconds"]))
         if "zero_lag" in p:
-            self.zero_lag_var.set(bool(p["zero_lag"]))
+            self.zero_lag_var.set(_as_bool(p["zero_lag"]))
         if "use_gpu" in p:
-            self.gpu_var.set(bool(p["use_gpu"]))
+            self.gpu_var.set(_as_bool(p["use_gpu"]))
         # Shuffle-null size and partial-correlation toggle: honoured when
         # the row carries them (including explicit 0 / False); otherwise
         # the Tab 7 widget values stay in effect.

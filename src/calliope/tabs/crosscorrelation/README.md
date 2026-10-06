@@ -35,8 +35,10 @@ From `plane0/`:
 > a child process (`run_cluster_xcorr_offload` via `core.offload`) and
 > adds its interactive filters. The GUI batch drives Tab 7 through
 > `apply_batch_row`, which honours a row's `max_lag_seconds`, `zero_lag`,
-> `use_gpu`, `n_shuffles` and `compute_partial` (absent keys leave the
-> widgets as they are). `run_crosscorrelation` also reads an optional
+> `use_gpu`, `n_shuffles` and `compute_partial`. All five are batch
+> columns (group `6. Cross-correlation`), so a blank cell means the batch
+> default; a direct `apply_batch_row` call without a key leaves that
+> widget as it is. Bool values accept strings such as `"false"`. `run_crosscorrelation` also reads an optional
 > `shuffle_seed` (default 0).
 
 ### Step 1 — Open dF/F and the cluster files
