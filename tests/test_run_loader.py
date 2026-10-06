@@ -131,7 +131,7 @@ def test_clusters_and_xcorr_detected_under_prefix(tmp_path):
     plane0 = _make_plane0(run)
     _touch(plane0 / "F.npy")
     _touch(plane0 / "stat.npy")
-    cdir = plane0 / "r0p7_filtered_cluster_results" / "gui_recluster"
+    cdir = plane0 / "r0p7_filtered_cluster_results"
     _touch(cdir / "linkage.npy")
     _touch(cdir / "cross_correlation_full" / "C0_C1.csv")
     inv = run_loader.scan_run(run)
@@ -176,7 +176,7 @@ def test_full_run_reports_everything(tmp_path):
               "r0p7_filtered_dff_lowpass.memmap.float32",
               "r0p7_filtered_dff_dt.memmap.float32"):
         _touch(plane0 / f)
-    cdir = plane0 / "r0p7_filtered_cluster_results" / "gui_recluster"
+    cdir = plane0 / "r0p7_filtered_cluster_results"
     _touch(cdir / "linkage.npy")
     _touch(cdir / "cross_correlation_per_event" / "event_0.csv")
     _write_manifest(run, {"min_prominence": 0.1})
