@@ -281,11 +281,12 @@ Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 
 Every processed recording writes `<plane0>/meta.json`, a single provenance file downstream tools read as the source of truth for how the recording was produced. It is filled across the detection/extraction and dF/F stages and groups its fields by stage:
 
 - **registration** — `block_size`, `smooth_sigma`, `nonrigid`
-- **detection** — `threshold_scaling`, `sparse_mode`
+- **detection** — `threshold_scaling`, `sparse_mode` (the schema also carries `cellpose_enabled`, `cellpose_model`, `cellpose_flow_threshold`, `enable_sam_vcorr_pass`, but these are reserved: no stage stamps them yet, so they stay `null`)
 - **extraction** — `neuropil_coef`, `tau_seconds`, `gcamp_variant_label` (stamped from the Tab 3 GCaMP dropdown)
 - **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec`, `fps`
 - **lowpass** — `cutoff_hz`, `filter_kind`, `order`
-- **spike_inference** — `backend` (`"oasis"`)
+- **spike_inference** — `backend` (always `"oasis"`, the only backend)
+- **denoising** — reserved stub (`applied: false`, `model: null`); nothing writes it yet
 - **qc** — the z-drift fields written by Step 8
 
 Writes are atomic (temp file + replace). Reads are always safe: a missing file or missing key falls back to defaults, so an older recording without a sidecar still loads.
