@@ -104,7 +104,7 @@ that tab's full parameter reference.
 The directional-monotonicity test's internals (`n_angles=360`,
 `n_shuffles=10000`, `seed=0`, passed to
 `spatial_helpers.directional_monotonicity_spearman` at
-[`tab.py:945`](tab.py)) are **hardcoded**, not user-tunable — they are
+[`tab.py:965`](tab.py)) are **hardcoded**, not user-tunable — they are
 fixed so the permutation p-value is reproducible across recordings.
 (`spatial_helpers` is `logic.py`'s re-export shim for `core.spatial`,
 so this is the same helper as the `core.spatial` one named above.)
@@ -113,7 +113,7 @@ The only user-tunable control on Tab 8 itself is one inline toggle:
 
 | Setting (`key`) | Default | What it does | What it means to you |
 | --- | --- | --- | --- |
-| Use Suite2p spks (`_use_spks_var`) | `False` (unchecked) | **What it does.** A `BooleanVar` checkbox ([`tab.py:184`](tab.py)). Unchecked, the per-ROI first-activation time is Tab 5's hysteresis-onset estimate (the published `first_time` / `A`). Checked, `_apply_spks_override` ([`tab.py:535`](tab.py)) loads `spks.npy` via `core.utils.s2p_load_spks` (auto-orients to `(T, N_kept)`, subset to `kept_idx`), and `_first_time_from_spks` ([`tab.py:600`](tab.py)) recomputes activation per event window `[t0, t1]`: it slices frames `[floor(t0·fps), ceil(t1·fps))`, finds the **first frame with `spks > 0`** per ROI (`argmax` over a boolean mask), and writes that as `first_time`; ROIs with no deconvolved spike in the window are marked inactive (`A=False`, `first_time=NaN`). It mutates `self._data["A"]` / `["first_time"]` in place; unchecking restores the stashed Tab 5 matrices from `_last_results`. Requires a valid `fps` and an on-disk `spks.npy`, or it silently reverts. | Flip this when you trust Suite2p's OASIS deconvolution more than the hysteresis-onset detector — e.g. when dF/F is noisy and the Schmitt-trigger onset times look jittery, or to sanity-check that the propagation direction is robust to the activation-time definition. Spks onsets are typically **sparser and crisper** (one frame per spike), so expect fewer participating ROIs per event and a cleaner cyan→red gradient; the monotonicity ρ and p-value will shift accordingly. Gotchas: it only redefines *timing within already-detected windows* — it does **not** re-detect events, so the event count and `[t0, t1]` bounds are unchanged; it needs `spks.npy` in the plane0 folder and a known `fps` (the toggle auto-unchecks with a status-bar message if either is missing); and the override is what gets written when you **Export figures**, recorded as `use_spks_override` in the export manifest. Parallels the `spks` signal-kind radio on Tab 5 (set both the same way if you want both tabs reading the deconvolved signal), but the activation rule differs: Tab 5 reruns MAD-z + hysteresis on `spks.npy`, whereas Tab 8 here just takes the first non-zero spks frame in the window — so the two won't produce identical onset times even with both set to spks.
+| Use Suite2p spks (`_use_spks_var`) | `False` (unchecked) | **What it does.** A `BooleanVar` checkbox ([`tab.py:190`](tab.py)). Unchecked, the per-ROI first-activation time is Tab 5's hysteresis-onset estimate (the published `first_time` / `A`). Checked, `_apply_spks_override` ([`tab.py:552`](tab.py)) loads `spks.npy` via `core.utils.s2p_load_spks` (auto-orients to `(T, N_kept)`, subset to `kept_idx`), and `_first_time_from_spks` ([`tab.py:618`](tab.py)) recomputes activation per event window `[t0, t1]`: it slices frames `[floor(t0·fps), ceil(t1·fps))`, finds the **first frame with `spks > 0`** per ROI (`argmax` over a boolean mask), and writes that as `first_time`; ROIs with no deconvolved spike in the window are marked inactive (`A=False`, `first_time=NaN`). It mutates `self._data["A"]` / `["first_time"]` in place; unchecking restores the stashed Tab 5 matrices from `_last_results`. Requires a valid `fps` and an on-disk `spks.npy`, or it silently reverts. | Flip this when you trust Suite2p's OASIS deconvolution more than the hysteresis-onset detector — e.g. when dF/F is noisy and the Schmitt-trigger onset times look jittery, or to sanity-check that the propagation direction is robust to the activation-time definition. Spks onsets are typically **sparser and crisper** (one frame per spike), so expect fewer participating ROIs per event and a cleaner cyan→red gradient; the monotonicity ρ and p-value will shift accordingly. Gotchas: it only redefines *timing within already-detected windows* — it does **not** re-detect events, so the event count and `[t0, t1]` bounds are unchanged; it needs `spks.npy` in the plane0 folder and a known `fps` (the toggle auto-unchecks with a status-bar message if either is missing); and the override is what gets written when you **Export figures**, recorded as `use_spks_override` in the export manifest. Parallels the `spks` signal-kind radio on Tab 5 (set both the same way if you want both tabs reading the deconvolved signal), but the activation rule differs: Tab 5 reruns MAD-z + hysteresis on `spks.npy`, whereas Tab 8 here just takes the first non-zero spks frame in the window — so the two won't produce identical onset times even with both set to spks.
 
 Event navigation (Prev / Next buttons, the `ttk.Spinbox` bound to
 `event_var`) is not a setting — it only selects which already-computed
@@ -125,9 +125,18 @@ Tab 5 doesn't ship `stat`/`ops` (they're large and the consumer can
 load them itself), so on each ingest Tab 8 reads:
 
 - `stat.npy` — Suite2p ROI pixel masks for `paint_spatial`.
-- `ops.npy` — `Ly`, `Lx`, and optional `pix_to_um`.
+- `core.utils.load_plane_view(plane0)` — the merged suite2p 1.0 view
+  (`db.npy` / `settings.npy` / `reg_outputs.npy` / `detect_outputs.npy`,
+  falling back to a legacy `ops.npy`) for `Ly`, `Lx`, and the optional
+  `pix_to_um` calibration. `pix_to_um` goes through
+  `core.scale.resolve_pix_to_um` — the same resolver the Export-figures
+  path uses — so a missing or non-positive value means pixel axes both
+  on screen and in the exported PNGs.
 
-Both are cached per `plane0` to avoid re-reading on every Tab 5 publish.
+The result is cached per `plane0`, keyed on `stat.npy`'s modification
+time and size, so a Tab 5 re-publish doesn't re-read it but a
+re-detection that rewrites `stat.npy` in the same session is picked up
+(otherwise the fresh `kept_idx` would index stale ROI footprints).
 
 ## Per-event painting (one navigation click)
 
@@ -151,23 +160,17 @@ For the selected event index `k`:
 - Top-left and top-right: identical `imshow` (with
   `cmap=CYAN_TO_RED`, `vmin=0`, `vmax=1`, `origin="upper"` plus a
   flipped y-extent so the FOV matches suite2p's GUI orientation, axes
-  in µm if `ops["pix_to_um"]` is present, else pixels) — built by a single
+  in µm if a valid `pix_to_um` resolved, else pixels) — built by a single
   inner helper that takes a `with_arrows` flag. The right-hand variant
   adds white-with-black-edge centroid dots and white `arrowstyle="->"`
   arrows connecting successive frame groups.
-- Bottom: blank axis matched to the same FOV extent, centred in a 1:2:1
-  inner-grid so it sits horizontally aligned with the top pair instead
-  of stretching to the full window width. Each frame group becomes a
-  `Circle` patch coloured by its absolute frame index via the same
-  `CYAN_TO_RED` cmap (linear in `frame - f_min`, so non-contiguous
-  active frames stay positioned correctly on the colour scale). Black
-  arrows connect successive groups. A vertical colorbar on the right
-  reports the frame range as ticks (`f_min`, midpoint, `f_max`); no
-  per-circle text labels. The circle radius is `0.20 * sigma_xy *
-  scale`, clamped to `[0.4%, 4%]` of the largest FOV dimension —
-  `sigma_xy = sqrt(var_x + var_y)` is roughly 1.41σ in 2D, and
-  rendering it at full scale blots out the FOV for diffuse frames, so
-  we shrink to ~28% of one std and cap it.
+- Bottom: the three-subplot directional-monotonicity panel described
+  at the top of this README. The Spearman sweep + 10k-shuffle null runs
+  on a background thread (debounced 150 ms so rapid Prev / Next only
+  computes the settled event); a placeholder is shown until it returns.
+  (A "vectors-only" panel of per-frame `Circle` patches sized by
+  `sigma_xy` used to sit here; it was dropped on 2026-05-10 because the
+  top-right arrow overlay already carries that information.)
 
 All helpers (`order_map_for_event`, `paint_order_map`,
 `event_frame_centroids`, `CYAN_TO_RED`) live in
@@ -186,14 +189,17 @@ view) as `event_001.png`, `event_002.png`, … in `figures_dir`. The
 returns (`event_windows`, `A`, `first_time`, `kept_idx`, `fps`), so the
 batch orchestrator hands one stage's output straight to the next.
 
-The interactive Tab 8 still owns the full four-panel view + directional
-monotonicity analysis and listens to `state.event_results` — those panels stay in
+The interactive Tab 8 still owns the full three-panel view (both
+order maps + the directional-monotonicity analysis) and listens to
+`state.event_results` — those panels stay in
 `tabs/spatial_propagation/tab.py`.
 
 ## UI
 
 - **Status label** — tells the user when Tab 5 events are available
   and how many.
+- **Export figures** — writes per-event PNG + SVG figures and the
+  export manifest (see *On-disk outputs*).
 - **Refresh from Tab 5** — re-pulls the most recent
   `state.event_results` (useful after manually loading a saved
   recording).
@@ -219,19 +225,27 @@ doesn't yank you back to event 1 unless the event count drops).
 3. Subscribe to `AppState.event_results` (the publish-side is in
    Tab 5's `_on_render_done`). Translate the published `kept_idx`
    into `stat_filtered` by indexing the locally-loaded `stat.npy`.
-4. Paint two figures per event on demand (one for the order map +
-   arrow overlay, one for vectors-only with std circles). Rebuild
-   each figure on every render so colorbars don't stack.
-5. Use a `Spinbox` + Prev / Next buttons for navigation. Honour
-   `ops["pix_to_um"]` if present (axes in µm), else fall back to
-   pixels — both panels share the same scale factor.
+4. Paint three figures per event on demand (plain order map, order
+   map + arrow overlay, and the directional-monotonicity panel).
+   Rebuild each figure on every render so colorbars don't stack.
+5. Use a `Spinbox` + Prev / Next buttons for navigation. Honour a
+   valid `pix_to_um` (via `core.scale.resolve_pix_to_um`) if present
+   (axes in µm), else fall back to pixels — all panels share the same
+   scale factor.
 
 ## On-disk outputs
 
-None in v1. Everything is in-memory. Saving per-event PNG batches and
-a `coactivation_summary.csv` (per-ROI timing per event) is on the
-roadmap and will mirror the layout written by the legacy
-`spatial_heatmap_updated.coactivation_maps`.
+Browsing is in-memory; nothing is written until you click **Export
+figures**. That button (`_on_export_figures`) calls
+`core.spatial.render_spatial_event_figures` on the current Tab 8 data
+(including the spks override, if active) and writes, per event, the
+order-map-with-arrows panel as `event_001.png` + `event_001.svg`, … into
+`<save_folder>/calliope_figures/spatial_propagation/`, then refreshes
+`<save_folder>/calliope_figures/manifest.json` (recording id, plane0,
+`use_spks_override`, `n_events`). Tab 0's batch pipeline writes the
+same per-event figures headlessly (see *Headless figure rendering*
+above). The EventMonotonicity scalars are written to the event
+workbook by Tab 5 / `core.event_detection_run`, not by this tab.
 
 
 ## UI affordances
@@ -240,4 +254,4 @@ Tab 8 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Three stacked matplotlib panels** (Activation order map, Activation order with arrows, Monotonicity panels) — matplotlib figures keep their white facecolor; navigation toolbars below each are dark-skinned.
 - **Event navigation row.** Prev / Next `CTkButton`s + a `ttk.Spinbox` (no CTk spinbox equivalent) to step through events.
-- **No popouts.** The Refresh button re-reads the event list from Tab 5 / from the EventWindows sheet on disk.
+- **No popouts.** The **Refresh from Tab 5** button re-ingests the in-memory `state.event_results` from Tab 5's latest publish; it does not read anything from disk.

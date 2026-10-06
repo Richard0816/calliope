@@ -69,6 +69,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from .logic import spatial as spatial_helpers
+from ...core import scale as scale_mod
 from ...core import utils as core_utils
 
 from ...gui_common import AppState, attach_fig_toolbar
@@ -97,7 +98,8 @@ class SpatialPropagationTab(ctk.CTkFrame):
         Set fresh in every ``_ingest_results`` call.
     ``_event_index`` : currently displayed event (0-based).
     ``_plane0_cache`` : cache of (stat, Ly, Lx, pix_to_um) keyed by
-        plane0 path so we don't re-read ops.npy on every publish.
+        plane0 path plus stat.npy's mtime/size, so we don't re-read the
+        plane metadata on every publish but do pick up a re-detection.
     """
 
     def __init__(self, master, state: AppState) -> None:
@@ -114,9 +116,12 @@ class SpatialPropagationTab(ctk.CTkFrame):
         # thread's result for a previous event is dropped.
         self._mono_after_id: Optional[str] = None
         self._mono_token: int = 0
-        # Cache of stat/Ly/Lx/pix_to_um keyed by plane0 path so we don't
-        # re-load Suite2p metadata on every Tab 5 publish.
-        self._plane0_cache: dict[Path, dict] = {}
+        # Cache of stat/Ly/Lx/pix_to_um keyed by (plane0, stat.npy
+        # mtime_ns, size) so we don't re-load Suite2p metadata on every
+        # Tab 5 publish, yet a re-detection that rewrites stat.npy in the
+        # same session invalidates the entry (stale stat would make the
+        # fresh kept_idx index the wrong ROI footprints).
+        self._plane0_cache: dict[tuple, dict] = {}
         # Stash of the *raw* Tab 5 publish (with hysteresis-onset
         # ``A`` / ``first_time``) so we can switch back to it when the
         # user untoggles the spks override after we've replaced
@@ -290,7 +295,6 @@ class SpatialPropagationTab(ctk.CTkFrame):
         # map, and a per-Δframe pairwise-distance violin was replaced
         # with this monotonicity test -- spread alone didn't tell us
         # about direction.
-        body.rowconfigure(1, weight=1)
         f_dist = ctk.CTkFrame(body)
         f_dist.grid(row=1, column=0, columnspan=2, sticky="nsew",
                     pady=(4, 0))
@@ -302,8 +306,7 @@ class SpatialPropagationTab(ctk.CTkFrame):
             font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
         self.fig_dist = plt.Figure(figsize=(8, 4.2), tight_layout=True)
-        self.ax_dist = self.fig_dist.add_subplot(111)
-        self.ax_dist.set_axis_off()
+        self.fig_dist.add_subplot(111).set_axis_off()
         self.canvas_dist = FigureCanvasTkAgg(self.fig_dist, master=f_dist)
         self.toolbar_dist = attach_fig_toolbar(
             self.canvas_dist, f_dist, data_basename="monotonicity")
@@ -499,17 +502,30 @@ class SpatialPropagationTab(ctk.CTkFrame):
         self._render_event(self._event_index)
 
     def _load_plane0_meta(self, plane0: Path) -> dict:
-        cached = self._plane0_cache.get(plane0)
+        stat_path = plane0 / "stat.npy"
+        try:
+            st = stat_path.stat()
+            key = (plane0, st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = (plane0, None, None)
+        cached = self._plane0_cache.get(key)
         if cached is not None:
             return cached
         view = core_utils.load_plane_view(plane0)
-        stat_all = np.load(plane0 / "stat.npy", allow_pickle=True)
+        stat_all = np.load(stat_path, allow_pickle=True)
         meta = {
             "stat_all": stat_all,
             "Ly": int(view["Ly"]), "Lx": int(view["Lx"]),
-            "pix_to_um": view.get("pix_to_um", None),
+            # Same resolver the Export-figures path uses
+            # (core.spatial.render_spatial_event_figures), so a stored
+            # non-positive / invalid pix_to_um falls back to pixel axes
+            # on screen exactly as it does in the exported PNGs.
+            "pix_to_um": scale_mod.resolve_pix_to_um(view),
         }
-        self._plane0_cache[plane0] = meta
+        # Drop any older entry for this plane0 (superseded stat.npy).
+        for k in [k for k in self._plane0_cache if k[0] == plane0]:
+            del self._plane0_cache[k]
+        self._plane0_cache[key] = meta
         return meta
 
     # -- Spks override ------------------------------------------------------
@@ -730,7 +746,6 @@ class SpatialPropagationTab(ctk.CTkFrame):
         else:
             extent = [0, Lx, Ly, 0]
             xlabel, ylabel = "X (px)", "Y (px)"
-        fov_w = Lx * scale; fov_h = Ly * scale
 
         # Per-frame centroid + 2D-spread groups.
         frame_groups = []
@@ -828,10 +843,12 @@ class SpatialPropagationTab(ctk.CTkFrame):
         3. ``ρ_obs = ρ(θ*)`` where θ* maximises ρ. Magnitude is the
            monotonicity strength; near 0 means no direction, near 1
            means perfectly monotone.
-        4. Permutation test for significance: at θ*, shuffle the
-           activation times across cells ``N`` times and recompute
-           ρ_k. The fraction of shuffles with ``ρ_k >= ρ_obs`` is the
-           empirical p-value.
+        4. Permutation test for significance: shuffle the activation
+           times across cells ``N`` times; for each shuffle re-sweep θ
+           and keep the *maximum* ρ over all angles (``ρ_k = max_θ``),
+           mirroring how ρ_obs was picked. The fraction of shuffles with
+           ``ρ_k >= ρ_obs`` is the empirical p-value (corrected for the
+           360-angle search).
 
         The panel is three subplots:
 
@@ -862,24 +879,24 @@ class SpatialPropagationTab(ctk.CTkFrame):
 
         sel = active_col & ~np.isnan(first_col)
         if not np.any(sel):
-            self.ax_dist = self.fig_dist.add_subplot(111)
-            self.ax_dist.set_axis_off()
-            self.ax_dist.text(
+            ax = self.fig_dist.add_subplot(111)
+            ax.set_axis_off()
+            ax.text(
                 0.5, 0.5, "no participating ROIs",
                 ha="center", va="center",
-                transform=self.ax_dist.transAxes)
+                transform=ax.transAxes)
             return
 
         roi_local = np.where(sel)[0]
         n = int(roi_local.size)
         if n < 3:
-            self.ax_dist = self.fig_dist.add_subplot(111)
-            self.ax_dist.set_axis_off()
-            self.ax_dist.text(
+            ax = self.fig_dist.add_subplot(111)
+            ax.set_axis_off()
+            ax.text(
                 0.5, 0.5,
                 "need >= 3 active ROIs for monotonicity test",
                 ha="center", va="center",
-                transform=self.ax_dist.transAxes)
+                transform=ax.transAxes)
             return
 
         # Pixel positions; the test is rotation-invariant so the px↔µm
@@ -923,11 +940,11 @@ class SpatialPropagationTab(ctk.CTkFrame):
                "ev_idx": ev_idx}
 
         # Placeholder while the worker runs (cleared above).
-        self.ax_dist = self.fig_dist.add_subplot(111)
-        self.ax_dist.set_axis_off()
-        self.ax_dist.text(
+        ax = self.fig_dist.add_subplot(111)
+        ax.set_axis_off()
+        ax.text(
             0.5, 0.5, "computing directional monotonicity ...",
-            ha="center", va="center", transform=self.ax_dist.transAxes)
+            ha="center", va="center", transform=ax.transAxes)
 
         # Token already bumped at the top of this method; capture it so
         # the worker's result is dropped if the user navigates onward.
@@ -962,14 +979,14 @@ class SpatialPropagationTab(ctk.CTkFrame):
             return
         self.fig_dist.clear()
         if not result:
-            self.ax_dist = self.fig_dist.add_subplot(111)
-            self.ax_dist.set_axis_off()
-            self.ax_dist.text(
+            ax = self.fig_dist.add_subplot(111)
+            ax.set_axis_off()
+            ax.text(
                 0.5, 0.5,
                 "monotonicity test undefined "
                 "(no spread in t or in x/y)",
                 ha="center", va="center",
-                transform=self.ax_dist.transAxes)
+                transform=ax.transAxes)
             self.canvas_dist.draw_idle()
             return
         self._draw_monotonicity_panels(result, ctx)
@@ -996,10 +1013,6 @@ class SpatialPropagationTab(ctk.CTkFrame):
         ax_xy = self.fig_dist.add_subplot(gs[0, 0])
         ax_curve = self.fig_dist.add_subplot(gs[0, 1])
         ax_null = self.fig_dist.add_subplot(gs[0, 2])
-        # Keep self.ax_dist pointing at *something* — downstream code
-        # (status updates, fig save) references it; pick the curve
-        # since that's the panel's signature image.
-        self.ax_dist = ax_curve
 
         # (a) Scatter coloured by activation time, with a θ* arrow.
         # Units on this subplot follow the rest of Tab 8 (µm when

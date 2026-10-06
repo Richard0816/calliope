@@ -305,12 +305,15 @@ def directional_monotonicity_spearman(
     * ``rho_obs`` -- ρ(θ*), in [-1, 1]; magnitude is the monotonicity
       strength, 0 ≈ no directional structure, 1 = perfectly monotone
       along θ*.
-    * Significance via a permutation test on activation times: at θ*,
-      shuffle ``t_i`` across cells ``n_shuffles`` times and compute
-      ρ for each shuffle. Spearman is rank-based so we precompute
-      the rank of ``s_i(θ*)`` once and permute the rank of ``t``
-      (numerically equivalent and ~30x faster than re-ranking each
-      shuffle).
+    * Significance via a permutation test on activation times: shuffle
+      ``t_i`` across cells ``n_shuffles`` times and, for each shuffle,
+      re-sweep the same θ grid and keep the *maximum* ρ over all
+      angles (a max-over-θ null). Because ρ_obs is itself a max over
+      ``n_angles`` directions, comparing it against a fixed-θ* null
+      would inflate significance. Spearman is rank-based so the
+      projection ranks ``s_i(θ)`` are precomputed once for every θ
+      and only the rank of ``t`` is permuted; one matmul then gives ρ
+      at every (shuffle, angle) pair.
 
     Parameters
     ----------
@@ -338,7 +341,7 @@ def directional_monotonicity_spearman(
           'rho_curve': (n_angles,) ρ at each θ,
           'theta_star':float, argmax θ (rad),
           'rho_obs':   float, ρ(θ*),
-          'null_rho':  (n_shuffles,) permutation-test ρ values,
+          'null_rho':  (n_shuffles,) per-shuffle max-over-θ ρ,
           'p_value':   float, P(shuffled ρ >= ρ_obs),
         }``
         Returns ``{}`` (empty dict) when there's insufficient signal
@@ -448,8 +451,11 @@ def render_spatial_event_figures(
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    ev = np.asarray(event_data.get("event_windows"))
-    if ev is None or ev.size == 0:
+    raw_ev = event_data.get("event_windows")
+    if raw_ev is None:
+        return []
+    ev = np.asarray(raw_ev)
+    if ev.size == 0:
         return []
     A = np.asarray(event_data["A"])
     first_time = np.asarray(event_data["first_time"])

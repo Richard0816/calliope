@@ -9,7 +9,7 @@ mean images, generating QC GIFs) lives in
 tab module can write::
 
     from . import logic as preprocessing
-    preprocessing.preprocess_tiff(...)
+    preprocessing.preprocess_offload(...)
 
 and keep its call sites unchanged even if the underlying functions
 move around inside ``core``.
@@ -25,7 +25,7 @@ The ``__all__`` list at the bottom is Python's way of saying "these
 are the public names of this module". When someone does
 ``from calliope.tabs.preprocess.logic import *`` they get exactly
 the names listed; ``__all__`` is only consulted for ``import *`` --
-explicit imports like ``from logic import preprocess_tiff`` always
+explicit imports like ``from logic import list_tiffs`` always
 work regardless.
 """
 
@@ -35,18 +35,24 @@ from __future__ import annotations
 # Three-dot relative import: go up TWO levels from ``tabs/preprocess/``
 # to ``calliope/``, then into ``core.preprocessing``. The dots count
 # package levels, not directories.
+#
+# Only the names Tab 1 actually uses: the child-process targets
+# (``preprocess_offload`` for a run, ``load_existing_offload`` for
+# regenerating an archived recording) and the cheap discovery helpers.
+# ``preprocess_tiff`` / ``preprocess_tiff_group`` run inside the child
+# process and are reached from ``core.preprocessing`` directly.
 from ...core.preprocessing import (
     PreprocessResult,
     list_tiffs,
+    load_existing_offload,
     load_existing_preprocess,
-    preprocess_tiff,
-    preprocess_tiff_group,
+    preprocess_offload,
 )
 
 __all__ = [
     "PreprocessResult",
     "list_tiffs",
+    "load_existing_offload",
     "load_existing_preprocess",
-    "preprocess_tiff",
-    "preprocess_tiff_group",
+    "preprocess_offload",
 ]
