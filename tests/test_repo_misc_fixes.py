@@ -134,3 +134,22 @@ def test_rehydrate_events_uses_apply_batch_row() -> None:
     # No PARAM_SPEC keys -> reported as a defaults fallback.
     assert PipelineApp._rehydrate_events(
         fake_app, {"onset_source": "x"}) is False
+
+
+def test_rehydrate_events_reports_apply_failure() -> None:
+    from types import SimpleNamespace
+    from calliope.pipeline_gui import PipelineApp
+
+    class _BadEv:
+        PARAM_SPEC = [{"name": "z_enter"}]
+        _suppress_manifest_write = False
+
+        def apply_batch_row(self, params, log=None):
+            raise ValueError("bad z_enter")
+
+        def _on_render(self):
+            pass
+
+    fake_app = SimpleNamespace(event_tab=_BadEv())
+    assert PipelineApp._rehydrate_events(fake_app, {"z_enter": "x"}) is False
+    assert "bad z_enter" in fake_app._rehydrate_error

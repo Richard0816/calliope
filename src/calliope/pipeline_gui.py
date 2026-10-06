@@ -642,10 +642,15 @@ class PipelineApp(ctk.CTk):
         # Same public seam Tab 0's batch runner uses: applies the
         # PARAM_SPEC keys plus the manual-subset / onset-source Tk vars
         # the render path snapshots (else they'd revert to GUI defaults).
+        self._rehydrate_error = None
         try:
             ev.apply_batch_row(params)
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't block the reload, but don't claim the saved params
+            # were used either: report it and fall back to "defaults".
+            print(f"[open run] could not apply saved event params: {e}")
+            self._rehydrate_error = str(e)
+            had_params = False
         # Don't let the reload's own recompute write params back to the
         # manifest -- we'd either rewrite what we just read or, if none
         # were found, record GUI defaults as the run's real settings.
@@ -711,6 +716,12 @@ class PipelineApp(ctk.CTk):
             lines += [f"  • {x}" for x in skipped]
 
         warns: list[str] = []
+        rehydrate_err = getattr(self, "_rehydrate_error", None)
+        if rehydrate_err:
+            warns.append(
+                f"The run's saved event-detection parameters could not be "
+                f"applied ({rehydrate_err}), so events may have been "
+                f"recomputed with other settings than the original run.")
         spec_keys = {s["name"] for s in self.event_tab.PARAM_SPEC}
         if inv.has_lowpass and not (set(params or {}) & spec_keys):
             warns.append(
