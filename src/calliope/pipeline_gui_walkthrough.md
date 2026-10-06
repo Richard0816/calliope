@@ -200,7 +200,7 @@ The first **derivative** of the low-pass trace (Savitzky-Golay smoothed) is what
 **What it does.** Two levels of "what's happening?":
 
 1. **Per-ROI onsets.** For each cell, it computes a robust z-score of the derivative (using median + MAD instead of mean + std, which is robust to outliers — see Stern et al. 2024) and runs **hysteresis thresholding** (Schmitt trigger): an onset is recorded when the cell's derivative-z crosses up through the *enter* threshold (default `3.5`, robust-z/MAD units); the cell then stays active — suppressing further onsets — until its derivative-z drops below the *exit* threshold (default `1.5`), at which point the detector re-arms. Only counting a new onset after the cell has fully de-activated stops a trace hovering near threshold from registering repeated spurious onsets. Onsets within `min_sep_s` (default `0.1 s`) of the previous accepted onset in the same ROI are merged.
-2. **Population events.** Once you have onsets for every cell, you build a histogram across time (`bin_sec=0.025` → 25 ms bins), Gaussian-smooth it (`sigma=1.5 bins`), then `find_peaks` on the smoothed density to find moments where many cells fired in a narrow window. Around each peak, the algorithm walks outward until the density falls back to baseline + `k·noise`, then enforces a hard physiological cap (default `0.5 s` — anything longer than this in epileptiform recordings is probably two events fused). If two walked windows overlap, they get *watershed-split* at the local minimum between their peaks.
+2. **Population events.** Once you have onsets for every cell, you build a histogram across time (`bin_sec=0.05` → 50 ms bins), Gaussian-smooth it (`sigma=1.5 bins`), then `find_peaks` on the smoothed density to find moments where many cells fired in a narrow window. Around each peak, the algorithm walks outward until the density falls back to baseline + `k·noise`, then enforces a hard physiological cap (`max_event_duration_s`, default `1.3 s` — anything much longer in epileptiform recordings is probably two events fused). If two walked windows overlap, they get *watershed-split* at the local minimum between their peaks.
 
 The three panels show: (1) sorted-by-activity heatmap of the low-pass dF/F, (2) sorted event raster (one dot per onset), (3) the smoothed density with detected event windows shaded.
 
@@ -212,7 +212,7 @@ The popout also overlays the **circular-shift null floor** — the p95/p99 of ca
 
 **Why it matters biologically.** This is the bridge from "calcium signals" to "events that a neurophysiologist would talk about." A **per-ROI onset** is the closest you get to a spike train without doing deconvolution. A **population event** is the calcium-imaging equivalent of an EEG ictal/interictal spike — the kind of thing you'd point to in a paper and say "the slice seized for 0.4 seconds, here are the cells that participated."
 
-The defaults are tuned for **short epileptiform events** (<0.5 s). If you're studying a slower phenomenon (e.g. spreading depolarization, tens of seconds), you'd loosen the duration cap and lengthen the rolling baseline window.
+The defaults are tuned for **short epileptiform events** (up to about a second). If you're studying a slower phenomenon (e.g. spreading depolarization, tens of seconds), you'd loosen the duration cap and lengthen the rolling baseline window.
 
 **Biological output.** (a) Per-cell spike-train-like onset times, (b) population event windows in seconds, (c) for every event × cell combination, did that cell participate?
 
@@ -305,7 +305,7 @@ You record a 10-minute, 15 fps calcium movie of a brain slice in low-magnesium a
 | 1–2 | The recording is stable, no obvious drift, ~200 candidate cell-shaped objects in the field of view. |
 | 3 | Suite2p + Cellpose find 312 ROIs; the cell filter accepts 187 as real cells. dF/F is computed; baseline is a rolling 10th-percentile over 45 s. |
 | 4 | The FFT shows clear signal up to ~3 Hz and white noise above. You pick a 1 Hz cutoff. |
-| 5 | 187 cells produce 4,200 onsets across the recording. The population-event detector finds 23 events, mean duration 0.32 s, well under the 0.5 s cap — consistent with brief interictal spikes. |
+| 5 | 187 cells produce 4,200 onsets across the recording. The population-event detector finds 23 events, mean duration 0.32 s, well under the 1.3 s cap — consistent with brief interictal spikes. |
 | 6 | Hierarchical clustering at the auto cut groups the cells into 4 clusters. The spatial map shows cluster C1 is a tight clump in the upper-left quadrant; C2 is a more diffuse ring; C3 and C4 are scattered. |
 | 7 | Across all 23 events, C1 leads C2 by a mean of 47 ms (`p < 0.001`), and C2 leads C3 by 22 ms (`p < 0.01`). C4's lags are not significantly different from zero — it follows the population without driving it. |
 | 8 | Clicking through the 23 per-event activation-order maps, the upper-left quadrant lights up cyan in 19/23 events with red trailing toward the lower-right — a stereotyped propagation pattern that visualises the C1 → C2 → C3 lead/lag found in Tab 7. |
