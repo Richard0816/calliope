@@ -1530,6 +1530,10 @@ class Suite2pTab(ctk.CTkFrame):
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
                     on_iscell_changed=self._on_iscell_flipped,
+                    get_size_outlier_z=lambda: float(
+                        self._params.get("size_outlier_z", 4.0)),
+                    get_ckpt_path=lambda: self.ckpt_var.get(),
+                    on_checkpoint_trained=self._on_cellfilter_retrained,
                 )
             except Exception as e:
                 messagebox.showerror("Curation popout failed", str(e))
@@ -1605,6 +1609,14 @@ class Suite2pTab(ctk.CTkFrame):
                             popout._T = 0
             except Exception:
                 pass
+
+    def _on_cellfilter_retrained(self, ckpt_path: Path) -> None:
+        """Curation-popout Retrain wrote a new ``best.pt``: select it so
+        later "Run detection" passes use the retrained model rather
+        than the bundled checkpoint. Browse... still switches back."""
+        self.ckpt_var.set(str(ckpt_path))
+        self._append_log(
+            f"[GUI] cell-filter checkpoint set to retrained {ckpt_path}")
 
     def _on_iscell_flipped(self, roi_idx: int, new_value: int) -> None:
         """Listener fired by the popout after a successful classification

@@ -51,14 +51,18 @@ from pathlib import Path
 # --- Paths ---
 # Curation CSV: one row per (plane0_path, ROI_number) with a 0/1
 # label. The training pipeline reads this; the Tab 3 popout and the
-# standalone ``scripts/roi_curation_app.py`` append to it. Lives
-# inside the project (next to the bundled cell-filter checkpoint)
-# so a fresh clone of the repo has everything it needs to
-# retrain without any external drive present.
+# standalone ``calliope.scripts.roi_curation_app`` upsert into it.
+# Its location is in-project (next to the bundled cell-filter
+# checkpoint) so it does not depend on any external drive, but the
+# file itself is gitignored and NOT shipped: labels are per-curator
+# data, and each row's ``plane0_path`` is an absolute path to a
+# recording on the curator's own disk. A fresh clone therefore starts
+# with no labels; public users curate their own recordings and
+# fine-tune the bundled checkpoint (see README 4.6b).
 #
 # Schema: ``plane0_path, recording_ID, ROI_number,
 # user_defined_cell, timestamp_iso``. Created lazily on the first
-# label append; missing CSV is treated as "no curated labels yet"
+# label write; missing CSV is treated as "no curated labels yet"
 # by ``dataset.load_labels``.
 LABELS_CSV = (Path(__file__).resolve().parents[2]
               / "data" / "cellfilter_labels.csv")
@@ -74,7 +78,8 @@ CHECKPOINT_DIR = Path.home() / ".calliope" / "cellfilter_checkpoints"
 DFF_PREFIX = "r0p7_"         # neuropil-corrected dF/F memmap prefix.
 PATCH_SIZE = 32              # spatial patch edge, pixels.
 TRACE_CROP_LEN = 2000        # random crop length for training (frames).
-VAL_FRAC = 0.20              # fraction of recordings held out for validation.
+VAL_FRAC = 0.20              # validation fraction: of ROIs (split="roi", the
+                             # default) or of recordings (split="recording").
 RANDOM_SEED = 0              # reproducible split between train / val.
 
 # --- Augmentation (training only; validation and inference pass through) ---
@@ -106,7 +111,9 @@ DROPOUT = 0.3                # applied between MLP layers.
 
 # --- Training ---
 BATCH_SIZE = 32
-LR = 1e-3                    # Adam learning rate.
+LR = 1e-3                    # Adam learning rate (training from random init).
+WARM_START_LR = 1e-4         # Adam learning rate when fine-tuning an existing
+                             # checkpoint (Tab 3 Retrain warm-starts with this).
 WEIGHT_DECAY = 1e-5          # L2 regularisation.
 EPOCHS = 40                  # max epochs; early-stopping ends sooner.
 NUM_WORKERS = 0              # Windows: keep 0 to avoid multiproc headaches.
