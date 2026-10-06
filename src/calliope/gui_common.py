@@ -540,7 +540,8 @@ class AppState:
         # batch runner subscribes to so it can advance to the next
         # stage. Payloads carry the plane0 / output path the producer
         # tab just wrote. Consumers use the listener payload; the stored
-        # value is only the latest payload, nothing reads it back.
+        # value is only the latest payload; nothing outside the setter
+        # reads it back.
         self.clusters_ready: Optional[Path] = None
         self.xcorr_ready: Optional[Path] = None
         # Latest stage-error string (transient; not reset across runs --
