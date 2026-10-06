@@ -247,7 +247,7 @@ Buttons that *do* something but carry no tunable value:
 
 ## Advanced settings (inline knobs)
 
-Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-var on the tab itself, defined in `tabs/clustering/tab.py`. Defaults are the literal `tk.*Var(value=…)` defaults. The headless equivalents (the `params` dict consumed by [`core/clustering.py`](../../core/clustering.py) `run_clustering`) are noted per row so a script run reproduces the GUI. Tab 0's batch runner sets `prefix` / `palette` / `threshold` through `ClusteringTab.apply_batch_row`: a `threshold` > 0 is an absolute Ward cut that the next Run applies in manual mode (clamped to `[0, zmax]`) and the batch export uses; `0` means auto.
+Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-var on the tab itself, defined in `tabs/clustering/tab.py`. Defaults are the literal `tk.*Var(value=…)` defaults. The headless equivalents (the `params` dict consumed by [`core/clustering.py`](../../core/clustering.py) `run_clustering`) are noted per row so a script run reproduces the GUI. Tab 0's batch runner sets `prefix` / `palette` / `threshold` through `ClusteringTab.apply_batch_row`: a `threshold` > 0 is an absolute Ward cut that the next Run applies in manual mode (clamped to `[0, zmax]`) and the batch export uses; `0` means auto. The batch pushes `threshold` only at the clustering stage, and an interactive Run (no batch active) discards any cut a batch left armed, so a skipped or aborted batch stage can't force its cut on your next Run.
 
 | Setting (`var`) | GUI label | Default | What it does | What it means to you |
 | --- | --- | --- | --- | --- |

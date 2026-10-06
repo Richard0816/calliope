@@ -133,3 +133,49 @@ def test_gui_export_refuses_mismatched_translator(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="Re-run clustering"):
         ctab.ClusteringTab._export_clusters(s)
     assert not list(tmp_path.glob("**/C*_rois.npy"))
+
+
+def _run_stub(batch_active):
+    s = _stub()
+    s.state = MagicMock(batch_active=batch_active)
+    s._job = None
+    s.path_var = _Var("nowhere")
+    s.prefix_var = _Var("r0p7_filtered_")
+    s._inputs_ready = lambda p0, pre: False   # stop right after the guard
+    return s
+
+
+def test_interactive_run_drops_leftover_batch_cut(monkeypatch):
+    # A batch whose clustering stage was skipped / aborted (or whose
+    # xcorr stage re-armed the cut) must not force that cut on the
+    # user's next interactive Run.
+    monkeypatch.setattr(cl_tab.messagebox, "showerror", lambda *a, **k: None)
+    s = _run_stub(batch_active=False)
+    ClusteringTab.apply_batch_row(s, {"threshold": 2.5})
+    ClusteringTab._on_run(s)
+    assert s._batch_threshold is None
+
+
+def test_batch_run_keeps_its_cut(monkeypatch):
+    monkeypatch.setattr(cl_tab.messagebox, "showerror", lambda *a, **k: None)
+    s = _run_stub(batch_active=True)
+    ClusteringTab.apply_batch_row(s, {"threshold": 2.5})
+    ClusteringTab._on_run(s)
+    assert s._batch_threshold == 2.5
+
+
+def test_batch_pushes_cluster_threshold_only_at_clustering_stage():
+    import types
+    from calliope.tabs.batch.tab import BatchTab
+
+    got = []
+    tab = types.SimpleNamespace(
+        apply_batch_row=lambda p, log=None: got.append(dict(p)))
+    s = types.SimpleNamespace(
+        _app=types.SimpleNamespace(clustering_tab=tab),
+        _append_log=lambda m: None,
+        _effective_row_params=lambda row: {"threshold": 2.5, "palette": "x"})
+    BatchTab._apply_row_params_to_tabs(s, None, "xcorr")
+    BatchTab._apply_row_params_to_tabs(s, None, "clustering")
+    assert "threshold" not in got[0] and got[0]["palette"] == "x"
+    assert got[1]["threshold"] == 2.5

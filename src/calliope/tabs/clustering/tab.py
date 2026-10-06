@@ -169,7 +169,8 @@ class ClusteringTab(ctk.CTkFrame):
         self._auto_threshold: float = 0.7  # fraction of max
         self._manual_T: float = 0.7  # absolute distance
         # Absolute cut requested by a Tab 0 batch row (``threshold`` > 0);
-        # applied (manual mode) by the next _on_done, then cleared.
+        # applied (manual mode) by the next _on_done, then cleared. An
+        # interactive (non-batch) Run drops any leftover request.
         self._batch_threshold: Optional[float] = None
 
         # Visual cluster index -> raw fcluster label, refreshed every render
@@ -614,6 +615,11 @@ class ClusteringTab(ctk.CTkFrame):
         if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "Analysis already running.")
             return
+        # A batch-requested cut belongs to a batch Run only. A batch whose
+        # clustering stage was skipped or aborted can leave one armed;
+        # an interactive Run must start from the auto pick instead.
+        if not getattr(self.state, "batch_active", False):
+            self._batch_threshold = None
         plane0 = Path(self.path_var.get())
         prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
         if not self._inputs_ready(plane0, prefix):

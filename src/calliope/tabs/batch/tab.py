@@ -1779,7 +1779,8 @@ class BatchTab(ctk.CTkFrame):
         merged.update(getattr(row, "params", None) or {})
         return merged
 
-    def _apply_row_params_to_tabs(self, row: "BatchRow") -> None:
+    def _apply_row_params_to_tabs(self, row: "BatchRow",
+                                  stage: Optional[str] = None) -> None:
         """Push the row's effective params into each pipeline tab BEFORE
         its run method fires.
 
@@ -1798,6 +1799,11 @@ class BatchTab(ctk.CTkFrame):
         reaches into any tab's private attributes / Tk vars -- so a rename
         inside a tab is a normal (loud) error there, not a silent no-op
         here.
+
+        Exception: Tab 6's ``threshold`` arms a one-shot cut that the
+        next clustering Run consumes, so it is pushed only when ``stage``
+        is ``"clustering"`` (or ``None``, i.e. not stage-driven). Pushing
+        it at the xcorr stage re-armed a cut clustering had already used.
         """
         p = self._effective_row_params(row)
         app = self._app
@@ -1808,7 +1814,11 @@ class BatchTab(ctk.CTkFrame):
                      "event_tab", "clustering_tab", "xcorr_tab"):
             tab = getattr(app, attr, None)
             if tab is not None and hasattr(tab, "apply_batch_row"):
-                tab.apply_batch_row(p, log=self._append_log)
+                tp = p
+                if (attr == "clustering_tab" and stage is not None
+                        and stage != "clustering"):
+                    tp = {k: v for k, v in p.items() if k != "threshold"}
+                tab.apply_batch_row(tp, log=self._append_log)
 
     def _apply_save_policy_to_detection_tab(self) -> None:
         """Translate the "What to save" toggles into Tab 3's
@@ -1865,7 +1875,7 @@ class BatchTab(ctk.CTkFrame):
         # (cheap dict / Tk var writes); re-applied on every transition
         # to defend against intermediate mutations.
         try:
-            self._apply_row_params_to_tabs(self._current_row)
+            self._apply_row_params_to_tabs(self._current_row, stage)
         except Exception as e:
             ident = (self._current_row.identifier
                      if getattr(self, "_current_row", None) is not None
