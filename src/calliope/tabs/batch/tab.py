@@ -71,6 +71,16 @@ from .logic import (
     scratch_root_problem, synchronous_final_sweep,
 )
 
+# Tab 5 knobs that live in Tk vars, not in any PARAM_SPEC, so they are
+# not in the union spec's defaults. Pinned to Tab 5's own widget defaults
+# so a row that doesn't set them gets these instead of whatever the
+# previous row (or the user) left in Tab 5.
+ROW_FIXED_DEFAULTS = {
+    "manual_subset_enabled": False,
+    "manual_roi_spec": "",
+    "onset_source": "derivative",
+}
+
 
 class BatchRow:
     """One recording in the queue. Owns its widgets, identifier,
@@ -1754,10 +1764,13 @@ class BatchTab(ctk.CTkFrame):
         ``default_params``, but rows loaded from a CSV / JSON may carry
         only some keys (or none). Filling the gaps here means a blank
         key means "batch default" rather than "whatever the previous
-        row left in the tab". During a run the ``default_params``
-        snapshot taken at Run All (``_run_default_params``) is used.
+        row left in the tab". ``ROW_FIXED_DEFAULTS`` adds the Tab 5
+        manual-subset / onset-source keys that no PARAM_SPEC carries.
+        During a run the ``default_params`` snapshot taken at Run All
+        (``_run_default_params``) is used.
         """
         merged = spec_defaults(self.PARAM_SPEC)
+        merged.update(ROW_FIXED_DEFAULTS)
         # While a batch runs, use the defaults frozen at Run All so every
         # stage of every row sees the same batch defaults.
         frozen = getattr(self, "_run_default_params", None)

@@ -95,3 +95,20 @@ def test_nwb_export_reads_effective_params(monkeypatch):
     s._row_results = {"plane0": "x"}
     BatchTab._maybe_export_nwb_for_row(s)
     assert any("pynwb not installed" in m for m in logs)
+
+
+def test_blank_row_resets_tab5_subset_and_onset_source():
+    # manual_subset_enabled / manual_roi_spec / onset_source are Tab 5 Tk
+    # vars outside every PARAM_SPEC; a blank row must still reset them.
+    s = _stub()
+    s._app = types.SimpleNamespace(event_tab=_RecordingTab())
+    tab = s._app.event_tab
+    BatchTab._apply_row_params_to_tabs(s, _row({
+        "manual_subset_enabled": True, "manual_roi_spec": "1-3",
+        "onset_source": "spks"}))
+    assert tab.state["manual_roi_spec"] == "1-3"
+
+    BatchTab._apply_row_params_to_tabs(s, _row({}))
+    assert tab.state["manual_subset_enabled"] is False
+    assert tab.state["manual_roi_spec"] == ""
+    assert tab.state["onset_source"] == "derivative"

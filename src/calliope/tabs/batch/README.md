@@ -711,7 +711,11 @@ PARAM_SPEC entry on their tab).
   union-spec defaults, overlaid by `BatchTab.default_params`, overlaid
   by `row.params`, so a key a row doesn't set (a blank or partial CSV
   `params` cell) means "batch default" — it never inherits the
-  previous row's value. `default_params` is snapshotted when **Run
+  previous row's value. The Tab 5 keys that sit outside every
+  PARAM_SPEC (`manual_subset_enabled`, `manual_roi_spec`,
+  `onset_source`) are pinned to Tab 5's widget defaults (off, empty,
+  `derivative`) by `ROW_FIXED_DEFAULTS`, so a subset or `spks` onset
+  source set on one row does not leak into the next. `default_params` is snapshotted when **Run
   all** starts, so every stage of every row in that run sees the same
   batch defaults. The NWB export and the OOM resource profile read the
   same effective params. The batch runner never pokes tab internals —
