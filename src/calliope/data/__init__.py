@@ -1,5 +1,7 @@
-"""Bundled resource files (Suite2p ``ops`` JSON, the cell-filter
-checkpoint, etc.).
+"""Bundled resource files -- currently the pretrained cell-filter
+checkpoint ``cellfilter_best.pt`` (Tab 3's default classifier). Base
+Suite2p settings are not bundled as a file; they live in source in
+``calliope.core.calliope_settings``.
 
 This sub-package isn't really code -- it's a folder full of static
 data files that ship alongside the Python source. The ``__init__.py``
@@ -13,7 +15,7 @@ Other modules look up bundled resources with the idiom::
 
     from pathlib import Path
     DATA_DIR = Path(__file__).parent              # this folder
-    ops_path = DATA_DIR / "suite2p_ops_v1.json"   # a sibling file
+    ckpt_path = DATA_DIR / "cellfilter_best.pt"    # a sibling file
 
 ``__file__`` is a special variable Python sets to the path of the
 current source file. Calling ``.parent`` on it gives the folder the

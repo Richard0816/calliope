@@ -28,10 +28,9 @@ def test_package_imports() -> None:
     failures: list[str] = []
     for module in pkgutil.walk_packages([str(pkg_path)],
                                         prefix="calliope."):
-        # Skip the ``scripts`` standalone CLI; it pulls in optional
-        # cellfilter training deps that aren't part of the GUI surface.
-        if module.name.startswith("calliope.scripts"):
-            continue
+        # ``calliope.scripts`` (the standalone curation app) is included:
+        # it imports only stdlib + numpy at module level; torch and the
+        # cell filter are imported lazily inside methods.
         try:
             importlib.import_module(module.name)
         except Exception as e:  # noqa: BLE001

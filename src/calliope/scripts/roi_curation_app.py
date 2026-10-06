@@ -14,7 +14,10 @@ recordings.
 Options
 -------
     --ckpt PATH         Override the cell-filter checkpoint.
-                        Defaults to ``CHECKPOINT_DIR/best.pt``.
+                        Defaults to ``CHECKPOINT_DIR/best.pt`` when a
+                        local retrain has written one, otherwise the
+                        bundled ``calliope/data/cellfilter_best.pt``
+                        (the same default Tab 3 uses).
     --sort MODE         ROI navigation order:
                           ``unsure`` (default; ``|p(cell) - 0.5|``
                                       ascending so the most-ambiguous
@@ -87,6 +90,32 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 
+# Pretrained checkpoint shipped with the package (Tab 3's default too).
+BUNDLED_CKPT_PATH = (Path(__file__).resolve().parent.parent
+                     / "data" / "cellfilter_best.pt")
+
+
+def _resolve_ckpt(ckpt_arg: str | None,
+                  checkpoint_dir: Path | None = None) -> Path:
+    """Pick the checkpoint to score ROIs with.
+
+    Precedence: explicit ``--ckpt`` (returned as-is, even if missing, so
+    a typo is reported rather than silently replaced) -> a local
+    retrain's ``CHECKPOINT_DIR/best.pt`` if it exists -> the bundled
+    ``cellfilter_best.pt``. Without the bundled fallback a fresh install
+    has no p(cell) scores and the default ``unsure`` sort does nothing.
+    """
+    if ckpt_arg:
+        return Path(ckpt_arg)
+    if checkpoint_dir is None:
+        from ..core.cellfilter import config as C
+        checkpoint_dir = C.CHECKPOINT_DIR
+    user_ckpt = Path(checkpoint_dir) / "best.pt"
+    if user_ckpt.exists():
+        return user_ckpt
+    return BUNDLED_CKPT_PATH
+
+
 # ---------------- plane0 metadata cache ----------------
 
 class _Plane0State:
@@ -147,7 +176,7 @@ class _Plane0State:
         from ..core import utils as _u
         import torch
 
-        ckpt_path = Path(ckpt_arg) if ckpt_arg else (C.CHECKPOINT_DIR / "best.pt")
+        ckpt_path = _resolve_ckpt(ckpt_arg)
         if not ckpt_path.exists():
             print(
                 f"[curation] no checkpoint at {ckpt_path}; ROIs will "
@@ -589,7 +618,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--ckpt", default=None,
         help="Cell-filter checkpoint path. Defaults to "
-             "cellfilter.config.CHECKPOINT_DIR/best.pt.")
+             "cellfilter.config.CHECKPOINT_DIR/best.pt if a local "
+             "retrain wrote one, else the bundled "
+             "calliope/data/cellfilter_best.pt.")
     ap.add_argument(
         "--sort", default="unsure",
         choices=("unsure", "prob_asc", "prob_desc", "index"),
