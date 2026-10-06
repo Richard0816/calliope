@@ -1086,13 +1086,14 @@ class Suite2pTab(ctk.CTkFrame):
 
         Tries the GPU path first when ``use_gpu_dff`` is on and the
         baseline mode is 'first_n'; otherwise (or on GPU failure) CPU.
+        The core helper reports the reason for any CPU fallback through
+        ``progress_cb``, so it lands in the GUI log.
         """
         from ...core import detection_run
         params = dict(self._params if params is None else params)
         fps_override = float(params.get("fps_override", 0.0) or 0.0)
         if fps_override > 0:
             print(f"[GUI] FPS override active: {fps_override:.4f} Hz")
-        gpu_wanted = self._gpu_dff_eligible(params, baseline_mode)
         print(f"[GUI] dF/F: {baseline_mode} baseline"
               + (f" ({baseline_min:g} min)" if baseline_mode == "first_n"
                  else f" (win={float(params.get('win_sec', 45.0)):g}s)")
@@ -1104,36 +1105,10 @@ class Suite2pTab(ctk.CTkFrame):
             baseline_mode=baseline_mode, baseline_min=baseline_min,
             progress_cb=lambda msg: print(f"[GUI] {msg}"),
         )
-        if gpu_wanted and info.get("path") != "gpu":
-            print("[GUI] GPU dF/F failed; fell back to CPU.")
         print(f"[GUI] r0p7_dff / r0p7_dff_lowpass / r0p7_dff_dt memmaps "
               f"written via {info.get('path', '?').upper()} "
               f"(fps={float(info.get('fps', 0.0)):g} Hz, "
               f"{time.time() - t0:.1f}s)")
-
-    @staticmethod
-    def _gpu_dff_eligible(params: dict, baseline_mode: str) -> bool:
-        """Log why the GPU dF/F path will or won't be tried. Mirrors the
-        gates in ``detection_run._maybe_run_dff_gpu`` so the GUI log keeps
-        the fallback reason that the core helper does not report."""
-        if not bool(params.get("use_gpu_dff", True)):
-            print("[GUI] GPU dF/F disabled in Advanced parameters; "
-                  "using CPU.")
-            return False
-        if baseline_mode != "first_n":
-            print("[GUI] GPU dF/F only supports first-N-min baseline; "
-                  "rolling mode falls back to CPU.")
-            return False
-        try:
-            from calliope.core import analyze_output_gpu as gpu
-        except Exception as e:
-            print(f"[GUI] analyze_output_gpu not importable ({e}); "
-                  "using CPU.")
-            return False
-        if not getattr(gpu, "_CUPY_OK", False):
-            print("[GUI] CuPy not available; using CPU dF/F.")
-            return False
-        return True
 
     def _run_filtered_dff(self, plane0: Path) -> None:
         """Slice r0p7_dff.memmap.float32 down to ROIs that pass the

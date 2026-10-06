@@ -455,26 +455,46 @@ def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
 def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
                       baseline_mode: str, baseline_min: float,
                       fps: float, cutoff_hz: float, sg_win_ms: int,
-                      sg_poly: int, r: float) -> bool:
+                      sg_poly: int, r: float,
+                      F: Optional[np.ndarray] = None,
+                      Fneu: Optional[np.ndarray] = None,
+                      progress_cb: Optional[Callable[[str], None]] = None,
+                      ) -> bool:
     """GPU dF/F via ``analyze_output_gpu``. Returns True on success.
 
-    Mirrors ``Suite2pTab._maybe_run_dff_gpu``: only kicks in when
-    ``use_gpu_dff`` is set, the baseline is ``first_n``, and CuPy is
-    importable.
+    Only kicks in when ``use_gpu_dff`` is set, the baseline is
+    ``first_n``, and CuPy is importable. Every reason for not using (or
+    failing on) the GPU is reported through ``progress_cb`` so callers
+    can log it. ``F`` / ``Fneu`` are reused when the caller has already
+    loaded them (avoids a second full read of both arrays).
     """
+    def _say(msg: str) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
     if not bool(params.get("use_gpu_dff", True)):
+        _say("GPU dF/F disabled (use_gpu_dff off); using CPU.")
         return False
     if baseline_mode != "first_n":
+        _say("GPU dF/F only supports the first-N-min baseline; "
+             "rolling mode uses CPU.")
         return False
     try:
         from calliope.core import analyze_output_gpu as gpu
-    except Exception:
+    except Exception as e:
+        _say(f"analyze_output_gpu not importable ({e}); using CPU.")
         return False
     if not getattr(gpu, "_CUPY_OK", False):
+        _say("CuPy not available; using CPU dF/F.")
         return False
 
-    F = np.load(plane0 / "F.npy", allow_pickle=False)
-    Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
+    if F is None:
+        F = np.load(plane0 / "F.npy", allow_pickle=False)
+    if Fneu is None:
+        Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
     roi_chunk = int(params.get("gpu_roi_chunk", 0)) or None
     try:
         gpu.process_suite2p_traces_gpu(
@@ -485,7 +505,8 @@ def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
             roi_chunk=roi_chunk,
         )
         return True
-    except Exception:
+    except Exception as e:
+        _say(f"GPU dF/F failed ({e}); falling back to CPU.")
         return False
 
 
@@ -559,7 +580,8 @@ def compute_dff_memmaps(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
             cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms,
-            sg_poly=sg_poly, r=r):
+            sg_poly=sg_poly, r=r, F=F, Fneu=Fneu,
+            progress_cb=progress_cb):
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)

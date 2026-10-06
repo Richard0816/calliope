@@ -69,3 +69,36 @@ def test_xcorr_apply_batch_row_parses_string_bools():
             "compute_partial": "true"})
     assert s.zero_lag_var.v is False and s.gpu_var.v is False
     assert s.partial_corr_var.v is True
+
+
+# ---- GPU dF/F fallback reason reaches the caller's log ----
+
+def test_gpu_dff_reports_why_it_used_cpu(tmp_path):
+    from calliope.core import detection_run
+    msgs = []
+    kw = dict(baseline_min=2.0, fps=15.0, cutoff_hz=1.0, sg_win_ms=333,
+              sg_poly=2, r=0.7, progress_cb=msgs.append)
+    assert not detection_run._maybe_run_dff_gpu(
+        tmp_path, {"use_gpu_dff": False}, baseline_mode="first_n", **kw)
+    assert not detection_run._maybe_run_dff_gpu(
+        tmp_path, {"use_gpu_dff": True}, baseline_mode="rolling", **kw)
+    assert "use_gpu_dff off" in msgs[0]
+    assert "rolling" in msgs[1]
+
+
+def test_gpu_dff_failure_reason_is_reported(tmp_path, monkeypatch):
+    from calliope.core import analyze_output_gpu as gpu
+    from calliope.core import detection_run
+
+    def boom(*a, **k):
+        raise RuntimeError("cuda kaput")
+
+    monkeypatch.setattr(gpu, "_CUPY_OK", True, raising=False)
+    monkeypatch.setattr(gpu, "process_suite2p_traces_gpu", boom)
+    msgs = []
+    F = np.ones((2, 10), dtype=np.float32)
+    assert not detection_run._maybe_run_dff_gpu(
+        tmp_path, {"use_gpu_dff": True}, baseline_mode="first_n",
+        baseline_min=2.0, fps=15.0, cutoff_hz=1.0, sg_win_ms=333,
+        sg_poly=2, r=0.7, F=F, Fneu=F, progress_cb=msgs.append)
+    assert any("cuda kaput" in m for m in msgs)

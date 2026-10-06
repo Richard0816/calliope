@@ -82,7 +82,7 @@ def test_gui_dff_stamps_meta_provenance(tmp_path):
     plane0, N, T = _tiny_plane0(tmp_path)
     params = spec_defaults(Suite2pTab.PARAM_SPEC)
     params.update(fps_override=30.0, use_gpu_dff=False, neuropil_coef=0.6)
-    stub = SimpleNamespace(_params={}, _gpu_dff_eligible=lambda p, m: False)
+    stub = SimpleNamespace(_params={})
     Suite2pTab._run_dff(stub, plane0, "first_n", 0.05, params=params)
 
     meta = json.loads((plane0 / "meta.json").read_text(encoding="utf-8"))
