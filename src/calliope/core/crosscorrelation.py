@@ -31,13 +31,25 @@ Public surface
     Benjamini-Hochberg FDR-corrected p-values. Use to flag which
     pair-correlations from ``batch_xcorr_clusters`` are significantly
     above the autocorrelation-preserving null.
-``run_cluster_xcorr_full(plane0, ..., progress_cb, abort_cb)``
-    Walk every cluster pair on disk and emit a CSV per pair, one row
-    per cell pair. Accepts ``n_shuffles`` to enable the shuffle null.
-``run_cluster_xcorr_per_event_fast(plane0, event_windows, ...)``
-    Same but cropped to each detected event window from Tab 5.
-``zscore_pair_traces`` and the ``xcorr_*`` helpers are used by the
-single-pair preview in Tab 7.
+``run_cluster_xcorr_full_fast(plane0, prefix, fps, cluster_folder, ...)``
+    Walk every cluster pair on disk and write one summary CSV per pair,
+    one row per cell pair. ``n_shuffles`` (default 500) enables the
+    shuffle null (seeded by ``shuffle_seed``); ``compute_partial`` adds a
+    population-wide partial-correlation column.
+``run_cluster_xcorr_per_event_fast(plane0, ..., event_windows, ...)``
+    Same but cropped to each detected event window from Tab 5 (no
+    shuffle null, no partial correlation).
+``compute_partial_correlation(Z)``
+    Partial-correlation matrix from a z-scored ``(T, N)`` matrix.
+``single_pair_xcorr_curve(...)``
+    Full r-vs-lag curve for one ROI pair (Tab 7's single-pair preview).
+``run_cluster_xcorr_offload(mode, plane0_str, ...)``
+    Picklable child-process target Tab 7 runs through
+    ``core.offload.run_offloaded``; abort is cooperative via an Event
+    that makes the progress callback raise ``XcorrAborted``.
+``run_crosscorrelation(plane0, params, ...)``
+    Headless entry point for the Tab 0 batch runner (full + optional
+    per-event run, plus violin figures).
 
 What you'll see if you've never read CuPy code
 ----------------------------------------------
@@ -567,6 +579,14 @@ def _load_clusters_from_dir(cluster_dir: Path,
       the dF/F was built). If ``keep_mask`` is ``None`` and there's no
       marker, indices are returned unchanged (assumed Suite2p; matches
       the unfiltered-prefix case where the two are identical).
+
+    No current writer produces the legacy layout (both Tab 6 writers drop
+    the marker), but it is kept so cluster folders already on disk still
+    load. ``keep_mask`` comes from ``_load_keep_mask`` (the frozen mask the
+    memmap was written with); the translation is only correct if that is
+    also the mask the legacy files were clustered against.
+    ``manual_combined*_rois.npy`` is excluded so a hand-merged selection
+    from older versions is not treated as an extra, overlapping cluster.
     """
     is_suite2p_layout = (cluster_dir / "_indices_are_suite2p").exists()
     roi_files = [
@@ -596,23 +616,80 @@ def _load_clusters_from_dir(cluster_dir: Path,
 
 
 def _load_keep_mask(plane0: Path, prefix: str) -> Optional[np.ndarray]:
-    """Boolean mask of which Suite2p ROIs are kept for a filtered prefix.
+    """Boolean mask of which Suite2p ROIs own a column in the filtered memmap.
 
     Returns ``None`` when the prefix is not filtered (in which case the
-    'kept' set is every Suite2p ROI). Mirrors clustering_tab._load_filter_mask.
+    'kept' set is every Suite2p ROI and column == Suite2p index).
+
+    The mask is resolved through ``utils.resolve_filtered_mask`` against the
+    ``{prefix}dff`` memmap's on-disk column count -- the same resolution
+    ``_open_dff_memmap`` uses to size the mapping -- so it prefers the
+    frozen ``r0p7_cell_mask_bool.npy`` written alongside the memmap. Reading
+    the live ``predicted_cell_mask.npy`` / ``iscell.npy`` here instead would
+    rank ROIs against a mask that curation may have changed since the
+    memmap was written, silently mapping Suite2p ROIs onto the wrong dF/F
+    columns. Same anchoring as ``tabs.clustering.logic.filtered_to_suite2p_indices``.
     """
     from . import utils as _cutils
     if not _cutils.is_filtered_prefix(prefix):
         return None
     plane0 = Path(plane0)
-    pred_path = plane0 / "predicted_cell_mask.npy"
-    if pred_path.exists():
-        return np.load(pred_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-    return None
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+    mask, _n_kept = _cutils.resolve_filtered_mask(
+        plane0, N_total,
+        memmap_path=plane0 / f"{prefix}dff.memmap.float32", T=T)
+    return np.asarray(mask, dtype=bool)
+
+
+def _cluster_columns(clusters: dict, keep_mask: Optional[np.ndarray],
+                     n_cols: int):
+    """Map each cluster's Suite2p ROI ids to dF/F memmap column positions.
+
+    Returns ``(rois_s2p, cols)``: two dicts keyed by cluster name holding
+    the Suite2p ids kept (for the CSVs) and their matching memmap columns
+    (for slicing). ROIs absent from ``keep_mask`` are dropped with a log
+    line. Raises ``ValueError`` (instead of slicing the wrong columns or an
+    opaque ``IndexError``) when an id or column falls outside the memmap.
+    """
+    if keep_mask is not None:
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        s2p_to_col = -np.ones(int(keep_mask.size), dtype=np.int64)
+        s2p_to_col[keep_mask] = np.arange(int(keep_mask.sum()),
+                                          dtype=np.int64)
+    else:
+        s2p_to_col = None
+    rois_s2p: dict = {}
+    cols: dict = {}
+    for name in sorted(clusters.keys()):
+        s2p = np.asarray(clusters[name], dtype=np.int64)
+        if s2p_to_col is not None:
+            if s2p.size and (int(s2p.min()) < 0
+                             or int(s2p.max()) >= s2p_to_col.size):
+                raise ValueError(
+                    f"[xcorr] cluster {name}: Suite2p ROI id out of range "
+                    f"for the {s2p_to_col.size}-ROI cell mask; re-run "
+                    f"clustering (Tab 6) for this recording.")
+            pos = s2p_to_col[s2p]
+            valid = pos >= 0
+            if not valid.all():
+                # Some Suite2p ROIs are not in the keep mask the memmap was
+                # written with; skip them so the slicing stays in range.
+                print(f"[xcorr] {name}: {int((~valid).sum())} ROI(s) not in "
+                      f"current filter, skipped.")
+                s2p = s2p[valid]
+                pos = pos[valid]
+        else:
+            pos = s2p
+        if pos.size and (int(pos.min()) < 0 or int(pos.max()) >= int(n_cols)):
+            raise ValueError(
+                f"[xcorr] cluster {name}: dF/F column {int(pos.max())} out "
+                f"of range for a memmap with {int(n_cols)} columns; the "
+                f"cluster files do not match this dF/F. Re-run clustering "
+                f"(Tab 6) or Filtered dF/F (Tab 3).")
+        rois_s2p[name] = s2p
+        cols[name] = pos
+    return rois_s2p, cols
 
 
 def compute_partial_correlation(Z, ridge: float = 1e-6):
@@ -859,45 +936,23 @@ def run_cluster_xcorr_full_fast(
 
     dff, n_frames, n_rois = _open_dff_memmap(plane0, prefix)
 
-    # Suite2p index -> position in the filtered dF/F memmap (or -1 if the
-    # ROI is no longer in the keep mask).
-    if keep_mask is not None:
-        s2p_to_filtered = -np.ones(int(keep_mask.size), dtype=np.int64)
-        s2p_to_filtered[np.asarray(keep_mask, dtype=bool)] = np.arange(
-            int(keep_mask.sum()), dtype=np.int64)
-    else:
-        s2p_to_filtered = None
+    # Suite2p ROI ids (for the CSV) and their memmap columns (for slicing),
+    # range-checked against the memmap's column count.
+    cluster_rois_s2p, cluster_cols = _cluster_columns(
+        clusters, keep_mask, n_rois)
 
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
 
     gpu_ok = bool(use_gpu and cp is not None)
-    xp = cp if gpu_ok else np
 
     cluster_names = sorted(clusters.keys())
 
     # Pre-build per-cluster (T, n_in_cluster) matrices and z-score once.
-    # Track both the Suite2p ROI list (for the CSV) and the filtered
-    # positions (for slicing the dF/F memmap).
     cluster_X = {}
     cluster_Z = {}
-    cluster_rois_s2p: dict[str, np.ndarray] = {}
     for name in cluster_names:
-        s2p_rois = np.asarray(clusters[name], dtype=np.int64)
-        if s2p_to_filtered is not None:
-            filt_pos = s2p_to_filtered[s2p_rois]
-            valid = filt_pos >= 0
-            if not valid.all():
-                # Some Suite2p ROIs are not in the current keep mask; skip
-                # them so the slicing stays in range.
-                dropped = int((~valid).sum())
-                print(f"[xcorr] {name}: {dropped} ROI(s) not in current "
-                      f"filter, skipped.")
-                s2p_rois = s2p_rois[valid]
-                filt_pos = filt_pos[valid]
-        else:
-            filt_pos = s2p_rois
-        cluster_rois_s2p[name] = s2p_rois
+        filt_pos = cluster_cols[name]
         # Materialise dF/F for these ROI columns as float32 (avoid memmap
         # views going to GPU repeatedly).
         X = np.asarray(dff[:, filt_pos], dtype=np.float32, order="C")
@@ -924,12 +979,7 @@ def run_cluster_xcorr_full_fast(
         # us a deterministic ordering for the slice maps below.
         all_filt_pos: list[int] = []
         for name in cluster_names:
-            s2p_rois = cluster_rois_s2p[name]
-            if s2p_to_filtered is not None:
-                fp = s2p_to_filtered[s2p_rois]
-                all_filt_pos.extend(int(p) for p in fp if p >= 0)
-            else:
-                all_filt_pos.extend(int(p) for p in s2p_rois)
+            all_filt_pos.extend(int(p) for p in cluster_cols[name])
         union_pos = np.array(sorted(set(all_filt_pos)), dtype=np.int64)
         n_union = int(union_pos.size)
         # Conditioning requirement: N << T. The audit's cutoff is N <
@@ -990,12 +1040,8 @@ def run_cluster_xcorr_full_fast(
             # missing rather than zero.
             partial_block = None
             if partial_full is not None:
-                if s2p_to_filtered is not None:
-                    fpA = s2p_to_filtered[roisA]
-                    fpB = s2p_to_filtered[roisB]
-                else:
-                    fpA = np.asarray(roisA, dtype=np.int64)
-                    fpB = np.asarray(roisB, dtype=np.int64)
+                fpA = cluster_cols[cA]
+                fpB = cluster_cols[cB]
                 idxA = np.array(
                     [partial_index.get(int(p), -1) for p in fpA],
                     dtype=np.int64)
@@ -1068,13 +1114,16 @@ def run_cluster_xcorr_per_event_fast(
     use_gpu: bool = True,
     output_subdir: str = "cross_correlation_per_event",
     min_event_frames: int = 8,
-    n_shuffles: int = 0,
-    shuffle_seed: int = 0,
     progress_cb=None,
 ):
     """Run cluster x cluster cross-correlation per event window using the
     batched core. Each ROI trace is cropped to ``[start_frame, end_frame]``
     so the best-lag and zero-lag values are local to that event.
+
+    No circular-shift null and no partial correlation are computed per
+    event (windows are too short for either), so unlike
+    ``run_cluster_xcorr_full_fast`` this runner takes no ``n_shuffles`` /
+    ``shuffle_seed`` / ``compute_partial`` arguments.
 
     Output:
       plane0 / {prefix}cluster_results / {cluster_folder} / {output_subdir} /
@@ -1092,12 +1141,10 @@ def run_cluster_xcorr_per_event_fast(
 
     dff, n_frames, n_rois = _open_dff_memmap(plane0, prefix)
 
-    if keep_mask is not None:
-        s2p_to_filtered = -np.ones(int(keep_mask.size), dtype=np.int64)
-        s2p_to_filtered[np.asarray(keep_mask, dtype=bool)] = np.arange(
-            int(keep_mask.sum()), dtype=np.int64)
-    else:
-        s2p_to_filtered = None
+    # Suite2p ROI ids (for the CSV) and their memmap columns (for slicing),
+    # range-checked against the memmap's column count.
+    cluster_rois_s2p, cluster_rois_filt = _cluster_columns(
+        clusters, keep_mask, n_rois)
 
     event_windows = [(float(s), float(e)) for s, e in event_windows]
     if not event_windows:
@@ -1108,26 +1155,6 @@ def run_cluster_xcorr_per_event_fast(
 
     gpu_ok = bool(use_gpu and cp is not None)
     cluster_names = sorted(clusters.keys())
-
-    # Track Suite2p ROI indices (for the CSV) alongside the filtered
-    # positions used to slice into the dF/F memmap.
-    cluster_rois_s2p: dict[str, np.ndarray] = {}
-    cluster_rois_filt: dict[str, np.ndarray] = {}
-    for n in cluster_names:
-        s2p_rois = np.asarray(clusters[n], dtype=np.int64)
-        if s2p_to_filtered is not None:
-            filt_pos = s2p_to_filtered[s2p_rois]
-            valid = filt_pos >= 0
-            if not valid.all():
-                dropped = int((~valid).sum())
-                print(f"[xcorr] {n}: {dropped} ROI(s) not in current "
-                      f"filter, skipped.")
-                s2p_rois = s2p_rois[valid]
-                filt_pos = filt_pos[valid]
-        else:
-            filt_pos = s2p_rois
-        cluster_rois_s2p[n] = s2p_rois
-        cluster_rois_filt[n] = filt_pos
 
     total = len(event_windows)
     for ev_idx, (s_sec, e_sec) in enumerate(event_windows):
@@ -1278,7 +1305,6 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
             ax_corr, corr_labels, corr_arrays,
             "Zero-lag correlation",
             f"Per-pair zero-lag correlation  ({title_suffix})",
-            show_sig=False,
         )
     else:
         ax_corr.set_axis_off()
@@ -1354,6 +1380,9 @@ def run_crosscorrelation(
         ``n_shuffles`` (default 500 -- circular-shift null + BH-FDR
         for per-pair p-values; set 0 to disable; per-event path
         does not use this),
+        ``shuffle_seed`` (default 0 -- base RNG seed for the shuffle
+        null; cluster pair k uses ``shuffle_seed + k``, so results are
+        reproducible run to run),
         ``compute_partial`` (default False -- population-wide
         partial-correlation matrix sliced into a
         ``partial_corr_zero_lag`` CSV column; skipped if
@@ -1379,6 +1408,7 @@ def run_crosscorrelation(
     zero_lag = bool(params.get("zero_lag", True))
     use_gpu = bool(params.get("use_gpu", True))
     n_shuffles = max(0, int(params.get("n_shuffles", 500)))
+    shuffle_seed = int(params.get("shuffle_seed", 0))
     compute_partial = bool(params.get("compute_partial", False))
 
     full_subdir = "cross_correlation_full"
@@ -1386,7 +1416,7 @@ def run_crosscorrelation(
         plane0, prefix=prefix, fps=fps, cluster_folder=cluster_folder,
         max_lag_seconds=max_lag, zero_lag=zero_lag, use_gpu=use_gpu,
         output_subdir=full_subdir, n_shuffles=n_shuffles,
-        compute_partial=compute_partial,
+        shuffle_seed=shuffle_seed, compute_partial=compute_partial,
         progress_cb=progress_cb,
     )
     full_outdir = (plane0 / f"{prefix}cluster_results" / cluster_folder
