@@ -102,3 +102,46 @@ def test_gpu_dff_failure_reason_is_reported(tmp_path, monkeypatch):
         baseline_min=2.0, fps=15.0, cutoff_hz=1.0, sg_win_ms=333,
         sg_poly=2, r=0.7, F=F, Fneu=F, progress_cb=msgs.append)
     assert any("cuda kaput" in m for m in msgs)
+
+
+# ---- QC "Reload from folder" never regenerates on the Tk thread ----
+
+def test_qc_reload_offloads_archived_regeneration(tmp_path, monkeypatch):
+    import types
+    from calliope.core import offload
+    from calliope.core.preprocessing import PreprocessResult
+    from calliope.tabs.qc import tab as qc_tab
+
+    calls = {}
+    archived = PreprocessResult(
+        out_dir=tmp_path, shifted_tiff=tmp_path / "shifted_a.tif",
+        qc_gif=tmp_path / "qc.gif", mean_image_path=tmp_path / "mean.npy",
+        n_frames=-1, shape_yx=(4, 4), raw_paths=[tmp_path / "a.tif"],
+        shifted_paths=[])
+
+    def fake_load(path, *, regenerate_shifted=True, **_):
+        calls["regen"] = regenerate_shifted
+        return archived
+
+    monkeypatch.setattr(qc_tab.preprocessing, "load_existing_preprocess",
+                        fake_load)
+    monkeypatch.setattr(qc_tab.filedialog, "askdirectory",
+                        lambda **_: str(tmp_path))
+    monkeypatch.setattr(offload, "run_offloaded",
+                        lambda *a, **k: calls.setdefault("offloaded", a[2]))
+    published = []
+    stub = types.SimpleNamespace(
+        _reload_job=None, _reload_q=None,
+        header_var=types.SimpleNamespace(set=lambda v: None),
+        state=types.SimpleNamespace(set_result=published.append))
+    qc_tab.QcTab._reload_from_folder(stub)
+    assert calls["regen"] is False           # probe only on the Tk thread
+    assert calls["offloaded"].__name__ == "load_existing_offload"
+    assert published == []                   # published when the job is done
+
+    # Shifted TIFF present -> published straight away, nothing offloaded.
+    calls.clear()
+    stub._reload_job = None
+    archived.shifted_paths = [tmp_path / "shifted_a.tif"]
+    qc_tab.QcTab._reload_from_folder(stub)
+    assert published == [archived] and "offloaded" not in calls

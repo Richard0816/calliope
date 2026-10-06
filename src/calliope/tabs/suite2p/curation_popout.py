@@ -58,7 +58,8 @@ from matplotlib.backends.backend_tkagg import (
 )
 from matplotlib.patches import Rectangle
 
-from ...core.utils import lowpass_zero_phase_1d
+from ...core.utils import (DISPLAY_CLIP_HIGH_PCT, DISPLAY_CLIP_LOW_PCT,
+                           lowpass_zero_phase_1d)
 from ...gui_common import install_scroll_router
 
 
@@ -488,7 +489,8 @@ class CurationPopout(ctk.CTkToplevel):
         # curating without checking the parent tab's header.
         for ax, (_key, label, img) in zip(self._img_axes,
                                           self._backgrounds):
-            vmin, vmax = np.percentile(img, [1, 99])
+            vmin, vmax = np.percentile(
+                img, [DISPLAY_CLIP_LOW_PCT, DISPLAY_CLIP_HIGH_PCT])
             ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
             ax.scatter(xpix, ypix, s=1.4, c="red", alpha=0.55,
                        edgecolors="none")
