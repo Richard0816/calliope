@@ -13,7 +13,7 @@ Two modes: **full recording** and **per event** (cropped to each window from Tab
 
 From `plane0/`:
 - `r0p7_filtered_dff.memmap.float32` — `(T, N_kept)` filtered dF/F.
-- `predicted_cell_mask.npy` (or `iscell.npy`) — for prefix translation.
+- `r0p7_cell_mask_bool.npy` — the keep mask frozen when Tab 3 wrote the filtered memmap; used (via `utils.resolve_filtered_mask`, anchored to the memmap's file size) to translate Suite2p ROI ids to dF/F columns. `predicted_cell_mask.npy` / `iscell.npy` are only fallbacks when the frozen mask is missing, so curation after Filtered dF/F can't shift the columns xcorr reads.
 - `<plane0>/r0p7_filtered_cluster_results/gui_recluster/C*_rois.npy` — cluster files from Tab 6 (Suite2p ROI indices, with the `_indices_are_suite2p` marker).
 - Event windows for per-event mode: live from Tab 5 via `AppState.event_results` (subscribed at `__init__`), with the `EventWindows` sheet of `<rec>_summary.xlsx` as a cold-start fallback when no Tab 5 publish exists yet.
 
@@ -31,15 +31,20 @@ From `plane0/`:
 > `per_event.png` shows one **representative** event window (the one with
 > the most cluster-pair data); per-window CSVs for every event are written
 > under the cluster-results tree.
-> Tab 0's batch worker uses this; Tab 7 still spawns its own worker
-> threads + interactive filters.
+> Tab 0's headless batch path uses this; Tab 7 runs the same runners in
+> a child process (`run_cluster_xcorr_offload` via `core.offload`) and
+> adds its interactive filters. The GUI batch drives Tab 7 through
+> `apply_batch_row`, which honours a row's `max_lag_seconds`, `zero_lag`,
+> `use_gpu`, `n_shuffles` and `compute_partial` (absent keys leave the
+> widgets as they are). `run_crosscorrelation` also reads an optional
+> `shuffle_seed` (default 0).
 
 ### Step 1 — Open dF/F and the cluster files
 
 `_open_dff_memmap(plane0, prefix)`:
 
 1. `F.npy` shape gives `N_total, T`.
-2. If `prefix` contains `filtered`, load the keep mask, set `N_kept = mask.sum()`, return `(memmap, T, N_kept)`.
+2. If `prefix` contains `filtered`, resolve the keep mask with `utils.resolve_filtered_mask` (frozen `r0p7_cell_mask_bool.npy` first, cross-checked against the memmap's file size), set `N_kept = mask.sum()`, return `(memmap, T, N_kept)`.
 3. Otherwise the memmap is `(T, N_total)`.
 
 `_load_clusters_from_dir(cluster_dir, keep_mask)`:
@@ -47,6 +52,8 @@ From `plane0/`:
 - If `_indices_are_suite2p` marker exists: read each `C*_rois.npy` as-is (Suite2p ROI indices).
 - Otherwise (legacy layout): translate filtered-list positions to Suite2p indices via `np.where(keep_mask)[0]`.
 - `manual_combined*` files are ignored.
+
+`_load_keep_mask(plane0, prefix)` returns that same file-size-anchored mask (never the live `predicted_cell_mask.npy`), and `_cluster_columns` maps each cluster's Suite2p ids to memmap columns. ROIs outside the mask are dropped with a log line; an id or column outside the memmap raises a `ValueError` asking you to re-run clustering, instead of silently slicing the wrong traces. No current Tab 6 writer produces the legacy layout; the branch stays so older cluster folders still load.
 
 ### Step 2 — Batched cross-correlation (`batch_xcorr_clusters`)
 
@@ -141,7 +148,7 @@ roiA, roiB, best_lag_sec, max_corr, zero_lag_corr [, p_value, p_value_fdr, parti
 - `p_value` — fraction of circular-shift draws (jittered alignment, preserving each ROI's autocorrelation) whose max-correlation ≥ the observed max, with the Phipson-Smyth +1/+1 correction so a pair that beats every shuffle still gets a non-zero p capped at `1/(n_shuffles+1)`.
 - `p_value_fdr` — Benjamini-Hochberg-adjusted q-value across the (nA × nB) matrix. Compare against your target FDR (typically 0.05) to flag significant pairs.
 
-The circular-shift null is the field-standard fix for the autocorrelation-inflated false-positive rate that parametric tests (Marčenko-Pastur) suffer on calcium imaging data — see Cheng et al. eLife 2023 ([doi:10.7554/eLife.81279](https://doi.org/10.7554/eLife.81279)). The per-event variant accepts the same kwarg for API symmetry but does not currently compute per-window shuffles; the Tab 7 GUI strips it before calling the per-event runner and logs a note.
+The circular-shift null is the field-standard fix for the autocorrelation-inflated false-positive rate that parametric tests (Marčenko-Pastur) suffer on calcium imaging data — see Cheng et al. eLife 2023 ([doi:10.7554/eLife.81279](https://doi.org/10.7554/eLife.81279)). The per-event runner does not compute per-window shuffles and takes no `n_shuffles` / `shuffle_seed` arguments; the Tab 7 GUI strips the field before calling it and logs a note. The full-recording null is seeded deterministically (cluster pair *k* uses `shuffle_seed + k`, `shuffle_seed` default 0), so re-running gives identical p-values.
 
 When the "+ partial corr" checkbox is on (default off), an additional column appears:
 
@@ -230,7 +237,7 @@ Significance markers: `***` (`p < 0.001`), `**` (`p < 0.01`), `*` (`p < 0.05`).
 
 ### Step 7 — Aborting
 
-A long full-recording run on a large cluster set can take minutes. The run executes in a child process (`core.offload`); the Abort button sets the shared `_abort_event`, the worker checks it between batches and exits cleanly, and the dispatcher posts an `("aborted", …)` queue message instead of an error dialog. (This replaced the legacy in-thread `RunAborted` exception, which is no longer used.)
+A long full-recording run on a large cluster set can take minutes. The run executes in a child process (`core.offload`); the Abort button sets `self._abort_evt` (a spawn `Event` from `core.offload.make_abort_event`). The child's progress callback checks it between batches and raises `XcorrAborted`, which `run_cluster_xcorr_offload` catches and turns into its normal `done` payload with `aborted=True`. `_on_xc_done` routes that payload to `_on_xc_aborted`, so you see a status message instead of an error dialog.
 
 ---
 
