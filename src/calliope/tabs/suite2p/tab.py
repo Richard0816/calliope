@@ -1373,6 +1373,13 @@ class Suite2pTab(ctk.CTkFrame):
             plane0=plane0, bg_images=bg_images, stat=stat,
             n_total=n_total, keep=keep, probs=probs, ops_view=ops_view,
         )
+        pipe_n = self._pipeline_kept_n(plane0, n_total)
+        if pipe_n is not None and pipe_n != int(keep.sum()):
+            self._append_log(
+                f"[GUI] Keep-mask drift: the cell filter now keeps "
+                f"{int(keep.sum())} ROIs, but the filtered dF/F that Tabs "
+                f"4-8 read holds {pipe_n}. Re-run 'Filtered dF/F' (and the "
+                f"stages after it) to resync.")
 
         from ...core.utils import infer_recording_id
         try:
@@ -1664,6 +1671,18 @@ class Suite2pTab(ctk.CTkFrame):
             self.state.set_plane0(plane0)
         except Exception:
             pass
+        # The rewrite resynced the frozen mask: drop Panel 3's [!] suffix.
+        self._redraw_with_bg()
+
+    @staticmethod
+    def _pipeline_kept_n(plane0, n_total) -> Optional[int]:
+        """Kept-ROI count frozen into the filtered memmaps (what Tabs
+        4-8 use), or ``None`` when unknown. Never raises."""
+        try:
+            from ...core import utils as _utils
+            return _utils.pipeline_mask_count(plane0, n_total)
+        except Exception:
+            return None
 
     def _redraw_with_bg(self) -> None:
         c = self._panel_cache
@@ -1726,16 +1745,21 @@ class Suite2pTab(ctk.CTkFrame):
             pix_to_um=pix_to_um)
 
         kept_n = int(keep.sum())
+        # Keep-mask drift: Panel 3 paints the live mask, downstream tabs
+        # read the memmaps frozen to r0p7_cell_mask_bool.npy.
+        pipe_n = self._pipeline_kept_n(c["plane0"], n_total)
+        drift = (f"  [!] downstream tabs use n = {pipe_n}"
+                 if pipe_n is not None and pipe_n != kept_n else "")
         if not self._roi_overlay_var.get():
             # Overlay off: show the clean background image only.
             self.fil_ax = render_background_panel(
                 self.fil_ax, self.fil_canvas, bg, vmin, vmax,
-                f"After filter (n = {kept_n} / {n_total})  "
+                f"After filter (n = {kept_n} / {n_total}){drift}  "
                 f"[bg: {bg_label}, no ROI overlay]",
                 pix_to_um=pix_to_um)
         elif probs is not None and probs.shape[0] == n_total:
             score_img = build_score_image(stat, keep, probs, Ly, Lx)
-            title = (f"After filter (n = {kept_n} / {n_total})  "
+            title = (f"After filter (n = {kept_n} / {n_total}){drift}  "
                      f"[bg: {bg_label}, coloured by predicted_cell_prob]")
             self.fil_ax = render_score_panel(
                 self.fil_ax, self.fil_canvas, bg, score_img,
@@ -1747,7 +1771,7 @@ class Suite2pTab(ctk.CTkFrame):
             render_panel(
                 self.fil_ax, self.fil_canvas, bg, label_kept,
                 vmin, vmax,
-                f"After filter (n = {kept_n} / {n_total})  "
+                f"After filter (n = {kept_n} / {n_total}){drift}  "
                 f"[bg: {bg_label}, {keep_src}]",
                 pix_to_um=pix_to_um)
 

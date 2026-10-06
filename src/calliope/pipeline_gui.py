@@ -672,17 +672,14 @@ class PipelineApp(ctk.CTk):
             import numpy as np
             from .core import utils
             plane0 = Path(plane0)
-            frozen_path = plane0 / "r0p7_cell_mask_bool.npy"
-            if not frozen_path.exists():
+            if not (plane0 / "r0p7_cell_mask_bool.npy").exists():
                 return []
             n_total = len(np.load(plane0 / "stat.npy", allow_pickle=True))
-            frozen = np.load(frozen_path, allow_pickle=False)
+            pipe_n = utils.pipeline_mask_count(plane0, n_total)
             live = np.asarray(utils.resolve_live_mask(plane0, n_total))
-            if (frozen.ndim != 1 or frozen.size != n_total
-                    or live.size != n_total):
+            if pipe_n is None or live.size != n_total:
                 return []
             live_n = int(live.astype(bool).sum())
-            pipe_n = int(frozen.astype(bool).sum())
         except Exception:
             return []
         if pipe_n == live_n:

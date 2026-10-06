@@ -193,6 +193,41 @@ def resolve_filtered_mask(plane0, n_total, *, memmap_path=None, T=None):
     )
 
 
+def pipeline_mask_count(plane0, n_total) -> Optional[int]:
+    """Kept-ROI count the downstream pipeline (Tabs 4-8) actually uses.
+
+    That is the mask frozen next to the filtered memmaps when Tab 3 wrote
+    them (``r0p7_cell_mask_bool.npy``), which can differ from the live
+    mask Tab 3 paints (:func:`resolve_live_mask`) after the cell filter is
+    re-run. When the filtered memmap and ``F.npy`` are both present the
+    count is anchored to the memmap's on-disk column count via
+    :func:`resolve_filtered_mask`, the same resolver every reader uses.
+
+    Returns ``None`` when no filtered output has been written yet (no
+    frozen mask) or the frozen mask belongs to a different detection
+    (length != ``n_total``).
+    """
+    plane0 = Path(plane0)
+    n_total = int(n_total)
+    frozen_path = plane0 / "r0p7_cell_mask_bool.npy"
+    if not frozen_path.exists():
+        return None
+    frozen = np.asarray(np.load(frozen_path, allow_pickle=False))
+    if frozen.ndim != 1 or frozen.size != n_total:
+        return None
+    n = int(frozen.astype(bool).sum())
+    memmap_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    f_path = plane0 / "F.npy"
+    if memmap_path.exists() and f_path.exists():
+        try:
+            T = int(np.load(f_path, mmap_mode="r").shape[1])
+            _, n = resolve_filtered_mask(
+                plane0, n_total, memmap_path=memmap_path, T=T)
+        except Exception:
+            pass  # unreadable F / no matching mask: keep the frozen count
+    return int(n)
+
+
 def resolve_live_mask(plane0, n_total):
     """Return the boolean keep mask reflecting CURRENT curation -- i.e.
     which ROIs SHOULD be kept right now. This is the WRITER-facing
