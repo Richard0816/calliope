@@ -686,6 +686,13 @@ def find_recording_root(path) -> Path:
     3. **Otherwise** (no chain folder anywhere in ``path``): ``path``
        itself is taken to be the recording folder (its parent if
        ``path`` is a file).
+
+    Known edge cases (callers today pass existing folders inside a run,
+    so neither bites): Strategy 2 anchors on the first chain-named folder
+    anywhere in the ancestry, so a non-canonical recording stored *under*
+    a folder named e.g. ``final`` or ``detection`` resolves to that
+    folder's parent; and Strategy 3 can only tell a file from a folder
+    when it exists, so a not-yet-written file path is returned as-is.
     """
     p = Path(path).resolve()
 
