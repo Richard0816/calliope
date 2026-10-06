@@ -165,3 +165,59 @@ def test_tab5_quiet_export_runs_inline_without_monotonicity(tmp_path):
     stub = _StubTab(plane0)
     EventDetectionTab._on_export_figures(stub, quiet=True)
     assert stub.status_var.value.startswith("Exported event figures")
+
+
+# ---- Tab 4 (#137 preview-only fallback, #132 header order) ----------------
+
+class _LpStub:
+    """Just enough of LowpassTab for _load_data / _on_plane0."""
+
+    def __init__(self):
+        from calliope.tabs.lowpass.tab import LowpassTab
+        self._params = {"filter_order": 2}
+        self._compute_ready = False
+        self.compute_btn = _Btn()
+        self.export_btn = _Btn()
+        self.status_var = _Var()
+        self.recording_var = _Var()
+        self.cutoff_var = type("V", (), {"get": lambda self: 1.0})()
+        self._load_data = lambda p: LowpassTab._load_data(self, p)
+        self._draw_fft = self._draw_raw = self._draw_lowpass = lambda: None
+
+    def update_idletasks(self):
+        pass
+
+
+def _make_unfiltered_only_plane0(tmp_path: Path) -> Path:
+    plane0 = tmp_path / "plane0"
+    plane0.mkdir()
+    np.save(plane0 / "F.npy", np.zeros((N, T), dtype=np.float32))
+    mm = np.memmap(str(plane0 / "r0p7_dff.memmap.float32"),
+                   dtype="float32", mode="w+", shape=(T, N))
+    mm[:] = 0.1
+    mm.flush()
+    del mm
+    return plane0
+
+
+def test_tab4_unfiltered_fallback_is_preview_only(tmp_path):
+    from calliope.tabs.lowpass.tab import LowpassTab
+    stub = _LpStub()
+    LowpassTab._on_plane0(stub, _make_unfiltered_only_plane0(tmp_path))
+    assert stub._compute_ready is False
+    assert stub.compute_btn.kw == {"state": "disabled"}
+    assert "preview only" in stub.status_var.value
+
+
+def test_tab4_filtered_memmap_enables_compute(tmp_path):
+    from calliope.tabs.lowpass.tab import LowpassTab
+    stub = _LpStub()
+    LowpassTab._on_plane0(stub, _make_plane0(tmp_path))
+    assert stub._compute_ready is True
+    assert stub.compute_btn.kw == {"state": "normal"}
+
+
+def test_tab4_header_reflects_filter_order():
+    from calliope.tabs.lowpass.tab import LowpassTab
+    stub = type("S", (), {"_params": {"filter_order": 4}})()
+    assert LowpassTab._header_text(stub).endswith("order 4)")
