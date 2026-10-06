@@ -14,7 +14,7 @@ Two modes: **full recording** and **per event** (cropped to each window from Tab
 From `plane0/`:
 - `r0p7_filtered_dff.memmap.float32` — `(T, N_kept)` filtered dF/F.
 - `predicted_cell_mask.npy` (or `iscell.npy`) — for prefix translation.
-- `<plane0>/r0p7_filtered_cluster_results/gui_recluster/C*_rois.npy` — cluster files from Tab 6 (Suite2p ROI indices, with the `_indices_are_suite2p` marker).
+- `<plane0>/r0p7_filtered_cluster_results/C*_rois.npy` — cluster files from Tab 6 (Suite2p ROI indices, with the `_indices_are_suite2p` marker).
 - Event windows for per-event mode: live from Tab 5 via `AppState.event_results` (subscribed at `__init__`), with the `EventWindows` sheet of `<rec>_summary.xlsx` as a cold-start fallback when no Tab 5 publish exists yet.
 
 ---
@@ -123,7 +123,7 @@ once as `CAxCB` (never the mirror `CBxCA`); self-pairs `CAxCA` are included.
 The output layout is:
 
 ```
-<plane0>/r0p7_filtered_cluster_results/gui_recluster/cross_correlation_full/
+<plane0>/r0p7_filtered_cluster_results/cross_correlation_full/
 ├── C1xC1/
 │   └── C1xC1_summary.csv          ← per-pair best_lag_sec, max_corr, zero_lag_corr
 ├── C1xC2/
@@ -237,7 +237,7 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 ## 3. Outputs (on disk)
 
 ```
-<plane0>/r0p7_filtered_cluster_results/gui_recluster/
+<plane0>/r0p7_filtered_cluster_results/
 ├── cross_correlation_full/
 │   ├── C{i}xC{j}/
 │   │   ├── C{i}xC{j}_summary.csv

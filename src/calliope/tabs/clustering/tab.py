@@ -34,8 +34,8 @@ What the user sees
 - Palette dropdown + "Per-cluster colors..." dialog.
 - Export buttons:
     * "Export *_rois.npy"  -> writes one ROI list per cluster into
-      ``<prefix>cluster_results/gui_recluster/Ci_rois.npy``. Tab 7
-      reads those files for cluster x cluster cross-correlation.
+      ``<prefix>cluster_results/Ci_rois.npy``. Tab 7 reads those
+      files for cluster x cluster cross-correlation.
     * "Reload clusters" -> restore a previously-saved linkage +
       threshold without recomputing.
     * "Recluster within branch" -> open the picked branch in a
@@ -44,9 +44,9 @@ What the user sees
 
 What gets written
 -----------------
-- ``<prefix>cluster_results/gui_recluster/Ci_rois.npy`` -- per-
-  cluster ROI lists in Suite2p ROI ids.
-- ``<prefix>cluster_results/gui_recluster/linkage.npy`` and
+- ``<prefix>cluster_results/Ci_rois.npy`` -- per-cluster ROI lists
+  in Suite2p ROI ids (plus an ``_indices_are_suite2p`` marker).
+- ``<prefix>cluster_results/linkage.npy`` and
   ``threshold_used.npy`` -- so "Reload clusters" can restore the
   state.
 - ``Clusters`` sheet of ``calliope_summary.xlsx``.
@@ -56,39 +56,40 @@ Workflow
 1. Pick a Suite2p plane0 folder.
 2. Click "Run analysis":
        - Loads dF/F (default prefix r0p7_filtered_).
-       - Computes the pairwise correlation-distance linkage
-         (1 - Pearson r between every pair of ROIs).
+       - Computes the Ward linkage on Euclidean distance between
+         z-scored traces (ranks pairs like 1 - Pearson r, but the
+         merge heights are absolute Ward distances).
        - Picks a starting cut (auto target 4-5 clusters) and renders
          the dendrogram + cluster-colored spatial map.
 3. Adjust the cut:
        - "Manual threshold" toggle ON -> the vertical slider next to
          the dendrogram drives the cut (the dashed line on the
          dendrogram tracks the slider). Spatial map recolors live.
-       - Toggle OFF -> auto-threshold (same logic as
-         clustering_cmap.auto_choose_threshold).
+       - Toggle OFF -> auto-threshold
+         (core.clustering.auto_choose_threshold).
 4. Recolor:
        - Pick a palette from the dropdown (categorical or continuous).
        - Or click "Per-cluster colors..." to define one hex color per
          cluster manually; this overrides the dropdown until reset.
-5. "Export *_rois.npy" writes one ROI list per cluster into the
-   r0p7_*cluster_results/gui_recluster/ folder so the Cross-correlation
-   tab (and other downstream tools) can pick them up.
+5. "Export *_rois.npy" writes one ROI list per cluster into
+   ``<prefix>cluster_results/`` so the Cross-correlation tab (and other
+   downstream tools) can pick them up.
 
-Cross-correlation lives on its own tab (see ``crosscorrelation_tab.py``).
+Cross-correlation lives on its own tab (see
+``calliope/tabs/crosscorrelation/tab.py``).
 
-The whole thing also runs as a standalone window via `python clustering_tab.py`.
+The tab also runs as a standalone window via
+``python -m calliope.tabs.clustering.tab``.
 """
 
 from __future__ import annotations
 
 import queue
-import threading
 import tkinter as tk
-import traceback
 
 import customtkinter as ctk
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 import matplotlib
@@ -96,15 +97,8 @@ matplotlib.use("TkAgg")
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_tkagg import (
-    FigureCanvasTkAgg, NavigationToolbar2Tk,
-)
-from scipy.cluster.hierarchy import (
-    dendrogram,
-    fcluster,
-    linkage,
-)
-from scipy.spatial.distance import pdist
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy.cluster.hierarchy import dendrogram, fcluster
 
 from .logic import (
     ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
@@ -142,7 +136,7 @@ POLL_MS = 80
 
 
 class ClusteringTab(ctk.CTkFrame):
-    """Cross-correlation hierarchical clustering tab."""
+    """Tab 6: Ward hierarchical clustering of z-scored ROI dF/F traces."""
 
     def __init__(self, master, state=None) -> None:
         super().__init__(master, fg_color="transparent")
@@ -167,6 +161,9 @@ class ClusteringTab(ctk.CTkFrame):
         # Threshold state.
         self._auto_threshold: float = 0.7  # fraction of max
         self._manual_T: float = 0.7  # absolute distance
+        # Absolute cut requested by a Tab 0 batch row (``threshold`` > 0);
+        # applied (manual mode) by the next _on_done, then cleared.
+        self._batch_threshold: Optional[float] = None
 
         # Visual cluster index -> raw fcluster label, refreshed every render
         # so the cluster picker matches what the user sees in the dendrogram.
@@ -241,24 +238,28 @@ class ClusteringTab(ctk.CTkFrame):
         if "threshold" in p:
             try:
                 t = float(p["threshold"])
-                # threshold == 0 means "auto"; leave the tab alone so its
-                # auto_choose_threshold path runs.
-                if t > 0.0:
-                    self._manual_T = t
-                    try:
-                        self.threshold_scale.set(t)
-                    except Exception:
-                        pass
             except (TypeError, ValueError):
-                pass
+                t = None
+            if t is not None:
+                if t > 0.0:
+                    # Absolute Ward cut height. Stored rather than applied:
+                    # the slider range is only known once the next Run's
+                    # linkage lands, and _on_done would otherwise overwrite
+                    # it with the auto cut. _apply_initial_cut consumes it.
+                    self._batch_threshold = t
+                else:
+                    # 0 means "auto": clear any cut / manual mode a previous
+                    # batch row left behind so auto_choose_threshold drives.
+                    self._batch_threshold = None
+                    self.manual_var.set(False)
 
     def _build_ui(self) -> None:
         head = ctk.CTkFrame(self)
         head.pack(fill="x", padx=10, pady=(10, 6))
         ctk.CTkLabel(
             head,
-            text="Cross-correlation clustering "
-                 "(1 - Pearson r, hierarchical, average linkage)",
+            text="Hierarchical clustering "
+                 "(Ward linkage, Euclidean on z-scored dF/F)",
             font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
 
@@ -301,7 +302,7 @@ class ClusteringTab(ctk.CTkFrame):
         self.cluster_menu_btn.config(menu=self.cluster_menu)
         self.cluster_menu_btn.pack(side="left", padx=(8, 0))
 
-        ctk.CTkLabel(row3, text="new threshold (1 - r):").pack(
+        ctk.CTkLabel(row3, text="new threshold (Ward dist.):").pack(
             side="left", padx=(8, 2))
         self.recluster_thr_var = tk.StringVar(value="")
         ctk.CTkEntry(row3, textvariable=self.recluster_thr_var, width=80).pack(
@@ -583,7 +584,7 @@ class ClusteringTab(ctk.CTkFrame):
     def _on_reload_clusters(self) -> None:
         """Restore linkage + threshold from a previous Export *_rois.npy run.
 
-        Skips the (expensive) correlation-linkage computation and snaps the
+        Skips the (expensive) Ward-linkage computation and snaps the
         slider to the saved threshold in manual mode. dF/F + stat + ops are
         still loaded fresh from disk so reclustering and the spatial map
         keep working.
@@ -628,6 +629,9 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
         self._refresh_reload_btn()
+        # A batch-requested cut belongs to the Run that just failed; don't
+        # let it leak into the next interactive Run.
+        self._batch_threshold = None
         self.status_var.set("Analysis failed.")
         # Forward to the batch runner (so a worker crash fails-and-
         # continues the queue) and skip the modal when a batch is driving.
@@ -652,13 +656,14 @@ class ClusteringTab(ctk.CTkFrame):
         self._zmax = float(np.max(self._Z[:, 2]))
 
         auto_frac = float(data["auto_frac"])
-        self._auto_threshold = auto_frac
-        self._manual_T = auto_frac * self._zmax
+        batch_cut = self._apply_initial_cut(auto_frac)
 
         # Calibrate slider range to current linkage.
         self._slider_user_driven = False
         self.threshold_scale.config(from_=self._zmax, to=0.0,
                                     resolution=max(self._zmax / 1000.0, 1e-6))
+        if batch_cut:
+            self.threshold_scale.config(state="normal")
         self.threshold_scale.set(self._manual_T)
         self._slider_user_driven = True
 
@@ -729,6 +734,7 @@ class ClusteringTab(ctk.CTkFrame):
 
         self._custom_colors = None
         self.export_btn.configure(state="normal")
+        self.export_figs_btn.configure(state="normal")
         self.summary_btn.configure(state="normal")
         self.recluster_btn.configure(state="normal")
         self.cluster_menu_btn.config(state="normal")
@@ -751,6 +757,28 @@ class ClusteringTab(ctk.CTkFrame):
         self._refresh_reload_btn()
 
     # -- Threshold + palette -----------------------------------------------
+
+    def _apply_initial_cut(self, auto_frac: float) -> bool:
+        """Seed the threshold state after a fresh Run (``self._zmax`` set).
+
+        Normally the cut starts at the auto pick (``auto_frac * zmax``).
+        If a Tab 0 batch row requested an absolute cut via
+        ``apply_batch_row``, switch to manual mode at that cut (clamped
+        to ``[0, zmax]`` -- above ``zmax`` is one cluster either way) so
+        ``_current_threshold`` -- and therefore the batch's
+        ``_on_export`` -- uses it. The request is consumed so a later
+        interactive Run starts from the auto pick again. Returns True
+        when a batch cut was applied.
+        """
+        self._auto_threshold = float(auto_frac)
+        if self._batch_threshold is not None:
+            t = min(max(float(self._batch_threshold), 0.0), float(self._zmax))
+            self._batch_threshold = None
+            self._manual_T = t
+            self.manual_var.set(True)
+            return True
+        self._manual_T = float(auto_frac) * float(self._zmax)
+        return False
 
     def _current_threshold(self) -> float:
         if self.manual_var.get():
@@ -862,14 +890,10 @@ class ClusteringTab(ctk.CTkFrame):
         if self.state is not None:
             event_results = getattr(self.state, "event_results", None)
 
-        # Resolve fps via lowpass-tab-style notes lookup; harmless to
-        # default to 1.0 (popout shows frame indices instead of seconds).
-        fps = 1.0
-        try:
-            from ...core import utils as core_utils
-            fps = float(core_utils.get_fps_from_notes(str(self._plane0)))
-        except Exception:
-            pass
+        # Frame rate detection ran at (ops.npy['fs'], incl. Tab 3's FPS
+        # override), else the warned DEFAULT_FPS fallback. With no
+        # notes_root, get_fps_from_notes never raises.
+        fps = float(utils.get_fps_from_notes(str(self._plane0)))
 
         popout = self._cluster_popout
         if (popout is None or not popout.winfo_exists()
@@ -1274,7 +1298,7 @@ class ClusteringTab(ctk.CTkFrame):
                    above_threshold_color=ABOVE_CUT_COLOR,
                    no_labels=True)
         ax.axhline(T, linestyle="--", linewidth=1.5, color="black")
-        ax.set_ylabel("1 - r  (linkage distance)")
+        ax.set_ylabel("Ward linkage distance")
         ax.set_xlabel(f"{self._Z.shape[0] + 1} ROIs ({n_clusters} clusters)")
         ax.set_title(f"cut @ {T:.3f}"
                      f"  ({T / self._zmax:.2f} x max)"
@@ -1452,10 +1476,9 @@ class ClusteringTab(ctk.CTkFrame):
         else:
             roi_indices = None
 
-        try:
-            fps = float(utils.get_fps_from_notes(str(self._plane0)))
-        except Exception:
-            fps = None
+        # ops.npy['fs'] (detection fps) or the warned DEFAULT_FPS fallback;
+        # get_fps_from_notes never raises without a notes_root.
+        fps = float(utils.get_fps_from_notes(str(self._plane0)))
 
         summary_writer.update_recording_meta(
             self._plane0, prefix=self._prefix, fps=fps,
@@ -1555,7 +1578,7 @@ def main() -> None:
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()
     apply_ttk_dark_theme(root)
-    root.title("CalLIOPE - Cross-correlation clustering")
+    root.title("CalLIOPE - Hierarchical clustering")
     root.geometry("1300x780")
     tab = ClusteringTab(root, state=None)
     tab.pack(fill="both", expand=True)

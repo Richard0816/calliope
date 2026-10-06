@@ -993,8 +993,8 @@ math counterpart — the algorithm lives in `core/utils.py` /
   `_skip_clustering_xcorr_few_rois`: clustering + crosscorrelation are
   marked `skipped` and the row jumps to spatial propagation (which only
   needs events), so it still finishes with its event/spatial output.
-  `core.clustering._ward_linkage` / `tabs.clustering.logic.ward_linkage`
-  also raise a clear `ValueError` for this case, and the separate headless
+  `core.clustering.ward_linkage` (re-exported as `tabs.clustering.logic.ward_linkage`)
+  also raises a clear `ValueError` for this case, and the separate headless
   `batch_pipeline.run_recording` applies the same `_kept_roi_count` skip.
 - **No events => per-event xcorr is skipped, not stalled.** When event
   detection finds zero population events, the xcorr tab's
