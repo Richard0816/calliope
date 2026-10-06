@@ -89,3 +89,20 @@ def test_tab_logic_reexports_core_helpers():
     for name in ("ward_linkage", "load_filtered_dff", "stat_for_prefix",
                  "filtered_to_suite2p_indices"):
         assert getattr(logic, name) is getattr(core_clustering, name)
+
+
+def test_run_clustering_zero_threshold_means_auto(tmp_path):
+    # Batch spec "Cluster threshold (0=auto)" defaults to 0.0; it must pick
+    # the same auto cut as threshold=None, not fcluster at t=0.
+    keep = [0, 1, 2, 3, 4, 5]
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    auto = core_clustering.run_clustering(
+        _make_plane0(tmp_path / "a", keep),
+        {"prefix": PREFIX, "threshold": None}, write_summary=False)
+    zero = core_clustering.run_clustering(
+        _make_plane0(tmp_path / "b", keep),
+        {"prefix": PREFIX, "threshold": 0.0}, write_summary=False)
+    assert zero["threshold"] == auto["threshold"] > 0
+    assert zero["n_clusters"] == auto["n_clusters"] < len(keep)
+    assert np.array_equal(zero["labels"], auto["labels"])

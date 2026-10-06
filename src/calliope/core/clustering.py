@@ -564,7 +564,8 @@ def run_clustering(
         Suite2p plane folder.
     params : dict
         ``prefix`` (default ``"r0p7_filtered_"``),
-        ``threshold`` (None = auto-pick via :func:`auto_choose_threshold`),
+        ``threshold`` (None or <= 0 = auto-pick via
+        :func:`auto_choose_threshold`),
         ``target_counts`` (default ``(4, 5)``),
         ``palette`` (default ``"tab10"``),
         ``method`` (default ``"ward"``),
@@ -595,7 +596,10 @@ def run_clustering(
     Z = ward_linkage(dff_arr, method=method)
 
     threshold_param = params.get("threshold")
-    if threshold_param is None:
+    # None or <= 0 selects the auto cut: the batch spec ("Cluster threshold
+    # (0=auto)", default 0.0) and the Tab 6 batch row both use 0 for auto,
+    # and fcluster at t=0 would make every ROI its own cluster.
+    if threshold_param is None or float(threshold_param) <= 0:
         frac = auto_choose_threshold(Z, target_counts=target_counts)
         threshold = float(frac) * float(np.max(Z[:, 2]))
     else:
