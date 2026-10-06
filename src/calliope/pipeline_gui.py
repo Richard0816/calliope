@@ -678,7 +678,8 @@ class PipelineApp(ctk.CTk):
             n_total = len(np.load(plane0 / "stat.npy", allow_pickle=True))
             frozen = np.load(frozen_path, allow_pickle=False)
             live = np.asarray(utils.resolve_live_mask(plane0, n_total))
-            if frozen.ndim != 1 or frozen.size != n_total                     or live.size != n_total:
+            if (frozen.ndim != 1 or frozen.size != n_total
+                    or live.size != n_total):
                 return []
             live_n = int(live.astype(bool).sum())
             pipe_n = int(frozen.astype(bool).sum())
