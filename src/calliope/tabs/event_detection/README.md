@@ -200,7 +200,7 @@ After all `(start_s, end_s)` pairs are walked:
 - **Hard duration cap** (`max_event_duration_s = 1.3 s`): if `end_s − start_s > 1.3`, clamp it to centred-on-peak ±0.65 s.
 - **Symmetric clamp** (`enforce_symmetric_clamp=False` by default): if true, *every* window becomes peak ± `max_event_duration_s/2` (0.65 s at the default cap), not just the ones that exceed the cap. Useful for stereotyping but loses the natural boundaries.
 
-The `merge_gap_s` parameter is kept for compatibility but is **disabled** when `enable_watershed_split=True` (the new logic supersedes it).
+The `merge_gap_s` parameter is kept (and stays editable) for compatibility but currently has **no effect in any configuration**: the overlap-merge code that read it was disabled on 2026-05-01 and is kept commented out in `_boundaries_from_peaks`. Turning `enable_watershed_split` off does not bring merging back — overlapping windows are then simply left as walked.
 
 #### 3e — Activation matrix
 
@@ -495,10 +495,11 @@ Walking each peak outward to a window, then splitting/clamping
 - **Watershed-split overlaps (`enable_watershed_split`) — default `True`.**
   - *What it does:* when two walked windows overlap, cut both at the
     minimum-density valley between their peaks (`utils.py:1748`), so close events
-    stay separate. When on, the legacy `merge_gap_s` path is disabled.
+    stay separate.
   - *What it means to you:* keep on for distinct back-to-back epileptiform
-    events. Turn off only to fall back to the old merge-overlapping behaviour
-    (then `merge_gap_s` applies).
+    events. Turning it off does **not** restore the old merge-overlapping
+    behaviour (that code is disabled, so `merge_gap_s` is inert): overlapping
+    walked windows are left overlapping.
 - **Force symmetric clamp (`enforce_symmetric_clamp`) — default `False`.**
   - *What it does:* when on, **every** window is forced to peak ±
     `max_event_duration_s/2`, not just the ones exceeding the cap
@@ -507,11 +508,12 @@ Walking each peak outward to a window, then splitting/clamping
     (handy for averaging/alignment) at the cost of each event's natural
     boundaries. Leave off to keep walked widths up to the cap.
 - **Merge gap (`merge_gap_s`) — default `0.0`.**
-  - *What it does:* legacy overlap-merge gap (seconds). **Ignored while
-    `enable_watershed_split` is on** (the watershed logic supersedes it,
-    `utils.py:1728`).
-  - *What it means to you:* only relevant if you disable watershed split — then
-    windows closer than this gap merge. Left at 0 / inert by default.
+  - *What it does:* legacy overlap-merge gap (seconds). **Currently has no
+    effect in any configuration**, with or without watershed split: the merge
+    block that read it was disabled on 2026-05-01 and is kept commented out in
+    `_boundaries_from_peaks` (`core/utils.py`) for a possible future restore.
+  - *What it means to you:* nothing today. It stays in the dialog so saved
+    parameter sets keep loading; changing it does not change results.
 
 ### Population events — gaussian fit
 
@@ -553,10 +555,11 @@ popout) to fall back to fixed `min_prominence`, or nudge
 `auto_min_prominence_percentile` within ~95–99. The `min_prominence_used` value
 is recorded in the diagnostics dict.
 
-The Gaussian-fit group and `merge_gap_s` are inactive in the default
-short-event configuration but stay editable so you can revert to the older
-boundary heuristics (set `use_gaussian_boundary` on and/or `enable_watershed_split`
-off) without leaving the GUI.
+The Gaussian-fit group is inactive in the default short-event configuration
+but stays editable so you can revert to the older Gaussian boundary heuristic
+(set `use_gaussian_boundary` on) without leaving the GUI. `merge_gap_s` also
+stays editable but is inert (see above); the old merge-overlapping behaviour
+cannot currently be re-enabled from the GUI.
 
 **Manual subset (UI-only, not in `PARAM_SPEC`).** A header checkbox
 (`manual_subset_var`) + text entry (`manual_roi_var`, format `0,3,5-9`) restrict
