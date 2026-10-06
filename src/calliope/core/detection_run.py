@@ -54,6 +54,7 @@ from . import utils
 from . import scale as scale_mod
 from . import sparse_plus_cellpose as spc
 from . import preprocessing as _pre
+from .cellfilter.config import SIZE_OUTLIER_Z
 
 
 # Intermediate-binary cleanup. ``sparse_plus_cellpose.run`` leaves two
@@ -654,20 +655,17 @@ def compute_dff_memmaps(
 
 
 def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
-                        size_outlier_z: float = 4.0) -> None:
+                        size_outlier_z: float = SIZE_OUTLIER_Z) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
     import gc
     import torch
-    from .cellfilter.model import CellFilter
-    from .cellfilter.predict import predict_recording
+    from .cellfilter.predict import (load_model_from_checkpoint,
+                                     predict_recording)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model = CellFilter().to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
+    model = load_model_from_checkpoint(Path(ckpt_path), device)
     try:
         predict_recording(rec_id, model, device, plane0=plane0,
                           size_outlier_z=size_outlier_z)
@@ -676,7 +674,7 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
         # weights actually return to the driver. Without this, every
         # recording's predict step adds another model copy worth of
         # VRAM to torch's cache, which suite2p's next run inherits.
-        del model, ckpt
+        del model
         gc.collect()
         try:
             if torch.cuda.is_available():
@@ -698,7 +696,9 @@ def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
 def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     """Slice ``r0p7_dff.memmap.float32`` down to ROIs that pass the
     cell-filter mask and write ``r0p7_filtered_dff.memmap.float32``
-    plus the legacy ``r0p7_cell_mask_bool.npy`` keep-mask file.
+    plus ``r0p7_cell_mask_bool.npy``, the keep mask this memmap was
+    sliced with (every filtered-memmap reader sizes against it via
+    :func:`utils.resolve_filtered_mask`).
     Returns the filtered memmap path (or None if no ROIs survive).
     """
     plane0 = Path(plane0)
@@ -954,7 +954,8 @@ def run_detection(
             progress_cb("[detection] running cell-filter prediction...")
         predict_cell_filter(
             plane0, ckpt_path, rec_id or plane0.parent.name,
-            size_outlier_z=float(params.get("size_outlier_z", 4.0)))
+            size_outlier_z=float(params.get("size_outlier_z",
+                                            SIZE_OUTLIER_Z)))
 
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")
