@@ -715,11 +715,13 @@ from .calliope_settings import DEFAULT_FPS  # noqa: E402
 
 # Canonical display contrast window (percentiles) for showing
 # fluorescence / projection images (mean, correlation, max, detection
-# backgrounds, per-ROI heatmaps). Unifies the previously divergent
-# clip points ([1, 99] in some panels, 0.995/0.01 quantiles in others)
-# so every panel renders with the same contrast. NOTE: this is display
-# only -- it is deliberately NOT used for Cellpose input rescaling
-# (suite2p_pipeline uses 0.01/0.999 there), which is algorithmic.
+# backgrounds, per-ROI heatmaps). Used by the Tab 3 panels, the
+# detection figures and the event-detection figures. Not yet fully
+# unified: the Tab 3 curation popout still clips at a hard-coded
+# [1, 99] and the QC tab applies only the HIGH clip (no vmin).
+# NOTE: this is display only -- it is deliberately NOT used for
+# Cellpose input rescaling (suite2p_pipeline uses 0.01/0.999 there),
+# which is algorithmic.
 DISPLAY_CLIP_LOW_PCT: float = 1.0
 DISPLAY_CLIP_HIGH_PCT: float = 99.5
 
