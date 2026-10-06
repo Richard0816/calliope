@@ -599,13 +599,19 @@ class SpatialPropagationTab(ctk.CTkFrame):
         """Read ``spks.npy`` from a plane0 folder, subset to the kept
         ROIs, and transpose to ``(T, N_kept)``.
 
-        Cached by ``(plane0, tuple(kept_idx))`` so repeated event-
-        navigation clicks don't re-read the file. The actual
-        orientation-detect + slicing logic lives in
-        ``core.utils.s2p_load_spks``; this method just adds caching
-        on top.
+        Cached by ``(plane0, spks.npy mtime/size, tuple(kept_idx))`` so
+        repeated event-navigation clicks don't re-read the file, while a
+        re-detection that rewrites ``spks.npy`` in the same folder is
+        never served stale traces. The actual orientation-detect +
+        slicing logic lives in ``core.utils.s2p_load_spks``; this method
+        just adds caching on top.
         """
-        cache_key = (str(plane0), tuple(int(i) for i in kept_idx))
+        try:
+            st = (Path(plane0) / "spks.npy").stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        cache_key = (str(plane0), stamp, tuple(int(i) for i in kept_idx))
         cached = self._spks_cache.get(cache_key)
         if cached is not None:
             return cached

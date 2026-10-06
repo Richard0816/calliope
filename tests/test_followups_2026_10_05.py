@@ -182,3 +182,23 @@ def test_tab5_export_dispatch_failure_reenables_button(monkeypatch, tmp_path):
     ed_tab.EventDetectionTab._on_export_figures(s)
     s.export_btn.configure.assert_called_with(state="normal")
     assert s._export_job is None
+
+
+# ---- Tab 8 spks cache is invalidated when spks.npy is rewritten ----
+
+def test_tab8_spks_cache_tracks_file_rewrites(tmp_path):
+    import os
+    import types
+    from calliope.tabs.spatial_propagation.tab import SpatialPropagationTab
+
+    p0 = tmp_path
+    np.save(p0 / "spks.npy", np.zeros((2, 5), dtype=np.float32))
+    stub = types.SimpleNamespace(_spks_cache={})
+    kept = np.array([0, 1])
+    a = SpatialPropagationTab._load_spks(stub, p0, kept)
+    assert float(a.sum()) == 0.0
+    np.save(p0 / "spks.npy", np.ones((2, 5), dtype=np.float32))
+    st = os.stat(p0 / "spks.npy")
+    os.utime(p0 / "spks.npy", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    b = SpatialPropagationTab._load_spks(stub, p0, kept)
+    assert float(b.sum()) == 10.0

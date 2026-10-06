@@ -775,8 +775,7 @@ vars at run time.
 #### 5. Clustering
 
 No clustering tab contributes a PARAM_SPEC, so these three are
-hand-built and flow into `core.clustering.run_clustering`
-(`clustering.py:520`).
+hand-built and flow into `core.clustering.run_clustering`.
 
 - **`prefix`** — *str*, default = `"r0p7_filtered_"`.
   - **What it does:** selects which dF/F memmap clustering reads
@@ -790,7 +789,7 @@ hand-built and flow into `core.clustering.run_clustering`
 - **`threshold`** — *float*, default = `0.0` (= auto).
   - **What it does:** the Ward-linkage cut height. `0` (passed as
     `None`) routes to `auto_choose_threshold(Z, target_counts=(4,5))`
-    (`clustering.py:566-569`), which picks the fraction-of-max-height
+    (inside `run_clustering`), which picks the fraction-of-max-height
     cut that lands the cluster count near the target band; any
     positive value is used directly as the `fcluster` distance
     threshold.
@@ -808,13 +807,12 @@ hand-built and flow into `core.clustering.run_clustering`
 
 #### 6. Cross-correlation
 
-Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`,
-`crosscorrelation.py:193`).
+Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`).
 
 - **`max_lag_seconds`** — *float*, default = `2.0`.
   - **What it does:** the lag search-window radius. Converted to
     frames as `L = floor(max_lag_seconds * fps)`
-    (`crosscorrelation.py:266`); the best-lag scan runs over
+    (`batch_xcorr_clusters`); the best-lag scan runs over
     `[-L, +L]`.
   - **What it means to you:** raise it if you expect slow propagation
     across the FOV (larger lags will be found); lower it to restrict
@@ -829,7 +827,7 @@ Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`,
 - **`use_gpu`** — *bool*, default = `True`.
   - **What it does:** runs the correlation on CuPy when available
     (`use_gpu = bool(use_gpu and cp is not None)`,
-    `crosscorrelation.py:238`); falls back to NumPy otherwise.
+    `batch_xcorr_clusters`); falls back to NumPy otherwise.
   - **What it means to you:** keep on for speed on a CUDA box; the
     code silently falls back to CPU if CuPy is missing, so it's safe
     to leave True. The OOM auto-retry path forces this off on the
@@ -853,7 +851,7 @@ Hand-built; consumed by `core.crosscorrelation` (`batch_xcorr_clusters`,
 #### 7. Pipeline-wide — dF/F baseline (suite2p detection)
 
 Hand-built; passed to `core.detection_run` (`baseline_mode` /
-`baseline_min`, `detection_run.py:425` / `:465`). Named
+`baseline_min` kwargs of `run_detection` / `compute_dff_memmaps`). Named
 `dff_baseline_mode` / `dff_baseline_min` (not `baseline_mode`) so they
 never collide with Tab 5's population-event `baseline_mode`.
 
@@ -862,7 +860,7 @@ never collide with Tab 5's population-event `baseline_mode`.
   - **What it does:** chooses the F₀ for dF/F. `first_n` = mean of the
     first `dff_baseline_min` minutes per ROI; `rolling` = a 45 s
     window, 10th-percentile baseline. `first_n` is also the only mode
-    the GPU dF/F fast path supports (`detection_run.py:436` — `rolling`
+    the GPU dF/F fast path supports (`_maybe_run_dff_gpu` — `rolling`
     forces the per-ROI CPU path).
   - **What it means to you:** use `first_n` when the recording starts
     quiet (clean pre-stimulus epoch). Switch to `rolling` if there's no
@@ -870,7 +868,7 @@ never collide with Tab 5's population-event `baseline_mode`.
     cost of dropping off the GPU path (slower).
 - **`dff_baseline_min`** — *float*, default = `2.0` (minutes).
   - **What it does:** the length of the `first_n` baseline window
-    (`baseline_sec = baseline_min * 60`, `detection_run.py:451`).
+    (`baseline_sec = baseline_min * 60`, `_maybe_run_dff_gpu`).
     Ignored when `dff_baseline_mode == "rolling"`.
   - **What it means to you:** raise it to average over a longer quiet
     epoch (steadier F₀, but only valid if the recording really is
