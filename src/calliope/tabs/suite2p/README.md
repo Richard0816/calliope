@@ -15,7 +15,7 @@ This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computatio
 ## 1. Inputs
 
 - `result.shifted_tiff` (and its sibling shifted TIFFs in the same folder) from Tab 1.
-- The in-source **base settings** dict from `calliope.core.calliope_settings` (defines per-pixel size, registration knobs, etc.). The user's Advanced parameters and the "Edit suite2p settings..." popout override individual fields at runtime.
+- The in-source **base settings** dict from `calliope.core.calliope_settings` (suite2p registration / detection / extraction overrides on top of suite2p's defaults; the pixel scale is not here — it comes from Tab 3's Pixel-scale params and `core.scale.FOV_UM_REFERENCE`). The user's Advanced parameters and the "Edit suite2p settings..." popout override individual fields at runtime.
 - A **cell-filter checkpoint** (`.pt`) for the trained `CellFilter` model. Ships bundled at `<calliope/data>/cellfilter_best.pt` and is loaded by default. Users can point the Browse... field at their own retrained checkpoint; if the file is missing or unreadable, the third panel falls back to Suite2p's `iscell.npy`.
 - The **per-recording GCaMP variant**, picked from the dropdown in the Tab 3 header. Resolves to the Suite2p deconvolution `tau` (seconds). Default is jGCaMP8m (`tau = 0.25 s`). A **custom τ (s)** entry field sits next to the dropdown: enter a positive number to override the variant τ (for an indicator not in the preset list, or a rig-calibrated value); leave it blank to use the dropdown. The actual τ used is recorded in `ops.npy` and surfaced in the export `manifest.json`.
 
@@ -26,19 +26,28 @@ This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computatio
 The tab worker (`Suite2pTab._run_pipeline`) is roughly:
 
 ```python
-final_plane0 = sparse_plus_cellpose.run(...)   # ROI detection
+final_plane0 = sparse_plus_cellpose.run(..., fps_override=...)  # ROI detection
+self._stamp_run_meta(final_plane0, ...)        # meta.json: spatial_scale + GCaMP label
 self._stamp_pix_to_um(final_plane0, params)    # calliope_calibration.npy from zoom or direct
-_run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative
+_run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative + meta.json stamp
 if ckpt_path:
     _run_cellfilter(final_plane0, ckpt_path)   # PyTorch keep/drop
 _run_filtered_dff(final_plane0)                # slice dF/F to kept ROIs
 ```
 
-The same chain is also exposed as a single headless callable:
-`core.detection_run.run_detection(tiff_folder, save_folder, params, ...)`.
-That's what Tab 0's batch runner invokes — both the tab and the batch
-worker share one code path, so anything tested via the GUI behaves
-identically when batched.
+`_stamp_pix_to_um`, `_run_dff` and `_run_cellfilter` are thin wrappers
+over `core.detection_run.stamp_pix_to_um`, `compute_dff_memmaps` and
+`predict_cell_filter`, the same functions the headless
+`core.detection_run.run_detection(tiff_folder, save_folder, params, ...)`
+calls, so the dF/F math, the `meta.json` dF/F provenance and the
+cell-filter step have one implementation. The GUI worker itself
+(`_run_pipeline`) is still a separate orchestration from `run_detection`:
+Tab 0's batch tab applies each row's params to this tab and presses its
+run button, so batched runs go through `_run_pipeline`, not
+`run_detection`. `_run_filtered_dff` keeps a local copy of
+`detection_run.compute_filtered_dff` (same mask resolver, same output)
+because Promote also calls it on the GUI main thread, where importing the
+detection stack would freeze the window.
 
 ### suite2p 1.0 adapter
 
@@ -159,22 +168,25 @@ These three arrays are written as `(T, N_total)` `float32` memmaps in `plane0/`:
 
 The `r0p7_` prefix encodes "neuropil coefficient r=0.7" and is hardcoded by older downstream tools (clustering, crosscorr, paper figures); changing it would require updating those.
 
+Only `r0p7_dff` is read downstream (cell filter, filtered dF/F, the curation popout). No stage reads the contents of the unfiltered `r0p7_dff_lowpass` / `r0p7_dff_dt` files: Tab 4 writes the `r0p7_filtered_*` low-pass and derivative that event detection and later tabs use, with its own cutoff. The two unfiltered files are still written because the cell-filter dataset loader (`utils.s2p_open_memmaps`) requires them to exist.
+
+The computation is `core.detection_run.compute_dff_memmaps`; Tab 3's `_run_dff` wraps it and logs the GPU/CPU choice. Before writing the memmaps it stamps the `dff`, `lowpass` and `extraction.neuropil_coef` sections of `meta.json` (Step 7).
+
 #### CPU loop
 
 ```python
-for i in range(N):
-    trace = F[i] − r·Fneu[i]
-    dff   = first_n_min_df_over_f_1d(trace, ...)  or  robust_df_over_f_1d(trace, ...)
-    lp, _, sos = lowpass_causal_1d(dff, fps, cutoff_hz, order=2, sos=cached)
-    dt  = sg_first_derivative_1d(lp, fps, win_ms=333, poly=2)
-    dff_mm[:, i] = dff
-    lp_mm[:, i]  = lp
-    dt_mm[:, i]  = dt
+for each chunk of up to 256 ROIs:
+    traces = F[chunk] − r·Fneu[chunk]
+    for each ROI in the chunk:
+        dff = first_n_min_df_over_f_1d(trace, ...)  or  robust_df_over_f_1d(trace, ...)
+        lp, _, sos = lowpass_causal_1d(dff, fps, cutoff_hz, order=2, sos=cached)
+    dt = savgol_filter(lp_chunk, win, polyorder=sg_poly, deriv=1, delta=1/fps, axis=1)
+    write dff / lp / dt columns for the chunk
 ```
 
-The Butterworth `sos` is computed once and reused across ROIs.
+The Butterworth `sos` is computed once and reused across ROIs. The batched Savitzky-Golay call gives the same result as `utils.sg_first_derivative_1d` run per ROI.
 
-#### GPU path (`_maybe_run_dff_gpu`)
+#### GPU path (`detection_run._maybe_run_dff_gpu`)
 
 If `use_gpu_dff` is true **and** `baseline_mode == 'first_n'` **and** `analyze_output_gpu` imports successfully **and** CuPy is available:
 
@@ -203,17 +215,7 @@ The two embeddings are concatenated (128-d) and passed through a small MLP head 
 
 **How it's trained.** A `roi_curation.csv` of hand-labelled ROIs (from this lab's recordings) provides positive/negative examples. The training loop uses BCE loss with a positive-class weight to handle class imbalance, splits validation by ROI, augments by random temporal cropping, and selects the best checkpoint by validation AUROC.
 
-**How it's applied here.** The Tab 3 worker:
-
-```python
-from calliope.core.cellfilter.model import CellFilter
-from calliope.core.cellfilter.predict import predict_recording
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-model = CellFilter().to(device); model.load_state_dict(ckpt['model']); model.eval()
-predict_recording(rec_id, model, device, plane0=plane0)
-```
+**How it's applied here.** The Tab 3 worker calls `core.detection_run.predict_cell_filter(plane0, ckpt_path, rec_id, size_outlier_z=...)`. It loads the checkpoint onto CUDA when available (CPU otherwise), runs `cellfilter.predict.predict_recording`, then frees the model and empties the CUDA cache so the next recording's suite2p run gets the VRAM back.
 
 `predict_recording` walks every ROI in the recording and writes:
 - `predicted_cell_prob.npy` — float, length `N_total`, the model's score in `[0, 1]`.
@@ -227,9 +229,9 @@ If the checkpoint is missing, the tab logs a warning and the third panel falls b
 
 `_run_filtered_dff(plane0)`: load `r0p7_dff.memmap.float32` of shape `(T, N_total)`, slice columns by the keep mask, write `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)`. Done in 4096-frame chunks to bound memory.
 
-Also writes `r0p7_cell_mask_bool.npy` (a copy of the keep mask under the legacy filename) so older downstream tools (clustering scripts, paper figures) that hardcode that name keep working.
+Also writes `r0p7_cell_mask_bool.npy`, the exact mask the filtered memmap was sliced with. This file is **authoritative**, not a legacy copy: `core.utils.resolve_filtered_mask` trusts it first to size every `r0p7_filtered_*` reader (the WinError 8 fix), and clustering, event detection and cross-correlation read it directly. Do not delete it.
 
-**Keep-mask drift.** Panel 3 paints the *live* mask (`resolve_live_mask`: `predicted_cell_mask.npy` → `iscell.npy`), i.e. what the filter would keep right now. Every downstream stage instead reads the filtered memmaps, which are frozen to the mask written here. Re-running the cell filter (new checkpoint, retrain) rewrites `predicted_cell_mask.npy` but *not* the memmaps, so the two counts diverge — this is why a reloaded run could show a different kept-ROI count on Tab 3 than in Tabs 4-8. `utils.pipeline_mask_count(plane0, n_total)` reports the frozen count; Panel 3's title appends `[!] downstream tabs use n = …` when it disagrees, and **Open run folder…** raises the same mismatch as a load warning. Re-run this step (and the stages after it) to resync.
+**Keep-mask drift.** Panel 3 paints the *live* mask (`resolve_live_mask`: `predicted_cell_mask.npy` → `iscell.npy`), i.e. what the filter would keep right now. Every downstream stage instead reads the filtered memmaps, which are frozen to the mask written here. Re-running the cell filter (new checkpoint, retrain) rewrites `predicted_cell_mask.npy` but *not* the memmaps, so the two counts diverge — this is why a reloaded run can show a different kept-ROI count on Tab 3 than in Tabs 4-8. The frozen count is the number of `True` entries in `r0p7_cell_mask_bool.npy`. The GUI does not flag the mismatch yet, so compare the two counts yourself after re-running the cell filter. **Promote to filter mask** (§6) rewrites the filtered memmap; otherwise re-run this step (and the stages after it) to resync.
 
 If the **Also write filtered dF/F as CSV** checkbox is on, `_write_filtered_dff_csv` mirrors the memmap into `r0p7_filtered_dff.csv` with one column per kept ROI, headed `roi_<i>` (the Suite2p index), in 4096-frame chunks. The frame index is preserved as the CSV index.
 
@@ -243,7 +245,7 @@ The shared helper `core.detection_run.prune_detection_intermediates(save_folder,
 - drops `data_raw*.bin` / `*.tmp` / `*.lock` anywhere under `detection/`,
 - **keeps** `_shared_reg/ops.npy` + the rest of the registration metadata for audit, and **keeps** everything under `final/`.
 
-**Re-detect override.** Setting `keep_registration_cache = True` (Tab 3 Advanced → "Re-detect" group, or the per-recording params dict) skips the `_shared_reg/.../data.bin` deletion. A subsequent re-detect of the same recording then reuses the registered movie (`_get_or_create_shared_registration` gates on `data.bin` + `ops.npy`, both present) and skips the ~5 min re-registration — the cheap path for iterating on detection params (e.g. forcing `spatial_scale` to break up blobby ROIs that the cell filter can't reject). Costs the ~13 GB on disk; default `False` keeps the space-saving behaviour. The chosen `spatial_scale` (0 = suite2p auto, or a forced 1–4) is stamped into `meta.json`'s `detection` block (plus `spatscale_pix`, the scale sparsery resolved, when suite2p recorded it) so a re-run is reproducible.
+**Re-detect override.** Setting `keep_registration_cache = True` (Tab 3 Advanced → "Re-detect" group, the Tab 0 batch column of the same name, or the per-recording params dict) skips the `_shared_reg/.../data.bin` deletion. A subsequent re-detect of the same recording then reuses the registered movie (`_get_or_create_shared_registration` gates on `data.bin` + `ops.npy`, both present) and skips the ~5 min re-registration — the cheap path for iterating on detection params (e.g. forcing `spatial_scale` to break up blobby ROIs that the cell filter can't reject). Costs the ~13 GB on disk; default `False` keeps the space-saving behaviour. The chosen `spatial_scale` (0 = suite2p auto, or a forced 1–4) is stamped into `meta.json`'s `detection` block by `sparse_plus_cellpose.run` (plus `spatscale_pix`, the scale sparsery resolved, when suite2p recorded it), so both the Tab 3 worker and the headless `run_detection` path record it; the Tab 3 worker also re-stamps the requested value (`_stamp_run_meta`). A re-run is therefore reproducible.
 
 The same helper is called from `core.detection_run.run_detection` so headless drivers (`batch_pipeline.run_recording`, any external agent that calls `run_detection` in a loop) get the cleanup unconditionally — not just GUI runs. This mirrors `tabs/batch/logic.py::prune_scratch_tree`'s policy but runs at the tail of every detection. Without it, an agent that runs detection over many recordings will fill the save drive (12 recordings ≈ 312 GB; observed disk-full at recording 13 in the 2026-05-12 batch).
 
@@ -285,7 +287,7 @@ Every processed recording writes `<plane0>/meta.json`, a single provenance file 
 - **detection** — `threshold_scaling`, `sparse_mode`, `spatial_scale`, `highpass_time` (the values the sparsery pass ran with, not the base settings), plus `spatscale_pix` when available (the schema also carries `cellpose_enabled`, `cellpose_model`, `cellpose_flow_threshold`, `enable_sam_vcorr_pass`, but these are reserved: no stage stamps them yet, so they stay `null`)
 - **extraction** — `neuropil_coef`, `tau_seconds`, `gcamp_variant_label` (stamped from the Tab 3 GCaMP dropdown)
 - **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec` (the first-N baseline length in seconds, i.e. `baseline_min · 60`), `fps`
-- **lowpass** — `cutoff_hz`, `filter_kind`, `order`
+- **lowpass** — `cutoff_hz`, `filter_kind`, `order` (from Tab 3's `default_lowpass_hz`; Tab 4 does not update this section, so it does not record the cutoff event detection used)
 - **spike_inference** — `backend` (always `"oasis"`, the only backend)
 - **denoising** — reserved stub (`applied: false`, `model: null`); nothing writes it yet
 - **qc** — the z-drift fields written by Step 8
@@ -299,7 +301,7 @@ After detection, a quick check flags axial (z) drift. It computes the first prin
 - `zdrift_qc.png` — the PC1 trace with flagged frames marked.
 - `zdrift_pc1.csv` — columns `frame, time_s, pc1, is_step`, so the figure is fully recreatable from a plain CSV.
 
-The result is also stamped into `meta.json`'s `qc` section (`zdrift_detected`, `zdrift_n_steps`, `zdrift_step_frames`, `zdrift_pc1_var_explained`). This is detection only — it flags frames for the user to judge and never drops them (dropping would require re-running registration). On by default.
+The result is also stamped into `meta.json`'s `qc` section (`zdrift_detected`, `zdrift_n_steps`, `zdrift_step_frames`, `zdrift_pc1_var_explained`). This is detection only — it flags frames for the user to judge and never drops them (dropping would require re-running registration). On by default; turn it off with `zdrift_qc` (Advanced → "QC", or the Tab 0 batch column). Turning it off skips the QC; existing `zdrift_*` files are not removed.
 
 ---
 
@@ -313,13 +315,14 @@ The result is also stamped into `meta.json`'s `qc` section (`zdrift_detected`, `
 | `Fneu.npy` | `(N_total, T)` | neuropil trace |
 | `iscell.npy` | `(N_total, 2)` | Suite2p classifier (binary + confidence) |
 | `r0p7_dff.memmap.float32` | `(T, N_total)` | dF/F (note: time-major) |
-| `r0p7_dff_lowpass.memmap.float32` | `(T, N_total)` | low-pass at default 1 Hz |
-| `r0p7_dff_dt.memmap.float32` | `(T, N_total)` | SG first derivative |
+| `r0p7_dff_lowpass.memmap.float32` | `(T, N_total)` | low-pass at `default_lowpass_hz`; contents unused downstream (see Step 2) |
+| `r0p7_dff_dt.memmap.float32` | `(T, N_total)` | SG first derivative; contents unused downstream |
 | `predicted_cell_mask.npy` | `(N_total,)` bool | cell-filter keep mask |
 | `predicted_cell_prob.npy` | `(N_total,)` float | cell-filter confidence |
 | `r0p7_filtered_dff.memmap.float32` | `(T, N_kept)` | dF/F restricted to kept ROIs |
-| `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | legacy duplicate of the keep mask |
+| `r0p7_cell_mask_bool.npy` | `(N_total,)` bool | mask the filtered memmaps were sliced with; authoritative for every `r0p7_filtered_*` reader |
 | `r0p7_filtered_dff.csv` | optional | per-frame CSV view of filtered dF/F |
+| `calliope_calibration.npy` | scalar | µm per pixel (only when a Pixel-scale param is set) |
 | `meta.json` | dict | provenance sidecar (registration / detection / extraction / dF/F / lowpass / spike-inference / qc); atomic write, safe read |
 | `zdrift_qc.png` | figure | PC1 trace with flagged z-drift frames marked |
 | `zdrift_pc1.csv` | `(T, 4)` | `frame, time_s, pc1, is_step` — recreates `zdrift_qc.png` |
@@ -346,18 +349,18 @@ A summary workbook (`calliope_summary.xlsx`) with a `Recording` sheet and an `RO
 
 Two separate dialogs sit in the Tab 3 header:
 
-- **Advanced...** opens the curated `PARAM_SPEC` form (`tab.py:236`,
-  `open_advanced(self, ..., self.PARAM_SPEC, self._params)` at `tab.py:691`).
+- **Advanced...** opens the curated `Suite2pTab.PARAM_SPEC` form
+  (`_on_advanced` → `open_advanced(self, ..., self.PARAM_SPEC, self._params)`).
   These are the knobs CalLIOPE actually owns — Sparsery / Cellpose / merge /
-  dF/F / low-pass / pixel-scale / GPU. Documented in full below. Each field's
+  dF/F / low-pass / pixel-scale / GPU / QC / Re-detect. Documented in full below. Each field's
   value lands in `self._params` and re-runs nothing on close: it applies on the
   **next** "Run detection + cell filter".
 - **Edit suite2p settings...** opens a second, deeper popout
-  (`_on_edit_suite2p_settings`, `tab.py:697`) that flattens the *entire*
+  (`_on_edit_suite2p_settings`) that flattens the *entire*
   suite2p 1.0 nested settings tree and lets you override any leaf. This is the
   raw escape hatch — see [§5.8](#58-raw-suite2p-settings-escape-hatch).
 
-The radio buttons (**baseline mode**), the **GCaMP variant** dropdown, the
+The radio buttons (**baseline mode**; the rolling option's window and percentile are the `win_sec` / `perc` params in §5.5), the **GCaMP variant** dropdown, the
 **custom τ (s)** field, and the two **filtered-dF/F CSV** / **archive**
 checkboxes are not in `PARAM_SPEC`; they are separate Tk vars read in `_on_run`
 and covered in §1–§2.
@@ -387,8 +390,8 @@ it finds anything that fired enough to stand out from a high-pass-filtered movie
 ### 5.2 Cellpose (generalist segmenter, primary pass on `meanImg`)
 
 Run on the mean image after Sparsery to recover morphologically obvious cells
-that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults at
-`sparse_plus_cellpose.py:131-135`). The pass input channel is fixed at
+that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults in
+`sparse_plus_cellpose.CELLPOSE_CFG`). The pass input channel is fixed at
 `cellpose_channel_input='meanImg'` (not exposed in the form).
 
 | Setting (`key`) | Default | What it does | What it means to you |
@@ -408,7 +411,7 @@ that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults at
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| `max_overlap` | `0.3` | A Cellpose ROI is **dropped** if more than this fraction of *its* pixels are already covered by a Sparsery ROI (`merge` at `sparse_plus_cellpose.py:197,227`). | This is the de-duplication aggressiveness between the two detectors. **Lower (e.g. 0.1)** = drop Cellpose ROIs at the slightest Sparsery overlap (favour Sparsery, fewer duplicates); **raise (e.g. 0.5)** = keep Cellpose ROIs that substantially overlap a Sparsery cell (more ROIs, risk of near-duplicates). 0.3 keeps a Cellpose cell unless it's mostly the same footprint as one Sparsery already found. |
+| `max_overlap` | `0.3` | A Cellpose ROI is **dropped** if more than this fraction of *its* pixels are already covered by a Sparsery ROI (`sparse_plus_cellpose.merge`). | This is the de-duplication aggressiveness between the two detectors. **Lower (e.g. 0.1)** = drop Cellpose ROIs at the slightest Sparsery overlap (favour Sparsery, fewer duplicates); **raise (e.g. 0.5)** = keep Cellpose ROIs that substantially overlap a Sparsery cell (more ROIs, risk of near-duplicates). 0.3 keeps a Cellpose cell unless it's mostly the same footprint as one Sparsery already found. |
 
 ### 5.4 Cellpose-SAM (Tier 2) — optional second pass on `Vcorr`
 
@@ -416,7 +419,7 @@ Off by default. When enabled, after the Sparsery + cyto2 passes the runner runs
 Cellpose-SAM (`model_type='cpsam'`, **requires cellpose ≥ 4.0**) on the
 correlation image `Vcorr` to recover *silent* cells, then filters that pass
 against Sparsery independently and tags survivors `_source='cellpose_sam'`
-(`sparse_plus_cellpose.py:714-766`). See §2 Step 1 for the full mechanism.
+(the SAM block in `sparse_plus_cellpose.run`). See §2 Step 1 for the full mechanism.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
@@ -426,37 +429,44 @@ against Sparsery independently and tags survivors `_source='cellpose_sam'`
 
 ### 5.5 dF/F (neuropil correction + baseline)
 
-Consumed in `_run_dff` (`tab.py:1022-1117`). The baseline-mode radio and the
+Consumed by `_run_dff` → `core.detection_run.compute_dff_memmaps`. The baseline-mode radio and the
 first-N-minutes value are separate Tk vars (§2 Step 2); the knobs here are the
 `PARAM_SPEC` portion.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| `fps_override` | `0.0` | Frame rate. **0 = use the 15.08 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** propagates to suite2p's `fs`/deconvolution `tau` timing. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, the low-pass cutoff, and the SG derivative's `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
+| `fps_override` | `0.0` | Frame rate. **0 = use the 15.08 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** is passed to `sparse_plus_cellpose.run(fps_override=...)`, so suite2p's `fs` (deconvolution timing) and `ops.npy['fs']`, which Tabs 4-8 read, use it too. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, the low-pass cutoff, and the SG derivative's `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
 | `neuropil_coef` | `0.7` | The `r` in `F_corr = F − r·Fneu`; fraction of the neuropil trace subtracted (Chen et al. 2013). | 0.7 removes ~70% of out-of-focus contamination, the field standard. **Raise** if traces still show obvious neuropil bleed-through (shared slow waves across all cells); **lower** if subtraction is over-correcting bright cells into negative dF/F. Note the on-disk `r0p7_` filename prefix is hardcoded by downstream tools and does **not** change when you change `r` — only the math does. |
 | `perc` | `10` | Baseline percentile of the sliding `percentile_filter` in **rolling** mode. **Ignored in first-N mode** — `first_n_min_df_over_f_1d` always uses the *mean* of the baseline window and accepts `perc` only for call-site symmetry. | The "what counts as baseline" knob for rolling mode. **Lower (e.g. 5)** chases the trough of the trace (good if cells are active most of the time and the 10th pct is still riding events); **raise** for very quiet cells where a low percentile sits in noise. Switch to first-N mode if you want a plain mean baseline instead. |
 | `win_sec` | `45.0` | Rolling-mode only: width (s) of the sliding percentile window for `F0[t]` (`utils.robust_df_over_f_1d`). | **Ignored in first-N mode.** Window must be wider than your longest real event or it will track the event and flatten it. **Shorten** to follow faster baseline drift (bleaching, swelling); **lengthen** if long events are being eaten by the baseline. |
 
 ### 5.6 Default low-pass / derivative
 
-Written once here for the whole recording (Tab 4 can overwrite the
-`filtered_*` variants later). Consumed in the per-ROI loop at `tab.py:1103-1107`
-(`utils.lowpass_causal_1d`, `utils.sg_first_derivative_1d`) and mirrored on the
-GPU path.
+These shape only the unfiltered `r0p7_dff_lowpass` / `r0p7_dff_dt` memmaps
+(`compute_dff_memmaps`: `utils.lowpass_causal_1d` plus a batched Savitzky-Golay
+derivative, mirrored on the GPU path). **No stage reads those memmaps'
+contents** (see §2 Step 2). The low-pass and derivative that event detection
+and later tabs use are the `r0p7_filtered_*` files Tab 4 writes with its own
+cutoff, so tune the low-pass in Tab 4. `default_lowpass_hz` is also the value
+`meta.json`'s `lowpass` section records.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| `default_lowpass_hz` | `1.0` | Cutoff (Hz) of the order-2 causal Butterworth applied to dF/F → `r0p7_dff_lowpass`. | Sets the smoothness of the default low-pass trace. **Lower** for slower indicators / heavier denoising; **raise** to preserve fast kinetics. Must stay below Nyquist (`fps/2`); the derivative is computed from this trace, so lowering it also smooths the derivative. |
-| `default_sg_win_ms` | `333` | Savitzky-Golay window (ms) for the first derivative `r0p7_dff_dt` (converted to an odd sample count via fps). | Wider window = smoother, more lagged derivative; narrower = noisier but more responsive. Pair with `default_lowpass_hz` — over-smoothing both stacks the lag. |
-| `default_sg_poly` | `2` | Polynomial order of the SG fit. | Leave at 2 (quadratic) for a standard first derivative. Order must be < the window's sample length; raising it tracks curvature more closely at the cost of noise. |
+| `default_lowpass_hz` | `1.0` | Cutoff (Hz) of the order-2 causal Butterworth applied to dF/F → `r0p7_dff_lowpass`. | No effect on analysis results. Must stay below Nyquist (`fps/2`). Leave at the default. |
+| `default_sg_win_ms` | `333` | Savitzky-Golay window (ms) for the first derivative `r0p7_dff_dt` (converted to an odd sample count via fps). | No effect on analysis results; Tab 4 has its own derivative settings. |
+| `default_sg_poly` | `2` | Polynomial order of the SG fit for `r0p7_dff_dt`. | No effect on analysis results. Order must be < the window's sample length. |
 
 ### 5.7 Pixel-scale (µm calibration) and GPU
 
 Pixel-scale knobs are resolved by `core.scale.resolve_pix_to_um`
-(`scale.py:82`) after detection and saved to `plane0/calliope_calibration.npy` (`utils.save_pix_to_um`),
-so Tabs 6 (spatial cluster map) and 8 (per-event order maps) and the detection
-scale bar render in µm with no further input. **Priority: `um_per_pixel` >
-`scope_zoom` > any pre-existing calibration (`calliope_calibration.npy`, or a legacy `ops['pix_to_um']` in old folders).** Leave both at 0 to skip
+after detection (`core.detection_run.stamp_pix_to_um`, via `core.scale.resolve_pix_to_um`) and written to
+`plane0/calliope_calibration.npy`, so Tabs 6 (spatial cluster map) and 8
+(per-event order maps) and the detection scale bar render in µm with no
+further input (`utils.load_pix_to_um`, which falls back to a legacy
+`ops['pix_to_um']` when the calibration file is absent). **Priority:
+`um_per_pixel` > `scope_zoom`; with both at 0 nothing is written, so any
+pre-existing calibration (`calliope_calibration.npy`, or a legacy
+`ops['pix_to_um']` in old folders) is kept.** Leave both at 0 to skip
 calibration and render in raw pixels (no scale bar).
 
 | Setting (`key`) | Default | What it does | What it means to you |
@@ -464,18 +474,27 @@ calibration and render in raw pixels (no scale bar).
 | `scope_zoom` | `0.0` (skip) | Microscope zoom factor. Computes `pix_to_um = (fov_um_reference / zoom) / Lx`. | Use this if you log the scope's zoom but not a direct µm/px. Needs `fov_um_reference` set correctly for your rig. Ignored if `um_per_pixel` is set. |
 | `fov_um_reference` | `3080.90169` | FOV width (µm) at 1× zoom, used only by the `scope_zoom` path. | **Rig-specific — the default is the lab's two-photon scope.** If you use the zoom path on a different microscope you *must* set this to your own 1× FOV width, or every µm axis and scale bar will be wrong. No effect when using `um_per_pixel`. |
 | `um_per_pixel` | `0.0` (skip) | Direct calibration in µm per pixel; **wins over `scope_zoom`**. | The cleanest option if you've measured it (e.g. from a calibration slide). Set this and you can ignore the zoom/FOV pair entirely. Must be > 0. |
-| `use_gpu_dff` | `True` | Route the dF/F + low-pass + derivative through the CuPy GPU path (`_maybe_run_dff_gpu`, `tab.py:1119`). | Leave on for speed. **Auto-falls back to CPU** if CuPy is missing, the import fails, or the baseline mode is `rolling` (GPU only implements the first-N-min mean baseline). Results are identical to CPU; this is purely a speed switch. |
+| `use_gpu_dff` | `True` | Route the dF/F + low-pass + derivative through the CuPy GPU path (`detection_run._maybe_run_dff_gpu`; Tab 3 logs why it fell back). | Leave on for speed. **Auto-falls back to CPU** if CuPy is missing, the import fails, or the baseline mode is `rolling` (GPU only implements the first-N-min mean baseline). Results are identical to CPU; this is purely a speed switch. |
 | `gpu_roi_chunk` | `0` (all) | Split ROIs into chunks of this size on the GPU to bound VRAM (0 = process all ROIs at once). | Only touch if the GPU path OOMs on a large recording. **Set a positive chunk** (e.g. 500) to trade a little speed for a smaller peak VRAM footprint. No effect on the CPU path. |
+
+### 5.7b QC and Re-detect
+
+| Setting (`key`) | Default | What it does | What it means to you |
+|---|---|---|---|
+| `zdrift_qc` | `True` | Runs the post-detection z-drift QC (§2 Step 8). | Turn off to skip the PCA pass on very large recordings. Existing `zdrift_*` files are left in place. |
+| `keep_registration_cache` | `False` | Keeps `_shared_reg/.../data.bin` after detection (§2 Step 5). | Turn on while iterating on detection params (e.g. a forced `spatial_scale`) so each re-detect skips the ~5 min re-registration. Costs ~13 GB of disk per recording. |
 
 ### 5.8 Raw suite2p settings (escape hatch)
 
-The **Edit suite2p settings...** button (`_on_edit_suite2p_settings`,
-`tab.py:697`) is *not* part of `PARAM_SPEC`. It flattens the full
+The **Edit suite2p settings...** button (`_on_edit_suite2p_settings`) is *not*
+part of `PARAM_SPEC`. It flattens the full
 `calliope_settings.build_base_settings()` tree into a spec, shows **every leaf**
-of suite2p 1.0's nested `db`/`settings` schema, and deep-merges your edits on
+of suite2p 1.0's nested `settings` schema (not `db`: file lists, `nplanes`,
+`nchannels` and the rest of the db half come from
+`calliope_settings.build_base_db()` and are not editable here), and deep-merges your edits on
 top of the in-source defaults for the session (`self._settings_override`, passed
-to `spc.run(..., settings_override=...)`). It forwards **arbitrary suite2p ops**
-— anything suite2p accepts (registration block size, `nonrigid`, `nbins`,
+to `spc.run(..., settings_override=...)`). It forwards **arbitrary suite2p settings**
+— anything in that tree (registration block size, `nonrigid`, `nbins`,
 `do_regmetrics`, etc.) you can set here.
 
 Use it for the registration/extraction knobs CalLIOPE does not curate above:
@@ -491,21 +510,18 @@ empty dialog (no changes) resets to the in-source defaults.
 
 ## 6. Curation popout (click an ROI on panel 2)
 
-Module: `tabs/suite2p/curation_popout.py`. Mirrors the standalone reference UI in `Calcium_imaging_suite2p/roi_curation_app.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
+Module: `tabs/suite2p/curation_popout.py`. The standalone equivalent is `src/calliope/scripts/roi_curation_app.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
 
-Panels:
-1. Mean image with a yellow locator box around the clicked ROI's bbox.
-2. Max projection with the same locator box (max projection is reconstructed from `ops['max_proj']` padded back to full frame using `ops['yrange']` / `ops['xrange']`).
-3. Max projection + ROI footprint scatter overlay (red).
-4. ROI footprint alone (axis-equal scatter for shape inspection).
-5. ΔF/F trace from `r0p7_dff.memmap.float32` (full all-ROI memmap, not the filtered one — figure 2 panel cell rejects are still inspectable).
+Panels (the layout depends on which background images the recording carries):
+- **Top row:** one panel per available background, in `CurationPopout._KNOWN_BACKGROUNDS` order — Mean, Mean (enhanced), Max projection, Correlation (`Vcorr`), Reg. ref (`refImg`), Mean ch2. Each shows the ROI's pixels scattered in red with a yellow locator box around its bbox. The max projection is padded back to full frame using `ops['yrange']` / `ops['xrange']`. The first panel's title carries the recording id. A final **ROI footprint** panel (axis-equal scatter for shape inspection) closes the row.
+- **Bottom row:** the ΔF/F trace from `r0p7_dff.memmap.float32` (the full all-ROI memmap, not the filtered one, so cell-filter rejects are still inspectable).
 
 Controls:
-- **Cell (1)** / **Not a cell (0)** flip iscell.npy in place and append to `cellfilter.config.LABELS_CSV` (default the in-project `calliope/data/cellfilter_labels.csv`) with columns `recording_ID, ROI_number, user_defined_cell` so the next training run picks up the new labels. Tab 3's panels 2 + 3 repaint immediately to reflect the new keep set.
+- **Cell (1)** / **Not a cell (0)** flip iscell.npy in place and upsert a row in `cellfilter.config.LABELS_CSV` (default the in-project `calliope/data/cellfilter_labels.csv`; columns `plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso`; one row per labelled ROI, so a re-flip replaces its row) so the next training run picks up the new labels. Tab 3's panels 2 + 3 repaint immediately to reflect the new keep set.
 - **Retrain cell filter** stays disabled until the user has flipped at least one ROI's classification this session. On click it spawns a worker thread that runs `cellfilter.train.main()` (synchronous, ~40 epochs); the GUI stays responsive but the popout's flip buttons stay enabled (the trainer reads the CSV at start, so further mid-training flips land in the *next* round). The trainer applies dihedral-group spatial augmentation (H/V flips + 90/180/270 rotation) and additive trace noise on the train split — tuneables live in `cellfilter/config.py::AUG_*`. Validation stays un-augmented so per-epoch val AUROC remains comparable across runs and against the bundled checkpoint.
 - **Promote to filter mask** stays disabled until the user has flipped at least one ROI this session. On click it overlays the flipped indices onto `predicted_cell_mask.npy`, preserving CNN predictions for un-touched ROIs. Use this when you want manual flips to take effect downstream (Tab 5/6/7, cross-correlation) *without* the cost of a full retrain. If `predicted_cell_mask.npy` does not yet exist (cell-filter never ran on this recording), the file is created from `iscell.npy[:, 0]` with the flips applied.
   - **Memmap rewrite + refresh (important for reloaded runs).** Updating `predicted_cell_mask.npy` alone is *not* enough on a completed/reloaded run: the filtered dF/F memmap `r0p7_filtered_dff.memmap.float32` is column-sliced to the keep mask that was live when it was written, and readers anchor to `r0p7_cell_mask_bool.npy` (the WinError-8 fix in `core.utils.resolve_filtered_mask`), so a changed prediction mask is ignored until the memmap is rewritten. Promote therefore re-runs `_run_filtered_dff` — re-slicing from the full-ROI source `r0p7_dff.memmap.float32` so both removed *and* re-added cells take effect — then re-publishes the `plane0` channel so memmap-reading tabs (e.g. lowpass `n_kept`) refresh immediately. This is a no-op when the source/filtered memmaps don't exist yet (nothing downstream to refresh). **Windows lock:** downstream tabs hold open memmap handles on the filtered file (Tab 7's `_dff_cache`, Tab 6's `self._dff` — both opened by the reload flow's `_on_reload_inputs` / `_on_reload_clusters`), and an open mapping locks the file on Windows, so the `mode="w+"` truncate would fail with `PermissionError`. `_regenerate_after_promote` calls the new `AppState.release_memmaps()` channel *before* the rewrite — Tab 7 nulls `_dff_cache` (lazy reopen on next xcorr run) and Tab 6 nulls `self._dff` (repopulated on next Run/Reload) — then `gc.collect()`s to free transient mappings before truncating. If a residual lock remains, the rewrite is caught and the user is told to close any cross-correlation/cluster popouts and re-run Tab 3 'filtered dF/F'. **Caveat:** already-computed downstream *results* (Tab 5 events, Tab 6/7 clusters, cross-correlation) are not recomputed — re-run those stages to reflect the new cell set.
-- **Show 1 Hz lowpass** overlays a 1 Hz order-2 causal Butterworth (`utils.lowpass_causal_1d`, the same filter the pipeline applies in Step 2) on top of the raw ΔF/F trace so the curator can preview what the trace will look like after the downstream lowpass. Toggle state persists across ROI switches — flip it on once and it stays on for the rest of the queue. Silently skipped on traces with non-finite samples (sosfilt is IIR and would propagate NaN).
+- **Show 1 Hz lowpass** overlays a 1 Hz order-2 **zero-phase** Butterworth (`utils.lowpass_zero_phase_1d`) on the raw ΔF/F trace, so its peaks line up with the raw ones. It is a preview only; the pipeline's own low-pass (Tab 4) is causal. Toggle state persists across ROI switches — flip it on once and it stays on for the rest of the queue. Silently skipped on traces with non-finite samples (sosfilt is IIR and would propagate NaN).
 
 Keybinds: `1` = cell, `0` = not a cell, `Esc` = close.
 
@@ -531,8 +547,8 @@ Tab 3 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Resizable console.** The "Suite2p console" (Panel 1, top) carries a draggable handle below it — drag down to grow the log without squeezing the detection panels beneath; the scrollable tab body absorbs the extra height.
 - **Detection panels** (2: raw ROIs, 3: after cell-filter mask). Matplotlib figures keep their white facecolor; toolbars are dark-skinned.
-- **Click an ROI** on the detected-ROIs panel to open the **CurationPopout** (`CurationPopout`) — resizable Toplevel that displays five per-ROI panels (locator + trace + four backgrounds) and lets the user re-label cells / retrain the cell-filter.
-- **Edit suite2p settings...** opens a second `AdvancedDialog`-style popout for arbitrary `ops` overrides; "Advanced..." opens the standard PARAM_SPEC form.
-- **Export figures.** Re-renders the detection ROI-overlay panels (`all_rois.{png,svg}`, `kept_rois.{png,svg}`) into `<save_folder>/calliope_figures/detection/` and drops a `manifest.json` next to the per-stage figures dirs at `<save_folder>/calliope_figures/manifest.json`. Manifest fields: `rec_id`, `created_at_iso`, `calliope_git_sha`, `gcamp_variant`, `tau`, `fs`, `n_cells_kept`, `n_cells_total`, `cellfilter_ckpt_path`, `cellfilter_ckpt_sha256`, and the full Tab 3 `params` dict. The button is enabled the moment `_final_plane0` is set (i.e. after "Run detection + cell filter" or "Load existing panels") and refuses to run while the CurationPopout has un-promoted flips (`CurationPopout.has_pending_promotion()`) — otherwise the exported figures would reflect a stale keep mask. For the full per-stage figure set (lowpass + events + clusters + xcorr + spatial), drive the recording through Tab 0 — `core/batch_pipeline.py::run_recording` produces the same `calliope_figures/<stage>/` tree plus manifest as part of the normal pipeline.
+- **Click an ROI** on the detected-ROIs panel to open the **CurationPopout** (`CurationPopout`) — resizable Toplevel that displays one panel per available background, a footprint panel and the ΔF/F trace and lets the user re-label cells / retrain the cell-filter.
+- **Edit suite2p settings...** opens a second `AdvancedDialog`-style popout for arbitrary suite2p `settings` overrides; "Advanced..." opens the standard PARAM_SPEC form.
+- **Export figures.** Re-renders the detection ROI-overlay panels (`all_rois.{png,svg}`, `kept_rois.{png,svg}`) into `<save_folder>/calliope_figures/detection/` and drops a `manifest.json` next to the per-stage figures dirs at `<save_folder>/calliope_figures/manifest.json`. Manifest fields: `rec_id`, `created_at_iso`, `calliope_git_sha`, `gcamp_variant`, `tau`, `fs`, `n_cells_kept`, `n_cells_total`, `cellfilter_ckpt_path`, `cellfilter_ckpt_sha256`, and the full Tab 3 `params` dict. The button is enabled the moment `_final_plane0` is set (i.e. after "Run detection + cell filter" or "Load existing panels") and refuses to run while the CurationPopout has un-promoted flips (`CurationPopout.has_pending_promotion()`) — otherwise the exported figures would reflect a stale keep mask. For the full per-stage figure set (lowpass + events + clusters + xcorr + spatial), drive the recording through Tab 0, whose batch run writes the same `calliope_figures/<stage>/` tree plus manifest as part of the normal pipeline.
 
 - **Export NWB.** Writes a DANDI-style `.nwb` for the recording. Enabled once a run finishes or after "Load existing panels"; clicking it opens a save dialog. The file contains an ImagingPlane (frame rate, indicator, tau, neuropil coef, pixel size when known), a PlaneSegmentation with per-ROI image masks plus cell columns (`iscell` = suite2p accept label incl. curation, `iscell_prob` = suite2p classifier probability, `cellfilter_prob` = CalLIOPE cell-filter probability, `kept` = the keep mask downstream stages used, from `r0p7_cell_mask_bool.npy`, else `predicted_cell_mask.npy`; each only when its file is present) and an ROI source column, Fluorescence / Neuropil / DfOverF `RoiResponseSeries`, an OASIS deconvolved spike-estimate series, and — when present — population event windows read from `calliope_summary.xlsx`. Imaging metadata is read from `meta.json`. Subject demographics are placeholders: the button and the batch export never supply them; pass `subject_metadata=` to `core.nwb_export.export_recording_to_nwb` from a script for DANDI-bound files. NWB support is an optional dependency (`pip install 'calliope[nwb]'`, which pulls in pynwb + nwbinspector); if pynwb is not installed the button shows a message and does nothing.

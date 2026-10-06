@@ -16,11 +16,12 @@ trace-extraction pipeline:
         |
         v
     dF/F computation with neuropil correction
-        (writes r0p7_dff*.memmap.float32)
+        (calliope.core.detection_run.compute_dff_memmaps;
+         writes r0p7_dff*.memmap.float32 + the meta.json dF/F stamp)
         |
         v
     Cell-filter CNN prediction
-        (calliope.core.cellfilter.predict.predict_recording)
+        (calliope.core.detection_run.predict_cell_filter)
         writes predicted_cell_prob.npy + predicted_cell_mask.npy
         |
         v
@@ -43,7 +44,7 @@ What the user sees
     * top: live console (stdout/stderr captured via ``QueueWriter``)
     * bottom-left:  raw detected ROIs over the chosen background image
     * bottom-right: ROIs that *passed* the cell-filter mask
-- A "Reload from folder..." button to load a previously-detected
+- A "Load existing panels" button to load a previously-detected
   recording without re-running anything.
 
 Threading
@@ -84,6 +85,7 @@ from .logic import (
 )
 from .curation_popout import CurationPopout
 
+from ...core.cellfilter.config import SIZE_OUTLIER_Z
 from ...core.scale import FOV_UM_REFERENCE
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
@@ -105,10 +107,12 @@ class Suite2pTab(ctk.CTkFrame):
 
     Class-attribute layout
     ----------------------
-    ``DEFAULT_OPS_PATH`` / ``DEFAULT_CKPT_PATH``
-        File paths the form is pre-populated with on startup. Users
-        can override via the Browse... buttons. Both the ops file and
-        the cell-filter checkpoint ship bundled in ``calliope/data``.
+    ``DEFAULT_CKPT_PATH``
+        Cell-filter checkpoint the form is pre-populated with on
+        startup (bundled in ``calliope/data``); override via Browse....
+        There is no ops file: base suite2p settings live in source
+        (``calliope.core.calliope_settings``) and per-session edits go
+        through "Edit suite2p settings...".
 
     ``KNOWN_BG_IMAGES``
         Background-image options shown in the dropdown above the
@@ -252,7 +256,7 @@ class Suite2pTab(ctk.CTkFrame):
          "help": "abort sparsery if it exceeds this many ROIs"},
         # Cell filter: hard size gate after the CNN
         {"name": "size_outlier_z", "label": "Size-outlier z (0=off)",
-         "type": "float", "default": 4.0, "group": "Cell filter",
+         "type": "float", "default": SIZE_OUTLIER_Z, "group": "Cell filter",
          "help": "drop kept ROIs whose robust z of log(area) exceeds "
                  "this (sparsery blob artifacts); 0 disables"},
         # Cellpose
@@ -291,8 +295,8 @@ class Suite2pTab(ctk.CTkFrame):
         # dF/F
         {"name": "fps_override", "label": "FPS override (0=auto)",
          "type": "float", "default": 0.0, "group": "dF/F",
-         "help": "non-zero sets the frame rate explicitly; "
-                 "0 uses the default (15.08 Hz)"},
+         "help": "non-zero sets the frame rate for suite2p (fs, ops.npy) "
+                 "and dF/F; 0 uses the default (15.08 Hz)"},
         {"name": "neuropil_coef", "label": "Neuropil coefficient (r)",
          "type": "float", "default": 0.7, "group": "dF/F"},
         {"name": "perc", "label": "Baseline percentile",
@@ -300,15 +304,26 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "win_sec", "label": "Rolling window (s)",
          "type": "float", "default": 45.0, "group": "dF/F",
          "help": "only used in 'rolling' baseline mode"},
-        # Default lowpass written here (Tab 4 overwrites filtered_*)
+        # Default low-pass: shapes ONLY the unfiltered (T, N_total)
+        # r0p7_dff_lowpass / r0p7_dff_dt memmaps written here. No stage
+        # reads their contents (the cell-filter dataset loader only needs
+        # them to exist); every downstream stage reads the r0p7_filtered_*
+        # low-pass / derivative memmaps that Tab 4 writes with its own
+        # cutoff. Tune the low-pass in Tab 4, not here.
         {"name": "default_lowpass_hz", "label": "Default low-pass (Hz)",
-         "type": "float", "default": 1.0, "group": "Default low-pass"},
+         "type": "float", "default": 1.0, "group": "Default low-pass",
+         "help": "only shapes the unfiltered r0p7_dff_lowpass memmap, "
+                 "which no stage reads; set the analysis cutoff in Tab 4"},
         {"name": "default_sg_win_ms", "label": "SG derivative window (ms)",
-         "type": "int", "default": 333, "group": "Default low-pass"},
+         "type": "int", "default": 333, "group": "Default low-pass",
+         "help": "only shapes the unfiltered r0p7_dff_dt memmap; "
+                 "Tab 4 writes the derivative downstream stages use"},
         {"name": "default_sg_poly", "label": "SG polynomial order",
-         "type": "int", "default": 2, "group": "Default low-pass"},
-        # Pixel <-> micrometre calibration (written to ops['pix_to_um']
-        # after detection so Tabs 6 & 7 render spatial plots in µm).
+         "type": "int", "default": 2, "group": "Default low-pass",
+         "help": "only shapes the unfiltered r0p7_dff_dt memmap"},
+        # Pixel <-> micrometre calibration (written to
+        # <plane0>/calliope_calibration.npy after detection so Tabs 6 & 7
+        # render spatial plots in µm).
         # Direct override wins over zoom; leave both at 0 to skip and
         # render in raw pixels.
         {"name": "scope_zoom", "label": "Scope zoom (0=skip)",
@@ -331,6 +346,20 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "gpu_roi_chunk", "label": "GPU ROI chunk (0=all)",
          "type": "int", "default": 0, "group": "GPU",
          "help": "split ROIs into chunks if VRAM is tight"},
+        # Post-detection z-drift QC (zdrift_pc1.csv + zdrift_qc.png +
+        # meta.json stamp). Detection only -- no frames are dropped.
+        {"name": "zdrift_qc", "label": "Run z-drift QC",
+         "type": "bool", "default": True, "group": "QC",
+         "help": "flag PC1 step changes in the dF/F after detection; "
+                 "off skips the QC (existing zdrift files are kept)"},
+        # Re-detect workflow: keep the shared registration so a re-run
+        # with different detection params (e.g. a forced spatial_scale)
+        # skips the ~5 min re-registration. Costs ~13 GB per recording.
+        {"name": "keep_registration_cache",
+         "label": "Keep registration cache (re-detect)",
+         "type": "bool", "default": False, "group": "Re-detect",
+         "help": "keep _shared_reg data.bin after detection so a re-detect "
+                 "reuses the registered movie; uses ~13 GB of disk"},
     ]
 
     def __init__(self, master, state: AppState) -> None:
@@ -369,7 +398,9 @@ class Suite2pTab(ctk.CTkFrame):
                      "done": lambda _p: self._on_done(),
                      "error": self._on_error,
                      "archive_done": self._on_archive_done,
-                     "archive_error": self._on_archive_error},
+                     "archive_error": self._on_archive_error,
+                     "nwb_done": self._on_nwb_done,
+                     "nwb_error": self._on_nwb_error},
                     poll_ms=self.POLL_MS)
         state.subscribe(self._on_preprocess_result)
 
@@ -460,7 +491,7 @@ class Suite2pTab(ctk.CTkFrame):
                      width=60).pack(side="left", padx=(0, 2))
         ctk.CTkLabel(row, text="min").pack(side="left", padx=(0, 12))
         ctk.CTkRadioButton(
-            row, text="Rolling (45 s window, 10th pct)",
+            row, text="Rolling percentile (window / pct in Advanced)",
             value="rolling", variable=self.baseline_var,
         ).pack(side="left")
 
@@ -888,6 +919,10 @@ class Suite2pTab(ctk.CTkFrame):
         }
         hard_cap = int(params.get("hard_cap", 60000))
         max_overlap = float(params.get("max_overlap", 0.3))
+        # FPS override -> suite2p ``fs`` (deconvolution timing and the
+        # ``ops.npy['fs']`` every downstream tab reads). 0 means "no
+        # override": suite2p keeps its base-settings fs.
+        fps_override = float(params.get("fps_override", 0.0) or 0.0)
 
         # Tier 2 #13 Cellpose-SAM second pass on Vcorr. Off by default
         # because (a) it requires cellpose >= 4.0 which not every box
@@ -924,6 +959,7 @@ class Suite2pTab(ctk.CTkFrame):
                 hard_cap=hard_cap,
                 max_overlap=max_overlap,
                 tau_override=tau_override,
+                fps_override=(fps_override if fps_override > 0 else None),
                 # Per-session overrides from the "Edit suite2p settings..."
                 # popout. Empty dict means no overrides.
                 settings_override=(self._settings_override
@@ -935,28 +971,24 @@ class Suite2pTab(ctk.CTkFrame):
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
             self._log_queue.put(("plane0", final_plane0))
 
-            # Stamp the GUI-supplied GCaMP variant label into meta.json (the
-            # core extraction stage records tau/neuropil coef but not the
-            # label). Best-effort -- a metadata failure never sinks the run.
-            if gcamp_label:
-                try:
-                    from ...core import recording_meta
-                    recording_meta.update_meta(
-                        final_plane0,
-                        extraction={"gcamp_variant_label": gcamp_label},
-                    )
-                except Exception as _e:
-                    print(f"[GUI] could not stamp gcamp label: {_e}")
+            # Stamp what the core extraction stage cannot know into
+            # meta.json: the GUI's GCaMP variant label and the Sparsery
+            # spatial_scale this run asked for (0 = suite2p auto), so a
+            # re-detect with a forced scale is reproducible. Best-effort --
+            # a metadata failure never sinks the run.
+            self._stamp_run_meta(final_plane0, sparsery_ops, gcamp_label)
 
             self._stamp_pix_to_um(final_plane0, params)
 
-            self._run_dff(final_plane0, baseline_mode, baseline_min)
+            self._run_dff(final_plane0, baseline_mode, baseline_min,
+                          params=params)
 
             if ckpt_path:
                 print("[GUI] running cell-filter prediction...")
                 self._run_cellfilter(
                     final_plane0, ckpt_path, rec_id,
-                    size_outlier_z=float(params.get("size_outlier_z", 4.0)))
+                    size_outlier_z=float(params.get(
+                        "size_outlier_z", SIZE_OUTLIER_Z)))
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
@@ -988,151 +1020,103 @@ class Suite2pTab(ctk.CTkFrame):
                 "plane0": str(final_plane0),
             }
 
-    def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
-        """Write the resolved µm-per-pixel onto ``plane0/ops.npy``.
+    @staticmethod
+    def _stamp_run_meta(plane0: Path, sparsery_ops: dict,
+                        gcamp_label: Optional[str]) -> None:
+        """Record GUI-side detection provenance in ``meta.json``.
 
-        Tabs 6 (clustering colormap) and 7 (spatial propagation) read
-        ``ops['pix_to_um']`` to render spatial axes in µm. We resolve
-        from either the user-supplied direct calibration or the scope
-        zoom (combined with the recording's ``Lx``) and stamp the
-        result so downstream tabs are oblivious to the source.
-
-        Skipped silently if the user left both inputs at 0.
+        The core extraction stage stamps tau / neuropil coefficient /
+        threshold_scaling itself; this adds the two values only the
+        caller knows: the GCaMP variant *label* and the Sparsery
+        ``spatial_scale`` the run requested (0 = suite2p auto, 1-4 =
+        forced). Best-effort: a metadata failure never sinks the run.
         """
-        from ...core.scale import resolve_pix_to_um
-        from ...core import utils
+        sections: dict = {
+            "detection": {
+                "spatial_scale": int(sparsery_ops.get("spatial_scale", 0)
+                                     or 0),
+            },
+        }
+        if gcamp_label:
+            sections["extraction"] = {"gcamp_variant_label": gcamp_label}
+        try:
+            from ...core import recording_meta
+            recording_meta.update_meta(plane0, **sections)
+        except Exception as _e:
+            print(f"[GUI] could not stamp meta.json: {_e}")
+
+    def _stamp_pix_to_um(self, plane0: Path, params: dict) -> None:
+        """Write the resolved µm-per-pixel to
+        ``plane0/calliope_calibration.npy``.
+
+        Thin wrapper over :func:`calliope.core.detection_run.stamp_pix_to_um`
+        (the one implementation the headless path also uses). Tabs 6 and 7
+        read the value back through ``utils.load_pix_to_um`` to render
+        spatial axes in µm. Direct µm/px wins over scope zoom; skipped when
+        both are 0.
+        """
+        from ...core import detection_run
         zoom = params.get("scope_zoom", 0.0) or None
         um_px = params.get("um_per_pixel", 0.0) or None
-        fov_um = params.get("fov_um_reference", FOV_UM_REFERENCE) \
-            or FOV_UM_REFERENCE
         if zoom is None and um_px is None:
             return
-        view = utils.load_plane_view(plane0)
-        if not view:
-            print(f"[GUI] pix_to_um: no plane outputs at {plane0}; "
+        resolved = detection_run.stamp_pix_to_um(plane0, params)
+        if resolved is None:
+            print(f"[GUI] pix_to_um: could not resolve a calibration for "
+                  f"{plane0} (missing plane outputs or invalid values); "
                   "skipping calibration stamp")
             return
-        try:
-            resolved = resolve_pix_to_um(
-                view, zoom=zoom, um_per_pixel=um_px, fov_um=fov_um,
-            )
-        except (TypeError, ValueError) as e:
-            print(f"[GUI] pix_to_um: invalid calibration ({e}); skipping")
-            return
-        if resolved is None:
-            return
-        utils.save_pix_to_um(plane0, float(resolved))
         source = "direct µm/px" if um_px is not None else f"zoom {zoom}"
         print(f"[GUI] pix_to_um = {resolved:.4f} µm/px (source: {source})")
 
     def _run_dff(
         self, plane0: Path, baseline_mode: str, baseline_min: float,
+        params: Optional[dict] = None,
     ) -> None:
-        """Inline dF/F + low-pass + derivative computation. Writes:
+        """dF/F + default low-pass + derivative for every Suite2p ROI.
+
+        Delegates to :func:`calliope.core.detection_run.compute_dff_memmaps`
+        so the GUI and headless paths share one implementation, including
+        the ``meta.json`` ``dff`` / ``lowpass`` / ``extraction`` provenance
+        stamp that the NWB exporter reads. Writes::
+
             plane0/r0p7_dff.memmap.float32          (T, N)
-            plane0/r0p7_dff_lowpass.memmap.float32  (T, N)  @ default 1 Hz
+            plane0/r0p7_dff_lowpass.memmap.float32  (T, N)
             plane0/r0p7_dff_dt.memmap.float32       (T, N)
-        Tries the GPU path first when ``use_gpu_dff`` is enabled and the
-        baseline mode is 'first_n'; otherwise falls back to per-cell CPU.
-        """
-        from ...core import utils
-        F = np.load(plane0 / "F.npy", allow_pickle=False)
-        Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
-        if F.shape != Fneu.shape or F.ndim != 2:
-            raise ValueError(
-                f"unexpected F/Fneu shapes: {F.shape}, {Fneu.shape}")
-        F = np.asarray(F, dtype=np.float32, order="C")
-        Fneu = np.asarray(Fneu, dtype=np.float32, order="C")
-        N, T = F.shape
 
-        fps_override = float(self._params.get("fps_override", 0.0))
+        Tries the GPU path first when ``use_gpu_dff`` is on and the
+        baseline mode is 'first_n'; otherwise (or on GPU failure) CPU.
+        """
+        from ...core import detection_run
+        params = dict(self._params if params is None else params)
+        fps_override = float(params.get("fps_override", 0.0) or 0.0)
         if fps_override > 0:
-            fps = fps_override
-            print(f"[GUI] FPS override active: {fps:.4f} Hz")
-        else:
-            fps = float(utils.get_fps_from_notes(str(plane0)))
-        if baseline_mode == "first_n":
-            print(f"[GUI] dF/F: first-{baseline_min:g}-min baseline "
-                  f"(fps={fps}, n_baseline_frames~"
-                  f"{int(baseline_min * 60 * fps)})")
-        else:
-            print(f"[GUI] dF/F: rolling baseline (fps={fps})")
-
-        cutoff_hz_default = float(
-            self._params.get("default_lowpass_hz", 1.0))
-        sg_win_ms_default = int(self._params.get("default_sg_win_ms", 333))
-        sg_poly_default = int(self._params.get("default_sg_poly", 2))
-        r_default = float(self._params.get("neuropil_coef", 0.7))
-
-        if self._maybe_run_dff_gpu(
-                plane0=plane0, baseline_mode=baseline_mode,
-                baseline_min=baseline_min, fps=fps,
-                cutoff_hz=cutoff_hz_default,
-                sg_win_ms=sg_win_ms_default, sg_poly=sg_poly_default,
-                r=r_default, F=F, Fneu=Fneu):
-            return
-        cutoff_hz = float(self._params.get("default_lowpass_hz", 1.0))
-        sg_win_ms = int(self._params.get("default_sg_win_ms", 333))
-        sg_poly = int(self._params.get("default_sg_poly", 2))
-        r = float(self._params.get("neuropil_coef", 0.7))
-        perc = int(self._params.get("perc", 10))
-        win_sec = float(self._params.get("win_sec", 45.0))
-        print(f"[GUI] low-pass default cutoff {cutoff_hz:.2f} Hz; "
-              f"SG derivative win {sg_win_ms} ms / poly {sg_poly}; "
-              f"neuropil r={r:.2f}, baseline pct={perc}, win={win_sec:g}s")
-
-        shape = (T, N)
-        dff_path = plane0 / "r0p7_dff.memmap.float32"
-        lp_path = plane0 / "r0p7_dff_lowpass.memmap.float32"
-        dt_path = plane0 / "r0p7_dff_dt.memmap.float32"
-        dff_mm = np.memmap(str(dff_path), mode="w+", dtype="float32",
-                           shape=shape)
-        lp_mm = np.memmap(str(lp_path), mode="w+", dtype="float32",
-                          shape=shape)
-        dt_mm = np.memmap(str(dt_path), mode="w+", dtype="float32",
-                          shape=shape)
-
-        batch = max(8, utils.change_batch_according_to_free_ram() * 20)
-        sos = None
-
+            print(f"[GUI] FPS override active: {fps_override:.4f} Hz")
+        gpu_wanted = self._gpu_dff_eligible(params, baseline_mode)
+        print(f"[GUI] dF/F: {baseline_mode} baseline"
+              + (f" ({baseline_min:g} min)" if baseline_mode == "first_n"
+                 else f" (win={float(params.get('win_sec', 45.0)):g}s)")
+              + f", pct={int(params.get('perc', 10))}, "
+              f"neuropil r={float(params.get('neuropil_coef', 0.7)):.2f}")
         t0 = time.time()
-        for i0 in range(0, N, batch):
-            i1 = min(N, i0 + batch)
-            for i in range(i0, i1):
-                trace = (F[i, :] - r * Fneu[i, :]).astype(np.float32)
-                if baseline_mode == "first_n":
-                    dff = utils.first_n_min_df_over_f_1d(
-                        trace, baseline_min=baseline_min,
-                        perc=perc, fps=fps)
-                else:
-                    dff = utils.robust_df_over_f_1d(
-                        trace, win_sec=win_sec, perc=perc, fps=fps)
-                lp, _, sos = utils.lowpass_causal_1d(
-                    dff, fps=fps, cutoff_hz=cutoff_hz,
-                    order=2, zi=None, sos=sos)
-                dt = utils.sg_first_derivative_1d(
-                    lp, fps=fps, win_ms=sg_win_ms, poly=sg_poly)
-                dff_mm[:, i] = dff
-                lp_mm[:, i] = lp
-                dt_mm[:, i] = dt
-            dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
-            print(f"[GUI] dF/F batch {i0}-{i1 - 1}/{N - 1} "
-                  f"({time.time() - t0:.1f}s)")
+        info = detection_run.compute_dff_memmaps(
+            plane0, params,
+            baseline_mode=baseline_mode, baseline_min=baseline_min,
+            progress_cb=lambda msg: print(f"[GUI] {msg}"),
+        )
+        if gpu_wanted and info.get("path") != "gpu":
+            print("[GUI] GPU dF/F failed; fell back to CPU.")
+        print(f"[GUI] r0p7_dff / r0p7_dff_lowpass / r0p7_dff_dt memmaps "
+              f"written via {info.get('path', '?').upper()} "
+              f"(fps={float(info.get('fps', 0.0)):g} Hz, "
+              f"{time.time() - t0:.1f}s)")
 
-        del dff_mm, lp_mm, dt_mm
-        print(f"[GUI] r0p7_dff / r0p7_dff_lowpass / r0p7_dff_dt "
-              f"memmaps written ({time.time() - t0:.1f}s)")
-
-    def _maybe_run_dff_gpu(
-        self, plane0: Path, baseline_mode: str, baseline_min: float,
-        fps: float, cutoff_hz: float, sg_win_ms: int, sg_poly: int,
-        r: float, F: np.ndarray, Fneu: np.ndarray,
-    ) -> bool:
-        """If the GPU path is enabled and usable, run it and return True.
-        The GPU module only supports a 'first-N seconds mean' baseline,
-        so we skip it for the rolling mode.
-        """
-        if not bool(self._params.get("use_gpu_dff", True)):
+    @staticmethod
+    def _gpu_dff_eligible(params: dict, baseline_mode: str) -> bool:
+        """Log why the GPU dF/F path will or won't be tried. Mirrors the
+        gates in ``detection_run._maybe_run_dff_gpu`` so the GUI log keeps
+        the fallback reason that the core helper does not report."""
+        if not bool(params.get("use_gpu_dff", True)):
             print("[GUI] GPU dF/F disabled in Advanced parameters; "
                   "using CPU.")
             return False
@@ -1149,31 +1133,7 @@ class Suite2pTab(ctk.CTkFrame):
         if not getattr(gpu, "_CUPY_OK", False):
             print("[GUI] CuPy not available; using CPU dF/F.")
             return False
-
-        baseline_sec = float(baseline_min) * 60.0
-        roi_chunk = int(self._params.get("gpu_roi_chunk", 0))
-        if roi_chunk <= 0:
-            roi_chunk = None
-        # F / Fneu are loaded + normalised once in ``_run_dff`` and passed
-        # in, so neither path re-reads these (often large) arrays.
-        print(f"[GUI] dF/F (GPU): baseline_sec={baseline_sec:g}  "
-              f"cutoff={cutoff_hz:g} Hz  sg=({sg_win_ms} ms, p{sg_poly})")
-        try:
-            t0 = time.time()
-            gpu.process_suite2p_traces_gpu(
-                F, Fneu, fps=fps, r=r,
-                baseline_sec=baseline_sec,
-                cutoff_hz=cutoff_hz,
-                sg_win_ms=sg_win_ms, sg_poly=sg_poly,
-                out_dir=str(plane0), prefix="r0p7_",
-                roi_chunk=roi_chunk,
-            )
-            print(f"[GUI] GPU dF/F + lowpass + dt complete "
-                  f"({time.time() - t0:.1f}s)")
-            return True
-        except Exception as e:
-            print(f"[GUI] GPU dF/F failed ({e}); falling back to CPU.")
-            return False
+        return True
 
     def _run_filtered_dff(self, plane0: Path) -> None:
         """Slice r0p7_dff.memmap.float32 down to ROIs that pass the
@@ -1203,11 +1163,11 @@ class Suite2pTab(ctk.CTkFrame):
             filt[t0:t1, :] = dff[t0:t1, :][:, mask]
         filt.flush()
         del filt, dff
-        # Also persist the keep-mask under the legacy filename downstream tools
-        # (clustering_cmap, cluster_mean_dff_gui, Fig1/Fig4, bins_visualization,
-        # older crosscorr code paths) still hardcode. Matches
-        # run_full_pipeline.make_filtered_memmaps so GUI and CLI runs produce
-        # the same on-disk layout.
+        # Persist the exact mask this memmap was sliced with. This file is
+        # AUTHORITATIVE, not a legacy copy: utils.resolve_filtered_mask
+        # trusts it first to size every r0p7_filtered_* reader (the
+        # WinError 8 fix), and clustering / event detection / cross-
+        # correlation read it directly. Never drop this save.
         np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
         print(f"[GUI] r0p7_filtered_dff.memmap.float32 written "
               f"(T={T}, N_kept={N_kept}/{N_total})  "
@@ -1254,20 +1214,19 @@ class Suite2pTab(ctk.CTkFrame):
 
     def _run_cellfilter(
         self, plane0: Path, ckpt_path: str, rec_id: str,
-        size_outlier_z: float = 4.0,
+        size_outlier_z: float = SIZE_OUTLIER_Z,
     ) -> None:
+        """Score every ROI with the cell-filter CNN. Delegates to
+        :func:`calliope.core.detection_run.predict_cell_filter` (shared
+        with the headless path; it also frees the model's VRAM before
+        the next recording's suite2p run)."""
         import torch
-        from ...core.cellfilter.model import CellFilter
-        from ...core.cellfilter.predict import predict_recording
+        from ...core import detection_run
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  device: {device}   ckpt: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        model = CellFilter().to(device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
-        predict_recording(rec_id, model, device, plane0=plane0,
-                          size_outlier_z=size_outlier_z)
+        detection_run.predict_cell_filter(
+            plane0, ckpt_path, rec_id, size_outlier_z=size_outlier_z)
 
     # -- Log queue + completion --------------------------------------------
 
@@ -1890,20 +1849,25 @@ class Suite2pTab(ctk.CTkFrame):
         self.nwb_btn.configure(state="disabled")
         self.status_var.set("Exporting NWB...")
 
+        # The worker never touches Tk: it posts a plain result onto the
+        # log queue and the main-thread handlers below update the UI.
         def worker():
             try:
                 path = nwb_export.export_recording_to_nwb(plane0, Path(out))
-                self.status_var.set(f"NWB -> {path}")
+                self._log_queue.put(("nwb_done", str(path)))
             except Exception as e:  # noqa: BLE001
-                self.status_var.set("NWB export failed")
-                messagebox.showerror("NWB export failed", str(e))
-            finally:
-                try:
-                    self.nwb_btn.configure(state="normal")
-                except Exception:
-                    pass
+                self._log_queue.put(("nwb_error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_nwb_done(self, path: str) -> None:
+        self.status_var.set(f"NWB -> {path}")
+        self.nwb_btn.configure(state="normal")
+
+    def _on_nwb_error(self, msg: str) -> None:
+        self.status_var.set("NWB export failed")
+        self.nwb_btn.configure(state="normal")
+        messagebox.showerror("NWB export failed", msg)
 
     def _on_export_figures(self, quiet: bool = False) -> None:
         """Re-render the Tab 3 detection panels as PNG+SVG and drop a
