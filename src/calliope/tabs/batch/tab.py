@@ -1307,6 +1307,7 @@ class BatchTab(ctk.CTkFrame):
         already-in-progress guard and all tabs would keep suppressing their
         error dialogs until the app restarts."""
         self._batch_active = False
+        self._run_default_params = None
         try:
             self.state.batch_active = False
         except Exception:
@@ -1391,6 +1392,9 @@ class BatchTab(ctk.CTkFrame):
         _core_utils.reset_adaptive_sizer()
         _core_utils.get_adaptive_sizer().conservative_scale = 1.0
         self._batch_queue = list(self._rows)
+        # Freeze the batch defaults for this run (see _effective_row_params).
+        from copy import deepcopy as _dc
+        self._run_default_params = _dc(self.default_params or {})
         # RAM-OOM retry state. Snapshot the user's baseline resource knobs
         # so conservative retries can restore them exactly (these tab
         # fields are shared across rows). ``use_gpu_dff`` is a PARAM_SPEC
@@ -1751,10 +1755,15 @@ class BatchTab(ctk.CTkFrame):
         ``default_params``, but rows loaded from a CSV / JSON may carry
         only some keys (or none). Filling the gaps here means a blank
         key means "batch default" rather than "whatever the previous
-        row left in the tab".
+        row left in the tab". During a run the ``default_params``
+        snapshot taken at Run All (``_run_default_params``) is used.
         """
         merged = spec_defaults(self.PARAM_SPEC)
-        merged.update(self.default_params or {})
+        # While a batch runs, use the defaults frozen at Run All so every
+        # stage of every row sees the same batch defaults.
+        frozen = getattr(self, "_run_default_params", None)
+        merged.update((frozen if frozen is not None
+                       else self.default_params) or {})
         merged.update(getattr(row, "params", None) or {})
         return merged
 
@@ -2410,9 +2419,10 @@ class BatchTab(ctk.CTkFrame):
         """Set the resource knobs for ``row`` based on its OOM-retry level.
 
         ``row._oom_attempt == 0`` -> normal profile, deterministically
-        re-asserted every stage from ``row.params`` + the batch-start
-        baselines so a prior conservative retry can't leak into a later
-        normal row. ``> 0`` -> progressively conservative: smaller suite2p
+        re-asserted every stage from the row's effective params
+        (``_effective_row_params``: spec defaults < batch defaults <
+        ``row.params``) so a prior conservative retry can't leak into a
+        later normal row. ``> 0`` -> progressively conservative: smaller suite2p
         ``batch_size`` (sizer ``conservative_scale``), CPU dF/F, GPU-off
         xcorr, ``nbins=500`` (injected into the independent
         ``det._settings_override`` the tab passes to ``spc.run`` -- NOT
@@ -2429,7 +2439,7 @@ class BatchTab(ctk.CTkFrame):
         det = getattr(app, "detection_tab", None)
         xc = getattr(app, "xcorr_tab", None)
         sizer = _core_utils.get_adaptive_sizer()
-        rp = row.params or {}
+        rp = self._effective_row_params(row)
         base_override = getattr(self, "_baseline_settings_override", {}) or {}
 
         if lvl <= 0:
@@ -2580,7 +2590,7 @@ class BatchTab(ctk.CTkFrame):
         the batch never stalls on the export.
         """
         row = self._current_row
-        params = getattr(row, "params", None) or {}
+        params = self._effective_row_params(row)
         if not bool(params.get("export_nwb", False)):
             return
         plane0 = self._row_results.get("plane0")
@@ -3178,6 +3188,7 @@ class BatchTab(ctk.CTkFrame):
         self._finalize_waiting = False
 
         self._batch_active = False
+        self._run_default_params = None
         # Restore interactive error dialogs now the queue is done.
         try:
             self.state.batch_active = False

@@ -73,3 +73,25 @@ def test_default_params_override_spec_defaults_and_fill_gaps():
     spec = spec_defaults(BatchTab.PARAM_SPEC)
     assert eff["filter_order"] == spec["filter_order"]
     assert set(spec) <= set(eff)
+
+
+def test_run_snapshot_of_default_params_wins_while_running():
+    s = _stub(default_params={"cutoff_hz": 1.7})
+    s._run_default_params = {"cutoff_hz": 2.2}
+    s.default_params["cutoff_hz"] = 9.9  # edited mid-run
+    assert BatchTab._effective_row_params(s, _row({}))["cutoff_hz"] == 2.2
+    s._run_default_params = None          # batch over -> live defaults
+    assert BatchTab._effective_row_params(s, _row({}))["cutoff_hz"] == 9.9
+
+
+def test_nwb_export_reads_effective_params(monkeypatch):
+    # export_nwb set only as a batch default (blank row) must still export.
+    from calliope.core import nwb_export
+    monkeypatch.setattr(nwb_export, "nwb_available", lambda: False)
+    s = _stub(default_params={"export_nwb": True})
+    logs = []
+    s._append_log = logs.append
+    s._current_row = types.SimpleNamespace(params={}, identifier="rec")
+    s._row_results = {"plane0": "x"}
+    BatchTab._maybe_export_nwb_for_row(s)
+    assert any("pynwb not installed" in m for m in logs)

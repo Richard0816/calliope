@@ -120,6 +120,12 @@ class _ProfStub:
     def _append_log(self, m):
         self.logs.append(m)
 
+    PARAM_SPEC = BatchTab.PARAM_SPEC
+    default_params: dict = {}
+
+    def _effective_row_params(self, row):
+        return BatchTab._effective_row_params(self, row)
+
 
 def test_resource_profile_conservative_then_restore():
     from calliope.core import utils as u
@@ -212,3 +218,16 @@ def test_fail_stage_oom_not_retried_when_aborting():
                          MemoryError("Unable to allocate 4 GiB"))
     assert stub.retried == []
     assert stub.row_done == 1
+
+
+def test_resource_profile_blank_row_uses_batch_default():
+    # A blank row gets the batch default, not the GUI baseline.
+    stub = _ProfStub()
+    stub._baseline_use_gpu_dff = False
+    stub._baseline_xc_gpu = False
+    stub.default_params = {"use_gpu_dff": True, "use_gpu": True,
+                           "downsample_t": 6}
+    BatchTab._apply_resource_profile(stub, _Row(0), "preprocess")
+    assert stub._app.detection_tab._params["use_gpu_dff"] is True
+    assert stub._app.xcorr_tab.gpu_var.get() is True
+    assert stub._app.preprocess_tab._params["downsample_t"] == 6

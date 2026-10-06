@@ -711,7 +711,10 @@ PARAM_SPEC entry on their tab).
   union-spec defaults, overlaid by `BatchTab.default_params`, overlaid
   by `row.params`, so a key a row doesn't set (a blank or partial CSV
   `params` cell) means "batch default" — it never inherits the
-  previous row's value. The batch runner never pokes tab internals —
+  previous row's value. `default_params` is snapshotted when **Run
+  all** starts, so every stage of every row in that run sees the same
+  batch defaults. The NWB export and the OOM resource profile read the
+  same effective params. The batch runner never pokes tab internals —
   a rename inside a tab surfaces as a loud error there, not a silent
   no-op here.
 - Group labels are renamed with a numbered stage prefix
@@ -974,7 +977,9 @@ math counterpart — the algorithm lives in `core/utils.py` /
   off (dF/F + xcorr), `nbins=500`, and a coarser preprocess QC downsample
   (the one preprocess allocation not covered by its streaming fallback).
   The overrides are snapshotted/restored so they never leak into later
-  normal rows. Disk-full errors are **not** retried (smaller batches can't
+  normal rows: on a normal attempt the GPU dF/F, xcorr GPU and QC
+  downsample knobs are re-asserted from the row's effective params
+  (blank = batch default, like every other key). Disk-full errors are **not** retried (smaller batches can't
   free disk) — they fall through to a normal failure. RAM OOM is most
   likely in detection/suite2p; preprocess itself is largely OOM-safe
   (single-TIFF shift auto-falls-back to streaming; the grouped path is
