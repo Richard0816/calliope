@@ -65,8 +65,10 @@ Suite2p / cellfilter helpers
 
 Recording metadata
     get_fps_from_notes
-        Locate the lab's ``notes.csv`` and read the frame rate for a
-        given recording. Falls back to a default if missing.
+        Frame rate for a recording: ``plane0/ops.npy['fs']`` (the rate
+        detection ran at, incl. Tab 3's FPS override), else
+        ``DEFAULT_FPS``. The per-date notes-XLSX lookup is opt-in and only
+        runs when a caller passes ``notes_root`` (no GUI control does).
 """
 
 # Type-hint forward-reference shim. See pipeline_gui.py for full
@@ -85,9 +87,9 @@ import threading           # daemon thread for the peak-RAM monitor
 # separate package rather than built-in. ``np`` is the conventional
 # alias.
 import numpy as np
-# pandas: DataFrame / Series, used here for reading the notes.csv
-# metadata file. The "df.iloc[i]" / "df.loc[name]" idiom is
-# pandas-specific row indexing.
+# pandas: DataFrame / Series, used here for reading the optional
+# per-date notes XLSX (opt-in fps lookup). The "df.iloc[i]" /
+# "df.loc[name]" idiom is pandas-specific row indexing.
 import pandas as pd
 # psutil exposes system info (free RAM, CPU count). We only use it
 # for the auto-batch-size logic at the bottom of the file.
@@ -703,11 +705,12 @@ def save_folder_for_plane0(plane0) -> Path:
 
 
 # Default frame rate (Hz) used as a fallback when a recording's fps can't
-# be read from the notes spreadsheet. Mirrors ``calliope_settings.fs``;
-# kept here as the single literal so the ~6 scattered ``15.07`` fallbacks
-# reference one source. (Defined here rather than imported from
-# calliope_settings to avoid an import cycle.)
-DEFAULT_FPS: float = 15.08
+# be read from ``plane0/ops.npy['fs']`` (see ``get_fps_from_notes``). The
+# single literal lives in ``calliope_settings.DEFAULT_FPS`` (it is also the
+# suite2p ``fs`` fallback there); re-exported here as ``utils.DEFAULT_FPS``
+# for existing callers. calliope_settings imports nothing from calliope, so
+# this import cannot cycle.
+from .calliope_settings import DEFAULT_FPS  # noqa: E402
 
 
 # Canonical display contrast window (percentiles) for showing
@@ -856,7 +859,11 @@ def get_fps_from_notes(
     ``path`` (the rate detection ran at, incl. Tab 3's FPS override) when
     present, else ``default_fps``.
 
-    If a caller passes an explicit ``notes_root``, it is treated as a folder
+    No GUI control, settings key or batch param supplies ``notes_root``; the
+    branch is a library-only convenience. To use it, call e.g.
+    ``get_fps_from_notes(plane0, notes_root="path/to/notes_folder")`` from
+    your own script. If a caller passes an explicit ``notes_root``, it is
+    treated as a folder
     of per-date notes XLSX files; each contains a "2P settings" sheet whose
     rows describe one recording per row, with columns including ``filename``
     and ``rate (hz)``. We search that sheet for the row matching the
