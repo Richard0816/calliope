@@ -45,21 +45,50 @@ Module index
                              ``_get_or_create_shared_registration``,
                              ``load_base_settings``, plus the
                              monkey-patches that work around suite2p
-                             1.0 quirks. Imported only by
-                             ``sparse_plus_cellpose``.
+                             1.0 quirks. Driven by
+                             ``sparse_plus_cellpose``; Tab 0's batch
+                             runner also imports it for its OOM-retry
+                             settings handling.
 - ``calliope_settings``   - in-source nested defaults for the lab's
-                             2-photon rig + popout flatten/nest
-                             helpers.
+                             2-photon rig (incl. the ``DEFAULT_FPS``
+                             fallback) + popout flatten/nest helpers.
 - ``summary_writer``      - writes ``calliope_summary.xlsx``
-                             (Recording / EventOnsets / EventWindows
-                             / Clusters / EventMonotonicity sheets)
-                             used by tabs 5+.
+                             (Recording / ROIs / EventWindows /
+                             EventOnsets / RoiEventTimes /
+                             EventMonotonicity / Clusters sheets;
+                             a FilterParams writer is reserved and
+                             currently unused).
 - ``cellfilter``          - PyTorch CNN that scores each ROI as
                              cell / not-cell on a mix of a 32x32
                              spatial crop and the trace timeseries.
 - ``detection_run`` / ``lowpass_run`` / ``event_detection_run``
-                            -- per-stage headless entry points for
-                             Tab 0's batch pipeline (Tabs 3 / 4 / 5).
-- ``batch_pipeline``      - end-to-end orchestrator that strings the
-                             headless entry points together (Tab 0).
+                            -- per-stage headless entry points
+                             (Tabs 3 / 4 / 5) that Tab 0's batch
+                             runner calls.
+- ``batch_pipeline``      - headless end-to-end helper
+                             (``run_recording``) that strings the
+                             stage entry points together, plus small
+                             batch guards (``_no_rois_survive``,
+                             ``_kept_roi_count``). The GUI's Tab 0 does
+                             NOT call ``run_recording``; it drives the
+                             stages itself.
+- ``analyze_output_gpu``  - CuPy dF/F / low-pass / derivative path
+                             (GPU twin of the CPU dF/F writer).
+- ``_cuda_import``        - the single place the optional CuPy
+                             dependency is imported (and probed).
+- ``correlation_image``   - per-pixel temporal correlation image
+                             (Vcorr) for the Cellpose-SAM pass.
+- ``zdrift``              - PCA-based z-drift QC (flags, never drops).
+- ``recording_meta``      - per-recording ``meta.json`` provenance
+                             sidecar (atomic write, safe read).
+- ``export_manifest``     - ``manifest.json`` written next to exported
+                             figures (git SHA, params, tau/fs, cell
+                             counts).
+- ``nwb_export``          - optional NWB export (``[nwb]`` extra).
+- ``scale`` / ``figscale`` - pixel<->µm maths (matplotlib-free) and
+                             the matching scale-bar drawing helper.
+- ``offload``             - run heavy compute in a child process so
+                             the Tk GUI stays responsive.
+- ``run_loader``          - discover/inventory a completed run on disk
+                             for "Open run folder...".
 """
