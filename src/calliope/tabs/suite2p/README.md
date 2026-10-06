@@ -27,7 +27,7 @@ The tab worker (`Suite2pTab._run_pipeline`) is roughly:
 
 ```python
 final_plane0 = sparse_plus_cellpose.run(...)   # ROI detection
-self._stamp_pix_to_um(final_plane0, params)    # ops['pix_to_um'] from zoom or direct
+self._stamp_pix_to_um(final_plane0, params)    # calliope_calibration.npy from zoom or direct
 _run_dff(final_plane0, baseline_mode, ...)     # dF/F + lowpass + derivative
 if ckpt_path:
     _run_cellfilter(final_plane0, ckpt_path)   # PyTorch keep/drop
@@ -67,7 +67,7 @@ progress reaches the GUI's `redirect_stderr` capture.
 
 CalLIOPE keeps a flat ops dict as its internal lingua franca because
 the on-disk base ops `.npy` is shaped that way and downstream tabs
-read `ops['Ly']` / `ops['spatial_scale']` / `ops['pix_to_um']`
+read `ops['Ly']` / `ops['spatial_scale']` (and `pix_to_um` from `calliope_calibration.npy`)
 straight from suite2p's own output. Translation only happens at the
 `run_s2p` call boundary.
 
@@ -97,8 +97,9 @@ settings…" popout if you want the regDX/regPC numbers.
 A union of two complementary detectors. Sparsery is bright-and-bursty; Cellpose is a generalist segmenter that catches morphologically obvious cells which never fired enough during the recording for Sparsery to spot.
 
 **Sparsery (Suite2p built-in detector).** Driven by the ops dict
-(`threshold_scaling`, `high_pass`, `smooth_sigma`, `max_iterations`,
-`spatial_scale`, `preclassify`, plus the `hard_cap` safety abort). `sparse_mode`
+(`threshold_scaling`, `high_pass`, `spatial_scale`, `preclassify`; the
+`smooth_sigma`, `max_iterations` and `hard_cap` entries are currently inert, see
+§5.1). `sparse_mode`
 is fixed `True` (use Sparsery, not the legacy anatomical pipeline). All of these
 are documented with defaults and tuning guidance in [§5.1](#51-sparsery-suite2p-built-in-detector).
 
@@ -242,9 +243,9 @@ The shared helper `core.detection_run.prune_detection_intermediates(save_folder,
 - drops `data_raw*.bin` / `*.tmp` / `*.lock` anywhere under `detection/`,
 - **keeps** `_shared_reg/ops.npy` + the rest of the registration metadata for audit, and **keeps** everything under `final/`.
 
-**Re-detect override.** Setting `keep_registration_cache = True` (Tab 3 Advanced → "Re-detect" group, or the per-recording params dict) skips the `_shared_reg/.../data.bin` deletion. A subsequent re-detect of the same recording then reuses the registered movie (`_get_or_create_shared_registration` gates on `data.bin` + `ops.npy`, both present) and skips the ~5 min re-registration — the cheap path for iterating on detection params (e.g. forcing `spatial_scale` to break up blobby ROIs that the cell filter can't reject). Costs the ~13 GB on disk; default `False` keeps the space-saving behaviour. The chosen `spatial_scale` (0 = suite2p auto, or a forced 1–4) is stamped into `meta.json`'s `detection` block so a re-run is reproducible.
+**Re-detect override.** Setting `keep_registration_cache = True` (Tab 3 Advanced → "Re-detect" group, or the per-recording params dict) skips the `_shared_reg/.../data.bin` deletion. A subsequent re-detect of the same recording then reuses the registered movie (`_get_or_create_shared_registration` gates on `data.bin` + `ops.npy`, both present) and skips the ~5 min re-registration — the cheap path for iterating on detection params (e.g. forcing `spatial_scale` to break up blobby ROIs that the cell filter can't reject). Costs the ~13 GB on disk; default `False` keeps the space-saving behaviour. The chosen `spatial_scale` (0 = suite2p auto, or a forced 1–4) is stamped into `meta.json`'s `detection` block (plus `spatscale_pix`, the scale sparsery resolved, when suite2p recorded it) so a re-run is reproducible.
 
-The same helper is called from `core.detection_run.run_detection` so headless drivers (`batch_pipeline.run_recording`, any external agent that calls `run_detection` in a loop) get the cleanup unconditionally — not just GUI runs. This mirrors `BatchTab._prune_scratch_tree`'s policy but runs at the tail of every detection. Without it, an agent that runs detection over many recordings will fill the save drive (12 recordings ≈ 312 GB; observed disk-full at recording 13 in the 2026-05-12 batch).
+The same helper is called from `core.detection_run.run_detection` so headless drivers (`batch_pipeline.run_recording`, any external agent that calls `run_detection` in a loop) get the cleanup unconditionally — not just GUI runs. This mirrors `tabs/batch/logic.py::prune_scratch_tree`'s policy but runs at the tail of every detection. Without it, an agent that runs detection over many recordings will fill the save drive (12 recordings ≈ 312 GB; observed disk-full at recording 13 in the 2026-05-12 batch).
 
 `gc.collect()` runs before the prune so any lingering suite2p `np.memmap` references are released and Windows lets `unlink`/`rmtree` succeed on the first pass. Errors on individual paths are caught and reported via `progress_cb` so a single file lock doesn't abort the whole cleanup.
 
@@ -281,9 +282,9 @@ Per-recording disk goes from ~20 GB (shifted + orphan `final/data.bin`) to ~6.5 
 Every processed recording writes `<plane0>/meta.json`, a single provenance file downstream tools read as the source of truth for how the recording was produced. It is filled across the detection/extraction and dF/F stages and groups its fields by stage:
 
 - **registration** — `block_size`, `smooth_sigma`, `nonrigid`
-- **detection** — `threshold_scaling`, `sparse_mode`
+- **detection** — `threshold_scaling`, `sparse_mode`, `spatial_scale`, `highpass_time` (the values the sparsery pass ran with, not the base settings), plus `spatscale_pix` when available
 - **extraction** — `neuropil_coef`, `tau_seconds`, `gcamp_variant_label` (stamped from the Tab 3 GCaMP dropdown)
-- **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec`, `fps`
+- **dff** — `baseline_mode`, `baseline_percentile`, `baseline_window_sec`, `baseline_min_sec` (the first-N baseline length in seconds, i.e. `baseline_min · 60`), `fps`
 - **lowpass** — `cutoff_hz`, `filter_kind`, `order`
 - **spike_inference** — `backend` (`"oasis"`)
 - **qc** — the z-drift fields written by Step 8
@@ -365,20 +366,22 @@ Defaults below are exactly those in `PARAM_SPEC`. Every key is the `name` field
 
 ### 5.1 Sparsery (Suite2p built-in detector)
 
-These map 1:1 onto Suite2p ops and are passed through to the sparsery pass
-(`sparse_plus_cellpose.run` → `run_one_pass`, defaults at
-`sparse_plus_cellpose.py:120-126`). Sparsery is the bright-and-bursty detector;
+These are passed through to the sparsery pass
+(`sparse_plus_cellpose.run` → `run_one_pass`, defaults in
+`sparse_plus_cellpose.SPARSERY_OPS`). Three of them currently have no effect
+on detection: `smooth_sigma`, `max_iterations` and `hard_cap` (details in the
+table); the run log prints a `note:` / `[warn]` line when that matters. Sparsery is the bright-and-bursty detector;
 it finds anything that fired enough to stand out from a high-pass-filtered movie.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
 | `threshold_scaling` | `0.85` | Scales Suite2p's per-iteration detection threshold; an ROI's peak must clear `threshold_scaling × noise` to be accepted. | The master sensitivity dial. **Lower → more ROIs** (more permissive, more junk/dim cells); **raise → fewer, higher-confidence ROIs.** First thing to touch if you are over- or under-detecting. The cell-filter CNN cleans up false positives downstream, so erring low is usually safe. |
 | `high_pass` | `100` (frames) | Frame-domain rolling-mean subtraction window applied before detection to flatten slow drift (photobleaching, swelling). | Leave at 100 for typical recordings. **Shorten** if slow baseline waves are masking events; **lengthen** for very short recordings where a 100-frame window eats real slow signal. Too small a window on a long recording is what blew up the temporal high-pass with an OOM in the 2026-06-09 sparsery crash — keep it sane. |
-| `smooth_sigma` | `1.0` | Gaussian spatial smoothing (σ in pixels) applied during detection. | **Raise** for noisy / low-zoom FOVs to merge speckle into coherent blobs; **lower** toward 0 on high-mag data with small, tightly packed somata you don't want bleeding together. |
-| `max_iterations` | `1500` | Hard cap on Sparsery's iterative peel-off detection loop. | Rarely touched. Each iteration extracts one ROI, so this is an upper bound on ROI count from the loop itself. Lower only to force an early stop for speed on a quick look. |
+| `smooth_sigma` | `1.0` | **No effect.** In suite2p 1.0 `smooth_sigma` is a *registration* setting; the sparsery pass reuses the shared registration and skips registration, so this value is never applied. Registration uses `registration.smooth_sigma` (1.15 in `calliope_settings`). | To change registration smoothing, edit `registration.smooth_sigma` in **Edit suite2p settings…** (a new registration only runs when `_shared_reg/` has no `data.bin`). The log prints a `note:` when this field differs from the registration value. |
+| `max_iterations` | `1500` | **No effect with sparsery.** suite2p routes it to `sourcery_settings`; sparsery's peel-off loop is bounded by `detection.sparsery_settings.max_ROIs` (10000 in `calliope_settings`). | To bound sparsery's ROI count, edit `detection.sparsery_settings.max_ROIs` in **Edit suite2p settings…**. |
 | `spatial_scale` | `0` (auto) | Suite2p's coarse-to-fine cell-size scale (0 = auto-estimate; 1–4 ≈ 6/12/24/48 px). | Leave at 0 unless auto-estimation is clearly wrong (e.g. detecting at the wrong size). Set 1–4 to pin the expected soma scale. |
 | `preclassify` | `0.0` | Probability threshold for Suite2p's built-in pre-detection classifier; 0 disables it. | Keep at 0 — CalLIOPE does its own classification with the cell-filter CNN, so the built-in preclassifier is redundant and would silently drop ROIs before our filter ever sees them. |
-| `hard_cap` | `60000` | Safety abort: if Sparsery returns more ROIs than this, `run_one_pass` raises rather than proceeding into a multi-GB extraction. | A guardrail, not a tuning knob. A run that hits 60k ROIs almost always means `threshold_scaling` is far too low or `high_pass` is wrong. **Raise** only if you have a genuine high-density FOV and the abort fires on a legitimate run; **lower** to fail fast while sweeping parameters. |
+| `hard_cap` | `60000` | **Not enforced.** The old mid-detection abort hooked `print` in suite2p's sparsery, but suite2p 1.0 logs progress through `logging`, so it never fired; the hook (and its `HARD_CAP_ABORTED.txt` marker) has been removed. The real bound is `detection.sparsery_settings.max_ROIs` (10000). | Edit `max_ROIs` in **Edit suite2p settings…** instead. Setting `hard_cap` below `max_ROIs` prints a `[warn]` line saying it is not enforced. |
 
 ### 5.2 Cellpose (generalist segmenter, primary pass on `meanImg`)
 
@@ -449,10 +452,10 @@ GPU path.
 ### 5.7 Pixel-scale (µm calibration) and GPU
 
 Pixel-scale knobs are resolved by `core.scale.resolve_pix_to_um`
-(`scale.py:82`) after detection and stamped onto `plane0/ops.npy['pix_to_um']`,
+(`scale.py:82`) after detection and saved to `plane0/calliope_calibration.npy` (`utils.save_pix_to_um`),
 so Tabs 6 (spatial cluster map) and 8 (per-event order maps) and the detection
 scale bar render in µm with no further input. **Priority: `um_per_pixel` >
-`scope_zoom` > any pre-existing `ops['pix_to_um']`.** Leave both at 0 to skip
+`scope_zoom` > any pre-existing calibration (`calliope_calibration.npy`, or a legacy `ops['pix_to_um']` in old folders).** Leave both at 0 to skip
 calibration and render in raw pixels (no scale bar).
 
 | Setting (`key`) | Default | What it does | What it means to you |
