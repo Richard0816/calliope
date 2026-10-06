@@ -87,6 +87,7 @@ from .curation_popout import CurationPopout
 
 from ...core.cellfilter.config import SIZE_OUTLIER_Z
 from ...core.scale import FOV_UM_REFERENCE
+from ...core.utils import DEFAULT_FPS
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
     drain_queue, open_advanced, report_stage_error, spec_defaults,
@@ -296,7 +297,7 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "fps_override", "label": "FPS override (0=auto)",
          "type": "float", "default": 0.0, "group": "dF/F",
          "help": "non-zero sets the frame rate for suite2p (fs, ops.npy) "
-                 "and dF/F; 0 uses the default (15.08 Hz)"},
+                 f"and dF/F; 0 uses the default ({DEFAULT_FPS:g} Hz)"},
         {"name": "neuropil_coef", "label": "Neuropil coefficient (r)",
          "type": "float", "default": 0.7, "group": "dF/F"},
         {"name": "perc", "label": "Baseline percentile",
@@ -1472,7 +1473,7 @@ class Suite2pTab(ctk.CTkFrame):
                     self.winfo_toplevel(), plane0, stat, ops_view,
                     on_iscell_changed=self._on_iscell_flipped,
                     get_size_outlier_z=lambda: float(
-                        self._params.get("size_outlier_z", 4.0)),
+                        self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
                     on_checkpoint_trained=self._on_cellfilter_retrained,
                 )

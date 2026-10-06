@@ -1389,8 +1389,7 @@ class BatchTab(ctk.CTkFrame):
         # previous queue (potentially mis-tuned for a different
         # cohort's frame sizes).
         from ...core import utils as _core_utils
-        _core_utils.reset_adaptive_sizer()
-        _core_utils.get_adaptive_sizer().conservative_scale = 1.0
+        _core_utils.reset_adaptive_sizer()  # also resets conservative_scale
         self._batch_queue = list(self._rows)
         # Freeze the batch defaults for this run (see _effective_row_params).
         from copy import deepcopy as _dc

@@ -746,8 +746,9 @@ class CurationPopout(ctk.CTkToplevel):
         if self._get_size_outlier_z is not None:
             try:
                 return float(self._get_size_outlier_z())
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[curation] could not read Tab 3's size_outlier_z "
+                      f"({e}); using the default {_cfg.SIZE_OUTLIER_Z:g}.")
         return float(_cfg.SIZE_OUTLIER_Z)
 
     def _warm_start_ckpt(self) -> Optional[Path]:
@@ -907,8 +908,9 @@ class CurationPopout(ctk.CTkToplevel):
             try:
                 self._on_checkpoint_trained(Path(trained))
                 msg = f"{msg} Selected checkpoint: {trained}"
-            except Exception:
-                pass
+            except Exception as e:
+                msg = (f"{msg} Could not select the new checkpoint in "
+                       f"Tab 3 ({e}); pick {trained} there by hand.")
         self._train_status_var.set(msg)
         # Leave the button enabled so the user can iterate (more flips
         # -> more training rounds).
