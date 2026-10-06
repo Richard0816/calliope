@@ -3,7 +3,7 @@
 Why this module exists
 ----------------------
 Tab 3's ``_run_pipeline`` chains five steps -- sparse_plus_cellpose
-detection, pix_to_um stamping, dF/F + low-pass, cell-filter
+detection, pix_to_um stamping, dF/F, cell-filter
 prediction, filtered-dF/F slicing -- with all logic living on the
 ``Suite2pTab`` class. Tab 0's batch runner needs the same pipeline
 without a Tk window, so we lift the chain into module-level
@@ -19,7 +19,7 @@ Public surface
     End-to-end Tab 3 pipeline. Returns ``{plane0, fps, T, N,
     pix_to_um, figures}``.
 ``compute_dff_memmaps(plane0, params, ...)``
-    The dF/F + low-pass + derivative loop.
+    The dF/F loop (writes only r0p7_dff).
 ``compute_filtered_dff(plane0)``
     Slice the cell-filter mask out of the per-ROI dF/F into the
     "filtered" memmap consumed by Tabs 4-8.
@@ -900,7 +900,7 @@ def run_detection(
     pix_to_um = stamp_pix_to_um(plane0, params)
 
     if progress_cb is not None:
-        progress_cb("[detection] computing dF/F + low-pass + derivative...")
+        progress_cb("[detection] computing dF/F...")
     dff_info = compute_dff_memmaps(
         plane0, params,
         baseline_mode=baseline_mode, baseline_min=baseline_min,
