@@ -629,6 +629,9 @@ class ClusteringTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
         self._refresh_reload_btn()
+        # A batch-requested cut belongs to the Run that just failed; don't
+        # let it leak into the next interactive Run.
+        self._batch_threshold = None
         self.status_var.set("Analysis failed.")
         # Forward to the batch runner (so a worker crash fails-and-
         # continues the queue) and skip the modal when a batch is driving.
