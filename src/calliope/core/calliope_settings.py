@@ -42,19 +42,28 @@ from typing import Any
 #       ``load_base_settings``). When no override is given the pipeline warns
 #       that this rig-specific fallback is being used.
 #     * ``registration.batch_size`` is much larger than suite2p's default
-#       because the rig has plenty of RAM for the registration buffer; the
-#       runtime ``change_batch_according_to_free_ram`` helper trims it
-#       further if needed.
+#       because the rig has plenty of RAM for the registration buffer. At
+#       run time the actual registration batch size is chosen by the
+#       adaptive sizer (``utils.get_adaptive_sizer().pick()`` in
+#       ``suite2p_pipeline``), which sizes it from free RAM / the TIFF frame
+#       shape; ``change_batch_according_to_free_ram`` is only its fallback
+#       when no TIFF frame shape can be read.
 #     * ``detection.threshold_scaling`` 0.8 (vs default 1.0) catches the
 #       dimmer somas typical of slice recordings.
 #     * ``detection.cellpose_settings.cellpose_model`` is pinned to the
 #       legacy ``cyto`` model (the brute-force winner from earlier
 #       calibration); suite2p's default ``cpsam`` is too aggressive.
 
+# Fallback frame rate (Hz): the lab rig's nominal rate. Single source of
+# truth for both the suite2p ``fs`` default below and ``utils.DEFAULT_FPS``
+# (the downstream fallback when ``plane0/ops.npy['fs']`` is missing).
+DEFAULT_FPS: float = 15.08
+
+
 CALLIOPE_BASE_SETTINGS: dict[str, Any] = {
     # Top-level
     "tau":     0.25,   # jGCaMP8m fallback; per-recording tau set by Tab 3 dropdown.
-    "fs":      15.08,
+    "fs":      DEFAULT_FPS,
 
     # Run-control overrides
     "run": {

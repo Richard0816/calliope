@@ -2,7 +2,7 @@
 
 What this file does
 -------------------
-Defines a PyTorch ``Dataset`` (``RoiDataset``) that yields one
+Defines a PyTorch ``Dataset`` (``ROIDataset``) that yields one
 training sample per ROI. PyTorch's training loop calls
 ``len(dataset)`` to know how many samples there are and
 ``dataset[i]`` to fetch the i-th sample; the framework handles
@@ -113,14 +113,9 @@ class _RecordingCache:
                  it.
     dff        : (T, N) float32 memmap of neuropil-corrected dF/F.
     T, N       : trace length and ROI count.
-    H, W       : FOV dimensions (pixels).
     """
     def __init__(self, plane0: Path):
         self.plane0 = Path(plane0)
-        # ``plane0`` is the suite2p plane folder
-        # (``<...>/suite2p/plane0``); two ``.parent`` calls reach
-        # the recording root.
-        self.root = self.plane0.parent.parent
 
         stat = np.load(self.plane0 / "stat.npy", allow_pickle=True)
         view = utils.load_plane_view(self.plane0)
@@ -148,7 +143,7 @@ class _RecordingCache:
             max_img = padded
 
         # dF/F memmap
-        dff, _, _, T, N = utils.s2p_open_memmaps(self.plane0, prefix=C.DFF_PREFIX)
+        dff, T, N = utils.s2p_open_dff_memmap(self.plane0, prefix=C.DFF_PREFIX)
 
         self.stat = stat
         self.mean_img_z = _znorm(mean_img)
@@ -156,7 +151,6 @@ class _RecordingCache:
         self.dff = dff
         self.T = T
         self.N = N
-        self.H, self.W = mean_img.shape
 
     def get_patch(self, roi_idx: int, size: int) -> np.ndarray:
         """Return (3, size, size) float32 patch: [mean, max, mask]."""
@@ -206,8 +200,13 @@ class ROIDataset(Dataset):
     Each ``__getitem__`` returns:
       spatial : (3, H, W) torch.Tensor
           (mean, max-projection, ROI mask).
-      trace   : (1, T_crop) torch.Tensor during training,
-                 (1, T_full) during eval.
+      trace   : (1, trace_crop) torch.Tensor when ``trace_crop`` is
+                 set (the default ``TRACE_CROP_LEN``: a random crop
+                 for training, the centred crop with
+                 ``random_crop=False``), (1, T_full) when
+                 ``trace_crop=None``. ``train.py`` validates on the
+                 centred 2000-frame crop; only ``predict.py`` sees
+                 full-length traces.
       label   : torch.Tensor, scalar 0.0 or 1.0
           The human curation: 1 = real cell, 0 = noise.
 
@@ -219,9 +218,12 @@ class ROIDataset(Dataset):
     patch_size : int
         Size of the spatial patch around the ROI centroid.
     trace_crop : int or None
-        If set, return a randomly-cropped sub-trace this long during
-        training. ``None`` -> always return the full trace (for
-        inference / validation).
+        If set, return a sub-trace this long (random or centred, see
+        ``random_crop``; zero-padded if the trace is shorter).
+        ``None`` -> always return the full trace. ``train.py`` keeps
+        the default for both train and validation sets, so validation
+        AUROC is measured on centred ``TRACE_CROP_LEN`` crops, not the
+        full traces ``predict.py`` scores.
     random_crop : bool
         ``True`` for random training crops, ``False`` for centred
         deterministic crops (validation).
@@ -369,6 +371,11 @@ def split_by_recording(
     Uniqueness key is ``plane0_path`` (since the same human-readable
     ``recording_ID`` could theoretically collide across cohorts;
     the plane0 path is the actual disk-level recording).
+
+    Selected with ``train.main(split="recording")`` /
+    ``python -m calliope.core.cellfilter.train --split recording``.
+    The trainer refuses the split if either side ends up without
+    both classes.
     """
     rng = np.random.default_rng(seed)
     # ``np.array`` + ``rng.shuffle`` shuffles in-place. ``sorted``

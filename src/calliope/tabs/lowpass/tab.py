@@ -16,24 +16,27 @@ Three panels updating live as you move a cutoff slider:
        marked as a vertical line. Used to pick the cutoff at the
        elbow between signal and noise.
     2. The raw dF/F trace.
-    3. The same trace passed through a causal Butterworth low-pass
-       at the slider cutoff.
+    3. The same trace passed through a zero-phase Butterworth low-pass
+       at the slider cutoff (preview only, so it lines up in time with
+       panel 2; the memmaps Compute writes use the causal filter).
 
 The "trace source" radio buttons let the user pick which trace to
-inspect: population mean, median, the most-active ROI, or a manual
-list of Suite2p ROI ids (mean / median aggregation).
+inspect: population median (default), mean, the best-scoring ROI
+(max predicted_cell_prob), or a manual list of Suite2p ROI ids
+(mean / median aggregation).
 
 When the user is happy, "Compute" runs the same filter + Savitzky-
 Golay first derivative on **every** kept ROI and writes two
 ``(T, N_kept)`` memmaps:
     r0p7_filtered_dff_lowpass.memmap.float32
     r0p7_filtered_dff_dt.memmap.float32
-Then it publishes ``state.set_lowpass_ready(plane0)`` so Tab 5 picks
-up automatically.
+stamps the settings into ``meta.json`` ``lowpass_filtered`` (Tab 5
+reads the cutoff / fps from there), then publishes
+``state.set_lowpass_ready(plane0)`` so Tab 5 picks up automatically.
 
 Class layout
 ------------
-``LowpassTab(ttk.Frame)``
+``LowpassTab(ctk.CTkFrame)``
     ``CUTOFF_MIN`` / ``CUTOFF_MAX`` / ``CUTOFF_DEFAULT``
         Slider bounds and starting value (also exposed in PARAM_SPEC
         so power users can override).
@@ -44,21 +47,25 @@ Class layout
         Subscribes to ``state.subscribe_plane0`` so it knows when a
         Suite2p detection has finished and the dF/F memmap is on
         disk.
-    ``_on_slider_drag``
+    ``_on_slider``
         Slider callback: redraws panel 3 + panel 1 cutoff line in
         real time. Debounced via ``_slider_job`` so dragging doesn't
         recompute on every pixel of motion.
     ``_on_compute``
-        Worker-thread launcher that filters every ROI and writes the
-        memmaps. Same threading pattern as Tabs 1 / 3.
+        Runs ``core.lowpass_run.compute_lowpass_offload`` in a child
+        process via ``core.offload.run_offloaded`` (a thread would let
+        the per-ROI scipy loop hold the GIL and freeze the GUI); it
+        filters every kept ROI and writes the memmaps. Enabled only when
+        ``r0p7_filtered_dff.memmap.float32`` exists -- the unfiltered
+        ``r0p7_dff`` fallback is preview-only.
 
 Default 0.01 - 7 Hz cutoff range; the slider bounds themselves are
 user-tunable from the Advanced dialog (``cutoff_min``/``cutoff_max``
 in PARAM_SPEC).
 
-Trace source can be the population mean, median, the highest-scoring
-ROI, or a user-supplied list / range of original Suite2p ROI ids
-(aggregated by mean/median).
+Trace source can be the population median (default), mean, the
+highest-scoring ROI, or a user-supplied list / range of original
+Suite2p ROI ids (aggregated by mean/median).
 
 The Compute button writes r0p7_filtered_dff_lowpass.memmap.float32 +
 r0p7_filtered_dff_dt.memmap.float32 at the user's chosen cutoff and
@@ -68,10 +75,7 @@ notifies the event-detection tab via ``state.set_lowpass_ready``.
 from __future__ import annotations
 
 import queue
-import threading
-import time
 import tkinter as tk
-import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional
@@ -91,13 +95,13 @@ from ...gui_common import (
 
 
 class LowpassTab(ctk.CTkFrame):
-    """Three panels:
-        1. FFT power spectrum of the population-mean filtered dF/F.
-        2. Population-mean dF/F (raw).
-        3. Population-mean dF/F passed through a causal low-pass at
-           the slider's cutoff (default 0.01 - 7 Hz, default 1 Hz; the
-           bounds are governed by the ``cutoff_min`` / ``cutoff_max``
-           PARAM_SPEC entries).
+    """Three panels, all for the selected trace source (default: the
+    median across kept ROIs of the filtered dF/F):
+        1. FFT power spectrum.
+        2. Raw dF/F.
+        3. Zero-phase low-pass preview at the slider's cutoff (slider
+           range 0.01 - 7 Hz, default 1 Hz; the bounds are governed by
+           the ``cutoff_min`` / ``cutoff_max`` PARAM_SPEC entries).
     Panel 3 (and the cutoff line on panel 1) update live as the slider
     moves; panels 1 and 2 are computed once when the data loads.
     """
@@ -125,7 +129,8 @@ class LowpassTab(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.state = state
         self._plane0: Optional[Path] = None
-        self._fps: float = 15.0
+        from ...core.utils import DEFAULT_FPS
+        self._fps: float = DEFAULT_FPS
         self._fps_src: str = "default"
         self._mean_dff: Optional[np.ndarray] = None
         self._trace_label: str = "mean"
@@ -142,6 +147,9 @@ class LowpassTab(ctk.CTkFrame):
         self._compute_job = None
         self._n_kept: int = 0
         self._T: int = 0
+        # True only when r0p7_filtered_dff exists (what Compute reads);
+        # the unfiltered r0p7_dff fallback in _load_data is preview-only.
+        self._compute_ready: bool = False
 
         self._build_ui()
         drain_queue(self, self._compute_queue,
@@ -166,6 +174,7 @@ class LowpassTab(ctk.CTkFrame):
             name = entry["name"]
             if name in p:
                 self._params[name] = p[name]
+        self._refresh_header()
         if "cutoff_hz" in p:
             try:
                 self.cutoff_var.set(float(p["cutoff_hz"]))
@@ -175,9 +184,9 @@ class LowpassTab(ctk.CTkFrame):
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))
+        self.header_var = tk.StringVar(value=self._header_text())
         ctk.CTkLabel(
-            header,
-            text="Low-pass filter (causal Butterworth, order 2)",
+            header, textvariable=self.header_var,
             font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
 
@@ -371,6 +380,15 @@ class LowpassTab(ctk.CTkFrame):
         self.lp_canvas.get_tk_widget().pack(fill="both", expand=True,
                                             padx=4, pady=(0, 4))
 
+    def _header_text(self) -> str:
+        order = self._params.get("filter_order", 2)
+        return f"Low-pass filter (causal Butterworth, order {order})"
+
+    def _refresh_header(self) -> None:
+        var = getattr(self, "header_var", None)
+        if var is not None:
+            var.set(self._header_text())
+
     # -- Plane0 handling ----------------------------------------------------
 
     def _reload_from_folder(self) -> None:
@@ -401,12 +419,20 @@ class LowpassTab(ctk.CTkFrame):
         self._draw_fft()
         self._draw_raw()
         self._draw_lowpass()
-        self.status_var.set(
-            f"Loaded T={self._mean_dff.size}  N_kept={self._n_kept}  "
-            f"fps={self._fps:.2f} ({self._fps_src})  "
-            f"cutoff={self.cutoff_var.get():.3f} Hz")
-        self.compute_btn.configure(state="normal")
-        self.export_btn.configure(state="normal")
+        msg = (f"Loaded T={self._mean_dff.size}  N_kept={self._n_kept}  "
+               f"fps={self._fps:.2f} ({self._fps_src})  "
+               f"cutoff={self.cutoff_var.get():.3f} Hz")
+        if self._compute_ready:
+            self.compute_btn.configure(state="normal")
+            self.export_btn.configure(state="normal")
+        else:
+            # Previewing the unfiltered r0p7_dff: Compute (and the
+            # headless figure export) need r0p7_filtered_dff.
+            self.compute_btn.configure(state="disabled")
+            self.export_btn.configure(state="disabled")
+            msg += ("  [preview only: r0p7_filtered_dff.memmap.float32 is "
+                    "missing -- run Tab 3's filtered dF/F before Compute]")
+        self.status_var.set(msg)
 
     def _load_data(self, plane0: Path) -> None:
         from . import logic as utils
@@ -417,7 +443,8 @@ class LowpassTab(ctk.CTkFrame):
         prob_path = plane0 / "predicted_cell_prob.npy"
         filtered_path = plane0 / "r0p7_filtered_dff.memmap.float32"
 
-        if filtered_path.exists():
+        self._compute_ready = filtered_path.exists()
+        if self._compute_ready:
             # Resolve the keep mask against the filtered memmap's on-disk
             # size, NOT the live predicted_cell_mask/iscell. Curation or a
             # "Promote to filter mask" after the memmap was written drifts
@@ -716,6 +743,8 @@ class LowpassTab(ctk.CTkFrame):
             cur = float(self.cutoff_var.get())
             self.cutoff_var.set(max(new_min, min(new_max, cur)))
             self._apply_cutoff()
+        self._refresh_header()
+        self._draw_lowpass()
         self.status_var.set(
             "Advanced parameters updated. The next 'Compute' click will "
             "use the new filter / derivative settings.")
@@ -727,7 +756,8 @@ class LowpassTab(ctk.CTkFrame):
             messagebox.showinfo(
                 "Busy", "Low-pass / derivative compute already running.")
             return
-        if self._plane0 is None or self._n_kept == 0 or self._T == 0:
+        if (self._plane0 is None or not self._compute_ready
+                or self._n_kept == 0 or self._T == 0):
             messagebox.showerror(
                 "Not ready",
                 "Load a plane0 with r0p7_filtered_dff.memmap.float32 first.")
@@ -736,8 +766,6 @@ class LowpassTab(ctk.CTkFrame):
         cutoff = max(self.CUTOFF_MIN, min(self.CUTOFF_MAX, cutoff))
 
         plane0 = self._plane0
-        T = self._T
-        N = self._n_kept
         fps = self._fps
 
         self.compute_btn.configure(state="disabled")

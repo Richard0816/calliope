@@ -3,7 +3,7 @@
 Why this module exists
 ----------------------
 Tab 3's ``_run_pipeline`` chains five steps -- sparse_plus_cellpose
-detection, pix_to_um stamping, dF/F + low-pass, cell-filter
+detection, pix_to_um stamping, dF/F, cell-filter
 prediction, filtered-dF/F slicing -- with all logic living on the
 ``Suite2pTab`` class. Tab 0's batch runner needs the same pipeline
 without a Tk window, so we lift the chain into module-level
@@ -11,12 +11,15 @@ functions.
 
 Public surface
 --------------
-``run_detection(tiff_folder, save_folder, params, *, ckpt_path=None,
-                rec_id=None, baseline_mode='first_n', baseline_min=2.0,
-                figures_dir=None, progress_cb=None)``
-    End-to-end Tab 3 pipeline. Returns ``{plane0, output_files}``.
+``run_detection(tiff_folder, save_folder, params, *, path_to_ops=None,
+                tau_override=None, ckpt_path=None, rec_id=None,
+                baseline_mode='first_n', baseline_min=2.0,
+                figures_dir=None, raw_paths=None, archive_root=None,
+                dest_root=None, write_summary=True, progress_cb=None)``
+    End-to-end Tab 3 pipeline. Returns ``{plane0, fps, T, N,
+    pix_to_um, figures}``.
 ``compute_dff_memmaps(plane0, params, ...)``
-    The dF/F + low-pass + derivative loop.
+    The dF/F loop (writes only r0p7_dff).
 ``compute_filtered_dff(plane0)``
     Slice the cell-filter mask out of the per-ROI dF/F into the
     "filtered" memmap consumed by Tabs 4-8.
@@ -24,7 +27,16 @@ Public surface
     Run the cell-filter CNN. Optional step.
 ``stamp_pix_to_um(plane0, params)``
     Resolve ``params['scope_zoom']`` / ``params['um_per_pixel']`` and
-    write ``ops['pix_to_um']`` for downstream tabs.
+    write ``<plane0>/calliope_calibration.npy`` (via
+    ``utils.save_pix_to_um``) for downstream tabs.
+
+Headless-only params
+--------------------
+``run_detection`` also reads two ``params`` keys that have no Tab 3
+Advanced entry: ``zdrift_qc`` (default True; False skips the
+post-detection z-drift QC) and ``keep_registration_cache`` (default
+False; True keeps ``_shared_reg/.../data.bin`` so a re-detect skips
+registration).
 """
 
 from __future__ import annotations
@@ -42,6 +54,7 @@ from . import utils
 from . import scale as scale_mod
 from . import sparse_plus_cellpose as spc
 from . import preprocessing as _pre
+from .cellfilter.config import SIZE_OUTLIER_Z
 
 
 # Intermediate-binary cleanup. ``sparse_plus_cellpose.run`` leaves two
@@ -55,9 +68,13 @@ from . import preprocessing as _pre
 # ~26 GB/recording until the save drive fills (observed at recording
 # 13 in the 2026-05-12 batch).
 #
-# This mirrors ``BatchTab._prune_scratch_tree`` but runs unconditionally
-# at the tail of every detection -- including direct-run agents and
-# headless drivers that don't route through BatchTab's row state machine.
+# This mirrors ``tabs/batch/logic.py::prune_scratch_tree`` but runs
+# unconditionally at the tail of every detection -- including direct-run
+# agents and headless drivers that don't route through the batch tab's
+# row state machine. The two tuples below must stay equal to
+# ``SCRATCH_PRUNE_FILE_PATTERNS`` / ``SCRATCH_RECORDING_INTERMEDIATE_DIRS``
+# there (core cannot import from tabs); tests/test_detection_core_fixes.py
+# checks that they do.
 _PRUNE_FILE_PATTERNS: tuple[str, ...] = (
     "**/data_raw.bin",
     "**/data_raw_chan2.bin",
@@ -438,38 +455,57 @@ def stamp_pix_to_um(plane0: Path, params: dict) -> Optional[float]:
 
 def _maybe_run_dff_gpu(plane0: Path, params: dict, *,
                       baseline_mode: str, baseline_min: float,
-                      fps: float, cutoff_hz: float, sg_win_ms: int,
-                      sg_poly: int, r: float) -> bool:
+                      fps: float, r: float,
+                      F: Optional[np.ndarray] = None,
+                      Fneu: Optional[np.ndarray] = None,
+                      progress_cb: Optional[Callable[[str], None]] = None,
+                      ) -> bool:
     """GPU dF/F via ``analyze_output_gpu``. Returns True on success.
 
-    Mirrors ``Suite2pTab._maybe_run_dff_gpu``: only kicks in when
-    ``use_gpu_dff`` is set, the baseline is ``first_n``, and CuPy is
-    importable.
+    Only kicks in when ``use_gpu_dff`` is set, the baseline is
+    ``first_n``, and CuPy is importable. Every reason for not using (or
+    failing on) the GPU is reported through ``progress_cb`` so callers
+    can log it. ``F`` / ``Fneu`` are reused when the caller has already
+    loaded them (avoids a second full read of both arrays).
     """
+    def _say(msg: str) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
     if not bool(params.get("use_gpu_dff", True)):
+        _say("GPU dF/F disabled (use_gpu_dff off); using CPU.")
         return False
     if baseline_mode != "first_n":
+        _say("GPU dF/F only supports the first-N-min baseline; "
+             "rolling mode uses CPU.")
         return False
     try:
         from calliope.core import analyze_output_gpu as gpu
-    except Exception:
+    except Exception as e:
+        _say(f"analyze_output_gpu not importable ({e}); using CPU.")
         return False
     if not getattr(gpu, "_CUPY_OK", False):
+        _say("CuPy not available; using CPU dF/F.")
         return False
 
-    F = np.load(plane0 / "F.npy", allow_pickle=False)
-    Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
+    if F is None:
+        F = np.load(plane0 / "F.npy", allow_pickle=False)
+    if Fneu is None:
+        Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
     roi_chunk = int(params.get("gpu_roi_chunk", 0)) or None
     try:
         gpu.process_suite2p_traces_gpu(
             F, Fneu, fps=fps, r=r,
             baseline_sec=float(baseline_min) * 60.0,
-            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms, sg_poly=sg_poly,
             out_dir=str(plane0), prefix="r0p7_",
             roi_chunk=roi_chunk,
         )
         return True
-    except Exception:
+    except Exception as e:
+        _say(f"GPU dF/F failed ({e}); falling back to CPU.")
         return False
 
 
@@ -481,12 +517,13 @@ def compute_dff_memmaps(
     baseline_min: float = 2.0,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """Compute neuropil-corrected dF/F + low-pass + SG derivative for
-    every Suite2p ROI. Writes::
+    """Compute neuropil-corrected dF/F for every Suite2p ROI. Writes::
 
         plane0/r0p7_dff.memmap.float32          (T, N)
-        plane0/r0p7_dff_lowpass.memmap.float32  (T, N)
-        plane0/r0p7_dff_dt.memmap.float32       (T, N)
+
+    No low-pass or derivative is computed here: Tab 4
+    (:mod:`core.lowpass_run`) writes the ``r0p7_filtered_dff_lowpass`` /
+    ``_dt`` memmaps that event detection reads, from the filtered dF/F.
 
     Tries the GPU path first when ``params.use_gpu_dff`` is enabled
     and the baseline is ``first_n``. Falls back to per-ROI CPU.
@@ -505,14 +542,11 @@ def compute_dff_memmaps(
     fps = (fps_override if fps_override > 0
            else float(utils.get_fps_from_notes(str(plane0))))
 
-    cutoff_hz = float(params.get("default_lowpass_hz", 1.0))
-    sg_win_ms = int(params.get("default_sg_win_ms", 333))
-    sg_poly = int(params.get("default_sg_poly", 2))
     r = float(params.get("neuropil_coef", 0.7))
     perc = int(params.get("perc", 10))
     win_sec = float(params.get("win_sec", 45.0))
 
-    # Record the dF/F + low-pass provenance in the meta.json sidecar before
+    # Record the dF/F provenance in the meta.json sidecar before
     # either the GPU or CPU branch returns, so the NWB exporter and the
     # cross-correlation tooltips can read back which parameters produced
     # these memmaps. A metadata write must never break the pipeline.
@@ -524,14 +558,9 @@ def compute_dff_memmaps(
                 "baseline_mode": baseline_mode,
                 "baseline_percentile": perc,
                 "baseline_window_sec": win_sec,
-                "baseline_min_sec": float(baseline_min),
+                # ``baseline_min`` is in minutes; the key is seconds.
+                "baseline_min_sec": float(baseline_min) * 60.0,
                 "fps": fps,
-            },
-            lowpass={
-                "cutoff_hz": cutoff_hz,
-                "filter_kind": "iir_butter",
-                "order": 2,
-                "group_delay_samples": None,
             },
             extraction={"neuropil_coef": r},
         )
@@ -541,25 +570,19 @@ def compute_dff_memmaps(
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
-            cutoff_hz=cutoff_hz, sg_win_ms=sg_win_ms,
-            sg_poly=sg_poly, r=r):
+            r=r, F=F, Fneu=Fneu,
+            progress_cb=progress_cb):
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
     dff_path = plane0 / "r0p7_dff.memmap.float32"
-    lp_path = plane0 / "r0p7_dff_lowpass.memmap.float32"
-    dt_path = plane0 / "r0p7_dff_dt.memmap.float32"
     dff_mm = np.memmap(str(dff_path), mode="w+", dtype="float32", shape=shape)
-    lp_mm = np.memmap(str(lp_path), mode="w+", dtype="float32", shape=shape)
-    dt_mm = np.memmap(str(dt_path), mode="w+", dtype="float32", shape=shape)
 
-    # 2D-vectorized chunk size: caps transient memory at ~3 * CHUNK * T
+    # 2D-vectorized chunk size: caps transient memory at ~2 * CHUNK * T
     # float32 buffers regardless of how generous the outer ``batch`` is.
     DFF_CHUNK = 256
     batch = max(8, utils.change_batch_according_to_free_ram() * 20)
-    sos = None
     t0 = time.time()
-    from scipy.signal import savgol_filter
     for i0 in range(0, N, batch):
         i1 = min(N, i0 + batch)
         for j0 in range(i0, i1, DFF_CHUNK):
@@ -568,67 +591,39 @@ def compute_dff_memmaps(
             # float32, so this stays float32 without an extra astype).
             traces_chunk = F[j0:j1] - r * Fneu[j0:j1]
             dff_chunk = np.empty_like(traces_chunk)
-            lp_chunk = np.empty_like(traces_chunk)
             for k in range(j1 - j0):
                 trace = traces_chunk[k]
                 if baseline_mode == "first_n":
-                    dff = utils.first_n_min_df_over_f_1d(
+                    dff_chunk[k] = utils.first_n_min_df_over_f_1d(
                         trace, baseline_min=baseline_min,
                         perc=perc, fps=fps)
                 else:
-                    dff = utils.robust_df_over_f_1d(
+                    dff_chunk[k] = utils.robust_df_over_f_1d(
                         trace, win_sec=win_sec, perc=perc, fps=fps)
-                lp, _, sos = utils.lowpass_causal_1d(
-                    dff, fps=fps, cutoff_hz=cutoff_hz,
-                    order=2, zi=None, sos=sos)
-                dff_chunk[k] = dff
-                lp_chunk[k] = lp
-            # Batched Savitzky-Golay derivative along the time axis:
-            # one savgol_filter call per chunk replaces CHUNK per-ROI
-            # calls. ``savgol_filter`` with ``axis=1`` is mathematically
-            # identical to per-row, just amortizes the Python overhead.
-            T_len = lp_chunk.shape[1]
-            win = max(3, int((sg_win_ms / 1000.0) * fps) | 1)
-            if win >= T_len:
-                win = max(3, (T_len - (1 - T_len % 2)))
-            if win < 3 or T_len < 3:
-                dt_chunk = np.empty_like(lp_chunk)
-                dt_chunk[:, 0] = 0.0
-                dt_chunk[:, 1:] = (lp_chunk[:, 1:] - lp_chunk[:, :-1]) * fps
-            else:
-                dt_chunk = savgol_filter(
-                    lp_chunk, window_length=win, polyorder=sg_poly,
-                    deriv=1, delta=1.0 / fps, axis=1,
-                ).astype(np.float32)
-            # Slab writes (one contiguous transposed block per buffer
-            # per chunk) replace CHUNK column-by-column updates.
+            # One contiguous transposed slab write per chunk replaces
+            # CHUNK column-by-column updates.
             dff_mm[:, j0:j1] = dff_chunk.T
-            lp_mm[:, j0:j1] = lp_chunk.T
-            dt_mm[:, j0:j1] = dt_chunk.T
-        dff_mm.flush(); lp_mm.flush(); dt_mm.flush()
+        dff_mm.flush()
         if progress_cb is not None:
             progress_cb(
                 f"dF/F batch {i0}-{i1 - 1}/{N - 1} "
                 f"({time.time() - t0:.1f}s)")
-    del dff_mm, lp_mm, dt_mm
+    del dff_mm
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 
 def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
-                        size_outlier_z: float = 4.0) -> None:
+                        size_outlier_z: float = SIZE_OUTLIER_Z) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
     import gc
     import torch
-    from .cellfilter.model import CellFilter
-    from .cellfilter.predict import predict_recording
+    from .cellfilter.predict import (load_model_from_checkpoint,
+                                     predict_recording)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model = CellFilter().to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
+    model = load_model_from_checkpoint(Path(ckpt_path), device)
     try:
         predict_recording(rec_id, model, device, plane0=plane0,
                           size_outlier_z=size_outlier_z)
@@ -637,7 +632,7 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
         # weights actually return to the driver. Without this, every
         # recording's predict step adds another model copy worth of
         # VRAM to torch's cache, which suite2p's next run inherits.
-        del model, ckpt
+        del model
         gc.collect()
         try:
             if torch.cuda.is_available():
@@ -659,7 +654,9 @@ def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
 def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     """Slice ``r0p7_dff.memmap.float32`` down to ROIs that pass the
     cell-filter mask and write ``r0p7_filtered_dff.memmap.float32``
-    plus the legacy ``r0p7_cell_mask_bool.npy`` keep-mask file.
+    plus ``r0p7_cell_mask_bool.npy``, the keep mask this memmap was
+    sliced with (every filtered-memmap reader sizes against it via
+    :func:`utils.resolve_filtered_mask`).
     Returns the filtered memmap path (or None if no ROIs survive).
     """
     plane0 = Path(plane0)
@@ -688,30 +685,22 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
 
 
 def _build_sparsery_ops(params: dict) -> dict:
-    """Mirror ``Suite2pTab._run_pipeline`` Sparsery dict assembly."""
-    return {
-        "high_pass":         params.get("high_pass", 100),
-        "preclassify":       params.get("preclassify", 0.0),
-        "smooth_sigma":      params.get("smooth_sigma", 1.0),
-        "sparse_mode":       True,
-        "spatial_scale":     params.get("spatial_scale", 0),
-        "threshold_scaling": params.get("threshold_scaling", 0.85),
-        "max_iterations":    params.get("max_iterations", 1500),
-    }
+    """Mirror ``Suite2pTab._run_pipeline`` Sparsery dict assembly.
+
+    Defaults come from ``sparse_plus_cellpose.SPARSERY_OPS``;
+    ``sparse_mode`` is always True.
+    """
+    ops = {k: params.get(k, v) for k, v in spc.SPARSERY_OPS.items()}
+    ops["sparse_mode"] = True
+    return ops
 
 
 def _build_cellpose_cfg(params: dict) -> dict:
-    return {
-        "cellpose_model_type":
-            params.get("cellpose_model_type", "cyto2"),
-        "cellpose_diameter":
-            params.get("cellpose_diameter", 0),
-        "cellpose_flow_threshold":
-            params.get("cellpose_flow_threshold", 0.8),
-        "cellpose_cellprob_threshold":
-            params.get("cellpose_cellprob_threshold", -1.0),
-        "cellpose_channel_input": "meanImg",
-    }
+    """Cellpose pass config; defaults from ``sparse_plus_cellpose.CELLPOSE_CFG``.
+    The input channel is always the mean image."""
+    cfg = {k: params.get(k, v) for k, v in spc.CELLPOSE_CFG.items()}
+    cfg["cellpose_channel_input"] = "meanImg"
+    return cfg
 
 
 def archive_offload(save_folder_str: str, params: dict, *,
@@ -851,12 +840,15 @@ def run_detection(
 
     Steps:
       1. ``sparse_plus_cellpose.run`` -> plane0.
-      2. Stamp ``ops['pix_to_um']`` from ``params['scope_zoom']`` /
-         ``params['um_per_pixel']``.
+      2. ``stamp_pix_to_um`` -> ``calliope_calibration.npy`` from
+         ``params['scope_zoom']`` / ``params['um_per_pixel']``.
       3. ``compute_dff_memmaps`` -> r0p7_dff* memmaps.
       4. ``predict_cell_filter`` -> predicted_cell_mask.npy / prob.
          (skipped when ``ckpt_path`` is None or empty)
       5. ``compute_filtered_dff`` -> r0p7_filtered_dff.memmap.
+      6. z-drift QC (skip with ``params['zdrift_qc'] = False``), prune
+         intermediates (``params['keep_registration_cache']`` keeps the
+         registered movie), archive, summary sheets, figures.
 
     Returns ``{plane0: Path, fps: float, T: int, N: int,
     pix_to_um: float|None, figures: list[str]}``.
@@ -865,8 +857,9 @@ def run_detection(
         progress_cb("[detection] running sparse_plus_cellpose...")
     sparsery_ops = _build_sparsery_ops(params)
     cellpose_cfg = _build_cellpose_cfg(params)
-    hard_cap = int(params.get("hard_cap", 60000))
-    max_overlap = float(params.get("max_overlap", 0.3))
+    hard_cap = int(params.get("hard_cap", spc.HARD_CAP))
+    max_overlap = float(params.get("max_overlap",
+                                   spc.CELLPOSE_MERGE_MAX_OVERLAP))
     # User's FPS override (0 = unset) so suite2p's deconvolution / spike
     # timing run at the real acquisition rate rather than the baked-in
     # fallback; the same value drives the dF/F fps in compute_dff_memmaps.
@@ -907,7 +900,7 @@ def run_detection(
     pix_to_um = stamp_pix_to_um(plane0, params)
 
     if progress_cb is not None:
-        progress_cb("[detection] computing dF/F + low-pass + derivative...")
+        progress_cb("[detection] computing dF/F...")
     dff_info = compute_dff_memmaps(
         plane0, params,
         baseline_mode=baseline_mode, baseline_min=baseline_min,
@@ -919,7 +912,8 @@ def run_detection(
             progress_cb("[detection] running cell-filter prediction...")
         predict_cell_filter(
             plane0, ckpt_path, rec_id or plane0.parent.name,
-            size_outlier_z=float(params.get("size_outlier_z", 4.0)))
+            size_outlier_z=float(params.get("size_outlier_z",
+                                            SIZE_OUTLIER_Z)))
 
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")

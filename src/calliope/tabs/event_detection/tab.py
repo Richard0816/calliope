@@ -56,7 +56,6 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
-import traceback
 
 import customtkinter as ctk
 from pathlib import Path
@@ -73,8 +72,7 @@ from .logic import summary_writer
 
 from ...gui_common import (
     AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, report_stage_error,
-    format_roi_indices, open_advanced, parse_manual_roi_spec,
-    spec_defaults,
+    open_advanced, spec_defaults,
 )
 
 
@@ -91,17 +89,14 @@ class EventDetectionTab(ctk.CTkFrame):
     ----------------
     ``POLL_MS``
         Render-queue polling interval (main thread).
-    ``Z_ENTER`` / ``Z_EXIT`` / ``MIN_SEP_S``
-        Default per-ROI hysteresis-onset thresholds (also exposed in
-        PARAM_SPEC).
-    ``TIME_COLS_TARGET``
-        Target column count for the down-sampled heatmap so the
-        figure stays interactive for long recordings.
     ``PARAM_SPEC``
-        The 26-entry knob list driving the Advanced... dialog --
-        every per-ROI threshold + every ``EventDetectionParams``
-        field. See ``calliope.core.utils.EventDetectionParams`` for
-        what each one does mathematically.
+        The 32-entry knob list driving the Advanced... dialog -- the
+        per-ROI hysteresis / onset-refinement knobs (``z_enter``,
+        ``z_exit``, ``min_sep_s``, ``min_rise_dff``,
+        ``onset_backtrack_s``), the heatmap ``time_cols_target``, and
+        every ``EventDetectionParams`` field. See
+        ``calliope.core.utils.EventDetectionParams`` for what each one
+        does mathematically.
 
     Lifecycle
     ---------
@@ -128,10 +123,6 @@ class EventDetectionTab(ctk.CTkFrame):
     """
 
     POLL_MS = 80
-    Z_ENTER = 3.5
-    Z_EXIT = 1.5
-    MIN_SEP_S = 0.1
-    TIME_COLS_TARGET = 1200
 
     PARAM_SPEC: list = [
         # Per-ROI onset hysteresis (mad_z + hysteresis_onsets)
@@ -154,8 +145,9 @@ class EventDetectionTab(ctk.CTkFrame):
          "type": "float", "default": 0.0, "group": "Per-ROI hysteresis",
          "help": "max window to walk an onset back to the foot of its rise. "
                  "0 = auto: max(indicator tau, 0.8/lowpass-cutoff) per "
-                 "recording (~0.8s for fast GCaMP at 1Hz); set a positive "
-                 "value to override"},
+                 "recording, using the cutoff Tab 4 last computed at "
+                 "(~0.8s for fast GCaMP at 1Hz); set a positive value to "
+                 "override"},
         # Display
         {"name": "time_cols_target", "label": "Heatmap time columns",
          "type": "int", "default": 1200, "group": "Display",
@@ -268,8 +260,9 @@ class EventDetectionTab(ctk.CTkFrame):
         {"name": "merge_gap_s", "label": "Merge gap (s)",
          "type": "float", "default": 0.0,
          "group": "Population events - boundaries",
-         "help": "legacy overlap-merge gap; ignored when watershed-split "
-                 "is enabled"},
+         "help": "legacy overlap-merge gap; currently has NO effect (the "
+                 "merge path was disabled on 2026-05-01 in favour of "
+                 "watershed split) -- kept for compatibility"},
         {"name": "use_gaussian_boundary",
          "label": "Use Gaussian-fit boundary",
          "type": "bool", "default": False,
@@ -300,6 +293,9 @@ class EventDetectionTab(ctk.CTkFrame):
         # the pure-Python per-ROI hysteresis loop can't hold the GIL and
         # freeze the GUI. ``None`` until the first render.
         self._render_job = None
+        # Interactive "Export figures" also runs in a child process
+        # (re-detection + figure render); ``None`` until the first export.
+        self._export_job = None
         self._params: dict = spec_defaults(self.PARAM_SPEC)
         self._last_data: Optional[dict] = None
         # When True, the next render skips persisting params to the run
@@ -320,7 +316,9 @@ class EventDetectionTab(ctk.CTkFrame):
         drain_queue(self, self._render_queue,
                     {"done": self._on_render_done,
                      "error": self._on_render_error,
-                     "status": self._on_render_status},
+                     "status": self._on_render_status,
+                     "export_done": self._on_export_done,
+                     "export_error": self._on_export_error},
                     poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
         state.subscribe_lowpass_ready(self._on_plane0)
@@ -851,7 +849,11 @@ class EventDetectionTab(ctk.CTkFrame):
         self._last_data = data
         self.summary_btn.configure(state="normal")
         self.prominence_btn.configure(state="normal")
-        self.export_btn.configure(state="normal")
+        # An interactive export still running keeps its button disabled;
+        # _on_export_done / _on_export_error re-enable it.
+        job = getattr(self, "_export_job", None)
+        if job is None or not job.running():
+            self.export_btn.configure(state="normal")
 
         # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
         # propagation) can render the same events without re-detecting.
@@ -867,10 +869,10 @@ class EventDetectionTab(ctk.CTkFrame):
                 "fps": data.get("fps"),
                 "T": data.get("T"),
                 "onsets_by_roi": data.get("onsets_by_roi"),
-                # Forward the per-event monotonicity scalars Tab 8's
-                # bottom panel uses so it can render from the cached
-                # result instead of re-running the 10k-shuffle sweep
-                # on every click.
+                # Per-event monotonicity scalars (theta*, rho, p, u_x,
+                # u_y) for any consumer that only needs the scalars.
+                # Tab 8 does not read them: its plots need the full rho
+                # curve + null distribution, so it re-runs the sweep.
                 "event_monotonicity": data.get("event_monotonicity"),
             })
         except Exception as e:
@@ -944,10 +946,10 @@ class EventDetectionTab(ctk.CTkFrame):
         # Spearman scalars ``run_event_detection`` already computed
         # and stashed on the data dict. Without this call the GUI
         # path silently skips the sheet -- the headless / batch
-        # path in ``run_event_detection.run_event_detection`` writes
-        # it via the same module but only when ``write_summary=True``
-        # (the tab passes ``write_summary=False`` and runs its own
-        # writer here instead).
+        # path in ``core.event_detection_run.run_event_detection``
+        # writes it via the same module but only when
+        # ``write_summary=True`` (the tab passes ``write_summary=False``
+        # and runs its own writer here instead).
         em = data.get("event_monotonicity")
         if em:
             try:
@@ -971,49 +973,80 @@ class EventDetectionTab(ctk.CTkFrame):
         """Re-render Tab 5's heatmap / raster / event-detection figures
         for the currently-loaded recording as PNG + SVG under
         ``<save_folder>/calliope_figures/event_detection/``, then update
-        the manifest. Re-runs the event-detection algorithm (cheap --
-        operates on the existing lowpass memmap; tens of seconds) so
-        the in-memory state can stay memory-light.
+        the manifest. Re-runs detection on the existing lowpass memmap
+        (minus the per-event monotonicity sweep, which the figures don't
+        use) so the in-memory state can stay memory-light.
 
-        ``quiet=True`` (Tab 0 batch toggle) suppresses messageboxes.
+        An interactive click runs that work in a child process via
+        ``core.offload.run_offloaded`` (like Render), so the GUI stays
+        responsive; ``_on_export_done`` / ``_on_export_error`` report the
+        result. ``quiet=True`` (Tab 0 batch toggle) runs it synchronously
+        -- the batch advances to the next stage as soon as this returns --
+        and suppresses messageboxes.
         """
         plane0 = self._plane0
         if plane0 is None:
             if not quiet:
                 messagebox.showinfo("No data", "Load a recording first.")
             return
+        if not quiet and any(
+                job is not None and job.running()
+                for job in (self._render_job, self._export_job)):
+            messagebox.showinfo(
+                "Busy", "Render / export is already running.")
+            return
         from ...core.utils import save_folder_for_plane0
+        from ...core import event_detection_run as edr
         save_folder = save_folder_for_plane0(plane0)
         figures_root = save_folder / "calliope_figures"
-        events_dir = figures_root / "event_detection"
+        params = dict(self._params)
         self.status_var.set("Exporting event figures ...")
+
+        if not quiet:
+            from ...core.offload import run_offloaded
+            self.export_btn.configure(state="disabled")
+            try:
+                self._export_job = run_offloaded(
+                    self, self._render_queue,
+                    edr.export_event_figures_offload,
+                    args=(str(plane0), params, str(figures_root)),
+                    done_kind="export_done", error_kind="export_error",
+                    progress_kind="status",
+                    poll_ms=self.POLL_MS,
+                )
+            except Exception as e:
+                # Dispatch itself failed (spawn / pickling): no job will
+                # ever post export_error, so recover the button here.
+                self._export_job = None
+                self._on_export_error(f"could not start export: {e}")
+            return
+
         self.update_idletasks()
         try:
-            from ...core.event_detection_run import run_event_detection
-            from ...core.export_manifest import write_export_manifest
-            from ...core.utils import safe_recording_id
-            rec_id = safe_recording_id(plane0)
-            params = dict(self._params)
-            run_event_detection(
-                plane0, params, figures_dir=events_dir,
-                write_summary=False,
-            )
-            manifest_path = write_export_manifest(
-                figures_root,
-                rec_id=rec_id, params=params,
-                plane0=plane0, ckpt_path=None,
-            )
-            self.status_var.set(f"Exported event figures -> {events_dir}")
-            if not quiet:
-                messagebox.showinfo(
-                    "Export complete",
-                    f"Wrote heatmap / raster / event-detection figures "
-                    f"(PNG + SVG) to:\n  {events_dir}\n\n"
-                    f"Manifest:\n  {manifest_path}")
+            result = edr.export_event_figures_offload(
+                str(plane0), params, str(figures_root))
         except Exception as e:
             self.status_var.set(f"Export failed: {e}")
-            if not quiet:
-                messagebox.showerror("Export failed", str(e))
+            return
+        self.status_var.set(
+            f"Exported event figures -> {result['events_dir']}")
+
+    def _on_export_done(self, result: dict) -> None:
+        """Main-thread completion handler for an interactive export."""
+        self.export_btn.configure(state="normal")
+        events_dir = result.get("events_dir", "")
+        self.status_var.set(f"Exported event figures -> {events_dir}")
+        messagebox.showinfo(
+            "Export complete",
+            f"Wrote heatmap / raster / event-detection figures "
+            f"(PNG + SVG) to:\n  {events_dir}\n\n"
+            f"Manifest:\n  {result.get('manifest', '')}")
+
+    def _on_export_error(self, payload: str) -> None:
+        self.export_btn.configure(state="normal")
+        first = payload.split("\n", 1)[0]
+        self.status_var.set(f"Export failed: {first}")
+        messagebox.showerror("Export failed", first)
 
     # -- Plot data export ---------------------------------------------------
 

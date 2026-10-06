@@ -55,9 +55,9 @@ cellpose model (~1 GB, one time).
 
 ## Pipeline stages
 
-1. **Preprocess** — rigid registration + intensity normalization.
-2. **QC preview** — inspect the registered recording before heavy compute.
-3. **Detection** — Suite2p + Cellpose ROI extraction, dF/F, cell-filter model.
+1. **Preprocess** — intensity shift to a non-negative uint16 TIFF, mean image, QC GIF.
+2. **QC preview** — inspect the QC movie and mean image before heavy compute.
+3. **Detection** — Suite2p registration + Suite2p/Cellpose ROI extraction, dF/F, cell-filter model.
 4. **Low-pass filter** — Butterworth low-pass + Savitzky-Golay derivative.
 5. **Event detection** — per-ROI onsets and population event windows.
 6. **Clustering** — hierarchical clustering of filtered traces.
@@ -65,6 +65,41 @@ cellpose model (~1 GB, one time).
 8. **Spatial propagation** — per-event spatial figures on the mean image.
 
 A **Batch runner** tab queues recordings and chains all eight stages.
+
+## Changes in this release
+
+Changes that affect existing outputs, scripts or batch files:
+
+- **NWB export.** `iscell_prob` now holds the Suite2p classifier
+  probability (`iscell.npy` column 1). The 0/1 accept label moved to a
+  new `iscell` column. New columns: `cellfilter_prob` (CalLIOPE
+  cell-filter probability) and `kept` (1 = ROI kept for downstream
+  analysis).
+- **GPU fallback.** On a machine with CuPy installed but no reachable
+  CUDA device, GPU stages now fall back to the CPU path instead of
+  failing at the first GPU operation.
+- **Batch report.** `batch_report.csv` has a row-level `error` column
+  with the failing stage's message.
+- **Batch parameters.** New per-row keys: `zdrift_qc`,
+  `keep_registration_cache`, `n_shuffles`, `compute_partial`. Removed:
+  `cutoff_min` / `cutoff_max` (they only set Tab 4's slider range and
+  had no effect in a batch run). A blank or missing batch cell now means
+  the batch default, not the value the previous row left in the tab.
+- **Clustering export.** `cluster_results/` also saves
+  `linkage_roi_ids.npy` (the Suite2p ids the linkage was built on);
+  Reload and Export refuse when the kept ROIs have changed since.
+- **`meta.json`.** `dff.baseline_min_sec` is now in seconds (it held
+  minutes under a seconds name).
+- **Detection outputs.** Detection no longer writes the unfiltered
+  `r0p7_dff_lowpass.memmap.float32` / `r0p7_dff_dt.memmap.float32`
+  (nothing read them; Tab 4's `r0p7_filtered_dff_lowpass` / `_dt` are
+  unchanged). The three Tab 3 settings that only shaped them,
+  `default_lowpass_hz`, `default_sg_win_ms` and `default_sg_poly`, are
+  removed; old settings or batch files that still carry them load and
+  ignore them. Copies of the two files already on disk are unused and
+  can be deleted. `meta.json`'s `lowpass` section is no longer stamped.
+- **Dependencies.** `seaborn` and `scikit-image` are no longer
+  required.
 
 ## License
 

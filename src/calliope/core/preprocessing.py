@@ -12,8 +12,10 @@ per-pixel mean image.
 
 Public surface
 --------------
-``run_preprocess(data_root, recording_name, ...)``
-    The top-level entry point Tab 1 calls. Returns a
+``run_preprocess(src_tiffs, data_root, params, ...)``
+    The headless entry point Tab 0's batch runner calls (interactive
+    Tab 1 goes through ``preprocess_offload`` in a child process
+    instead). Both return a
     ``PreprocessResult`` dataclass describing the on-disk artefacts
     written under ``<data_root>/<recording_name>/``:
         shifted_<original>.tif         (single-TIFF case)
@@ -49,9 +51,9 @@ analysis.
 # Type-hint forward-reference shim (see pipeline_gui.py).
 from __future__ import annotations
 
-# ``dataclass`` decorator and ``asdict`` helper -- see the comment on
-# ``EventDetectionParams`` in core/utils.py for the basics.
-from dataclasses import dataclass, field, asdict
+# ``dataclass`` decorator -- see the comment on ``EventDetectionParams``
+# in core/utils.py for the basics.
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -107,24 +109,6 @@ class PreprocessResult:
     raw_paths: list = field(default_factory=list)
     shifted_paths: list = field(default_factory=list)
 
-    def to_dict(self) -> dict:
-        """Serialise to a plain JSON-friendly dict (every Path -> str).
-
-        Used when we want to write the result alongside the artefacts
-        as part of a sidecar JSON for reproducibility.
-        """
-        # ``asdict`` is the dataclass helper that turns a dataclass
-        # instance into a plain dict.
-        d = asdict(self)
-        # Replace any ``Path`` value with its string form.
-        # ``isinstance`` is Python's ``inherits()`` analogue.
-        for k, v in d.items():
-            if isinstance(v, Path):
-                d[k] = str(v)
-            elif isinstance(v, list):
-                d[k] = [str(x) if isinstance(x, Path) else x for x in v]
-        return d
-
 
 # ---------------------------------------------------------------------------
 # Shift  (make minimum zero, save as uint16)
@@ -139,9 +123,12 @@ class ShiftResult:
     to re-read the shifted TIFF from disk. On spinning disks that's the
     difference between three full stack reads and one.
 
+    The full shifted stack is deliberately *not* kept here: no caller
+    needs it once it is on disk, and holding it would keep the whole
+    movie in RAM through the QC-GIF encode.
+
     Fields
     ------
-    array       : full shifted stack if it fit in RAM, else ``None``.
     mean        : (Y, X) float32 per-pixel time average of the shifted
                   stack.
     qc_frames   : (T // qc_downsample_t, Y, X) uint16 every-Nth shifted
@@ -149,7 +136,6 @@ class ShiftResult:
                   ``downsample_t=1``.
     n_frames    : exact T (number of pages in the shifted stack).
     """
-    array: Optional[np.ndarray]
     mean: np.ndarray
     qc_frames: np.ndarray
     n_frames: int
@@ -212,7 +198,7 @@ def shift_tiff_to_uint16(
         tifffile.imwrite(str(dst_tiff), data)
         _log(f"[shift] done -> {dst_tiff.name}")
         return ShiftResult(
-            array=data, mean=mean, qc_frames=qc_frames,
+            mean=mean, qc_frames=qc_frames,
             n_frames=int(data.shape[0]),
         )
     except MemoryError:
@@ -229,7 +215,7 @@ def shift_tiff_to_uint16(
             qc_downsample_t=qc_step,
         )
         return ShiftResult(
-            array=None, mean=mean, qc_frames=qc_frames,
+            mean=mean, qc_frames=qc_frames,
             n_frames=int(n_pages),
         )
 
@@ -328,9 +314,10 @@ def _shift_tiff_streaming(
 _COMPRESS_TMP_SUFFIX = ".compressing"
 
 # Sidecar file recording the raw source paths for a recording. Written
-# by ``run_preprocess`` so the post-detection archive step can locate
-# the originals without needing PreprocessResult passed through to
-# detection_run.
+# by ``run_preprocess`` (batch) and ``preprocess_offload`` (interactive
+# Tab 1) so the post-detection archive step can locate the originals
+# without needing PreprocessResult passed through to detection_run, and
+# so ``load_existing_preprocess`` can regenerate archived shifted TIFFs.
 RAW_PATHS_SIDECAR = "_calliope_raw_paths.json"
 
 
@@ -792,6 +779,8 @@ def preprocess_tiff_group(
     recording_name: Optional[str] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
     qc_params: Optional[dict] = None,
+    *,
+    overwrite: bool = False,
 ) -> PreprocessResult:
     """End-to-end preprocessing for a group of raw TIFFs treated as one
     continuous recording.
@@ -806,6 +795,12 @@ def preprocess_tiff_group(
 
     If ``recording_name`` is omitted, defaults to the ``+``-joined stems of
     ``src_tiffs`` (in the order given).
+
+    Resume behaviour: by default an ``NNN_shifted_*.tif`` that already
+    exists from a prior run is reused (only re-read to accumulate the
+    mean / QC frames) -- but only when its page count matches its source;
+    a short file left by a killed run is rewritten. ``overwrite=True``
+    (Tab 1's Force rerun) rewrites every shifted file unconditionally.
     """
     if not src_tiffs:
         raise ValueError("preprocess_tiff_group: empty src_tiffs")
@@ -876,8 +871,23 @@ def preprocess_tiff_group(
     # each file was sampled independently with stride ``downsample_t``;
     # the global counter makes the result file-boundary-agnostic).
     qc_index = 0
-    for src, dst in zip(srcs, shifted_paths):
-        if dst.exists():
+    for src, dst, src_pages in zip(srcs, shifted_paths, page_counts):
+        reuse = False
+        if dst.exists() and not overwrite:
+            try:
+                with tifffile.TiffFile(str(dst)) as tf:
+                    dst_pages = len(tf.pages)
+            except Exception as e:
+                dst_pages = None
+                log(f"[2/2]   unreadable existing {dst.name} ({e}); "
+                    f"rewriting")
+            if dst_pages == src_pages:
+                reuse = True
+            elif dst_pages is not None:
+                log(f"[2/2]   existing {dst.name} has {dst_pages} pages, "
+                    f"source has {src_pages} (incomplete prior run?); "
+                    f"rewriting")
+        if reuse:
             # Already shifted on a prior run -- read it through to
             # update the accumulators so the mean/QC remain correct
             # for the full concatenation.
@@ -953,27 +963,66 @@ def preprocess_offload(src_strs: list[str], data_root: str, *,
                        recording_name: Optional[str] = None,
                        group: bool = False,
                        qc_params: Optional[dict] = None,
+                       force: bool = False,
                        progress_q=None) -> "PreprocessResult":
     """Picklable :mod:`calliope.core.offload` target for Tab 1.
 
     Dispatches the single-file vs group preprocessing path in a child
     process so the TIFF shift / mean / QC-GIF work can't freeze the GUI.
-    Takes only picklable inputs (path *strings* + a flag + a dict) and
+    Takes only picklable inputs (path *strings* + flags + a dict) and
     returns the picklable :class:`PreprocessResult` the tab's ``_on_done``
     already consumes.
+
+    ``force=True`` (Tab 1's Force rerun) makes the group path overwrite
+    existing ``NNN_shifted_*.tif`` files instead of reusing them; the
+    single-file path always overwrites.
+
+    Like :func:`run_preprocess`, writes the ``_calliope_raw_paths.json``
+    sidecar so an archived GUI-preprocessed recording can later be
+    reloaded / regenerated by :func:`load_existing_preprocess`.
     """
     from .offload import make_progress_cb
     cb = make_progress_cb(progress_q)
     srcs = [Path(s) for s in src_strs]
     if group:
-        return preprocess_tiff_group(
+        result = preprocess_tiff_group(
             src_tiffs=srcs, data_root=data_root,
             recording_name=recording_name, progress_cb=cb,
+            qc_params=qc_params, overwrite=force)
+    else:
+        result = preprocess_tiff(
+            src_tiff=srcs[0], data_root=data_root,
+            recording_name=recording_name, progress_cb=cb,
             qc_params=qc_params)
-    return preprocess_tiff(
-        src_tiff=srcs[0], data_root=data_root,
-        recording_name=recording_name, progress_cb=cb,
-        qc_params=qc_params)
+    try:
+        write_raw_paths_sidecar(result.out_dir, result.raw_paths)
+    except OSError as e:
+        if cb is not None:
+            cb(f"[preprocess] raw-paths sidecar write failed: {e}")
+    return result
+
+
+def load_existing_offload(out_dir: str, *,
+                          progress_q=None) -> "PreprocessResult":
+    """Picklable :mod:`calliope.core.offload` target: reload an existing
+    recording folder, regenerating archived shifted TIFFs.
+
+    ``load_existing_preprocess(..., regenerate_shifted=True)`` can
+    re-shift a multi-gigabyte raw, so Tab 1 runs it in a child process
+    instead of on the Tk thread. Raises ``RuntimeError`` when the folder
+    can't be loaded (e.g. the archived raw is gone) so the tab's error
+    handler reports it.
+    """
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q)
+    result = load_existing_preprocess(
+        out_dir, regenerate_shifted=True, progress_cb=cb)
+    if result is None:
+        raise RuntimeError(
+            f"Could not reload preprocess outputs from {out_dir} "
+            f"(shifted TIFFs missing and the raw source could not be "
+            f"found to regenerate them).")
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,12 @@ def default_meta() -> Dict[str, Any]:
     Every section/key the rest of the pipeline may stamp is present with a
     ``None`` (or sensible default) placeholder so downstream consumers can
     rely on the keys existing.
+
+    Not every key is stamped today. Keys marked RESERVED below are kept for
+    schema stability (``meta.json`` files already exist on disk) but no
+    pipeline stage writes them yet, so their value is always the
+    placeholder -- a ``None``/``False`` there means "not recorded", not
+    "disabled".
     """
     return {
         "schema_version": SCHEMA_VERSION,
@@ -71,6 +77,8 @@ def default_meta() -> Dict[str, Any]:
         "detection": {
             "threshold_scaling": None,
             "sparse_mode": None,
+            # RESERVED: not stamped yet (the detection stage does not
+            # record its Cellpose / SAM-Vcorr settings here).
             "cellpose_enabled": None,
             "cellpose_model": None,
             "cellpose_flow_threshold": None,
@@ -88,15 +96,24 @@ def default_meta() -> Dict[str, Any]:
             "baseline_min_sec": None,
             "fps": None,
         },
+        # RESERVED: detection used to stamp the cutoff of the unfiltered
+        # r0p7_dff_lowpass memmap here; that memmap is no longer written,
+        # so nothing stamps or reads this section. Tab 4's filter settings
+        # live under ``lowpass_filtered``. Kept for schema stability.
         "lowpass": {
             "cutoff_hz": None,
             "filter_kind": None,
             "order": None,
             "group_delay_samples": None,
         },
+        # Always "oasis": the only spike-inference backend (the CASCADE
+        # alternative this section was added for was dropped). Stamped as a
+        # constant by sparse_plus_cellpose; nothing reads it.
         "spike_inference": {
             "backend": "oasis",
         },
+        # RESERVED: stub slot for a future denoising step (e.g. DeepCAD-RT).
+        # No stage writes or reads it; "applied": False is the placeholder.
         "denoising": {
             "applied": False,
             "model": None,

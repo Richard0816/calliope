@@ -3,22 +3,24 @@ computation for batch execution and Tab 4.
 
 Why this module exists
 ----------------------
-Tab 4's compute loop used to live inline in ``LowpassTab._run_compute``,
-which means the batch runner couldn't invoke the same code without
-spinning up a Tk window. This module lifts the math out so both the
-GUI tab (still does the interactive plotting + slider) and the batch
-runner can call the same function.
+Tab 4's compute loop used to live inline in the tab, which meant the
+batch runner couldn't invoke the same code without spinning up a Tk
+window. This module lifts the math out so both the GUI tab (still does
+the interactive plotting + slider; its Compute button runs
+:func:`compute_lowpass_offload` in a child process) and the batch runner
+can call the same function.
 
 Public surface
 --------------
 ``compute_lowpass_and_dt(plane0, fps, cutoff_hz, ...)``
     Read ``r0p7_filtered_dff.memmap.float32``, write
     ``r0p7_filtered_dff_lowpass.memmap.float32`` and
-    ``r0p7_filtered_dff_dt.memmap.float32``.
+    ``r0p7_filtered_dff_dt.memmap.float32``, then stamps the settings
+    into ``meta.json`` ``lowpass_filtered`` (read back by Tab 5).
 ``render_lowpass_figures(plane0, fps, cutoff_hz, figures_dir, ...)``
     Render the same three diagnostic plots Tab 4 shows (FFT, raw
-    trace, low-pass trace) for the population-mean dF/F and save
-    them as PNGs into ``figures_dir``.
+    trace, zero-phase low-pass preview) for the population-median dF/F
+    and save them as PNG + SVG into ``figures_dir``.
 ``run_lowpass(plane0, params, figures_dir=None, progress_cb=None)``
     Convenience wrapper used by the batch runner: resolves fps + N,
     runs ``compute_lowpass_and_dt``, and (if ``figures_dir`` is set)
@@ -74,16 +76,24 @@ def compute_lowpass_and_dt(
 
     Returns a summary dict (cutoff, fps, T, N, written paths).
 
+    After both memmaps are flushed, the filter settings are stamped into
+    ``<plane0>/meta.json`` under a ``lowpass_filtered`` section
+    (``cutoff_hz``, ``filter_kind``, ``order``, ``sg_win_ms``,
+    ``sg_poly``, ``fps``). Tab 5 (:mod:`core.event_detection_run`) reads
+    it so its auto onset-backtrack window and frame rate match what was
+    actually baked into these memmaps. The older ``lowpass`` section
+    (reserved; detection no longer stamps it) is left untouched. The stamp is best-effort: a metadata failure never fails
+    the compute.
+
     ``progress_cb`` (if provided) is called with status strings such
     as ``"120/2350 ROIs (3.4s)"`` every ~5% of progress.
     """
     plane0 = Path(plane0)
-    T, N = _load_kept_count_and_T(plane0)
-
     src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
     if not src_path.exists():
         raise FileNotFoundError(
             f"Missing {src_path.name}; run Tab 3 first.")
+    T, N = _load_kept_count_and_T(plane0)
     src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
 
     lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
@@ -120,6 +130,26 @@ def compute_lowpass_and_dt(
     lp_mm.flush()
     dt_mm.flush()
     del lp_mm, dt_mm, src
+
+    try:
+        from . import recording_meta
+        recording_meta.update_meta(
+            plane0,
+            lowpass_filtered={
+                "cutoff_hz": float(cutoff_hz),
+                "filter_kind": "iir_butter_causal",
+                "order": int(filter_order),
+                "sg_win_ms": int(sg_win_ms),
+                "sg_poly": int(sg_poly),
+                "fps": float(fps),
+            },
+        )
+    except Exception as e:
+        msg = f"[lowpass] meta.json lowpass_filtered stamp failed: {e}"
+        if progress_cb is not None:
+            progress_cb(msg)
+        else:
+            print(msg)
 
     return {
         "cutoff_hz": float(cutoff_hz),
@@ -179,9 +209,10 @@ def render_lowpass_figures(
     figures_dir: Path,
     filter_order: int = 2,
 ) -> list[str]:
-    """Render the three diagnostic Tab 4 plots for the population mean
-    dF/F and save them as ``fft.png``, ``raw_dff.png``,
-    ``lowpass_dff.png`` under ``figures_dir``. Returns the paths.
+    """Render the three diagnostic Tab 4 plots for the population-median
+    filtered dF/F and save them as ``fft.png``, ``raw_dff.png``,
+    ``lowpass_dff.png`` (+ ``.svg``) under ``figures_dir``. Returns the
+    PNG paths.
 
     Uses the matplotlib ``Agg`` backend so it works in headless batch
     contexts without a display.
@@ -200,9 +231,9 @@ def render_lowpass_figures(
     xf = np.fft.rfftfreq(pop_dff.size, 1.0 / fps)
     power = np.abs(yf) ** 2
     # Diagnostic figure only — zero-phase preview so the overlay
-    # aligns with the raw mean-dF/F trace in time. The on-disk lowpass
+    # aligns with the raw median-dF/F trace in time. The on-disk lowpass
     # memmap that feeds event detection is still built with the causal
-    # filter in ``write_lowpass_dt_memmaps`` above.
+    # filter in ``compute_lowpass_and_dt`` above.
     lp, _ = utils.lowpass_zero_phase_1d(
         pop_dff, fps=fps, cutoff_hz=cutoff_hz, order=filter_order,
         sos=None)
@@ -268,10 +299,11 @@ def run_lowpass(
       * ``filter_order`` (default 2)
       * ``sg_win_ms`` (default 333)
       * ``sg_poly`` (default 2)
-      * ``fps_override`` (0 or absent -> read from notes.csv)
+      * ``fps_override`` (0 or absent -> ``utils.get_fps_from_notes``,
+        i.e. ``ops.npy['fs']`` or ``DEFAULT_FPS``)
 
     ``figures_dir``, when provided, gets ``fft.png`` /
-    ``raw_dff.png`` / ``lowpass_dff.png`` for the population-mean
+    ``raw_dff.png`` / ``lowpass_dff.png`` for the population-median
     trace.
     """
     plane0 = Path(plane0)

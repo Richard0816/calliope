@@ -1,8 +1,12 @@
 """Suite2p 1.0 invocation helpers for CalLIOPE.
 
-This is the single home for everything that talks to suite2p directly.
-``sparse_plus_cellpose.py`` (Tab 3's worker) imports from here; nothing
-else in the package should import suite2p outside of this module.
+This is the home for suite2p *invocation* (``run_s2p`` / ``run_plane``)
+and the flat-to-nested settings routing. ``sparse_plus_cellpose.py``
+(Tab 3's worker) imports from here. Two other modules import suite2p
+directly for narrower jobs: ``sparse_plus_cellpose`` (``roi_stats``,
+``extract``, ``dcnv``, ``classification`` and ``BinaryFile`` for the
+merged-ROI extraction it runs by hand) and ``calliope_settings``
+(``suite2p.parameters`` defaults).
 
 The pipeline has three layers:
 
@@ -30,13 +34,11 @@ The pipeline has three layers:
    so we can union its ROIs with sparsery's set.
 
 Settings routing helpers (``set_setting`` / ``get_setting`` /
-``apply_settings_overrides`` / ``apply_db_overrides`` /
-``default_db_settings``) translate flat legacy ops keys (the format
-suite2p 0.x used and the GUI tabs still produce in PARAM_SPEC) to
-the nested 1.0 schema.
+``apply_settings_overrides`` / ``apply_db_overrides``) translate flat
+legacy ops keys (the format suite2p 0.x used and the GUI tabs still
+produce in PARAM_SPEC) to the nested 1.0 schema.
 
-Two monkey-patches are installed: :func:`_install_sparsery_roi_cap`
-(abort sparsery mid-pass once ROI count crosses a cap) and
+One monkey-patch is installed:
 :func:`_patch_suite2p_estimate_spatial_scale` (coerce suite2p's broken
 ``mode(..., keepdims=True)`` ndarray return back to a Python int).
 """
@@ -45,7 +47,6 @@ from __future__ import annotations
 
 import copy
 import os
-import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -219,12 +220,6 @@ def _coerce_to_default_type(value, default):
         except (TypeError, ValueError):
             return value
     return value
-
-
-def default_db_settings() -> tuple[dict, dict]:
-    """Return a fresh ``(db, settings)`` pair of suite2p 1.0 defaults."""
-    from suite2p.parameters import default_db, default_settings
-    return default_db(), default_settings()
 
 
 def set_setting(settings: dict, key: str, value) -> None:
@@ -609,90 +604,39 @@ def _invoke_run_plane(db: dict, settings: dict):
 
 
 # ============================================================================
-# Mid-detection ROI hard-cap via sparsery monkey-patch
+# ROI hard cap (retired)
 # ============================================================================
-# Suite2p's sparsery() prints "%d ROIs, score=%.2f" every 1000 ROIs (see
-# suite2p/detection/sparsedetect.py:446). Python's LEGB scope resolution means
-# if we install a module-level `print` onto suite2p.detection.sparsedetect,
-# sparsery's call to print(...) picks up *our* version instead of the builtin.
-# Our version watches the ROI count and raises _RoiHardCapExceeded once the
-# cap is crossed — aborting mid-detection without touching suite2p source.
+# CalLIOPE used to abort sparsery mid-pass by monkey-patching ``print`` in
+# ``suite2p.detection.sparsedetect`` and watching for "<n> ROIs" progress
+# lines. suite2p 1.0 reports progress through ``logging`` instead (and only
+# every 500 ROIs), so that hook never saw a line and the cap was inert. The
+# real bound on a sparsery pass is ``detection.sparsery_settings.max_ROIs``
+# (10000 in ``calliope_settings``): sparsery loops ``range(max_ROIs)``.
+# ``hard_cap`` is still accepted by :func:`run_one_pass` for API
+# compatibility; :func:`hard_cap_note` explains what it does (nothing).
 
-class _RoiHardCapExceeded(Exception):
-    """Raised from inside sparsery when the ROI count crosses the cap.
 
-    Why a custom exception class
-    ----------------------------
-    Python lets you subclass ``Exception`` to carry typed state along
-    with the error message. Doing so lets callers do
-    ``except _RoiHardCapExceeded as e: ... e.count ...`` to recover
-    the diagnostic numbers without parsing the string. Equivalent to
-    R's ``simpleCondition`` / ``stop`` with a custom class slot.
+def hard_cap_note(hard_cap, settings: dict) -> Optional[str]:
+    """Return a one-line note when a caller passes a ``hard_cap`` that
+    would have been stricter than sparsery's own ``max_ROIs`` bound, or
+    ``None`` when there is nothing to say.
 
-    We raise this from inside Suite2p's own detection loop via the
-    print-monkey-patch trick below, which lets us abort *mid-detection*
-    when ``threshold_scaling`` is too low and Sparsery starts finding
-    spurious noise blobs.
+    The cap is not enforced (see the section comment above); this keeps
+    a user who lowered it from assuming it still aborts a noisy pass.
     """
-    def __init__(self, count: int, cap: int):
-        super().__init__(f"sparsery produced {count} ROIs (>= cap={cap}); "
-                         f"threshold is almost certainly detecting noise")
-        self.count = count
-        self.cap = cap
-
-
-_SPARSERY_PROGRESS_RE = re.compile(r'^\s*(\d+)\s+ROIs')
-# Looser detector used only to fail loud: a line that clearly reports an
-# ROI count (digits followed by "ROIs") but doesn't match the strict
-# anchored pattern above signals that suite2p's log wording has drifted.
-_SPARSERY_PROGRESS_LOOSE_RE = re.compile(r'\d+\s*ROIs', re.IGNORECASE)
-
-
-def _install_sparsery_roi_cap(cap: int):
-    """Monkey-patch suite2p.detection.sparsedetect to abort once len(stats)>=cap.
-
-    Returns the original print so the caller can restore it.
-
-    The abort hinges on suite2p's progress line format ("<n> ROIs"). If a
-    suite2p upgrade changes that wording, ``_SPARSERY_PROGRESS_RE`` stops
-    matching and the hard cap would silently go inert -- detection would
-    run to completion producing the noise-blob explosion the cap exists to
-    prevent. To fail loud instead, the shim warns once if it sees a line
-    that looks like an ROI count yet doesn't match the strict parser.
-    """
-    import suite2p.detection.sparsedetect as _sd
-    original_print = getattr(_sd, 'print', print)
-    warned = [False]
-
-    def _watching_print(*args, **kwargs):
-        if args:
-            msg = args[0] if isinstance(args[0], str) else str(args[0])
-            m = _SPARSERY_PROGRESS_RE.match(msg)
-            if m:
-                if int(m.group(1)) >= cap:
-                    raise _RoiHardCapExceeded(int(m.group(1)), cap)
-            elif not warned[0] and _SPARSERY_PROGRESS_LOOSE_RE.search(msg):
-                warned[0] = True
-                original_print(
-                    "[warn] suite2p ROI-progress line did not match the "
-                    "hard-cap parser (%r); the ROI hard cap may be INERT -- "
-                    "verify _SPARSERY_PROGRESS_RE against this suite2p "
-                    "version." % (msg.strip()[:120],))
-        return original_print(*args, **kwargs)
-
-    _sd.print = _watching_print
-    return original_print
-
-
-def _restore_sparsery_print(original_print):
-    """Undo _install_sparsery_roi_cap."""
-    import suite2p.detection.sparsedetect as _sd
-    if original_print is print:
-        # Was the builtin; just remove our shim so lookups fall through to builtin
-        if 'print' in _sd.__dict__:
-            del _sd.__dict__['print']
-    else:
-        _sd.print = original_print
+    try:
+        cap = int(hard_cap or 0)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+    max_rois = (settings.get('detection', {})
+                .get('sparsery_settings', {}).get('max_ROIs'))
+    if max_rois is None or cap >= int(max_rois):
+        return None
+    return (f"[warn] hard_cap={cap} is not enforced with suite2p 1.0; "
+            f"sparsery is bounded by sparsery_settings.max_ROIs={int(max_rois)} "
+            f"(edit it in 'Edit suite2p settings...').")
 
 
 # ----------------------------------------------------------------------------
@@ -707,8 +651,8 @@ def _restore_sparsery_print(original_print):
 # spatial_scale == 0`` (auto-estimate).
 #
 # Wrap the upstream function so its return is coerced to a Python int. Idem-
-# potent (only patches once); preserves the original via ``_calliope_orig``
-# so we can restore for tests.
+# potent (only patches once). The wrapper keeps a reference to the original
+# as ``_calliope_orig`` for debugging; nothing restores it.
 
 def _patch_suite2p_estimate_spatial_scale() -> None:
     """Coerce ``estimate_spatial_scale`` return to a Python int.
@@ -749,11 +693,13 @@ class Suite2pPipelineConfig:
 
     Consumers:
 
-    * ``load_base_settings`` reads paths, AAV/tau settings, the popout
-      override dict, and the legacy ``path_to_ops`` back-compat file.
+    * ``load_base_settings`` reads paths, ``tau_override`` /
+      ``fs_override``, the popout override dict, and the legacy
+      ``path_to_ops`` back-compat file.
     * ``_get_or_create_shared_registration`` reads ``tiff_folder`` and
       ``save_folder``.
-    * ``run_one_pass`` reads ``use_cache`` and ``verbose``.
+    * ``use_cache`` is not read by anything: :func:`run_one_pass` takes
+      its own ``use_cache`` argument (the only caller passes False).
     """
 
     # ---- Required paths ----
@@ -785,9 +731,9 @@ class Suite2pPipelineConfig:
     fs_override: Optional[float] = None
 
     # ---- Caching ----
-    # When True, each pass checks its save_dir for an existing completed
-    # suite2p run with matching settings and reuses it instead of rerunning.
-    # Delete the pass directory to force a rerun of just that pass.
+    # Currently unused (kept for API compatibility). Per-pass caching is
+    # controlled by ``run_one_pass(use_cache=...)``, and
+    # ``sparse_plus_cellpose.run`` passes False there, so every pass reruns.
     use_cache: bool = True
 
     # ---- Misc ----
@@ -837,6 +783,38 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
+# Settings the sparsery + cellpose pipeline needs regardless of what the
+# popout says: sparsery detection, no ROI overlap at extraction, and an
+# auto spatial scale for the base settings (the sparsery pass overlays
+# Tab 3's own ``spatial_scale``). Values are the nested settings leaves.
+_PIPELINE_PINS: tuple = (
+    (('detection', 'algorithm'), 'sparsery'),
+    (('extraction', 'allow_overlap'), False),
+    (('detection', 'sparsery_settings', 'spatial_scale'), 0),
+)
+
+
+def _apply_pipeline_pins(settings: dict) -> list:
+    """Force the pipeline-required settings in place and return one
+    warning line per value that a popout / legacy-file edit had set to
+    something else (those edits are discarded, so say so).
+    """
+    msgs = []
+    for path, value in _PIPELINE_PINS:
+        node = settings
+        for p in path[:-1]:
+            node = node.setdefault(p, {})
+        old = node.get(path[-1], value)
+        if old != value:
+            msgs.append(
+                f"[settings] WARNING: {'.'.join(path)}={old!r} ignored; "
+                f"the sparsery+cellpose pipeline requires {value!r}"
+                + (" (set Tab 3's spatial_scale param instead)"
+                   if path[-1] == 'spatial_scale' else ""))
+        node[path[-1]] = value
+    return msgs
+
+
 def load_base_settings(config: Suite2pPipelineConfig):
     """Build a suite2p 1.0 ``(db, settings)`` pair tailored to the recording.
 
@@ -848,7 +826,9 @@ def load_base_settings(config: Suite2pPipelineConfig):
 
     For backward-compat, ``config.path_to_ops`` still works: if set, it's
     treated as a flat legacy ops dict (pre-1.0 suite2p) or an already-
-    nested settings dict, and its values overlay the hardcoded base. New
+    nested settings dict, and its values overlay the hardcoded base
+    (before the popout edits, which win). No in-repo caller sets it; it
+    is reachable only through the headless ``run_detection`` API. New
     code should prefer the in-source dict + popout edits.
 
     The pipeline then overlays per-recording dynamics:
@@ -861,8 +841,12 @@ def load_base_settings(config: Suite2pPipelineConfig):
       a queue, closed-loop scaling against the previous run's observed
       peak RAM thereafter. Target fraction defaults to
       ``utils.RAM_TARGET_FRACTION`` (0.80).
-    * **spatial_scale** : pinned to 0 (suite2p auto-pick); the broken
-      ``estimate_spatial_scale`` ndarray bug is patched at
+    * **algorithm / allow_overlap / spatial_scale** : pinned by
+      :func:`_apply_pipeline_pins` (sparsery, no overlap, 0 = auto) on
+      top of any popout edit, with a warning when an edit is discarded.
+      The sparsery pass then applies Tab 3's ``spatial_scale``
+      PARAM_SPEC value, so that (not the pin) is what detection uses.
+      The broken ``estimate_spatial_scale`` ndarray bug is patched at
       ``_invoke_run_*`` dispatch time via
       :func:`_patch_suite2p_estimate_spatial_scale`.
     * **nbins** (legacy ``nbinned``) : capped via
@@ -884,12 +868,9 @@ def load_base_settings(config: Suite2pPipelineConfig):
     db['nchannels'] = 1
     db['nplanes'] = 1
 
-    # --- Step 1: optional Tab 3 popout overrides (per-session edits) ---
-    settings_override = getattr(config, 'settings_override', None)
-    if settings_override:
-        _deep_merge(settings, settings_override)
-
-    # --- Step 2: optional legacy override file (back-compat) ---
+    # --- Step 1: optional legacy override file (back-compat) ---
+    # Applied BEFORE the popout edits so an explicit per-session edit
+    # always wins over a saved file.
     if config.path_to_ops is not None and os.path.exists(config.path_to_ops):
         if config.verbose:
             print(f"Loading base ops from {config.path_to_ops}")
@@ -906,18 +887,20 @@ def load_base_settings(config: Suite2pPipelineConfig):
             apply_db_overrides(db, loaded)
             apply_settings_overrides(settings, loaded)
 
+    # --- Step 2: optional Tab 3 popout overrides (per-session edits) ---
+    settings_override = getattr(config, 'settings_override', None)
+    if settings_override:
+        _deep_merge(settings, settings_override)
+
     # --- Pipeline-required settings, applied unconditionally.
-    # spatial_scale=0 lets suite2p auto-pick (calliope's monkey-patch
-    # coerces the result to int). NOTE: preclassify is intentionally NOT
-    # forced here -- it is a user-facing knob (Tab 3 PARAM_SPEC, default
-    # 0.0/off) and whatever the user / popout / base settings supply is
-    # respected. preclassify > 0 culls speckle ROIs in low-threshold
-    # passes, so users who see speckle should raise it.
-    apply_settings_overrides(settings, {
-        'sparse_mode':       True,
-        'spatial_scale':     0,
-        'allow_overlap':     False,
-    })
+    # NOTE: preclassify is intentionally NOT forced here -- it is a
+    # user-facing knob (Tab 3 PARAM_SPEC, default 0.0/off) and whatever
+    # the user / popout / base settings supply is respected. preclassify
+    # > 0 culls speckle ROIs in low-threshold passes, so users who see
+    # speckle should raise it.
+    for _msg in _apply_pipeline_pins(settings):
+        if config.verbose:
+            print(_msg)
 
     # --- Sample-specific tau ---
     # If the caller (Tab 3's GCaMP-variant picker) supplied a tau,
@@ -1027,6 +1010,12 @@ def build_roi_pixel_mask(stat, Ly: int, Lx: int) -> np.ndarray:
 # Single Suite2p pass wrapper
 # ============================================================================
 
+# Per-pass cache. NOTE: currently disabled -- the only caller
+# (``sparse_plus_cellpose.run``) passes ``run_one_pass(use_cache=False)``,
+# so ``_load_cached_pass`` never runs in the shipped pipeline. Kept so a
+# headless caller can opt in. (``sparse_mode`` has no ``_SETTINGS_PATHS``
+# entry, so its comparison is always None == None.)
+#
 # Keys whose values determine whether a cached pass is reusable. RAM-varying
 # keys like nbinned and batch_size are deliberately excluded — they don't
 # materially change which ROIs get detected.
@@ -1121,11 +1110,11 @@ def _get_or_create_shared_registration(config: 'Suite2pPipelineConfig',
     Why this exists
     ---------------
     Suite2p's motion correction (registration) is by far the most
-    expensive step -- minutes per recording. The adaptive loop and
-    ``sparse_plus_cellpose`` both want to run *detection* multiple
-    times against the same registered movie (different threshold,
-    different detector). Re-registering each time is wasteful, so
-    this helper:
+    expensive step -- minutes per recording. ``sparse_plus_cellpose``
+    runs *detection* more than once against the same registered movie
+    (the sparsery pass, then the cellpose pass(es)), and a re-detect of
+    the same recording can reuse it too (``keep_registration_cache``).
+    Re-registering each time is wasteful, so this helper:
 
     1. Checks for an existing ``_shared_reg/suite2p/plane0/data.bin``.
     2. If present, returns its plane0 path immediately.
@@ -1206,11 +1195,12 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
     2. If a ``shared_plane0`` was passed (the shared-registration
        cache), hardlink its ``data.bin`` into ``save_dir`` and call
        ``suite2p.run_plane`` (which skips registration entirely).
-    3. (Optional) install the ROI-hard-cap monkey-patch on
-       ``suite2p.detection.sparsedetect.print`` so a sparsery run
-       that finds more than ``hard_cap`` ROIs aborts mid-iteration.
-    4. Otherwise dispatch to ``suite2p.run_s2p`` for the full
+    3. Otherwise dispatch to ``suite2p.run_s2p`` for the full
        TIFF -> binary -> registration -> detection -> extraction flow.
+
+    ``hard_cap`` is accepted for API compatibility but not enforced (see
+    :func:`hard_cap_note`); sparsery stops at
+    ``detection.sparsery_settings.max_ROIs``.
 
     Returns
     -------
@@ -1281,24 +1271,11 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
                   f"spatial_scale={get_setting(plane_settings, 'spatial_scale')}  "
                   f"max_iterations={get_setting(plane_settings, 'max_iterations')}")
 
-        _orig_print = (_install_sparsery_roi_cap(hard_cap)
-                       if hard_cap and hard_cap > 0 else None)
+        _note = hard_cap_note(hard_cap, plane_settings)
+        if verbose and _note:
+            print(f"  > {_note}")
         try:
             _invoke_run_plane(plane_db, plane_settings)
-        except _RoiHardCapExceeded as e:
-            if verbose:
-                print(f"  > ABORT: {e} -- returning empty pass")
-            try:
-                plane0.mkdir(parents=True, exist_ok=True)
-                np.save(plane0 / 'stat.npy',
-                        np.array([], dtype=object), allow_pickle=True)
-                (plane0 / 'HARD_CAP_ABORTED.txt').write_text(
-                    f"Sparsery aborted at ~{e.count} ROIs "
-                    f"(cap={e.cap}).\n"
-                )
-            except Exception:
-                pass
-            return [], utils.load_plane_view(plane0), plane0
         except ValueError as e:
             if 'no ROIs' in str(e) or 'ROIs were found' in str(e):
                 if verbose:
@@ -1312,9 +1289,6 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
                     pass
                 return [], utils.load_plane_view(plane0), plane0
             raise
-        finally:
-            if _orig_print is not None:
-                _restore_sparsery_print(_orig_print)
 
         stat = list(np.load(plane0 / 'stat.npy', allow_pickle=True))
         return stat, utils.load_plane_view(plane0), plane0
@@ -1328,24 +1302,11 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
               f"threshold_scaling={get_setting(settings, 'threshold_scaling')}  "
               f"max_iterations={get_setting(settings, 'max_iterations')}")
 
-    _orig_print = (_install_sparsery_roi_cap(hard_cap)
-                   if hard_cap and hard_cap > 0 else None)
+    _note = hard_cap_note(hard_cap, settings)
+    if verbose and _note:
+        print(f"  > {_note}")
     try:
         _invoke_run_s2p(full_db, settings)
-    except _RoiHardCapExceeded as e:
-        if verbose:
-            print(f"  > ABORT: {e} -- returning empty pass")
-        try:
-            plane0.mkdir(parents=True, exist_ok=True)
-            np.save(plane0 / 'stat.npy',
-                    np.array([], dtype=object), allow_pickle=True)
-            (plane0 / 'HARD_CAP_ABORTED.txt').write_text(
-                f"Sparsery aborted at ~{e.count} ROIs "
-                f"(cap={e.cap}).\n"
-            )
-        except Exception:
-            pass
-        return [], utils.load_plane_view(plane0), plane0
     except ValueError as e:
         if 'no ROIs' in str(e) or 'ROIs were found' in str(e):
             if verbose:
@@ -1359,9 +1320,6 @@ def run_one_pass(tiff_folder: str, save_dir: Path,
                 pass
             return [], utils.load_plane_view(plane0), plane0
         raise
-    finally:
-        if _orig_print is not None:
-            _restore_sparsery_print(_orig_print)
 
     stat = list(np.load(plane0 / 'stat.npy', allow_pickle=True))
     return stat, utils.load_plane_view(plane0), plane0

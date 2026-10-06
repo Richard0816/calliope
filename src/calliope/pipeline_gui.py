@@ -33,11 +33,6 @@ from __future__ import annotations
 # Windows-only taskbar workaround below.
 import sys
 
-# Vanilla tkinter. We only touch it directly when CTk doesn't cover
-# a primitive we need (e.g. ``tk.TclError`` for the wheel-binding
-# fallback) -- everything user-facing is built with customtkinter.
-import tkinter as tk
-
 # ``Path`` is used by the "Open run folder…" handler to derive a run's
 # on-disk layout.
 from pathlib import Path
@@ -466,14 +461,19 @@ class PipelineApp(ctk.CTk):
         """Activate the tab at ``idx_or_widget`` (int index OR tab
         instance / container).
 
+        Every current caller (sidebar, Tab 0's batch runner, "Open run
+        folder...", tests, screenshot scripts) passes an int index; the
+        widget/container lookup is kept as a small convenience for
+        callers that hold a tab reference rather than its position.
+
         Fires ``on_tab_hidden`` on the outgoing tab and ``on_tab_shown``
         on the incoming one (both optional). Tabs use those hooks for
         cheap on-show refreshes (e.g. re-reading the working directory
         if Tab 1 might have changed it).
         """
         # The dispatch on input type lets callers pass either an index
-        # (sidebar button click) or the actual widget/container (when
-        # another tab wants to push the user to a specific tab).
+        # (what every current caller does) or the actual widget /
+        # container (currently unused, see the docstring).
         if isinstance(idx_or_widget, int):
             idx = idx_or_widget
         else:
@@ -638,26 +638,62 @@ class PipelineApp(ctk.CTk):
         ev = self.event_tab
         params = params or {}
         spec_keys = {s["name"] for s in ev.PARAM_SPEC}
-        applied = {k: v for k, v in params.items() if k in spec_keys}
-        ev._params.update(applied)
-        # The render path snapshots these three knobs from Tk vars, so
-        # restore them too or they'd silently revert to GUI defaults.
+        had_params = bool(set(params) & spec_keys)
+        # Same public seam Tab 0's batch runner uses: applies the
+        # PARAM_SPEC keys plus the manual-subset / onset-source Tk vars
+        # the render path snapshots (else they'd revert to GUI defaults).
+        self._rehydrate_error = None
         try:
-            if "manual_subset_enabled" in params:
-                ev.manual_subset_var.set(bool(params["manual_subset_enabled"]))
-            if "manual_roi_spec" in params:
-                ev.manual_roi_var.set(str(params["manual_roi_spec"]))
-            if "onset_source" in params:
-                ev.onset_source_var.set(str(params["onset_source"]))
-        except Exception:
-            pass
+            ev.apply_batch_row(params)
+        except Exception as e:
+            # Don't block the reload, but don't claim the saved params
+            # were used either: report it and fall back to "defaults".
+            print(f"[open run] could not apply saved event params: {e}")
+            self._rehydrate_error = str(e)
+            had_params = False
         # Don't let the reload's own recompute write params back to the
         # manifest -- we'd either rewrite what we just read or, if none
         # were found, record GUI defaults as the run's real settings.
         ev._suppress_manifest_write = True
         # Async: publishes set_event_results when the worker finishes.
         ev._on_render()
-        return bool(applied)
+        return had_params
+
+    @staticmethod
+    def _keep_mask_drift_warning(plane0) -> list[str]:
+        """Warn when Tab 3's kept-ROI count won't match the rest of the app.
+
+        Tab 3 paints the live cell-filter mask; every downstream stage
+        reads the filtered memmaps, which are frozen to the mask that was
+        live when they were written (``r0p7_cell_mask_bool.npy``).
+        Re-running the cell filter afterwards moves one and not the
+        other. Returns ``[]`` when there is no frozen mask yet, when
+        either mask doesn't match this run's ROI count, or on any read
+        error -- a malformed file must never block opening a run. Equal
+        counts don't guarantee identical ROI membership; differing
+        counts do mean the filtered outputs are stale.
+        """
+        try:
+            import numpy as np
+            from .core import utils
+            plane0 = Path(plane0)
+            if not (plane0 / "r0p7_cell_mask_bool.npy").exists():
+                return []
+            n_total = len(np.load(plane0 / "stat.npy", allow_pickle=True))
+            pipe_n = utils.pipeline_mask_count(plane0, n_total)
+            live = np.asarray(utils.resolve_live_mask(plane0, n_total))
+            if pipe_n is None or live.size != n_total:
+                return []
+            live_n = int(live.astype(bool).sum())
+        except Exception:
+            return []
+        if pipe_n == live_n:
+            return []
+        return [f"The cell filter now keeps {live_n} ROIs, but the filtered "
+                f"dF/F this run's lowpass / events / clusters / figures are "
+                f"built from holds {pipe_n}. Tab 3 shows {live_n}; everything "
+                f"else shows {pipe_n}. Re-run Tab 3's 'Filtered dF/F' (and "
+                f"the stages after it) to make them agree."]
 
     def _calliope_git_sha(self) -> Optional[str]:
         try:
@@ -680,6 +716,12 @@ class PipelineApp(ctk.CTk):
             lines += [f"  • {x}" for x in skipped]
 
         warns: list[str] = []
+        rehydrate_err = getattr(self, "_rehydrate_error", None)
+        if rehydrate_err:
+            warns.append(
+                f"The run's saved event-detection parameters could not be "
+                f"applied ({rehydrate_err}), so events may have been "
+                f"recomputed with other settings than the original run.")
         spec_keys = {s["name"] for s in self.event_tab.PARAM_SPEC}
         if inv.has_lowpass and not (set(params or {}) & spec_keys):
             warns.append(
@@ -693,6 +735,8 @@ class PipelineApp(ctk.CTk):
                 f"This run was produced by a different CalLIOPE version "
                 f"(manifest {man_sha[:8]} vs running {cur_sha[:8]}); "
                 f"recomputed stages may not match the saved figures/CSVs.")
+        if inv.has_detection:
+            warns += self._keep_mask_drift_warning(inv.plane0)
         if warns:
             lines.append("")
             lines.append("⚠ Heads up:")
@@ -714,10 +758,10 @@ def main() -> None:
     callbacks we wired up above.
     """
     # Heavy compute is offloaded to child processes (core.offload) via
-    # the multiprocessing ``spawn`` start method. In a frozen build
-    # (Nuitka / PyInstaller) the child re-launches this executable;
-    # ``freeze_support`` makes it run the worker instead of relaunching
-    # the whole GUI. It is a harmless no-op when running from source.
+    # the multiprocessing ``spawn`` start method. CalLIOPE runs from
+    # source only (no frozen/packaged build is shipped), where
+    # ``freeze_support`` is a harmless no-op; it is kept so the spawn
+    # entry point stays correct if a freezer is ever reintroduced.
     import multiprocessing
     multiprocessing.freeze_support()
 

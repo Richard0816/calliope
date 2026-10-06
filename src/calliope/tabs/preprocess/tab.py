@@ -4,19 +4,19 @@ What the user sees
 ------------------
 A simple form with three rows: pick a working directory, pick one or
 more TIFFs inside it (multi-selection groups them into a single
-recording), and click Run. While the worker thread runs, status
+recording), and click Run. While the child process runs, status
 messages stream into the log panel below. When Run finishes, a
 ``PreprocessResult`` is published on ``AppState`` so Tab 2 can
 display the QC GIF and Tab 3 can pick up the shifted TIFF.
 
-Why a worker thread
+Why a child process
 -------------------
 Preprocessing a 10-minute movie can take 30+ seconds. If we ran it
 on the main (Tk) thread the GUI would freeze. The pattern used here
 shows up in every "long-running" tab in CalLIOPE:
 
-    1. ``_on_run`` (main thread) snapshots the form values into
-       plain Python types.
+    1. ``_on_run`` / ``_on_force_rerun`` -> ``_start_run`` (main
+       thread) snapshots the form values into plain Python types.
     2. It offloads ``preprocessing.preprocess_offload(...)`` to a child
        process via ``core.offload.run_offloaded`` (a thread would let
        the TIFF I/O / mean / QC-GIF work hold the GIL and freeze the
@@ -43,23 +43,27 @@ Module layout
 
 Lifecycle
 ---------
-    __init__        -- build widgets, subscribe to AppState, prime defaults.
-    _build_ui       -- lay out the Tk widgets.
-    _on_browse      -- folder picker -> update the working directory.
-    _on_run         -- snapshot params, launch the worker thread.
-    _on_advanced    -- pop up the Advanced... dialog.
-    _drain_log_queue-- main-thread polling loop draining the log queue.
+    __init__          -- build widgets, start the queue drain, prime defaults.
+    _build_ui         -- lay out the Tk widgets.
+    _browse_dir       -- folder picker -> update the working directory.
+    _browse_data_root -- folder picker -> output root.
+    _update_existing_status -- cheap probe (never regenerates TIFFs) that
+                         enables Force rerun when outputs already exist.
+    _on_run / _on_force_rerun -> _start_run -- snapshot params, launch the
+                         child process (or reload existing outputs).
+    _on_advanced      -- pop up the Advanced... dialog.
+    _on_done / _on_error -- queue handlers dispatched by
+                         ``gui_common.drain_queue``.
 """
 
 # ``from __future__ import annotations`` keeps type hints as strings
 # at parse time (see pipeline_gui.py for the full rationale).
 from __future__ import annotations
 
-# Threading + queue: the long-running preprocess step runs on a
-# worker thread; we communicate with the GUI thread via a thread-
-# safe FIFO queue.
+# The long-running preprocess step runs in a child process
+# (core.offload); its progress lines and result come back to the GUI
+# thread through this FIFO queue.
 import queue
-import threading
 import tkinter as tk
 from pathlib import Path
 
@@ -70,9 +74,9 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-# ``logic`` is the per-tab worker module; aliasing it as
+# ``logic`` is the per-tab re-export shim; aliasing it as
 # ``preprocessing`` lets the call sites read like
-# ``preprocessing.preprocess_tiff(...)``.
+# ``preprocessing.preprocess_offload(...)``.
 from . import logic as preprocessing
 from .logic import PreprocessResult
 
@@ -127,9 +131,9 @@ class PreprocessTab(ctk.CTkFrame):
         # Stash the state bus so the worker callback can publish onto
         # it later.
         self.state = state
-        # The log queue: worker pushes ('log', line) tuples and a
-        # final ('done', result) sentinel; main thread's
-        # ``_drain_log_queue`` reads them.
+        # The log queue: the child process's progress comes back as
+        # ('log', line) tuples plus a final ('done', result) or
+        # ('error', msg); ``drain_queue`` (main thread) dispatches them.
         self._log_queue: queue.Queue = queue.Queue()
         # Preprocessing runs in a child process (see core.offload) so the
         # TIFF shift / mean / QC-GIF work can't hold the GIL and freeze
@@ -145,8 +149,7 @@ class PreprocessTab(ctk.CTkFrame):
         # ``drain_queue`` polls ``self._log_queue`` from the Tk main
         # thread every ``POLL_MS`` ms and dispatches each
         # ``(kind, payload)`` to the matching handler -- the worker
-        # thread can ``print`` (via QueueWriter) without ever blocking
-        # the GUI.
+        # process's progress never blocks the GUI.
         drain_queue(self, self._log_queue,
                     {"log": self._append_log,
                      "done": self._on_done,
@@ -161,13 +164,23 @@ class PreprocessTab(ctk.CTkFrame):
         Public seam the Tab 0 batch runner calls before this tab's run
         method fires, instead of poking ``_params`` directly. Consumes
         only the keys this tab owns (the 5 QC-gif knobs) and ignores the
-        rest; keys the row didn't override leave tab state untouched.
+        rest. Tab 0 always passes the row's full effective params (batch
+        defaults filled in), so a key the row didn't override gets the
+        batch default; only a direct caller passing a partial dict leaves
+        tab state for absent keys untouched.
         """
         p = params or {}
-        for k in ("downsample_t", "max_size_px", "playback_fps",
-                  "clip_low", "clip_high"):
+        for k in self._qc_keys():
             if k in p:
                 self._params[k] = p[k]
+
+    @classmethod
+    def _qc_keys(cls) -> tuple:
+        """Names of the QC-gif knobs, derived from ``PARAM_SPEC`` so a
+        new knob added there reaches ``make_qc_gif`` without editing
+        a second hard-coded tuple."""
+        return tuple(spec["name"] for spec in cls.PARAM_SPEC
+                     if spec.get("group") == "QC gif")
 
     def _build_ui(self) -> None:
         # Panels stack vertically at their natural heights. Only panels
@@ -407,15 +420,47 @@ class PreprocessTab(ctk.CTkFrame):
             return None
         return Path(data_root) / self._resolved_identifier(names)
 
+    @staticmethod
+    def _probe_existing(out_dir: Optional[Path]) -> Optional[PreprocessResult]:
+        """Cheap, Tk-thread-safe check for reusable outputs in ``out_dir``.
+
+        Uses ``regenerate_shifted=False`` so an archived recording
+        (shifted TIFFs pruned, raw sidecar present) is *never*
+        re-shifted here -- that is a multi-GB, multi-minute job and this
+        runs on every listbox click / identifier keystroke. Returns the
+        result when the shifted TIFFs are on disk, or when they are
+        archived but regenerable (every raw named by the sidecar still
+        exists at its path or inside the recording folder). Otherwise
+        ``None``, and Run preprocesses from the selected TIFFs.
+        """
+        if out_dir is None:
+            return None
+        res = preprocessing.load_existing_preprocess(
+            out_dir, regenerate_shifted=False)
+        if res is None:
+            return None
+        if res.shifted_paths:
+            return res
+        raws = list(res.raw_paths or [])
+        if raws and all(Path(r).exists() or (Path(out_dir) / Path(r).name)
+                        .is_file() for r in raws):
+            return res
+        return None
+
     def _update_existing_status(self) -> None:
         out_dir = self._existing_out_dir()
-        existing = (preprocessing.load_existing_preprocess(out_dir)
-                    if out_dir is not None else None)
+        existing = self._probe_existing(out_dir)
         if existing is not None:
             self.rerun_btn.configure(state="normal")
-            self.status_var.set(
-                f"Existing outputs at {out_dir} - Run will load them; "
-                f"use Force rerun to redo.")
+            if existing.shifted_paths:
+                self.status_var.set(
+                    f"Existing outputs at {out_dir} - Run will load them; "
+                    f"use Force rerun to redo.")
+            else:
+                self.status_var.set(
+                    f"Archived outputs at {out_dir} - Run will regenerate "
+                    f"the shifted TIFF(s) from the raw; use Force rerun "
+                    f"to redo.")
         else:
             self.rerun_btn.configure(state="disabled")
             if out_dir is not None:
@@ -466,18 +511,31 @@ class PreprocessTab(ctk.CTkFrame):
 
         if not force:
             out_dir = self._existing_out_dir()
-            existing = (preprocessing.load_existing_preprocess(out_dir)
-                        if out_dir is not None else None)
-            if existing is not None:
+            existing = self._probe_existing(out_dir)
+            if existing is not None and existing.shifted_paths:
                 self._append_log(
                     f"--- Loading existing outputs from {out_dir} ---")
                 self._on_done(existing)
                 return
+            if existing is not None:
+                # Archived run: regenerating the shifted TIFF(s) from the
+                # raw is heavy, so do it in a child process like a fresh
+                # preprocess rather than on the Tk thread.
+                self._set_busy()
+                self._append_log(
+                    f"--- Regenerating archived shifted TIFF(s) in "
+                    f"{out_dir} ---")
+                from ...core.offload import run_offloaded
+                self._job = run_offloaded(
+                    self, self._log_queue,
+                    preprocessing.load_existing_offload,
+                    args=(str(out_dir),),
+                    progress_kind="log",
+                    poll_ms=self.POLL_MS,
+                )
+                return
 
-        self.run_btn.configure(state="disabled")
-        self.rerun_btn.configure(state="disabled")
-        self.progress.start()
-        self.status_var.set("Running...")
+        self._set_busy()
         if len(srcs) == 1:
             self._append_log(f"--- Preprocessing {srcs[0].name} ---")
         else:
@@ -491,9 +549,7 @@ class PreprocessTab(ctk.CTkFrame):
         # Snapshot params on the main thread so the worker sees a stable
         # value even if the user opens Advanced again mid-run.
         params = dict(self._params)
-        qc_keys = ("downsample_t", "max_size_px", "playback_fps",
-                   "clip_low", "clip_high")
-        qc_params = {k: params[k] for k in qc_keys if k in params}
+        qc_params = {k: params[k] for k in self._qc_keys() if k in params}
         explicit_identifier = self.identifier_var.get().strip() or None
 
         # Offload to a child process (not a thread): TIFF I/O + the
@@ -502,19 +558,26 @@ class PreprocessTab(ctk.CTkFrame):
         # boundary; progress strings come back as ("log", msg) so the
         # existing ``_append_log`` handler is reused. The done payload is
         # the picklable PreprocessResult ``_on_done`` already expects.
+        # ``force`` makes the group path overwrite existing shifted TIFFs
+        # instead of reusing them (Force rerun promises an overwrite).
         group = len(srcs) > 1
         rec_name = identifier if group else explicit_identifier
         from ...core.offload import run_offloaded
-        from ...core import preprocessing as _pp
         self._job = run_offloaded(
             self, self._log_queue,
-            _pp.preprocess_offload,
+            preprocessing.preprocess_offload,
             args=([str(s) for s in srcs], data_root),
             kwargs=dict(recording_name=rec_name, group=group,
-                        qc_params=qc_params),
+                        qc_params=qc_params, force=force),
             progress_kind="log",
             poll_ms=self.POLL_MS,
         )
+
+    def _set_busy(self) -> None:
+        self.run_btn.configure(state="disabled")
+        self.rerun_btn.configure(state="disabled")
+        self.progress.start()
+        self.status_var.set("Running...")
 
     def _on_advanced(self) -> None:
         if open_advanced(self, "Preprocess - Advanced parameters",

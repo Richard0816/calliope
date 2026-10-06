@@ -50,10 +50,10 @@ Population events (Tab 5 + Tab 8)
         Diagnostic-plot helpers used by Tab 5.
 
 Suite2p / cellfilter helpers
-    s2p_open_memmaps
-        Read Suite2p outputs (``F.npy`` / ``Fneu.npy`` / dF/F memmaps)
-        with shape inference so the rest of the code never has to
-        worry about ``(T, N)`` vs ``(N, T)`` orientation.
+    s2p_open_dff_memmap
+        Open the ``(T, N)`` dF/F memmap read-only, sized from the
+        ``F.npy`` header (and, for filtered prefixes, the persisted
+        keep mask) so callers never infer the shape themselves.
     robust_df_over_f_1d, first_n_min_df_over_f_1d
         Two dF/F baselines: a rolling 10th-percentile window (for
         long recordings with slow drift) or the mean of the first
@@ -65,8 +65,10 @@ Suite2p / cellfilter helpers
 
 Recording metadata
     get_fps_from_notes
-        Locate the lab's ``notes.csv`` and read the frame rate for a
-        given recording. Falls back to a default if missing.
+        Frame rate for a recording: ``plane0/ops.npy['fs']`` (the rate
+        detection ran at, incl. Tab 3's FPS override), else
+        ``DEFAULT_FPS``. The per-date notes-XLSX lookup is opt-in and only
+        runs when a caller passes ``notes_root`` (no GUI control does).
 """
 
 # Type-hint forward-reference shim. See pipeline_gui.py for full
@@ -85,9 +87,9 @@ import threading           # daemon thread for the peak-RAM monitor
 # separate package rather than built-in. ``np`` is the conventional
 # alias.
 import numpy as np
-# pandas: DataFrame / Series, used here for reading the notes.csv
-# metadata file. The "df.iloc[i]" / "df.loc[name]" idiom is
-# pandas-specific row indexing.
+# pandas: DataFrame / Series, used here for reading the optional
+# per-date notes XLSX (opt-in fps lookup). The "df.iloc[i]" /
+# "df.loc[name]" idiom is pandas-specific row indexing.
 import pandas as pd
 # psutil exposes system info (free RAM, CPU count). We only use it
 # for the auto-batch-size logic at the bottom of the file.
@@ -189,6 +191,41 @@ def resolve_filtered_mask(plane0, n_total, *, memmap_path=None, T=None):
         f"re-run Tab 3 (filtered dF/F) to rewrite it, or restore "
         f"r0p7_cell_mask_bool.npy."
     )
+
+
+def pipeline_mask_count(plane0, n_total) -> Optional[int]:
+    """Kept-ROI count the downstream pipeline (Tabs 4-8) actually uses.
+
+    That is the mask frozen next to the filtered memmaps when Tab 3 wrote
+    them (``r0p7_cell_mask_bool.npy``), which can differ from the live
+    mask Tab 3 paints (:func:`resolve_live_mask`) after the cell filter is
+    re-run. When the filtered memmap and ``F.npy`` are both present the
+    count is anchored to the memmap's on-disk column count via
+    :func:`resolve_filtered_mask`, the same resolver every reader uses.
+
+    Returns ``None`` when no filtered output has been written yet (no
+    frozen mask) or the frozen mask belongs to a different detection
+    (length != ``n_total``).
+    """
+    plane0 = Path(plane0)
+    n_total = int(n_total)
+    frozen_path = plane0 / "r0p7_cell_mask_bool.npy"
+    if not frozen_path.exists():
+        return None
+    frozen = np.asarray(np.load(frozen_path, allow_pickle=False))
+    if frozen.ndim != 1 or frozen.size != n_total:
+        return None
+    n = int(frozen.astype(bool).sum())
+    memmap_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    f_path = plane0 / "F.npy"
+    if memmap_path.exists() and f_path.exists():
+        try:
+            T = int(np.load(f_path, mmap_mode="r").shape[1])
+            _, n = resolve_filtered_mask(
+                plane0, n_total, memmap_path=memmap_path, T=T)
+        except Exception:
+            pass  # unreadable F / no matching mask: keep the frozen count
+    return int(n)
 
 
 def resolve_live_mask(plane0, n_total):
@@ -591,8 +628,8 @@ def paint_spatial(values_per_roi, stat_list, Ly, Lx):
     return img
 
 
-# Pre-compile a regex matching folder names like ``2024-07-01_00018``
-# **and** ``+``-joined groups like ``2024-07-01_00018+2024-07-01_00019``
+# Pre-compile a regex matching folder names like ``2025-01-15_00001``
+# **and** ``+``-joined groups like ``2025-01-15_00001+2025-01-15_00002``
 # (preprocess_tiff_group merges multiple TIFFs into one recording named
 # by joining the source stems with ``+``). The ``(?:...)`` wraps a
 # non-capturing optional repetition: any number of ``+YYYY-MM-DD_NNN``
@@ -638,16 +675,24 @@ def find_recording_root(path) -> Path:
        folder whose name matches the canonical recording-id regex
        (``YYYY-MM-DD_#####`` or ``+``-joined groups). First match
        wins -- works for both old and new layouts.
-    2. **Fallback for arbitrary user-named recordings**: if step 1
-       fails, look for the deepest ancestor whose name is *not*
-       part of the standard suite2p chain (``suite2p``, ``plane0``,
-       ``detection``, ``final``, ``shared_reg``, ``sparsery_pass``,
-       ``cellpose_pass``). Returns that as the best guess.
-    3. **Last resort**: legacy two-parents-up if ``path`` ends in
-       ``suite2p/plane0``.
-    4. **Otherwise**: return ``path`` unchanged so callers always get
-       a Path back (the ``recording id`` they end up displaying may
-       be wrong, but at least nothing crashes).
+    2. **Fallback for arbitrary user-named recordings**: walk up from
+       ``path`` itself to the deepest folder of the standard suite2p
+       chain (``plane0``, ``suite2p``, ``final``, ``detection``,
+       ``_shared_reg``, ``sparsery_pass``, ``cellpose_pass``,
+       ``merged``), then keep walking up past the rest of that chain;
+       the first folder above it is the recording root. Anything
+       *below* ``plane0`` (e.g. ``plane0/<cluster_results>/C1/...``) is
+       skipped this way, so it can't be mistaken for the recording.
+    3. **Otherwise** (no chain folder anywhere in ``path``): ``path``
+       itself is taken to be the recording folder (its parent if
+       ``path`` is a file).
+
+    Known edge cases (callers today pass existing folders inside a run,
+    so neither bites): Strategy 2 anchors on the first chain-named folder
+    anywhere in the ancestry, so a non-canonical recording stored *under*
+    a folder named e.g. ``final`` or ``detection`` resolves to that
+    folder's parent; and Strategy 3 can only tell a file from a folder
+    when it exists, so a not-yet-written file path is returned as-is.
     """
     p = Path(path).resolve()
 
@@ -656,26 +701,26 @@ def find_recording_root(path) -> Path:
     if hit is not None:
         return hit
 
-    # Strategy 2: skip past well-known intermediate folder names and
-    # take the next one up. Ordered from "deepest" to "shallowest"
-    # so we land on the user-named recording folder.
+    # Strategy 2: anchor on the suite2p output chain.
     INTERMEDIATE_NAMES = {
         "plane0", "suite2p",                # Suite2p output structure
         "final", "detection",               # sparse_plus_cellpose layout
         "_shared_reg", "sparsery_pass",
         "cellpose_pass", "merged",          # legacy multi-pass layout
     }
-    for ancestor in p.parents:
-        if ancestor.name not in INTERMEDIATE_NAMES:
-            return ancestor
-        # Keep walking; e.g. plane0 -> suite2p -> final -> detection -> rec.
+    chain = [p] + list(p.parents)           # deepest -> shallowest
+    for i, folder in enumerate(chain):
+        if folder.name in INTERMEDIATE_NAMES:
+            # Skip the rest of the chain (plane0 -> suite2p -> final ->
+            # detection -> ...) and return the first folder above it.
+            for above in chain[i + 1:]:
+                if above.name not in INTERMEDIATE_NAMES:
+                    return above
+            return chain[-1]
 
-    # Strategy 3: legacy "<rec>/suite2p/plane0" assumption.
-    if p.name == "plane0" and p.parent.name == "suite2p":
-        return p.parent.parent
-
-    # Last resort.
-    return p
+    # Strategy 3: no suite2p chain in the path -- the path is the
+    # recording folder itself.
+    return p.parent if p.is_file() else p
 
 
 def infer_recording_id(path) -> str:
@@ -703,20 +748,22 @@ def save_folder_for_plane0(plane0) -> Path:
 
 
 # Default frame rate (Hz) used as a fallback when a recording's fps can't
-# be read from the notes spreadsheet. Mirrors ``calliope_settings.fs``;
-# kept here as the single literal so the ~6 scattered ``15.07`` fallbacks
-# reference one source. (Defined here rather than imported from
-# calliope_settings to avoid an import cycle.)
-DEFAULT_FPS: float = 15.08
+# be read from ``plane0/ops.npy['fs']`` (see ``get_fps_from_notes``). The
+# single literal lives in ``calliope_settings.DEFAULT_FPS`` (it is also the
+# suite2p ``fs`` fallback there); re-exported here as ``utils.DEFAULT_FPS``
+# for existing callers. calliope_settings imports nothing from calliope, so
+# this import cannot cycle.
+from .calliope_settings import DEFAULT_FPS  # noqa: E402
 
 
 # Canonical display contrast window (percentiles) for showing
 # fluorescence / projection images (mean, correlation, max, detection
-# backgrounds, per-ROI heatmaps). Unifies the previously divergent
-# clip points ([1, 99] in some panels, 0.995/0.01 quantiles in others)
-# so every panel renders with the same contrast. NOTE: this is display
-# only -- it is deliberately NOT used for Cellpose input rescaling
-# (suite2p_pipeline uses 0.01/0.999 there), which is algorithmic.
+# backgrounds, per-ROI heatmaps). Used by the Tab 3 panels, the
+# detection figures, the event-detection figures, the Tab 3 curation
+# popout and the QC tab's mean image.
+# NOTE: this is display only -- it is deliberately NOT used for
+# Cellpose input rescaling (suite2p_pipeline uses 0.01/0.999 there),
+# which is algorithmic.
 DISPLAY_CLIP_LOW_PCT: float = 1.0
 DISPLAY_CLIP_HIGH_PCT: float = 99.5
 
@@ -856,7 +903,11 @@ def get_fps_from_notes(
     ``path`` (the rate detection ran at, incl. Tab 3's FPS override) when
     present, else ``default_fps``.
 
-    If a caller passes an explicit ``notes_root``, it is treated as a folder
+    No GUI control, settings key or batch param supplies ``notes_root``; the
+    branch is a library-only convenience. To use it, call e.g.
+    ``get_fps_from_notes(plane0, notes_root="path/to/notes_folder")`` from
+    your own script. If a caller passes an explicit ``notes_root``, it is
+    treated as a folder
     of per-date notes XLSX files; each contains a "2P settings" sheet whose
     rows describe one recording per row, with columns including ``filename``
     and ``rate (hz)``. We search that sheet for the row matching the
@@ -890,8 +941,8 @@ def get_fps_from_notes(
         if rec_root is None:
             return default_fps
 
-        # Folder name "2024-07-01_00018" -> date_str="2024-07-01",
-        # rec_str="00018". ``split("_", 1)`` splits at most once,
+        # Folder name "2025-01-15_00001" -> date_str="2025-01-15",
+        # rec_str="00001". ``split("_", 1)`` splits at most once,
         # leaving any trailing underscores in the second piece.
         date_str, rec_str = rec_root.name.split("_", 1)
         target = f"{date_str}-{rec_str}"
@@ -958,11 +1009,24 @@ class EventDetectionParams:
     with the listed default. R's nearest equivalent is
     ``setRefClass(..., fields=list(...))``.
 
-    NOTE (short-event rework, 2026-05-01): defaults were retuned to match
-    event_detection_short.py. Epileptiform events should be < ~0.5 s long;
-    wide windows from the OLD merge logic are now broken up via a watershed
-    split + hard duration clamp. The OLD defaults are kept commented out
-    next to each field for easy revert.
+    NOTE (short-event rework, 2026-05-01): defaults were retuned for
+    short epileptiform events (< ~0.5 s long); wide windows from the OLD
+    merge logic are now broken up via a watershed split + hard duration
+    clamp. The OLD defaults are kept commented out next to each field for
+    reference.
+
+    These dataclass defaults are NOT the Tab 5 GUI defaults. The GUI's
+    ``PARAM_SPEC`` (``tabs/event_detection/tab.py``) is the source of truth
+    for real runs and ``_build_event_params`` writes it over these values;
+    two differ on purpose: GUI ``bin_sec=0.05`` (here 0.025) and GUI
+    ``max_event_duration_s=1.3`` (here 0.5). Code that builds a bare
+    ``EventDetectionParams()`` gets the values below, so pass those two
+    explicitly if you need to reproduce a GUI run.
+
+    ``merge_gap_s`` currently has NO effect in any configuration: its only
+    consumer (the overlap-merge block in ``_boundaries_from_peaks``) was
+    disabled on 2026-05-01 and is kept commented out. The field stays so
+    saved parameter sets and the Tab 5 Advanced dialog keep working.
     """
     # Density construction
     bin_sec: float = 0.025                 # OLD: 0.05
@@ -997,8 +1061,10 @@ class EventDetectionParams:
     max_walk_duration_s: float = 2.0       # NEW: cap on one-sided walk distance from peak (s).
     max_event_duration_s: float = 0.5      # OLD: 10.0  (now: hard physiological cap on FINAL event duration)
 
-    # Overlap merging  (DISABLED in favour of watershed split below)
-    merge_gap_s: float = 0.0  # OLD path: merge events closer than this
+    # Overlap merging -- currently INERT: the merge code that read this was
+    # disabled on 2026-05-01 (see _boundaries_from_peaks), so the value has
+    # no effect whether or not watershed split is enabled.
+    merge_gap_s: float = 0.0
 
     # NEW: watershed split + hard duration cap  ----------------------------
     enable_watershed_split: bool = True
@@ -1035,7 +1101,8 @@ def detect_event_windows(
     ----------
     onsets_by_roi : list of 1D arrays
         Per-ROI onset times in SECONDS (already in recording time, not frames).
-        Equivalent to the output of _event_onsets_by_roi / extract_onsets_by_roi.
+        As built by ``core.event_detection_run.run_event_detection`` (per-ROI
+        hysteresis onsets divided by fps).
         Length = number of ROIs (post cell-mask filtering, if any).
     T : int
         Number of frames in the recording.
@@ -1119,7 +1186,7 @@ def detect_event_windows(
             pass  # keep the static fallback
 
     # NEW: pass prominence_wlen_s through so prominence is measured
-    # locally (matches event_detection_short.py behaviour). We need
+    # locally (within a window around each peak). We need
     # this in *bin* units, so we convert seconds -> bins via
     # ``prominence_wlen_s / bin_sec``. ``| 1`` forces an odd number
     # because scipy.signal.find_peaks's ``wlen`` parameter wants odd.
@@ -1434,10 +1501,9 @@ def circular_shift_null_prominences(
     (:func:`compute_candidate_prominences`). The pooled distribution is
     the noise floor a real population event must clear.
 
-    This is the shared engine behind both the
-    ``scripts/null_prominence_audit.py`` experiment and Tab 5's
-    prominence-popout null-floor overlay, so the GUI and the audit see
-    the exact same null.
+    This is the shared engine behind Tab 5's prominence-popout null-floor
+    overlay and the ``auto_min_prominence`` floor, so what the popout
+    shows is exactly the null that sets the floor.
 
     ``progress_cb(done, total)`` is invoked after each shuffle when
     given (the CLI audit uses it for a rate/ETA readout).
@@ -1526,8 +1592,7 @@ def _detect_density_peaks(
 
     ``wlen_bins`` (optional) makes the prominence calculation
     *local*: instead of "the deepest valley anywhere on the trace",
-    use the deepest valley within ``wlen_bins`` of the peak. Matches
-    the behaviour of ``event_detection_short.py``.
+    use the deepest valley within ``wlen_bins`` of the peak.
 
     Returns
     -------
@@ -1822,6 +1887,10 @@ def _boundaries_from_peaks(
     # OLD: merge overlapping / touching events (DISABLED 2026-05-01).
     # Replaced by watershed split below so closely-spaced epileptiform
     # events stay separate instead of being fused into one wide window.
+    # This was the only reader of ``params.merge_gap_s``, so that field is
+    # inert in every configuration -- turning watershed split off does NOT
+    # bring merging back (overlapping windows are then left as walked).
+    # Kept commented out as the reference for a possible future restore.
     # ------------------------------------------------------------------
     # merge_gap_samples = max(0, int(round(params.merge_gap_s / dt)))
     # keep = np.ones(peaks.size, dtype=bool)
@@ -2148,8 +2217,18 @@ _silence_classifier_load_deprecation()
 def change_batch_according_to_free_ram() -> int:
     """Legacy linear fit on currently-available RAM (no frame-size input).
 
-    Kept as a fallback when no TIFF folder is available to peek at the
-    frame shape. Tuned empirically:
+    Two uses today:
+
+    * the registration ``batch_size`` fallback inside
+      :func:`pick_batch_size` when no TIFF frame shape can be read;
+    * a free-RAM scale for the dF/F writers' ROI chunk:
+      ``detection_run`` and the Tab 3 GUI use
+      ``max(8, change_batch_according_to_free_ram() * 20)`` as the
+      number of ROIs processed per block when filling the dF/F memmaps.
+      That second use only borrows the RAM curve; the numbers below
+      are registration frames, not ROIs.
+
+    Tuned empirically:
 
         16 GiB available  -> batch_size 150
         200 GiB available -> batch_size 4000
@@ -2341,7 +2420,6 @@ class PeakMemoryMonitor:
 
         with PeakMemoryMonitor() as mon:
             run_long_thing()
-        print(mon.peak_fraction)       # max(cpu, gpu)
         print(mon.cpu_peak_fraction)   # system RAM only
         print(mon.gpu_peak_fraction)   # GPU only, or 0.0 if no CUDA
 
@@ -2351,12 +2429,14 @@ class PeakMemoryMonitor:
     torch's allocator tracks high-water-mark across the window
     natively, so we just reset it at __enter__ and read at __exit__.
 
-    ``peak_fraction`` returns ``max(cpu, gpu)`` -- the adaptive sizer
-    uses this so the closed loop scales against whichever resource
-    actually pressured. Without it, suite2p would happily oversize
-    batch_size against a 6 GiB GPU on a workstation with 32 GiB CPU
-    RAM (which is exactly the regression that crashed registration
-    with batch_size=5524 + 512x512 frames).
+    The adaptive sizer is fed the two peaks separately
+    (``update_from_peak(cpu_peak=..., gpu_peak=...)``) and binds on
+    whichever resource is closest to its target, so the closed loop
+    scales against whichever resource actually pressured. Without
+    that, suite2p would happily oversize batch_size against a 6 GiB
+    GPU on a workstation with 32 GiB CPU RAM (which is exactly the
+    regression that crashed registration with batch_size=5524 +
+    512x512 frames).
     """
 
     def __init__(self, sample_interval: float = 0.5):
@@ -2365,11 +2445,6 @@ class PeakMemoryMonitor:
         self._cpu_peak = 0.0
         self._gpu_peak = 0.0
         self._thread: Optional[threading.Thread] = None
-
-    @property
-    def peak_fraction(self) -> float:
-        """The tighter of CPU and GPU peak. Drives the closed loop."""
-        return max(self._cpu_peak, self._gpu_peak)
 
     @property
     def cpu_peak_fraction(self) -> float:
@@ -2466,8 +2541,6 @@ class AdaptiveBatchSizer:
         self._last_batch_size: Optional[int] = None
         self._last_cpu_peak: Optional[float] = None
         self._last_gpu_peak: Optional[float] = None
-        # (batch_size, cpu_peak, gpu_peak) per learning step.
-        self.history: list[tuple[int, float, float]] = []
         # Multiplier applied to every ``pick()`` result. Stays 1.0 in
         # normal operation; the batch runner drops it (e.g. 0.5, 0.25)
         # when re-running a recording that hit a RAM out-of-memory error,
@@ -2554,18 +2627,15 @@ class AdaptiveBatchSizer:
         return new_bs
 
     def update_from_peak(self,
-                         peak_fraction: Optional[float] = None,
                          *,
                          cpu_peak: Optional[float] = None,
                          gpu_peak: Optional[float] = None,
                          batch_size: Optional[int] = None) -> None:
         """Record the observed peak(s) from a completed suite2p run.
 
-        Preferred call shape: pass ``cpu_peak`` and ``gpu_peak``
-        explicitly so the loop can bind to whichever resource was
-        tighter. Legacy single-``peak_fraction`` callers are still
-        supported -- the value is recorded as the CPU peak and GPU
-        peak stays unknown.
+        Pass ``cpu_peak`` and ``gpu_peak`` so the loop can bind to
+        whichever resource was tighter; omit ``gpu_peak`` when it is
+        not meaningful (the GPU peak then stays unknown).
 
         ``batch_size`` lets the caller pin the value that was actually
         used (in case suite2p clamped or :meth:`pick` and the
@@ -2574,22 +2644,16 @@ class AdaptiveBatchSizer:
         """
         if cpu_peak is not None:
             self._last_cpu_peak = float(cpu_peak)
-        elif peak_fraction is not None and self._last_cpu_peak is None:
-            self._last_cpu_peak = float(peak_fraction)
         if gpu_peak is not None:
             self._last_gpu_peak = float(gpu_peak)
         if batch_size is not None:
             self._last_batch_size = int(batch_size)
-        self.history.append((int(self._last_batch_size or 0),
-                             float(self._last_cpu_peak or 0.0),
-                             float(self._last_gpu_peak or 0.0)))
 
     def reset(self) -> None:
         """Wipe learned state. Call at the start of a fresh queue."""
         self._last_batch_size = None
         self._last_cpu_peak = None
         self._last_gpu_peak = None
-        self.history.clear()
         self.conservative_scale = 1.0
 
 
@@ -2604,12 +2668,8 @@ def get_adaptive_sizer() -> AdaptiveBatchSizer:
     return _global_sizer
 
 
-def reset_adaptive_sizer(target_fraction: Optional[float] = None) -> None:
-    """Wipe the singleton's learned state. Optionally retune the
-    target fraction in the same call.
-    """
-    if target_fraction is not None:
-        _global_sizer.target_fraction = float(target_fraction)
+def reset_adaptive_sizer() -> None:
+    """Wipe the singleton's learned state (incl. ``conservative_scale``)."""
     _global_sizer.reset()
 
 
@@ -2618,9 +2678,10 @@ def _peek_tiff_frame_shape(tiff_folder: str):
 
     "Peek" because we don't read pixel data -- we only open the file
     and look at the page header to find the height and width. Used
-    by ``change_nbinned_according_to_free_ram`` to size things
-    appropriately for the recording's FOV without spending the time
-    or RAM to actually load a frame.
+    by ``pick_batch_size``, ``change_nbinned_according_to_free_ram``
+    and ``suite2p_pipeline`` to size things appropriately for the
+    recording's FOV without spending the time or RAM to actually load
+    a frame.
     """
     try:
         import tifffile
@@ -2772,31 +2833,24 @@ def s2p_load_spks(plane0: Union[str, Path],
     return np.ascontiguousarray(spks, dtype=np.float32)
 
 
-def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.memmap, np.memmap, np.memmap, int, int]:
-    """Open the three dF/F memmaps written by Tab 3 / Tab 4.
+def s2p_open_dff_memmap(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.memmap, int, int]:
+    """Open the ``<prefix>dff.memmap.float32`` dF/F memmap read-only.
 
-    On disk we keep three parallel ``(T, N)`` float32 memmaps:
-        ``<prefix>dff.memmap.float32``
-            Neuropil-corrected dF/F.
-        ``<prefix>dff_lowpass.memmap.float32``
-            ``dff`` after the user-chosen Butterworth low-pass.
-        ``<prefix>dff_dt.memmap.float32``
-            Savitzky-Golay first derivative of the low-passed
-            trace.
-
-    We use ``np.memmap`` rather than ``np.load`` because each file
-    can be hundreds of MB; mmap'ing them lets us slice columns /
-    frames without ever loading the whole array into RAM.
+    The file is a ``(T, N)`` float32 memmap: the neuropil-corrected dF/F
+    written by Tab 3 (``r0p7_``) or its cell-filtered slice
+    (``r0p7_filtered_``). We use ``np.memmap`` rather than ``np.load``
+    because the file can be hundreds of MB; mmap'ing it lets us slice
+    columns / frames without loading the whole array into RAM.
 
     For filtered prefixes (e.g. ``r0p7_filtered_``), the column count
     is resolved via :func:`resolve_filtered_mask`, which anchors to the
     memmap's on-disk size and prefers the persisted
     ``r0p7_cell_mask_bool.npy`` over a (possibly drifted) live mask.
 
-    Returns ``(dff, low, dt, T, N_kept)``.
+    Returns ``(dff, T, N)``.
     """
     root = Path(root)
-    # We only need the (N_ROIs, T) shape to size the memmap views below --
+    # We only need the (N_ROIs, T) shape to size the memmap view below --
     # never the F/Fneu data itself. Read just the .npy shape header via mmap
     # instead of np.load-ing both full (N_ROIs, T) float32 arrays (hundreds
     # of MB each) into RAM. F.npy is canonically (N_ROIs, T), so unpack
@@ -2806,7 +2860,7 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
     del _F  # drop the header mmap handle
 
     if is_filtered_prefix(prefix):
-        # Size against the mask the memmaps were written with (persisted
+        # Size against the mask the memmap was written with (persisted
         # as r0p7_cell_mask_bool.npy), cross-checked against the file size,
         # so a drifted live mask can't request a wrong-shaped mapping
         # ([WinError 8]). See resolve_filtered_mask.
@@ -2815,10 +2869,7 @@ def s2p_open_memmaps(root: Union[str, Path], prefix: str = "r0p7_") -> tuple[np.
             root, num_rois, memmap_path=dff_path, T=num_frames)
 
     dff = np.memmap(root / f"{prefix}dff.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
-    low = np.memmap(root / f"{prefix}dff_lowpass.memmap.float32", dtype="float32", mode="r",
-                    shape=(num_frames, num_rois))
-    dt = np.memmap(root / f"{prefix}dff_dt.memmap.float32", dtype="float32", mode="r", shape=(num_frames, num_rois))
-    return dff, low, dt, num_frames, num_rois
+    return dff, num_frames, num_rois
 
 
 # ============================================================================

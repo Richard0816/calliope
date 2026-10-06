@@ -60,8 +60,6 @@ dependencies = [
     "pandas>=2.2,<4",
     "scipy>=1.13,<2",
     "matplotlib>=3.8,<4",
-    "seaborn>=0.13,<0.14",
-    "scikit-image>=0.24,<0.27",
     "openpyxl>=3.1,<4",
     "Pillow>=10,<13",
     "psutil>=5.9",
@@ -76,7 +74,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # Dev tooling: ``pip install -e ".[dev]"`` then ``pytest tests/``.
-# Currently a smoke-test suite (package imports + headless GUI walk).
+# The suite covers package imports + a headless GUI walk plus focused
+# unit/regression tests (batch, NWB export, onset refinement, ...).
+# NWB tests also need the ``nwb`` extra and skip without it.
 dev = ["pytest>=7"]
 
 # GPU cross-correlation needs a prebuilt CuPy wheel that matches the

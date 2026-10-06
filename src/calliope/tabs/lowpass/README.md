@@ -10,7 +10,7 @@ This tab is interactive: a slider drives the cutoff, three panels (FFT, raw dF/F
 
 From `plane0/`:
 - `r0p7_filtered_dff.memmap.float32` of shape `(T, N_kept)` — preferred. The keep mask / `N_kept` is resolved via `utils.resolve_filtered_mask(plane0, N_total, memmap_path=<filtered memmap>, T=T)` — **anchored to the memmap's on-disk column count**, not the live `predicted_cell_mask`/`iscell`. This prevents `[WinError 8] Not enough memory resources` when curation has drifted the cell mask since Tab 3 wrote the memmap (a wrong-shaped mapping request, not real memory pressure).
-- Falls back to `r0p7_dff.memmap.float32` of shape `(T, N_total)` masked by the live `predicted_cell_mask.npy` / `iscell.npy` **only when the filtered memmap is missing** (no fixed file size to anchor against).
+- Falls back to `r0p7_dff.memmap.float32` of shape `(T, N_total)` masked by the live `predicted_cell_mask.npy` / `iscell.npy` **only when the filtered memmap is missing** (no fixed file size to anchor against). This fallback is **preview-only**: the FFT / raw / low-pass panels draw, but *Compute* stays disabled (it reads `r0p7_filtered_dff`) and the status line says to run Tab 3's filtered dF/F first.
 - `F.npy` for `(N_total, T)` shape lookup.
 - `r0p7_cell_mask_bool.npy` — the authoritative keep mask persisted by Tab 3 alongside the memmap; `resolve_filtered_mask` prefers it, then `predicted_cell_mask.npy`, then `iscell.npy`.
 - `predicted_cell_prob.npy` (only used by the "best-scoring ROI" trace source).
@@ -26,10 +26,11 @@ The tab subscribes to the AppState `plane0` broadcast so it auto-loads when Tab 
 > **Headless entry point.** `core/lowpass_run.py` exposes
 > `compute_lowpass_and_dt(plane0, fps, cutoff_hz, ...)` (the per-ROI compute
 > loop), `render_lowpass_figures(plane0, ..., figures_dir)` (saves
-> `fft.png` / `raw_dff.png` / `lowpass_dff.png` for the population-mean
+> `fft.png` / `raw_dff.png` / `lowpass_dff.png` for the population-median
 > trace), and `run_lowpass(plane0, params, figures_dir=None, progress_cb=None)`
-> (compute + figures). Tab 4's `_run_compute` delegates to
-> `compute_lowpass_and_dt`, so the GUI and batch worker share one code path.
+> (compute + figures). Tab 4's *Compute* button (`_on_compute`) runs
+> `compute_lowpass_offload` -> `compute_lowpass_and_dt` in a child process via
+> `core.offload.run_offloaded`, so the GUI and batch worker share one code path.
 
 ### Step 1 — Choose a representative trace
 
@@ -44,16 +45,21 @@ Manual ids are **always** Suite2p indices into the full `(T, N_total)` `r0p7_dff
 
 ### Step 2 — FFT power spectrum
 
-Computed once per trace via `fft_all_rois.compute_fft(trace, fps)`:
+Computed once per trace, inline in `_load_data` (and identically in
+`lowpass_run.render_lowpass_figures`):
 
 ```python
-N = trace.size
-yf = np.fft.rfft(trace - mean(trace))
-xf = np.fft.rfftfreq(N, d=1.0/fps)
-power = abs(yf)**2 / N
+yf = np.fft.rfft(trace)                  # no mean subtraction
+xf = np.fft.rfftfreq(trace.size, d=1.0/fps)
+power = abs(yf)**2                       # not normalised by N
 ```
 
-(Look up `fft_all_rois.py` in the legacy `Calcium_imaging_suite2p/` repo for the exact code.) The plot is `semilogy(xf[1:], maximum(power[1:], 1e-12))` with `xlim = (0, min(fps/2, 15))`. A red dashed `axvline` marks the current cutoff and updates live as the slider moves.
+The DC bin (`xf[0]`) is dropped when plotting, so the missing mean
+subtraction doesn't affect the displayed spectrum, and the missing `/N` only
+rescales the y-axis. A **y-axis** toggle above the panel switches between
+`semilogy(xf[1:], maximum(power[1:], 1e-12))` (log, default) and a linear
+plot of `power[1:]`; `xlim = (0, min(fps/2, 15))`. A red dashed `axvline`
+marks the current cutoff and updates live as the slider moves.
 
 **Why log y.** Calcium signal lives mostly below ~3 Hz at typical GCaMP kinetics; shot noise is roughly white above that. On a log axis the elbow between signal and noise is the cutoff you usually want.
 
@@ -95,7 +101,11 @@ If the window is wider than the trace, falls back to a forward-difference gradie
 
 ### Step 5 — Compute (write to disk)
 
-`_run_compute(plane0, T, N, fps, cutoff)`:
+`_on_compute` hands `(plane0, fps, cutoff, filter_order, sg_win_ms, sg_poly)`
+to `core.lowpass_run.compute_lowpass_offload` in a child process, which calls
+`compute_lowpass_and_dt` (`T`/`N` are re-derived from the source memmap via
+`resolve_filtered_mask`). In outline (the real loop reads 256-column blocks to
+bound the strided I/O):
 
 ```python
 src = memmap('r0p7_filtered_dff.memmap.float32', shape=(T, N))  # input
@@ -112,7 +122,13 @@ for i in range(N):
     dt_mm[:, i] = dt
 ```
 
-Both memmaps are flushed at the end. The tab broadcasts `state.set_lowpass_ready(plane0)` which Tabs 5–7 listen for.
+Both memmaps are flushed at the end, then the settings are stamped into
+`plane0/meta.json` under `lowpass_filtered` (`cutoff_hz`, `filter_kind`,
+`order`, `sg_win_ms`, `sg_poly`, `fps`). Tab 5 reads that section for the
+cutoff behind its auto onset-backtrack window and for the frame rate it times
+onsets at, so the two tabs agree even though Tab 5's own params don't carry
+the cutoff. The tab then broadcasts `state.set_lowpass_ready(plane0)` which
+Tabs 5–7 listen for.
 
 ---
 
@@ -122,8 +138,11 @@ Both memmaps are flushed at the end. The tab broadcasts `state.set_lowpass_ready
 |---|---|---|
 | `r0p7_filtered_dff_lowpass.memmap.float32` | `(T, N_kept)` | float32 |
 | `r0p7_filtered_dff_dt.memmap.float32` | `(T, N_kept)` | float32 |
+| `meta.json` → `lowpass_filtered` | — | JSON section |
 
-These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 4 at, say, 0.5 Hz changes Tab 5's onsets accordingly.
+Only Tab 4 (or the batch lowpass stage) writes these two filtered memmaps;
+Tab 3 writes no low-pass or derivative of its own. Re-running Tab 4 at, say,
+0.5 Hz overwrites them and changes Tab 5's onsets accordingly.
 
 ---
 
@@ -141,43 +160,43 @@ These overwrite the defaults that Tab 3 wrote at 1 Hz cutoff, so re-running Tab 
 ## 5. Advanced settings (`PARAM_SPEC`)
 
 Five tunables open in the standard `AdvancedDialog` (the gear / "Advanced…"
-button → `_on_advanced`, `tab.py:699`). The cutoff itself is *not* here — it
+button → `_on_advanced`). The cutoff itself is *not* here — it
 lives on the live slider/entry; these only set the slider's **bounds** plus
 the fixed filter/derivative knobs that the next **Compute** click bakes into
-the on-disk memmaps. The same five flow through `apply_batch_row`
-(`tab.py:157`) so Tab 0 batch rows can override them per recording, then on to
-`core/lowpass_run.compute_lowpass_and_dt` (`filter_order`, `sg_win_ms`,
-`sg_poly` at `lowpass_run.py:64-66`).
+the on-disk memmaps. The same five flow through `apply_batch_row` so Tab 0
+batch rows can override them per recording, then on to
+`core/lowpass_run.compute_lowpass_and_dt` (its `filter_order`, `sg_win_ms`,
+`sg_poly` keyword arguments). The header label shows the current Butterworth
+order and refreshes when the dialog closes.
 
 ### Low-pass filter
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| Butterworth order (`filter_order`) | `2` | Passed as `order` to `butter(order, cutoff/nyq, btype='low', output='sos')` in `utils.lowpass_causal_1d` (`utils.py:295`). Sets how many biquad second-order sections the SOS filter has: a Butterworth of order *n* rolls off at ≈ `6·n` dB/octave above the cutoff. The same `sos` is designed once and reused for every ROI in the Compute loop. | Raise it (3–4) for a sharper signal/noise split — frequencies just above the cutoff are attenuated harder, so high-frequency shot noise leaks through less. The cost: a steeper IIR has **longer group delay** and more ringing, so causal onset times shift later (the ≈ half-impulse-response lag in §3 grows) and sharp GCaMP8 transients can develop a small overshoot. Lower it to `1` for a very gentle, near-lag-free roll-off at the expense of letting more noise through. Order `2` is the validated default; only change it if the FFT elbow is unusually steep/shallow. Interacts with the cutoff: a higher order makes the cutoff *location* matter more. |
+| Butterworth order (`filter_order`) | `2` | Passed as `order` to `butter(order, cutoff/nyq, btype='low', output='sos')` in `utils.lowpass_causal_1d`. Sets how many biquad second-order sections the SOS filter has: a Butterworth of order *n* rolls off at ≈ `6·n` dB/octave above the cutoff. The same `sos` is designed once and reused for every ROI in the Compute loop. | Raise it (3–4) for a sharper signal/noise split — frequencies just above the cutoff are attenuated harder, so high-frequency shot noise leaks through less. The cost: a steeper IIR has **longer group delay** and more ringing, so causal onset times shift later (the ≈ half-impulse-response lag in §3 grows) and sharp GCaMP8 transients can develop a small overshoot. Lower it to `1` for a very gentle, near-lag-free roll-off at the expense of letting more noise through. Order `2` is the validated default; only change it if the FFT elbow is unusually steep/shallow. Interacts with the cutoff: a higher order makes the cutoff *location* matter more. |
 
 ### Derivative
 
 These govern the Savitzky–Golay first derivative written to
 `r0p7_filtered_dff_dt.memmap.float32`, which **is** the signal Tab 5
-thresholds for onset detection (`utils.sg_first_derivative_1d`,
-`utils.py:347`). Loosening or tightening them directly changes how many
+thresholds for onset detection (`utils.sg_first_derivative_1d`). Loosening or tightening them directly changes how many
 events Tab 5 finds.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| SG derivative window (ms) (`sg_win_ms`) | `333` | Converted to an **odd** sample count `win = max(3, int((sg_win_ms/1000)*fps) | 1)` (`utils.py:363`), then used as `savgol_filter(..., window_length=win, deriv=1, delta=1/fps)`. SG fits a `sg_poly`-degree polynomial across `win` samples and reports its analytic slope at the centre. At the default 15.08 fps, 333 ms ≈ a 5-sample window. If `win` ≥ trace length it shrinks to the largest odd window that fits; if still < 3 it falls back to a one-sample finite difference. | The single most impactful derivative knob. **Widen** it (e.g. 500–800 ms) to average over more samples → a smoother, less noisy `dt` trace and fewer spurious Tab 5 onsets, but slow real onsets get blurred and time-smeared (more lag, fused close events). **Narrow** it (e.g. 150–200 ms) to track fast transients crisply at the price of a noisier derivative and more false onsets. Always specified in **milliseconds**, so it self-adjusts when `fps` changes — you don't have to recompute sample counts. Re-Compute after changing it, then re-check Tab 5. |
-| SG polynomial order (`sg_poly`) | `2` | The `polyorder` of the fitted polynomial (`utils.py:377`). Degree 2 (quadratic) lets the local fit follow curvature — a rising/peaking transient — rather than assuming a straight line. SciPy requires `sg_poly < window_length`, so it must stay below the effective `sg_win_ms` sample count. | Leave at `2` for almost all data. Raising to `3`–`4` makes the fit hug sharp inflections more faithfully (useful only for very fast GCaMP8 kinetics with a wide window) but also lets the polynomial chase noise, partly undoing the smoothing `sg_win_ms` buys you. Lowering to `1` makes the derivative a plain moving-slope estimate — very smooth, but it underestimates the steepness of fast onsets. Gotcha: a high `sg_poly` with a **narrow** `sg_win_ms` can violate `poly < window` and error out; widen the window if you raise the order. |
+| SG derivative window (ms) (`sg_win_ms`) | `333` | Converted to an **odd** sample count `win = max(3, int((sg_win_ms/1000)*fps) | 1)` (`utils.sg_first_derivative_1d`), then used as `savgol_filter(..., window_length=win, deriv=1, delta=1/fps)`. SG fits a `sg_poly`-degree polynomial across `win` samples and reports its analytic slope at the centre. At the default 15.08 fps, 333 ms ≈ a 5-sample window. If `win` ≥ trace length it shrinks to the largest odd window that fits; if still < 3 it falls back to a one-sample finite difference. | The single most impactful derivative knob. **Widen** it (e.g. 500–800 ms) to average over more samples → a smoother, less noisy `dt` trace and fewer spurious Tab 5 onsets, but slow real onsets get blurred and time-smeared (more lag, fused close events). **Narrow** it (e.g. 150–200 ms) to track fast transients crisply at the price of a noisier derivative and more false onsets. Always specified in **milliseconds**, so it self-adjusts when `fps` changes — you don't have to recompute sample counts. Re-Compute after changing it, then re-check Tab 5. |
+| SG polynomial order (`sg_poly`) | `2` | The `polyorder` of the fitted polynomial (`utils.sg_first_derivative_1d`). Degree 2 (quadratic) lets the local fit follow curvature — a rising/peaking transient — rather than assuming a straight line. SciPy requires `sg_poly < window_length`, so it must stay below the effective `sg_win_ms` sample count. | Leave at `2` for almost all data. Raising to `3`–`4` makes the fit hug sharp inflections more faithfully (useful only for very fast GCaMP8 kinetics with a wide window) but also lets the polynomial chase noise, partly undoing the smoothing `sg_win_ms` buys you. Lowering to `1` makes the derivative a plain moving-slope estimate — very smooth, but it underestimates the steepness of fast onsets. Gotcha: a high `sg_poly` with a **narrow** `sg_win_ms` can violate `poly < window` and error out; widen the window if you raise the order. |
 
 ### Slider bounds
 
 These only reshape the **live cutoff slider** in the GUI; they are not written
 to disk and have no effect in headless/batch runs (which take an explicit
-`cutoff_hz`). Applied in `_on_advanced` (`tab.py:704-711`).
+`cutoff_hz`). Applied in `_on_advanced`.
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
 | Slider min (Hz) (`cutoff_min`) | `0.01` | Becomes the slider's `from_` and `self.CUTOFF_MIN`. After the dialog closes the current cutoff is re-clamped into `[cutoff_min, cutoff_max]`. | Raise it if you never want to drag below some floor; lower it to explore very aggressive smoothing (a sub-0.1 Hz cutoff flattens almost everything but the slowest envelope). Cosmetic/convenience only — it constrains the slider, not the math. |
-| Slider max (Hz) (`cutoff_max`) | `7.0` | Becomes the slider's `to` and `self.CUTOFF_MAX`. | Raise it (toward but below Nyquist, `fps/2`) to audition near-passthrough cutoffs; the filter core independently clamps any cutoff to `0.95·Nyquist` (`utils.py:291`), so a `cutoff_max` above Nyquist just can't take effect. **Gotcha:** the whole bounds update is silently ignored unless `cutoff_min < cutoff_max` (`tab.py:706`) — set them in the right order. |
+| Slider max (Hz) (`cutoff_max`) | `7.0` | Becomes the slider's `to` and `self.CUTOFF_MAX`. | Raise it (toward but below Nyquist, `fps/2`) to audition near-passthrough cutoffs; the filter core independently clamps any cutoff to `0.95·Nyquist` (`utils.lowpass_causal_1d`), so a `cutoff_max` above Nyquist just can't take effect. **Gotcha:** the whole bounds update is silently ignored unless `cutoff_min < cutoff_max` (checked in `_on_advanced`) — set them in the right order. |
 
 ---
 
@@ -186,7 +205,7 @@ to disk and have no effect in headless/batch runs (which take an explicit
 1. `scipy.signal.butter(order, cutoff/nyq, btype='low', output='sos')` + `scipy.signal.sosfilt` for the filter.
 2. Initialise `zi = ones((sos.shape[0], 2)) * x[0]` to suppress the startup transient.
 3. `scipy.signal.savgol_filter(x, window_length=odd_window, polyorder=2, deriv=1, delta=1/fps)` for the derivative.
-4. An FFT power-spectrum routine: subtract the mean, `rfft`, square, normalise by `T`, plot on `semilogy`.
+4. An FFT power-spectrum routine: `rfft`, square the magnitude, drop the DC bin, plot on `semilogy` (optional linear toggle).
 5. A live slider that calls (1) per drag and updates a Matplotlib axvline + the low-pass plot. Debounce via `after(80, …)` to avoid melting the GUI thread.
 6. A worker that re-runs the SOS filter + SG derivative once per ROI (re-using the cached `sos`) and writes two `(T, N)` `float32` memmaps with the standardised filenames.
 7. The trace-source rules: aggregate over the kept-only memmap for mean/median/best, but reach into the full `(T, N_total)` memmap when the user passes Suite2p ROI ids manually.
@@ -197,5 +216,5 @@ to disk and have no effect in headless/batch runs (which take an explicit
 Tab 4 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Cutoff slider.** `CTkSlider` driving the cutoff value; the numeric Entry next to it lets the user type an exact value.
-- **Three stacked matplotlib panels** (FFT power spectrum, raw dF/F, low-pass + derivative preview) live in `ttk.LabelFrame`s — matplotlib figures keep their white facecolor; the surrounding chrome is dark. Each canvas has a dark-skinned navigation toolbar (pan/zoom/save + Save data CSV).
+- **Three stacked matplotlib panels** (FFT power spectrum, raw dF/F, zero-phase low-pass preview — no derivative is plotted) live in `CTkFrame`s — matplotlib figures keep their white facecolor; the surrounding chrome is dark. Each canvas has a dark-skinned navigation toolbar (pan/zoom/save + Save data CSV).
 - **No popouts.** Advanced parameters open in the standard `AdvancedDialog`.

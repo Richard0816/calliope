@@ -23,15 +23,19 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 > params, *, figures_dir=None, write_summary=True)` runs the linkage,
 > picks a threshold (auto via `clustering.auto_choose_threshold` when
 > `params['threshold']` is `None`), cuts to flat clusters, exports
-> `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `threshold_used.npy` +
-> `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
-> `spatial_clusters.png`. Tab 6 still owns the interactive recluster /
-> palette / picker UI; the headless module is what Tab 0's batch worker
-> calls and what you'd reach for in a script.
+> `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `linkage_roi_ids.npy` +
+> `threshold_used.npy` + `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
+> `spatial_clusters.png`. Filtered-position → Suite2p translation uses the
+> same memmap-anchored keep mask `load_filtered_dff` sized the matrix with
+> (not the live `predicted_cell_mask`/`iscell`), so the marker is always
+> truthful. Tab 6 still owns the interactive recluster / palette / picker
+> UI. Tab 0's GUI batch runner drives Tab 6 itself (`apply_batch_row` →
+> Run → Export); `run_clustering` is what `core.batch_pipeline.run_recording`
+> and scripts call.
 
 ### Step 1 — Distance matrix
 
-`_ward_linkage(dff, method='ward')`:
+`ward_linkage(dff, method='ward')` (single implementation in `core/clustering.py`, re-exported by `tabs/clustering/logic.py`):
 
 ```python
 dff_z = (dff − mean(dff, axis=0)) / (std(dff, axis=0) + 1e-8)   # z-score each column
@@ -50,7 +54,7 @@ The output `dist` is a condensed `(N·(N−1)/2,)` array fed straight to `scipy.
 - **Average (UPGMA)** merges by mean pairwise distance. On unbalanced data (one big mode + several small ones) it tends toward "1 huge cluster + a few tiny outliers". The earlier per-event xcorr fragmentation guard was a workaround for exactly this failure mode.
 - **Ward** minimises within-cluster sum-of-squares (Lance-Williams). Produces compact, balanced clusters — the "4–5 modes" shape lab members find useful. Z-scoring removes the only objection to Ward (its Euclidean requirement); previous reluctance was based on a misreading of the math.
 
-(Switched from average + correlation → Ward + Euclidean on 2026-05-11 after user pointed out that z-scoring already kills amplitude differences. The function is now named `ward_linkage` / `_ward_linkage`; there is no `_correlation_linkage`.)
+(Switched from average + correlation → Ward + Euclidean on 2026-05-11 after user pointed out that z-scoring already kills amplitude differences. The function is now named `ward_linkage`; there is no `_correlation_linkage`. Because the merge heights are Ward distances, the dendrogram y-axis, slider and recluster entry are labelled "Ward linkage distance", not `1 − r`.)
 
 ### Step 2 — Auto-pick a cut
 
@@ -96,7 +100,7 @@ Done independently for R, G, B channels. Background (no ROI coverage) is `NaN` s
 
 **Axes in µm + scale bar.** When the run carries a pixel calibration (`<plane0>/calliope_calibration.npy` → `utils.load_pix_to_um`, resolved by `_resolve_pix_to_um`), the live spatial map (and the `ReclusterWindow` sub-map) sets an `imshow` extent of `[0, Lx·pix, Ly·pix, 0]`, labels the axes `x (µm)` / `y (µm)`, and adds a black scale bar. Without a calibration it keeps the prior `x (px)` / `y (px)` labels and no bar. Both render paths go through the shared `logic.render_spatial_map(ax, img, Lx, Ly, pix_to_um, title)` helper so they behave identically; this matches the already-µm batch export (`core.clustering.plot_spatial`) and the Tab 8 maps.
 
-A parallel `(Ly, Lx)` int label image (`_build_label_image`) encoding `filtered_idx + 1` per painted pixel is also rebuilt every render so the spatial-click handler can resolve a cursor position back to an ROI without a per-pixel scan over `stat`. Because the axes are in µm when calibrated, the click handler divides the cursor `(xdata, ydata)` by `pix_to_um` before indexing the (pixel-space) label image. Click any coloured ROI to open the cluster popout (see §"Cluster popout").
+A parallel `(Ly, Lx)` int label image (`logic.build_label_image`) encoding `filtered_idx + 1` per painted pixel is also rebuilt every render so the spatial-click handler can resolve a cursor position back to an ROI without a per-pixel scan over `stat`. Because the axes are in µm when calibrated, the click handler divides the cursor `(xdata, ydata)` by `pix_to_um` before indexing the (pixel-space) label image. Click any coloured ROI to open the cluster popout (see §"Cluster popout").
 
 ### Step 4 — Per-cluster colours
 
@@ -137,7 +141,9 @@ return sorted(local_idx.tolist())
 > **"Spatial unavailable (stat / dF/F mismatch)"** and the export/ROI-id paths
 > silently fell back to emitting filtered-list positions instead of Suite2p ids.
 > Anchoring to file size keeps `stat`, the dF/F columns, and the translator the
-> exact same length.
+> exact same length. The headless `core.clustering.run_clustering` and its
+> `plot_spatial` (via `stat_for_prefix`) use the same anchored mask; the
+> live-mask readers `_load_filter_mask` / `load_filter_mask` were removed.
 
 Refresh hooks:
 - `_update_cluster_pick_label` (fires on every menu toggle) → calls `_refresh_roi_list_var`.
@@ -163,7 +169,7 @@ A separate `ReclusterWindow` opens with its own dendrogram + slider + spatial ma
 
 ### Step 5b — Reload existing clusters
 
-A "Reload clusters" button next to "Run analysis" restores a previous Export run without recomputing the linkage (which is the expensive part — pdist of `1−r` is O(N²·T) and can be 30 s to a few minutes per recording).
+A "Reload clusters" button next to "Run analysis" restores a previous Export run without recomputing the linkage (which is the expensive part — `pdist` + Ward linkage is O(N²·T) and can be 30 s to a few minutes per recording).
 
 The button is enabled only when both files exist for the active prefix:
 
@@ -172,21 +178,23 @@ The button is enabled only when both files exist for the active prefix:
 <plane0>/{prefix}cluster_results/threshold_used.npy
 ```
 
-`_reload_compute(plane0, prefix)`:
+`logic.reload_clustering_offload(plane0, prefix, cluster_dir)` (run in a child process via `core.offload.run_offloaded`, like Run analysis's `compute_clustering_offload`):
 
-1. `Z = np.load(linkage.npy)` — the saved condensed linkage matrix.
+1. `Z = np.load(linkage.npy)` — the saved linkage matrix.
 2. `thr = float(np.load(threshold_used.npy)[0])` — the cut at which the user clicked Export.
-3. `dff_mm, T, N = _load_filtered_dff(...)` — fresh memmap for spatial recolouring + reclustering.
-4. **Validation:** `Z.shape[0] + 1 == N`. If the cell-filter mask has changed since export, leaf count and ROI count won't match — the reload aborts with a clear error rather than silently misaligning ROIs to dendrogram leaves.
-5. `stat`, `ops`, `Lx`, `Ly` loaded as in `_compute`.
+3. `_, T, N, _ = load_filtered_dff(...)` — only to read the current column count.
+4. **Validation:** `Z.shape[0] + 1 == N`, and the ordered Suite2p ids the linkage was built on (`linkage_roi_ids.npy`; for older exports, the sorted union of the `C*_rois.npy` files when the `_indices_are_suite2p` marker is present) must equal the current kept ids (`core.clustering.linkage_roi_ids`). A promotion can swap kept ROIs at the same count (`[0,1,3]` → `[0,2,3]`), so the count alone is not enough. On a mismatch the reload aborts with a clear error rather than silently misaligning ROIs to dendrogram leaves.
+5. `Lx`, `Ly` from `utils.load_plane_view`.
 6. `zmax = max(Z[:, 2])` for slider calibration.
+
+Only picklable data crosses the process boundary; `_on_reloaded` re-opens the dF/F memmap (`load_filtered_dff`) and `stat` (`stat_for_prefix`) by path on the main thread.
 
 `_on_reloaded(data)`:
 
 - Sets `_Z`, `_stat`, `_dff`, `_Lx`, `_Ly`, `_zmax` from the payload.
 - Snaps `_manual_T = saved_threshold` (clamped to `[0, zmax]` to handle stale exports).
 - Forces `manual_var = True` so the slider tracks the saved cut, not the auto threshold.
-- Calibrates the slider, enables Export / Save summary / Recluster / cluster menu, seeds the recluster threshold to `_manual_T / 2`.
+- Calibrates the slider, enables Export *_rois.npy / Export figures / Save summary / Recluster / cluster menu, seeds the recluster threshold to `_manual_T / 2`.
 - Calls `_render_all()` (which redraws dendrogram + spatial map and refreshes the picked-cluster ROI list).
 - Status: `Reloaded from <cluster_dir>. N_rois=N  T=T  saved cut=...  (n_clusters clusters).`
 
@@ -200,13 +208,14 @@ The button is enabled only when both files exist for the active prefix:
 ├── C2_rois.npy
 ├── ...
 ├── linkage.npy           ← the full Z matrix
+├── linkage_roi_ids.npy   ← ordered Suite2p ids of the linkage leaves
 ├── threshold_used.npy    ← the threshold at which the cut was made
 └── _indices_are_suite2p  ← marker file: "1"
 ```
 
 Cluster numbering matches the dendrogram's left-to-right visual order (C1, C2, … = leftmost branch, second branch, …). The `_indices_are_suite2p` marker tells Tab 7 that the indices in `C*_rois.npy` are positions in `stat.npy` / `F.npy` (Suite2p indices), not positions in the kept-only memmap.
 
-For the filtered prefix, the export translates from filtered-position to Suite2p index using `filtered_to_suite2p_indices(plane0, prefix)` (the file-size-anchored translator — see Step 4's keep-mask note). For an unfiltered prefix it's a no-op.
+The export translates leaf positions to Suite2p ids with the ordered ids recorded when the linkage was computed (or reloaded). Export, the picked-cluster ROI list and the summary sheet first check that the current kept ids (`core.clustering.linkage_roi_ids`, which uses the file-size-anchored `filtered_to_suite2p_indices` — see Step 4's keep-mask note) are exactly those ids in the same order; if not, Export refuses with "Re-run clustering", the ROI list stays empty and the summary write is skipped. When Tab 3 regenerates the filtered dF/F after a promotion (`AppState.release_memmaps`), Tab 6 drops its in-memory linkage and disables Export / Recluster / Save summary until you re-run.
 
 Stale `C*_rois.npy` files are deleted before writing, so re-export with fewer clusters doesn't leave ghost files behind.
 
@@ -238,17 +247,17 @@ Buttons that *do* something but carry no tunable value:
 
 ## Advanced settings (inline knobs)
 
-Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-var on the tab itself, defined in `tabs/clustering/tab.py`. Defaults are the literal `tk.*Var(value=…)` defaults. The headless equivalents (the `params` dict consumed by `core/clustering.py:run_clustering`, [clustering.py:520](../../core/clustering.py)) are noted per row so a batch/script run reproduces the GUI.
+Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-var on the tab itself, defined in `tabs/clustering/tab.py`. Defaults are the literal `tk.*Var(value=…)` defaults. The headless equivalents (the `params` dict consumed by [`core/clustering.py`](../../core/clustering.py) `run_clustering`) are noted per row so a script run reproduces the GUI. Tab 0's batch runner sets `prefix` / `palette` / `threshold` through `ClusteringTab.apply_batch_row`: a `threshold` > 0 is an absolute Ward cut that the next Run applies in manual mode (clamped to `[0, zmax]`) and the batch export uses; `0` means auto. The batch pushes `threshold` only at the clustering stage, and an interactive Run (no batch active) discards any cut a batch left armed, so a skipped or aborted batch stage can't force its cut on your next Run.
 
 | Setting (`var`) | GUI label | Default | What it does | What it means to you |
 | --- | --- | --- | --- | --- |
-| `prefix_var` ([tab.py:424](tab.py)) | `prefix:` | `r0p7_filtered_` | Names the dF/F memmap to cluster: `<plane0>/<prefix>dff.memmap.float32`. Drives `load_filtered_dff` (loads the `(T, N_kept)` columns), `stat_for_prefix` (matching ROI stats), and `filtered_to_suite2p_indices` (export id translation). When the prefix contains `filtered`, the keep mask is resolved via `utils.resolve_filtered_mask` **anchored to the memmap file size** so leaf count, `stat`, and the export translator stay the same length. Headless: `params['prefix']`. | Leave it at `r0p7_filtered_` for the normal pipeline — that's the curated, cell-filtered, baseline-corrected dF/F. Switch to `r0p7_` (unfiltered) only to cluster *every* detected source including rejected ROIs; the export then writes filtered-list positions, not Suite2p ids, and Tab 7 alignment is your problem. A prefix with no matching memmap disables **Run analysis** (status bar says "Missing dF/F memmaps"). |
-| `manual_var` ([tab.py:405](tab.py)) | `Manual threshold` (checkbox) | `False` (auto) | Switches `_current_threshold()` between **auto** (`auto_frac × zmax`, from `auto_choose_threshold` targeting 4–5 clusters) and **manual** (the slider's absolute value). Turning it ON enables the slider and snaps it to the current auto value as a starting point; OFF disables the slider and reverts to auto. Headless: pass `threshold=None` for auto, or a float for manual. | Keep it OFF (auto) for a sane first look — auto lands ~4–5 clusters, good for ~100–500 cells. Tick it ON the moment the auto cut looks wrong (one giant blob, or shattered into 30 specks) so you can drag the slider. **Reload clusters** also forces this ON at the saved cut. |
-| `threshold_scale` ([tab.py:368](tab.py)) | `cut` (vertical slider) | range `zmax → 0`, resolution `zmax/1000` (~1000 steps) | The cut **height in absolute Ward distance** (sum-of-squares units, *not* the "1 − r" the header text implies). Feeds `fcluster(Z, t=T, criterion='distance')` on every settled drag; the dashed line on the dendrogram tracks it and the spatial map recolours. Renders are debounced (~120 ms) so a drag doesn't freeze the GUI. Only live when `manual_var` is ON. | This is your main shaping control. **Lower** the cut → finer split → **more, smaller** clusters; **raise** it → coarser → **fewer, larger** clusters. Drag until the spatial map shows ensembles that match your anatomy/physiology, then Export. The absolute scale is recording-specific (it depends on `zmax`), so a value that works on one recording won't transfer to another — re-judge by eye each time. |
-| `palette_var` ([tab.py:411](tab.py)) | `palette:` (dropdown) | `tab10` | Picks the colour scheme from `AVAILABLE_PALETTES` (categorical `tab10/tab20/Set1/Set2/Set3/Paired/Accent/Pastel1/Pastel2/Dark2`; continuous `viridis/plasma/inferno/magma/cividis/coolwarm/RdBu/RdYlBu/Spectral/turbo/rainbow/hsv`). `resolve_palette(name, n_clusters)` returns one hex per cluster, spread across the full range so C1 and Cn are maximally distinct. Picking a palette **clears** any per-cluster custom colours. Headless: `params['palette']`. | Cosmetic — it has **zero** effect on which ROIs cluster together, only on the colours in the dendrogram, spatial map, and the `cluster_color` column of the Clusters sheet. Use a **categorical** palette (`tab10`) when clusters are nominal (the default, almost always right); use a **continuous** one (`viridis`) only if you want C1→Cn to read as an ordered ramp. If you have >10 clusters with a 10-colour categorical palette, colours cycle/repeat — switch to `tab20` or a continuous map for distinct colours. |
-| `recluster_thr_var` ([tab.py:306](tab.py)) | `new threshold (1 - r):` (entry) | `""` (seeded to `manual_T / 2` after a run/reload) | The cut for the **Recluster (new window)** sub-tree. Despite the "1 − r" label it is parsed as a plain float and used as an **absolute Ward-distance** cut: the ticked branches' ROIs are sliced out, `ward_linkage` re-runs on just that subset, and the new window cuts its own dendrogram at this value. The parent clustering is untouched. | Use this to sub-divide one fat ensemble without disturbing the rest. It's pre-filled with half the main cut as a reasonable "go finer" starting point; **lower** it for a tighter split of the branch, **raise** it toward the parent cut for a coarser one. Tick at least one cluster in **Pick clusters…** first, and the selection must contain ≥2 ROIs or the recluster is refused. Sub-windows pick a *different* palette than the parent on purpose so the two don't visually collide. |
+| `prefix_var` ([tab.py:425](tab.py)) | `prefix:` | `r0p7_filtered_` | Names the dF/F memmap to cluster: `<plane0>/<prefix>dff.memmap.float32`. Drives `load_filtered_dff` (loads the `(T, N_kept)` columns), `stat_for_prefix` (matching ROI stats), and `filtered_to_suite2p_indices` (export id translation). When the prefix contains `filtered`, the keep mask is resolved via `utils.resolve_filtered_mask` **anchored to the memmap file size** so leaf count, `stat`, and the export translator stay the same length. Headless: `params['prefix']`. | Leave it at `r0p7_filtered_` for the normal pipeline — that's the curated, cell-filtered, baseline-corrected dF/F. Switch to `r0p7_` (unfiltered) only to cluster *every* detected source including rejected ROIs; the export then writes filtered-list positions, not Suite2p ids, and Tab 7 alignment is your problem. A prefix with no matching memmap disables **Run analysis** (status bar says "Missing dF/F memmaps"). |
+| `manual_var` ([tab.py:406](tab.py)) | `Manual threshold` (checkbox) | `False` (auto) | Switches `_current_threshold()` between **auto** (`auto_frac × zmax`, from `auto_choose_threshold` targeting 4–5 clusters) and **manual** (the slider's absolute value). Turning it ON enables the slider and snaps it to the current auto value as a starting point; OFF disables the slider and reverts to auto. Headless: pass `threshold=None` (or any value <= 0) for auto, or a positive float for manual. Batch: `threshold` column, `0` = auto. | Keep it OFF (auto) for a sane first look — auto lands ~4–5 clusters, good for ~100–500 cells. Tick it ON the moment the auto cut looks wrong (one giant blob, or shattered into 30 specks) so you can drag the slider. **Reload clusters** also forces this ON at the saved cut. |
+| `threshold_scale` ([tab.py:369](tab.py)) | `cut` (vertical slider) | range `zmax → 0`, resolution `zmax/1000` (~1000 steps) | The cut **height in absolute Ward distance** (sum-of-squares units, *not* a `1 − r` value). Feeds `fcluster(Z, t=T, criterion='distance')` on every settled drag; the dashed line on the dendrogram tracks it and the spatial map recolours. Renders are debounced (~120 ms) so a drag doesn't freeze the GUI. Only live when `manual_var` is ON. | This is your main shaping control. **Lower** the cut → finer split → **more, smaller** clusters; **raise** it → coarser → **fewer, larger** clusters. Drag until the spatial map shows ensembles that match your anatomy/physiology, then Export. The absolute scale is recording-specific (it depends on `zmax`), so a value that works on one recording won't transfer to another — re-judge by eye each time. |
+| `palette_var` ([tab.py:412](tab.py)) | `palette:` (dropdown) | `tab10` | Picks the colour scheme from `AVAILABLE_PALETTES` (categorical `tab10/tab20/Set1/Set2/Set3/Paired/Accent/Pastel1/Pastel2/Dark2`; continuous `viridis/plasma/inferno/magma/cividis/coolwarm/RdBu/RdYlBu/Spectral/turbo/rainbow/hsv`). `resolve_palette(name, n_clusters)` returns one hex per cluster, spread across the full range so C1 and Cn are maximally distinct. Picking a palette **clears** any per-cluster custom colours. Headless: `params['palette']`. | Cosmetic — it has **zero** effect on which ROIs cluster together, only on the colours in the dendrogram, spatial map, and the `cluster_color` column of the Clusters sheet. Use a **categorical** palette (`tab10`) when clusters are nominal (the default, almost always right); use a **continuous** one (`viridis`) only if you want C1→Cn to read as an ordered ramp. If you have >10 clusters with a 10-colour categorical palette, colours cycle/repeat — switch to `tab20` or a continuous map for distinct colours. |
+| `recluster_thr_var` ([tab.py:307](tab.py)) | `new threshold (Ward dist.):` (entry) | `""` (seeded to `manual_T / 2` after a run/reload) | The cut for the **Recluster (new window)** sub-tree. Parsed as a plain float and used as an **absolute Ward-distance** cut: the ticked branches' ROIs are sliced out, `ward_linkage` re-runs on just that subset, and the new window cuts its own dendrogram at this value. The parent clustering is untouched. | Use this to sub-divide one fat ensemble without disturbing the rest. It's pre-filled with half the main cut as a reasonable "go finer" starting point; **lower** it for a tighter split of the branch, **raise** it toward the parent cut for a coarser one. Tick at least one cluster in **Pick clusters…** first, and the selection must contain ≥2 ROIs or the recluster is refused. Sub-windows pick a *different* palette than the parent on purpose so the two don't visually collide. |
 
-> **Naming caveat.** The header label, the slider, and the recluster entry all say "correlation / 1 − r", but since the 2026-05-11 switch to Ward + Euclidean the cut is in **absolute Ward (sum-of-squares) distance**. The z-scoring makes pair *ranking* identical to `1 − r` (§2 Step 1), so the labels are not *wrong* about ordering — but the numeric value on the slider is a Ward distance, not a correlation. Calibrate by eye, not by an expected `1 − r` number.
+> **Units.** Since the 2026-05-11 switch to Ward + Euclidean the cut is in **absolute Ward (sum-of-squares) distance**, and the header, dendrogram y-axis and recluster entry now say so. The z-scoring makes pair *ranking* identical to `1 − r` (§2 Step 1), but the numeric value on the slider is a Ward distance, not a correlation. Calibrate by eye, not by an expected `1 − r` number.
 
 ---
 
@@ -258,7 +267,8 @@ Module: `tabs/clustering/cluster_popout.py`. Single-instance per plane0 — clic
 
 Stacked panels:
 1. **Heatmap** of filtered lowpass dF/F restricted to that ROI's cluster (`(n_in_cluster, T)`, per-row min-max normalised, `magma` colormap). The cluster's colour from the spatial map tints the title background so the popout reads at a glance.
-2. **Event raster** for the same rows. In the GUI this is the `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout: the live `AppState.event_results` payload published by Tab 5 does **not** carry a precomputed `'raster'` (only the headless event-detection runner emits one), so the `event_results['raster']` branch is forward-compatible scaffolding that activates only if a future payload supplies a column-matched raster (and its row-alignment to the filtered stat list is established).
+2. **Event raster** for the same rows. In the GUI this is the `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout: the live `AppState.event_results` payload published by Tab 5 does **not** carry a precomputed `'raster'` (only the headless event-detection runner emits one), so the `event_results['raster']` branch is forward-compatible scaffolding that activates only if a future payload supplies a column-matched raster (and its row-alignment to the filtered stat list is established). Whether to build a real onset raster from `event_results['onsets_by_roi']` is an open owner decision.
+3. **Status row** lists the cluster's members as *filtered-list positions* (dF/F columns), not Suite2p ids — use the tab's "ROIs in picked clusters (Suite2p ids)" box for ids.
 
 Both panels share the time axis (seconds, using the resolved frame rate — Tab 3's FPS override, else the default fallback) and draw a yellow row marker for the clicked ROI's position within the cluster. The status bar lists the cluster's filtered-position roster (capped at 30 + overflow count).
 
@@ -282,7 +292,7 @@ for f in grid[i:]:
 return start                                  # nothing hit the band → fall back to 0.90
 ```
 
-(See `core/clustering.py:217` for the exact implementation.) Defaults `target_counts=(4, 5)` aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
+(See `auto_choose_threshold` in `core/clustering.py` for the exact implementation.) Defaults `target_counts=(4, 5)` aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
 
 ---
 
@@ -299,11 +309,11 @@ return start                                  # nothing hit the band → fall ba
 6. **Recluster:** for selected branches, slice dF/F to those ROIs, re-run `ward_linkage`, open a sub-window with its own slider and palette.
 7. **Export format:**
    - One `C{i}_rois.npy` per cluster, indices = Suite2p ROI indices.
-   - `linkage.npy` (full `Z`), `threshold_used.npy` (single-element float).
+   - `linkage.npy` (full `Z`), `linkage_roi_ids.npy` (ordered Suite2p ids of the leaves), `threshold_used.npy` (single-element float).
    - Marker file `_indices_are_suite2p` to disambiguate from the legacy filtered-position layout.
 8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
-9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate filtered-list positions to Suite2p ROI ids using the keep mask if the prefix is filtered, sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
-10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
+9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate leaf positions to Suite2p ROI ids with the ids the linkage was built on (empty if the current kept ids differ), sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
+10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept` and that `linkage_roi_ids.npy` equals the current kept ids, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
 
 
 ## UI affordances

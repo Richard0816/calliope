@@ -8,7 +8,7 @@
 > falls back to compiling packages from source and fails without a C++
 > toolchain (e.g. `Could not find vswhere.exe`). The default button on
 > python.org installs the newest release — pick a **3.12.x** installer
-> explicitly, then build the venv with `py -3.12 -m venv .venv`. Check
+> explicitly, then build the venv with `py -3.12 -m venv venv`. Check
 > with `python --version`.
 
 > **Install onto a local disk, not a network/UNC drive.** Creating the
@@ -45,11 +45,17 @@ pip install -r requirements.txt           # exact tested versions (incl. PyTorch
 pip install -e . --no-deps                # CalLIOPE itself; deps already satisfied
 ```
 
-`requirements.txt` pins the CUDA 12.6 PyTorch wheel, which is
-self-contained and also runs on CPU-only machines. For a smaller
-CPU-only download, change the index URL at the top of `requirements.txt`
-to `https://download.pytorch.org/whl/cpu` and drop the `+cu126` suffix
-from the torch line before installing.
+`requirements.txt` pins the plain PyPI `torch` wheel, which is the CPU
+build on Windows and macOS (it runs on any machine). For NVIDIA GPU
+acceleration, reinstall the CUDA build afterwards:
+
+```bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+> **venv folder name.** The pip path above (and the README) uses `venv`;
+> `uv sync` creates `.venv`. Either works. Just use the same name when
+> activating, deleting or rebuilding it.
 
 ## Latest-compatible install (development)
 
@@ -63,24 +69,27 @@ pip install -e ".[dev]"     # + pytest, then: pytest tests/
 
 ## conda / mamba
 
-Suite2p, cellpose, and PyTorch have well-tested conda-forge builds, so
-pulling them through conda first avoids the heaviest source builds:
+conda supplies the compiled scientific stack and PyTorch from
+conda-forge, which avoids the heaviest source builds. `pip install -e .`
+then adds the rest from PyPI: Suite2p (pinned exactly to `1.0.0.1`),
+cellpose and customtkinter.
 
 ```bash
 conda create -n calliope python=3.11        # 3.11 or 3.12
 conda activate calliope
-conda install -c conda-forge numpy pandas scipy matplotlib seaborn \
-    scikit-image openpyxl pillow psutil tifffile pytorch
-pip install -e .                            # CalLIOPE on top of the conda stack
+conda install -c conda-forge numpy pandas scipy matplotlib openpyxl \
+    pillow psutil tifffile imagecodecs numba pytorch
+pip install -e .                            # Suite2p, cellpose, customtkinter + CalLIOPE
 ```
 
 `mamba` is a faster drop-in for `conda`.
 
 ## GPU acceleration (optional)
 
-The GPU cross-correlation path needs a CuPy wheel matching your CUDA
+The GPU paths — Tab 3's GPU dF/F (`use_gpu_dff`, first-N baseline mode)
+and Tab 7's GPU cross-correlation — need a CuPy wheel matching your CUDA
 toolkit (`nvcc --version` / `CUDA_PATH`); without it CalLIOPE falls back
-to NumPy automatically.
+to the CPU / NumPy path automatically.
 
 ```bash
 pip install -e ".[gpu-cuda11]"   # CUDA 11.2 – 11.8
@@ -90,6 +99,17 @@ pip install -e ".[gpu-cuda12]"   # CUDA 12.x
 > **CUDA 13.** CuPy ships wheels only for CUDA 11 / 12. The rest of the
 > pipeline (PyTorch, Suite2p) is fine on CUDA 13; for the GPU extra,
 > install the CUDA 12 toolkit alongside and use `".[gpu-cuda12]"`.
+
+## NWB export (optional)
+
+Writing NWB files for DANDI (Tab 3's *Export NWB* button, or the batch
+`export_nwb` option) needs the `nwb` extra (`pynwb` + `nwbinspector`).
+The base pipeline never imports them; without them the export reports
+that pynwb is missing and everything else runs normally.
+
+```bash
+pip install -e ".[nwb]"
+```
 
 ## First-run note
 

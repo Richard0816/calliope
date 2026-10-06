@@ -14,7 +14,6 @@ All exercised against lightweight stubs / temp dirs -- no Tk, no suite2p.
 
 from __future__ import annotations
 
-import types
 
 import numpy as np
 import pytest
@@ -112,12 +111,12 @@ def test_arm_completion_ignores_error_for_other_stage():
 def test_ward_linkage_rejects_single_roi():
     dff = np.random.RandomState(0).rand(100, 1).astype(np.float32)  # (T, 1)
     with pytest.raises(ValueError, match="at least 2 ROIs"):
-        core_clustering._ward_linkage(dff)
+        core_clustering.ward_linkage(dff)
 
 
 def test_ward_linkage_works_with_two_rois():
     dff = np.random.RandomState(1).rand(100, 2).astype(np.float32)
-    Z = core_clustering._ward_linkage(dff)
+    Z = core_clustering.ward_linkage(dff)
     assert Z.shape == (1, 4)  # one merge for two leaves
 
 

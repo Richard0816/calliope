@@ -151,7 +151,10 @@ class ProcessJob:
     tagged messages land on ``out_queue`` (the tab's existing
     ``queue.Queue``) where ``drain_queue`` dispatches them on the main
     thread. ``running()`` replaces ``thread.is_alive()`` busy-guards;
-    ``cancel()`` terminates the child (used by tabs with an Abort button).
+    ``cancel()`` hard-terminates the child (reported as ``aborted_kind``
+    when that is set). No tab uses it today: Tab 7's Abort is
+    cooperative (``make_abort_event`` + an ``aborted`` flag in the done
+    payload). Kept as available hard-termination support.
     """
 
     def __init__(self, widget, out_queue, fn: Callable, args: Sequence = (),

@@ -3,19 +3,18 @@
 Why this module exists
 ----------------------
 Several tabs and post-processing helpers need to render ROI / spatial
-plots on physical (µm) axes instead of raw pixels. The conversion
-factor used to be inlined in two places:
+plots on physical (µm) axes instead of raw pixels. This module is the
+single place the conversion maths lives, and it accepts either the
+scope's zoom factor or a *direct* µm-per-pixel calibration straight
+from the microscope.
 
-* ``clustering_cmap._resolve_pix_to_um`` -- read ``ops['pix_to_um']``,
-  fall back to a notes-CSV zoom lookup that was actually broken
-  (called ``utils.get_zoom_from_notes`` which doesn't exist; the
-  fallback was silently dead).
-* ``spatial_propagation/tab.py`` -- read ``ops['pix_to_um']`` directly.
-
-This module centralises the maths so callers only have one entry
-point and adds a *direct* µm-per-pixel override (in addition to the
-zoom-based formula) so users with a calibration straight from their
-microscope can plug it in without computing zoom.
+Where the calibration is stored
+-------------------------------
+Tab 3 stamps the resolved value into ``<plane0>/calliope_calibration.npy``
+(``utils.save_pix_to_um``). Readers normally pass
+``utils.load_plane_view(plane0)`` as ``ops``: that view layers the
+calibration file in as ``view['pix_to_um']`` (legacy plane folders
+without the file fall back to an ``ops.npy['pix_to_um']`` key).
 
 Conversion formula
 ------------------
@@ -35,10 +34,11 @@ Public API
     Compute µm-per-pixel from the scope's zoom factor + image width.
 ``pix_to_um_direct(um_per_pixel)``
     Validation passthrough for an explicit calibration.
-``resolve_pix_to_um(ops, *, zoom=None, um_per_pixel=None)``
+``resolve_pix_to_um(ops, *, zoom=None, um_per_pixel=None, fov_um=FOV_UM_REFERENCE)``
     Single resolver used by callers. Priority order:
     explicit ``um_per_pixel`` -> explicit ``zoom`` -> ``ops['pix_to_um']``
-    -> ``None``. ``zoom`` requires ``ops['Lx']`` to be available.
+    (the calibration layered in by ``load_plane_view``) -> ``None``.
+    ``zoom`` requires ``ops['Lx']`` to be available.
 """
 
 from __future__ import annotations
@@ -46,9 +46,8 @@ from __future__ import annotations
 from typing import Optional
 
 
-# Reference FOV width at 1x scope zoom for the lab's two-photon rig.
-# Sourced from the manufacturer calibration that was hard-coded in
-# the legacy ``clustering_cmap`` resolver. Override at the call site
+# Reference FOV width at 1x scope zoom for the lab's two-photon rig
+# (manufacturer calibration). Override at the call site via ``fov_um``
 # if a recording was made on a different rig.
 FOV_UM_REFERENCE = 3080.90169
 
@@ -88,7 +87,9 @@ def resolve_pix_to_um(ops: Optional[dict] = None, *,
     Priority order (first match wins):
       1. ``um_per_pixel`` explicit kwarg (direct calibration).
       2. ``zoom`` explicit kwarg + ``ops['Lx']``.
-      3. ``ops['pix_to_um']`` previously stored on the ops dict.
+      3. ``ops['pix_to_um']`` -- pass ``utils.load_plane_view(plane0)``
+         as ``ops`` so this is the value from
+         ``calliope_calibration.npy`` (or a legacy ``ops.npy`` key).
       4. ``None`` (caller should treat axes as raw pixels).
 
     Returns ``None`` if no source resolved to a usable positive value.

@@ -13,17 +13,22 @@ the model's p(cell) when available. A **Cell** / **Not cell** flip
 pair persists the curator's verdict, and a **Retrain cell filter**
 button (disabled until the user has flipped at least one
 classification this session) re-trains the model on the updated
-labels CSV.
+labels CSV in a worker thread, warm-starting from Tab 3's selected
+checkpoint when the parent supplies one.
 
 Side effects of a flip
 ----------------------
 1. Mutates ``<plane0>/iscell.npy[roi, 0]`` to the new value.
-2. Appends a row to the curation CSV
+2. Upserts one row in the curation CSV
    (``cellfilter.config.LABELS_CSV``, by default the in-project
-   ``calliope/data/cellfilter_labels.csv``) with columns
-   ``recording_ID, ROI_number, user_defined_cell``. This is the same
-   CSV ``cellfilter.train.main()`` reads, so retraining picks up the
-   new labels immediately.
+   ``calliope/data/cellfilter_labels.csv``, created lazily) keyed on
+   ``(plane0_path, ROI_number)``. Columns follow
+   ``cellfilter.config.LABELS_CSV_COLUMNS``: ``plane0_path,
+   recording_ID, ROI_number, user_defined_cell, timestamp_iso``;
+   ``plane0_path`` is what the trainer resolves, ``recording_ID`` is
+   for human auditing only. This is the same CSV
+   ``cellfilter.train.main()`` reads, so retraining picks up the new
+   labels immediately.
 3. Tracks the flip in ``self._flipped`` so the parent Tab 3 can
    refresh its overlay panels when the popout closes (or when the
    user moves to another ROI).
@@ -42,7 +47,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
-from typing import Optional
+from typing import Callable, Optional
 
 import customtkinter as ctk
 
@@ -53,63 +58,33 @@ from matplotlib.backends.backend_tkagg import (
 )
 from matplotlib.patches import Rectangle
 
-from ...core.utils import lowpass_zero_phase_1d
+from ...core.utils import (DISPLAY_CLIP_HIGH_PCT, DISPLAY_CLIP_LOW_PCT,
+                           lowpass_zero_phase_1d)
 from ...gui_common import install_scroll_router
-
-
-def _padded_max_image(ops: dict, mean_img: np.ndarray) -> np.ndarray:
-    """Return ops['max_proj'] padded back into a full-frame image.
-
-    Suite2p's ``ops['max_proj']`` is cropped to ``ops['yrange']`` x
-    ``ops['xrange']``; pad it back so ROI coords (full-frame) align.
-    Falls back to mean image when neither max_proj nor maxImg is set.
-    """
-    max_img = ops.get("max_proj", None)
-    if max_img is None:
-        max_img = ops.get("maxImg", None)
-    if max_img is None:
-        return mean_img
-    max_img = np.asarray(max_img)
-    if max_img.shape == mean_img.shape:
-        return max_img
-    full = np.zeros_like(mean_img, dtype=max_img.dtype)
-    yr = ops.get("yrange", (0, max_img.shape[0]))
-    xr = ops.get("xrange", (0, max_img.shape[1]))
-    y0, y1 = int(yr[0]), int(yr[1])
-    x0, x1 = int(xr[0]), int(xr[1])
-    h = min(y1 - y0, max_img.shape[0])
-    w = min(x1 - x0, max_img.shape[1])
-    full[y0:y0 + h, x0:x0 + w] = max_img[:h, :w]
-    return full
 
 
 def _open_dff(plane0: Path, n_total: int) -> tuple[Optional[np.memmap], int]:
     """Open the unfiltered all-ROI dF/F memmap for trace display.
 
-    Returns ``(dff, T)`` or ``(None, 0)`` when no compatible memmap
-    is on disk. We try the standard ``r0p7_dff.memmap.float32`` first
-    (one column per Suite2p ROI), then fall back to the F.npy-derived
-    trace if that's all we have.
+    Returns ``(dff, T)`` or ``(None, 0)`` when
+    ``r0p7_dff.memmap.float32`` (one column per Suite2p ROI, the only
+    prefix any writer uses) is missing or its size is not a whole
+    number of ``n_total``-ROI frames. The trace panel then shows a
+    "no dF/F" placeholder; there is no F.npy fallback.
     """
-    candidates = [
-        plane0 / "r0p7_dff.memmap.float32",
-        plane0 / "dff.memmap.float32",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        n_bytes = path.stat().st_size
-        floats = n_bytes // 4
-        if floats % n_total != 0:
-            continue
-        T = floats // n_total
-        try:
-            return (np.memmap(path, dtype="float32", mode="r",
-                              shape=(T, n_total)),
-                    T)
-        except OSError:
-            continue
-    return None, 0
+    path = plane0 / "r0p7_dff.memmap.float32"
+    if not path.exists() or n_total <= 0:
+        return None, 0
+    floats = path.stat().st_size // 4
+    if floats % n_total != 0:
+        return None, 0
+    T = floats // n_total
+    try:
+        return (np.memmap(path, dtype="float32", mode="r",
+                          shape=(T, n_total)),
+                T)
+    except OSError:
+        return None, 0
 
 
 def _fps_for(plane0: Path, fallback: Optional[float] = None) -> float:
@@ -243,7 +218,30 @@ class CurationPopout(ctk.CTkToplevel):
     )
 
     def __init__(self, master, plane0: Path, stat, ops: dict,
-                 *, on_iscell_changed=None) -> None:
+                 *, on_iscell_changed=None,
+                 get_size_outlier_z: Optional[Callable[[], float]] = None,
+                 get_ckpt_path: Optional[Callable[[], str]] = None,
+                 on_checkpoint_trained: Optional[
+                     Callable[[Path], None]] = None) -> None:
+        """Build the popout.
+
+        Optional parent hooks (all called on the Tk main thread):
+
+        ``get_size_outlier_z``
+            Returns the parent's active ``size_outlier_z`` so the
+            post-Retrain re-predict applies the same size gate as the
+            parent's detection run (``0`` = off). ``None`` -> the
+            ``cellfilter.config.SIZE_OUTLIER_Z`` default.
+        ``get_ckpt_path``
+            Returns the parent's selected cell-filter checkpoint.
+            Retrain warm-starts from it (``config.WARM_START_LR``)
+            when it exists; ``None`` / missing file -> train from
+            random init with ``config.LR``.
+        ``on_checkpoint_trained``
+            Called with the new ``CHECKPOINT_DIR/best.pt`` after a
+            Retrain that wrote one, so the parent can select it for
+            later detection runs.
+        """
         super().__init__(master)
         self.title("ROI curation")
         self.geometry("1500x720")
@@ -262,14 +260,13 @@ class CurationPopout(ctk.CTkToplevel):
         # single popout instance.
         self._backgrounds: list[tuple[str, str, np.ndarray]] = (
             self._collect_backgrounds(ops, self._mean_img))
-        # Keep ``_max_img`` as the legacy fall-back for the
-        # ROI-overlay panel; it's the recording's max projection
-        # padded to full FOV (or the mean if max isn't on disk).
-        self._max_img = _padded_max_image(ops, self._mean_img)
         self._n_total = len(stat)
         self._dff, self._T = _open_dff(self._plane0, self._n_total)
         self._fps = _fps_for(self._plane0)
         self._rec_id = self._derive_recording_id(self._plane0)
+        self._get_size_outlier_z = get_size_outlier_z
+        self._get_ckpt_path = get_ckpt_path
+        self._on_checkpoint_trained = on_checkpoint_trained
         self._csv_path = _curation_csv_path()
         # Listener fired after every successful flip so the parent
         # tab can repaint its overlays without us reaching back.
@@ -492,7 +489,8 @@ class CurationPopout(ctk.CTkToplevel):
         # curating without checking the parent tab's header.
         for ax, (_key, label, img) in zip(self._img_axes,
                                           self._backgrounds):
-            vmin, vmax = np.percentile(img, [1, 99])
+            vmin, vmax = np.percentile(
+                img, [DISPLAY_CLIP_LOW_PCT, DISPLAY_CLIP_HIGH_PCT])
             ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
             ax.scatter(xpix, ypix, s=1.4, c="red", alpha=0.55,
                        edgecolors="none")
@@ -742,75 +740,149 @@ class CurationPopout(ctk.CTkToplevel):
         """
         return bool(self._flipped)
 
+    def _size_outlier_z(self) -> float:
+        """Active size gate for the post-Retrain re-predict."""
+        from ...core.cellfilter import config as _cfg
+        if self._get_size_outlier_z is not None:
+            try:
+                return float(self._get_size_outlier_z())
+            except Exception as e:
+                print(f"[curation] could not read Tab 3's size_outlier_z "
+                      f"({e}); using the default {_cfg.SIZE_OUTLIER_Z:g}.")
+        return float(_cfg.SIZE_OUTLIER_Z)
+
+    def _warm_start_ckpt(self) -> Optional[Path]:
+        """Parent-selected checkpoint to warm-start Retrain from, or
+        ``None`` (train from random init) when the parent gives none
+        or the file is missing."""
+        if self._get_ckpt_path is None:
+            return None
+        try:
+            raw = str(self._get_ckpt_path() or "").strip()
+        except Exception:
+            return None
+        if not raw:
+            return None
+        path = Path(raw)
+        return path if path.is_file() else None
+
     def _on_retrain(self) -> None:
         if self._train_thread is not None and self._train_thread.is_alive():
             return
+        from ...core.cellfilter import config as _cfg
+        # Snapshot Tk-side state on the main thread; the worker must
+        # not touch Tk variables.
+        warm_start = self._warm_start_ckpt()
+        size_z = self._size_outlier_z()
+        if warm_start is not None:
+            init_line = (f"Fine-tunes the selected checkpoint\n"
+                         f"{warm_start}\n(lr {_cfg.WARM_START_LR:g}).")
+        else:
+            init_line = (f"Trains from random init (lr {_cfg.LR:g}); no "
+                         f"selected checkpoint to warm-start from.")
+        # Tab 3 (the only parent that supplies the checkpoint hook)
+        # also rewrites the filtered dF/F memmap on the (-1, -1)
+        # sentinel and selects the new best.pt.
+        parent_line = (
+            " Tab 3 then rewrites the filtered dF/F memmap to the new "
+            "cell set and selects the new best.pt as its checkpoint."
+            if self._on_checkpoint_trained is not None else "")
         if not messagebox.askyesno(
                 "Retrain cell filter",
-                f"Run cellfilter.train.main() now?\n\n"
-                f"This reads {self._csv_path}\n"
-                f"and writes new checkpoints to "
-                f"cellfilter.config.CHECKPOINT_DIR.\n\n"
-                f"Training is synchronous and may take a while; the "
-                f"GUI stays responsive but the popout will block "
-                f"further flips until training finishes."):
+                f"Retrain the cell filter now?\n\n"
+                f"Reads {self._csv_path}\n"
+                f"and writes best.pt / last.pt to\n"
+                f"{_cfg.CHECKPOINT_DIR}.\n{init_line}\n\n"
+                f"Training runs in the background and may take a while. "
+                f"Flip buttons stay enabled, but the trainer reads the "
+                f"labels CSV when it starts, so flips made during "
+                f"training go into the next round.\n\n"
+                f"When it finishes, this recording is re-predicted "
+                f"(size_outlier_z={size_z:g}) and "
+                f"{_cfg.PREDICTED_MASK_NAME} is overwritten."
+                f"{parent_line}"):
             return
         self._retrain_btn.configure(state="disabled")
         self._train_status_var.set("Training... see console for epoch log")
         self._train_thread = threading.Thread(
-            target=self._train_worker, daemon=True)
+            target=self._train_worker, args=(warm_start, size_z),
+            daemon=True)
         self._train_thread.start()
         # Poll the worker so the status label flips back when done.
         self._poll_train_state()
 
-    def _train_worker(self) -> None:
+    def _train_worker(self, warm_start: Optional[Path] = None,
+                      size_outlier_z: Optional[float] = None) -> None:
         """Run training, then immediately re-score the current
         recording's ROIs with the fresh checkpoint so Tab 3's panels
         + the popout's status bar reflect the new predictions
         without a manual re-detect.
 
         Sequence (all in this worker thread; main thread only
-        consumes ``self._train_result``):
+        consumes ``self._train_result`` / ``self._trained_ckpt``):
           1. ``cellfilter.train.main()`` -- reads the curation CSV,
-             writes new ``best.pt`` + ``last.pt``.
+             writes new ``best.pt`` + ``last.pt``. Warm-starts from
+             ``warm_start`` at ``config.WARM_START_LR`` when given,
+             else random init at ``config.LR``.
           2. Load the fresh ``best.pt`` and run
-             ``predict_recording`` against ``self._plane0`` so
+             ``predict_recording`` against ``self._plane0`` with
+             ``size_outlier_z`` (the parent's live setting, snapshot
+             when Retrain was clicked) so
              ``predicted_cell_prob.npy`` / ``predicted_cell_mask.npy``
              reflect the new model.
           3. Stash ``("ok", ...)`` for the poller. The poller flips
              the status label, reloads ``self._probs``, and fires
-             ``on_iscell_changed`` so the parent Tab 3 repaints
-             panels 2 + 3 against the new mask.
+             ``on_iscell_changed(-1, -1)``.
 
         Errors in step 1 surface as ``("err", msg)``; errors in step
         2 surface as ``("warn", msg)`` -- the new checkpoint is
-        still on disk and usable, we just couldn't auto-refresh.
+        still on disk and usable, we just couldn't auto-refresh. A
+        run whose validation AUROC was never defined writes no
+        ``best.pt``; that is a ``("warn", msg)`` with no re-predict.
         """
+        from ...core.cellfilter import config as _cfg
+        self._trained_ckpt = None
+        if size_outlier_z is None:
+            size_outlier_z = float(_cfg.SIZE_OUTLIER_Z)
         try:
             from ...core.cellfilter import train as _train
-            _train.main()
+            if warm_start is not None:
+                best_auc = _train.main(warm_start=warm_start,
+                                       lr=_cfg.WARM_START_LR)
+            else:
+                best_auc = _train.main()
         except Exception as e:
             self._train_result = ("err", f"Training failed: {e}")
             return
 
+        ckpt_path = _cfg.CHECKPOINT_DIR / "best.pt"
+        # ``train.main`` returns -1.0 when no epoch had a defined
+        # validation AUROC, i.e. it never wrote best.pt this run. Any
+        # best.pt on disk is then from an earlier run -- don't
+        # re-predict with it or hand it to the parent as "new".
+        if best_auc is None or not (best_auc >= 0):
+            self._train_result = (
+                "warn",
+                "Training finished but validation AUROC was never "
+                "defined (the validation split lacks one class), so no "
+                "new best.pt was written. Label more ROIs of both "
+                "classes and retrain.")
+            return
+        self._trained_ckpt = ckpt_path
+
         # Step 2: auto re-predict against this plane0.
         try:
-            from ...core.cellfilter import config as _cfg
             from ...core.cellfilter.predict import (
                 load_model_from_checkpoint,
                 predict_recording,
             )
-            from ...core import utils as _u
             import torch
-            ckpt_path = _cfg.CHECKPOINT_DIR / "best.pt"
             device = torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu")
             model = load_model_from_checkpoint(ckpt_path, device)
-            try:
-                rec_id = _u.infer_recording_id(self._plane0)
-            except Exception:
-                rec_id = self._rec_id
-            predict_recording(rec_id, model, device, plane0=self._plane0)
+            predict_recording(self._rec_id, model, device,
+                              plane0=self._plane0,
+                              size_outlier_z=size_outlier_z)
             self._train_result = (
                 "ok",
                 "Training complete. predicted_cell_mask.npy refreshed.")
@@ -828,6 +900,17 @@ class CurationPopout(ctk.CTkToplevel):
             return
         result = getattr(self, "_train_result", ("err", "no result"))
         kind, msg = result
+        # A new best.pt was written (even if the re-predict then
+        # failed): let the parent select it so later detection runs
+        # use the retrained model instead of the bundled one.
+        trained = getattr(self, "_trained_ckpt", None)
+        if trained is not None and self._on_checkpoint_trained is not None:
+            try:
+                self._on_checkpoint_trained(Path(trained))
+                msg = f"{msg} Selected checkpoint: {trained}"
+            except Exception as e:
+                msg = (f"{msg} Could not select the new checkpoint in "
+                       f"Tab 3 ({e}); pick {trained} there by hand.")
         self._train_status_var.set(msg)
         # Leave the button enabled so the user can iterate (more flips
         # -> more training rounds).
@@ -840,12 +923,13 @@ class CurationPopout(ctk.CTkToplevel):
             # ``ok``: the re-predict pass also succeeded, so the new
             # ``predicted_cell_prob.npy`` / ``predicted_cell_mask.npy``
             # are on disk. Reload the popout's own probability cache
-            # so the status bar shows fresh p(cell) values, then ping
-            # the parent Tab 3 so it reloads the keep mask and
-            # repaints panels 2 + 3. Using the existing
-            # ``on_iscell_changed`` channel with a sentinel ROI index
-            # of -1 keeps the parent-side handler trivial: it already
-            # ignores the index and just reloads the keep mask.
+            # so the status bar shows fresh p(cell) values, then fire
+            # the same ``(-1, -1)`` sentinel Promote uses. Tab 3
+            # treats it as "predicted_cell_mask.npy changed": it
+            # reloads the keep mask, repaints, AND rewrites the
+            # filtered dF/F memmap (releasing downstream handles
+            # first) via ``_regenerate_after_promote``. The Retrain
+            # confirmation dialog says so up front.
             self._probs = self._load_probs()
             self._refresh_status()
             if self._on_iscell_changed is not None:
@@ -883,21 +967,19 @@ class CurationPopout(ctk.CTkToplevel):
 
     @staticmethod
     def _derive_recording_id(plane0: Path) -> str:
-        """Return the recording id matching ``cellfilter`` conventions.
+        """Human-readable recording id for the labels CSV's
+        ``recording_ID`` column and the re-predict log line.
 
-        ``cellfilter.config`` resolves a recording by name relative
-        to ``DATA_ROOT`` / ``EXTRA_DATA_ROOTS``. The name is the
-        directory two levels above plane0
-        (``<recording>/suite2p/plane0`` for the standalone runs, or
-        ``<recording>/detection/final/suite2p/plane0`` for the
-        calliope pipeline). We pick the deepest non-suite2p ancestor
-        as the recording id so the CSV row matches the trainer's
-        lookup.
+        Audit-only: the trainer keys rows on ``plane0_path``, so this
+        value never affects which recording a label resolves to. Uses
+        the same ``utils.infer_recording_id`` as every other tab;
+        falls back to the plane0's parent folder name if that raises.
         """
-        ancestors = [a for a in plane0.parents
-                     if a.name not in ("plane0", "suite2p", "final",
-                                       "detection")]
-        return ancestors[0].name if ancestors else plane0.parent.name
+        from ...core import utils as _u
+        try:
+            return str(_u.infer_recording_id(plane0))
+        except Exception:
+            return Path(plane0).parent.name
 
     def _load_iscell(self) -> Optional[np.ndarray]:
         path = self._plane0 / "iscell.npy"

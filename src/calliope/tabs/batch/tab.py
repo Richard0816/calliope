@@ -36,7 +36,7 @@ The list of rows + per-row params is serialised to
 re-opening the GUI restores the queue.
 
 After every Run All, ``<output>/batch_report.csv`` is written with
-``recording_id, status, plane0, total_s, <stage>_status,
+``recording_id, status, plane0, total_s, error, <stage>_status,
 <stage>_duration_s`` columns for downstream analysis.
 """
 
@@ -64,14 +64,22 @@ from ...gui_common import (
 )
 from ...core.detection_run import archive_recording_post_detection
 from .logic import (
-    BATCH_JSON_NAME, BATCH_REPORT_NAME, SCRATCH_DETECTION_KEEP_DIRS,
-    SCRATCH_PRUNE_FILE_PATTERNS, SCRATCH_RECORDING_INTERMEDIATE_DIRS,
+    BATCH_JSON_NAME, BATCH_REPORT_NAME,
     SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC, TIFF_GLOBS,
-    build_batch_param_spec, copy_one_dedup, is_scratch_mirror_skippable,
-    is_scratch_owned, mark_scratch_owned, measure_tree, mirror_sync_pass,
-    prune_scratch_tree, scratch_root_problem, synchronous_final_sweep,
-    throttled_copy2,
+    build_batch_param_spec, is_scratch_owned, mark_scratch_owned,
+    measure_tree, mirror_sync_pass, prune_scratch_tree,
+    scratch_root_problem, synchronous_final_sweep,
 )
+
+# Tab 5 knobs that live in Tk vars, not in any PARAM_SPEC, so they are
+# not in the union spec's defaults. Pinned to Tab 5's own widget defaults
+# so a row that doesn't set them gets these instead of whatever the
+# previous row (or the user) left in Tab 5.
+ROW_FIXED_DEFAULTS = {
+    "manual_subset_enabled": False,
+    "manual_roi_spec": "",
+    "onset_source": "derivative",
+}
 
 
 class BatchRow:
@@ -187,7 +195,6 @@ class BatchTab(ctk.CTkFrame):
         self.default_params: dict = spec_defaults(self.PARAM_SPEC)
 
         self._log_queue: queue.Queue = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
         self._abort_flag = threading.Event()
 
         # Deferred-cleanup janitor: a long-lived daemon thread that
@@ -225,9 +232,7 @@ class BatchTab(ctk.CTkFrame):
 
         self._build_ui()
         drain_queue(self, self._log_queue,
-                    {"log": self._on_log_payload,
-                     "status": self._on_status_payload,
-                     "done": self._on_batch_done},
+                    {"log": self._on_log_payload},
                     poll_ms=self.POLL_MS)
 
     # ---- Scratch capacity pre-flight ----------------------------------
@@ -588,8 +593,11 @@ class BatchTab(ctk.CTkFrame):
         # externally. Defaults preserve today's behavior exactly:
         # registration + shifted TIFF kept, raw compression off. The
         # preset bulk-sets the three checkboxes; users can still tweak
-        # each one afterward. Read at finalize (see _finalize_recording_row
-        # / _start_continuous_mirror), never persisted -- matches
+        # each one afterward. Read by the continuous mirror
+        # (_start_mirror_for_row), the row-end finalize
+        # (_finalize_via_mirror_async / its _finalize_worker) and the
+        # Tab 3 save-policy push (_apply_save_policy_to_detection_tab);
+        # never persisted -- matches
         # save_figures_var, which is also session-only.
         self.keep_registration_var = tk.BooleanVar(value=True)
         self.keep_shifted_var = tk.BooleanVar(value=True)
@@ -1309,6 +1317,7 @@ class BatchTab(ctk.CTkFrame):
         already-in-progress guard and all tabs would keep suppressing their
         error dialogs until the app restarts."""
         self._batch_active = False
+        self._run_default_params = None
         try:
             self.state.batch_active = False
         except Exception:
@@ -1390,9 +1399,11 @@ class BatchTab(ctk.CTkFrame):
         # previous queue (potentially mis-tuned for a different
         # cohort's frame sizes).
         from ...core import utils as _core_utils
-        _core_utils.reset_adaptive_sizer()
-        _core_utils.get_adaptive_sizer().conservative_scale = 1.0
+        _core_utils.reset_adaptive_sizer()  # also resets conservative_scale
         self._batch_queue = list(self._rows)
+        # Freeze the batch defaults for this run (see _effective_row_params).
+        from copy import deepcopy as _dc
+        self._run_default_params = _dc(self.default_params or {})
         # RAM-OOM retry state. Snapshot the user's baseline resource knobs
         # so conservative retries can restore them exactly (these tab
         # fields are shared across rows). ``use_gpu_dff`` is a PARAM_SPEC
@@ -1429,11 +1440,13 @@ class BatchTab(ctk.CTkFrame):
         # report are guaranteed to exist on disk.
         self._batch_finalize_threads: list[threading.Thread] = []
         self._finalize_waiting = False
-        # Continuous-mirror state when scratch is on a different
-        # physical drive from the output folder: one daemon thread
+        # Continuous-mirror state whenever scratch routing is on
+        # (single- and two-drive layouts alike): one daemon thread
         # per row that polls scratch and copies new files to HDD
         # while the pipeline is still computing. See
-        # ``_start_mirror_for_row`` / ``_drain_mirror_for_row``.
+        # ``_start_mirror_for_row`` (start) and
+        # ``_finalize_via_mirror_async`` / ``_retry_row_conservative``
+        # (stop + drain).
         self._mirror_workers: dict[str, dict] = {}
         # True iff scratch and output are on different physical
         # drives -- only set when scratch routing is enabled.
@@ -1743,9 +1756,33 @@ class BatchTab(ctk.CTkFrame):
 
         self._begin_stage("preprocess")
 
-    def _apply_row_params_to_tabs(self, row: "BatchRow") -> None:
-        """Push ``row.params`` into each pipeline tab BEFORE its run
-        method fires.
+    def _effective_row_params(self, row: "BatchRow") -> dict:
+        """Full param dict for ``row``: union-spec defaults, overlaid by
+        ``default_params``, overlaid by the row's own ``params``.
+
+        Rows added in the GUI already carry a full copy of
+        ``default_params``, but rows loaded from a CSV / JSON may carry
+        only some keys (or none). Filling the gaps here means a blank
+        key means "batch default" rather than "whatever the previous
+        row left in the tab". ``ROW_FIXED_DEFAULTS`` adds the Tab 5
+        manual-subset / onset-source keys that no PARAM_SPEC carries.
+        During a run the ``default_params`` snapshot taken at Run All
+        (``_run_default_params``) is used.
+        """
+        merged = spec_defaults(self.PARAM_SPEC)
+        merged.update(ROW_FIXED_DEFAULTS)
+        # While a batch runs, use the defaults frozen at Run All so every
+        # stage of every row sees the same batch defaults.
+        frozen = getattr(self, "_run_default_params", None)
+        merged.update((frozen if frozen is not None
+                       else self.default_params) or {})
+        merged.update(getattr(row, "params", None) or {})
+        return merged
+
+    def _apply_row_params_to_tabs(self, row: "BatchRow",
+                                  stage: Optional[str] = None) -> None:
+        """Push the row's effective params into each pipeline tab BEFORE
+        its run method fires.
 
         The orchestrator drives each tab via its native ``_on_run`` /
         ``_on_compute`` / ``_on_render`` / ``_start_run``, every one of
@@ -1756,15 +1793,19 @@ class BatchTab(ctk.CTkFrame):
 
         Each tab owns a public ``apply_batch_row(params, log=...)`` that
         consumes only the keys it cares about (PARAM_SPEC fields and/or its
-        own Tk vars) and ignores the rest; keys the row didn't override
-        leave that tab's state untouched. The batch runner no longer
+        own Tk vars) and ignores the rest. Every row pushes the full
+        effective dict (see ``_effective_row_params``), so no key can
+        carry over from the previous row. The batch runner no longer
         reaches into any tab's private attributes / Tk vars -- so a rename
         inside a tab is a normal (loud) error there, not a silent no-op
         here.
+
+        Exception: Tab 6's ``threshold`` arms a one-shot cut that the
+        next clustering Run consumes, so it is pushed only when ``stage``
+        is ``"clustering"`` (or ``None``, i.e. not stage-driven). Pushing
+        it at the xcorr stage re-armed a cut clustering had already used.
         """
-        p = row.params or {}
-        if not p:
-            return
+        p = self._effective_row_params(row)
         app = self._app
         # Order is cosmetic (tabs are independent); kept pipeline-order for
         # readability. ``log`` carries tab-side notices (e.g. Tab 3's GCaMP
@@ -1773,15 +1814,19 @@ class BatchTab(ctk.CTkFrame):
                      "event_tab", "clustering_tab", "xcorr_tab"):
             tab = getattr(app, attr, None)
             if tab is not None and hasattr(tab, "apply_batch_row"):
-                tab.apply_batch_row(p, log=self._append_log)
+                tp = p
+                if (attr == "clustering_tab" and stage is not None
+                        and stage != "clustering"):
+                    tp = {k: v for k, v in p.items() if k != "threshold"}
+                tab.apply_batch_row(tp, log=self._append_log)
 
     def _apply_save_policy_to_detection_tab(self) -> None:
         """Translate the "What to save" toggles into Tab 3's
         post-detection archive params.
 
-        Separate from ``_apply_row_params_to_tabs`` because that method
-        early-returns when a row has no per-row overrides, whereas the
-        save policy must apply to EVERY batch run. Tab 3's
+        Separate from ``_apply_row_params_to_tabs`` because the save
+        policy comes from the Tab 0 "What to save" toggles, not from row
+        params, and must apply to EVERY batch run. Tab 3's
         ``_archive_recording`` runs at the tail of detection in both
         scratch and non-scratch mode, defaulting to compress + delete
         shifted + delete data.bin. Left untouched it would (a) ignore
@@ -1830,7 +1875,7 @@ class BatchTab(ctk.CTkFrame):
         # (cheap dict / Tk var writes); re-applied on every transition
         # to defend against intermediate mutations.
         try:
-            self._apply_row_params_to_tabs(self._current_row)
+            self._apply_row_params_to_tabs(self._current_row, stage)
         except Exception as e:
             ident = (self._current_row.identifier
                      if getattr(self, "_current_row", None) is not None
@@ -1839,8 +1884,8 @@ class BatchTab(ctk.CTkFrame):
                 f"[{ident}] WARN: failed to apply per-row params: {e}")
 
         # "What to save" archive policy -- applies to every run, not just
-        # rows with per-row overrides, so it lives outside
-        # _apply_row_params_to_tabs (which early-returns on empty params).
+        # rows with per-row overrides; it is driven by the Tab 0 toggles,
+        # not row params, so it lives outside _apply_row_params_to_tabs.
         try:
             self._apply_save_policy_to_detection_tab()
         except Exception as e:
@@ -2026,9 +2071,14 @@ class BatchTab(ctk.CTkFrame):
 
         Tab 7 needs the per-cluster ROI lists Tab 6 writes via the
         Export button -- without them, _on_run_full bails because the
-        cluster folder doesn't exist. Tab 6's _on_export is synchronous
-        (no worker), so we just run it inline after the analysis
-        publishes set_clusters_ready and before advancing to xcorr.
+        cluster folder doesn't exist. The export is synchronous (no
+        worker), so we run it inline after the analysis publishes
+        set_clusters_ready and before advancing to xcorr.
+
+        This calls Tab 6's raising ``_export_clusters`` rather than the
+        button handler ``_on_export``: the handler swallows write errors
+        behind a modal dialog, so the batch would log success and
+        advance with no ROI lists on disk.
         """
         cl = self._app.clustering_tab
         fired = [False]
@@ -2047,14 +2097,25 @@ class BatchTab(ctk.CTkFrame):
             fired[0] = True
             _cleanup()
             try:
-                cl._on_export()
+                out_dir = cl._export_clusters()
             except Exception as e:
                 self._append_log(
                     f"  [clustering] export FAILED: {e}\n"
                     f"{traceback.format_exc()}")
-                self.after(0, lambda: self._fail_stage(
-                    "clustering", e))
+                self.after(0, lambda exc=e: self._fail_stage(
+                    "clustering", exc))
                 return
+            # Same best-effort summary write + status text as Tab 6's
+            # Export button handler (_on_export).
+            try:
+                cl._write_summary()
+            except Exception as e:
+                self._append_log(
+                    f"  [clustering] cluster summary write failed: {e}")
+            try:
+                cl.status_var.set(f"Exported clusters to {out_dir}")
+            except Exception:
+                pass
             self._append_log(
                 "  [clustering] cluster ROI lists exported")
             self.after(0, lambda: self._on_stage_done(
@@ -2088,9 +2149,12 @@ class BatchTab(ctk.CTkFrame):
         could land at "5 clusters visible" while fcluster returned
         30+, producing the over-fragmented input the guard was
         catching. Bug fixed 2026-05-11 in
-        ``clustering_cmap.auto_choose_threshold``; guard removed.)
+        ``core.clustering.auto_choose_threshold``; guard removed.)
         """
         xc = self._app.xcorr_tab
+        # Diagnostic / test-observable marker of which xcorr step is in
+        # flight. The state machine itself runs on the ``fired`` flags
+        # below; nothing in production branches on this attribute.
         self._xcorr_step = "full"
         fired = [False, False]   # one slot per step, shared via closure
         unsubs: list = []
@@ -2377,9 +2441,10 @@ class BatchTab(ctk.CTkFrame):
         """Set the resource knobs for ``row`` based on its OOM-retry level.
 
         ``row._oom_attempt == 0`` -> normal profile, deterministically
-        re-asserted every stage from ``row.params`` + the batch-start
-        baselines so a prior conservative retry can't leak into a later
-        normal row. ``> 0`` -> progressively conservative: smaller suite2p
+        re-asserted every stage from the row's effective params
+        (``_effective_row_params``: spec defaults < batch defaults <
+        ``row.params``) so a prior conservative retry can't leak into a
+        later normal row. ``> 0`` -> progressively conservative: smaller suite2p
         ``batch_size`` (sizer ``conservative_scale``), CPU dF/F, GPU-off
         xcorr, ``nbins=500`` (injected into the independent
         ``det._settings_override`` the tab passes to ``spc.run`` -- NOT
@@ -2396,7 +2461,7 @@ class BatchTab(ctk.CTkFrame):
         det = getattr(app, "detection_tab", None)
         xc = getattr(app, "xcorr_tab", None)
         sizer = _core_utils.get_adaptive_sizer()
-        rp = row.params or {}
+        rp = self._effective_row_params(row)
         base_override = getattr(self, "_baseline_settings_override", {}) or {}
 
         if lvl <= 0:
@@ -2528,6 +2593,10 @@ class BatchTab(ctk.CTkFrame):
             "error": err,
         }
         self._row_results["status"] = "failed"
+        # Surface the failure in batch_report.csv's row-level ``error``
+        # column (_write_report never writes the per-stage errors).
+        if not self._row_results.get("error"):
+            self._row_results["error"] = f"{stage}: {err}"
         self._append_log(
             f"  [{stage}] FAILED: {exc}\n{traceback.format_exc()}")
         self._on_row_done()
@@ -2543,7 +2612,7 @@ class BatchTab(ctk.CTkFrame):
         the batch never stalls on the export.
         """
         row = self._current_row
-        params = getattr(row, "params", None) or {}
+        params = self._effective_row_params(row)
         if not bool(params.get("export_nwb", False)):
             return
         plane0 = self._row_results.get("plane0")
@@ -2683,12 +2752,12 @@ class BatchTab(ctk.CTkFrame):
         The worker polls every 2 s when nothing's changed, every
         0.2 s after a copy lands (to drain bursts quickly). Skips
         files whose mtime is < 1 s old (in-flight writes) and
-        anything ``_is_scratch_mirror_skippable`` says is an
+        anything ``logic.is_scratch_mirror_skippable`` says is an
         intermediate the row-end prune would have dropped.
 
         Tracked in ``self._mirror_workers[ident]`` as a dict of
-        ``{thread, stop, synced, seen, inode_to_dst,
-        throttle_provider}`` so ``_finalize_via_mirror_async``
+        ``{thread, stop, synced, seen, inode_to_dst}`` so
+        ``_finalize_via_mirror_async``
         can signal stop + wait for the final pass to complete.
         """
         if self._batch_scratch_root is None:
@@ -2777,7 +2846,6 @@ class BatchTab(ctk.CTkFrame):
             "synced": synced_evt,
             "seen": seen,
             "inode_to_dst": inode_to_dst,
-            "throttle_provider": throttle_provider,
         }
         t.start()
         self._batch_finalize_threads.append(t)
@@ -2788,7 +2856,8 @@ class BatchTab(ctk.CTkFrame):
                                    *,
                                    row=None,
                                    base_status: str = "") -> None:
-        """Two-drive finalize: stop the row's continuous mirror,
+        """Row-end finalize (both single- and two-drive layouts):
+        stop the row's continuous mirror,
         wait for it to drain, then repoint AppState + rmtree
         scratch. Runs in a daemon thread so the orchestrator can
         advance to the next row immediately.
@@ -3000,8 +3069,8 @@ class BatchTab(ctk.CTkFrame):
         path rewrite shouldn't have side effects, so we just swap
         the values in place.
 
-        Tab-local ``_plane0`` / ``_final_plane0`` / ``_plane0_path``
-        caches get the same direct rewrite. We touch every tab the
+        Tab-local ``_plane0`` / ``_final_plane0`` caches get the
+        same direct rewrite. We touch every tab the
         pipeline_gui exposes -- a stale cache on any one of them
         would survive the AppState swap.
         """
@@ -3041,14 +3110,12 @@ class BatchTab(ctk.CTkFrame):
             if new_p is not None:
                 evr["plane0"] = new_p
 
-        # ``AppState.result`` is the PreprocessResult dataclass.
-        # Phase 1 (``_repoint_preprocess_result``) may have already
-        # swapped the four file paths during the row; this row-end
-        # pass also rewrites the ``out_dir`` field (left at scratch
-        # during the row because Tabs 4-8 were still writing there).
-        # Idempotent: if Phase 1 already ran, the four file paths
-        # are already at HDD and ``_rewrite`` returns ``None`` for
-        # them (no-op).
+        # ``AppState.result`` is the PreprocessResult dataclass. Its
+        # paths stay at scratch for the whole row (Tabs 4-8 are still
+        # writing there), so this row-end pass rewrites ``out_dir``
+        # and the three file paths together. Idempotent: a field
+        # already outside ``scratch`` makes ``_rewrite`` return
+        # ``None`` (no-op).
         pre_result = getattr(state, "result", None)
         if pre_result is not None:
             for fld in ("out_dir", "shifted_tiff", "qc_gif",
@@ -3067,8 +3134,7 @@ class BatchTab(ctk.CTkFrame):
         tab_attrs = ("preprocess_tab", "qc_tab", "detection_tab",
                      "lowpass_tab", "event_tab", "clustering_tab",
                      "xcorr_tab", "spatial_tab")
-        plane0_fields = ("_plane0", "_final_plane0", "_plane0_path",
-                         "_current_plane0", "plane0")
+        plane0_fields = ("_plane0", "_final_plane0")
         for tab_attr in tab_attrs:
             tab = getattr(app, tab_attr, None)
             if tab is None:
@@ -3144,6 +3210,7 @@ class BatchTab(ctk.CTkFrame):
         self._finalize_waiting = False
 
         self._batch_active = False
+        self._run_default_params = None
         # Restore interactive error dialogs now the queue is done.
         try:
             self.state.batch_active = False
@@ -3277,16 +3344,6 @@ class BatchTab(ctk.CTkFrame):
 
     def _on_log_payload(self, payload) -> None:
         self._append_log(str(payload))
-
-    def _on_status_payload(self, payload) -> None:
-        row, status = payload
-        if row in self._rows:
-            row.set_status(str(status))
-
-    def _on_batch_done(self, _payload) -> None:
-        self.run_btn.configure(state="normal")
-        self.abort_btn.configure(state="disabled")
-        self._append_log("[batch] all rows processed.")
 
     def _append_log(self, text: str) -> None:
         if not text:

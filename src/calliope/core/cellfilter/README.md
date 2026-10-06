@@ -95,7 +95,7 @@ h = Dropout(0.3)(h)
 logit = Linear(64, 1)(h).squeeze(-1)        # (B,)
 ```
 
-`forward(spatial, trace) -> logit`. Use `predict_proba(...)` for `sigmoid(logit)` directly with `@torch.no_grad`.
+`forward(spatial, trace) -> logit`. `predict_proba(...)` returns `sigmoid(logit)` under `@torch.no_grad` — a public convenience for ad-hoc scoring (call `model.eval()` first); the pipeline's own `predict.py` / `train.py` apply `torch.sigmoid` to batched logits directly.
 
 Total parameter count is ~250k; small enough to fit on any GPU and to train in tens of minutes on a few thousand labelled ROIs.
 
@@ -116,7 +116,7 @@ Combined, the model can learn rules like "looks like a cell *and* fires sometime
 One sample = one `(spatial, trace, label)` triple for one ROI:
 
 - `spatial`: `(3, 32, 32) float32` — `[mean_z, max_z, roi_mask]`.
-- `trace`: `(1, T) float32` — z-scored dF/F (T = `TRACE_CROP_LEN = 2000` during training, full length at eval).
+- `trace`: `(1, T) float32` — z-scored dF/F (T = `TRACE_CROP_LEN = 2000` for training — random crop — and for validation — centred crop; full length only at inference in `predict.py`).
 - `label`: scalar `0.0` or `1.0` (curated by hand).
 
 ### 3.2 The label CSV
@@ -174,7 +174,7 @@ mean_img    = view.get('meanImgE') or view.get('meanImg')
 max_img     = view.get('max_proj') or view.get('maxImg') or mean_img
 mean_img_z  = (mean_img - mean) / std                    # z-score
 max_img_z   = (max_img  - mean) / std
-dff, _, _, T, N = utils.s2p_open_memmaps(plane0, prefix='r0p7_')
+dff, T, N = utils.s2p_open_dff_memmap(plane0, prefix='r0p7_')
 ```
 
 If `max_proj` is cropped to Suite2p's `yrange/xrange` (a common quirk), it's padded back to full FOV using those ranges so it spatially aligns with `mean_img`.
@@ -229,10 +229,10 @@ The augmentation is applied **after** the random temporal crop so it never cross
 
 Two split helpers — choose based on dataset size:
 
-- `split_by_recording(df, val_frac=0.20)` — preferred once you have ≥5 labelled recordings. Hold out a fraction of *recordings* (not ROIs). Validation never sees ROIs from training-set recordings, so AUROC reflects generalisation across mice/slices, not memorisation of a particular FOV. Uniqueness key is `plane0_path` rather than `recording_ID` (post-2026-05-12 schema) so two recordings whose human-readable ids collide get treated as distinct.
-- `split_by_roi(df, val_frac=0.20)` — fallback. Random per-ROI split, stratified on label so val keeps the class balance. Looser test of generalisation but works with one or two labelled recordings.
+- `split_by_recording(df, val_frac=0.20)` — preferred once you have ≥5 labelled recordings; select it with `train.main(split="recording")` / `--split recording`. Hold out a fraction of *recordings* (not ROIs). Validation never sees ROIs from training-set recordings, so AUROC reflects generalisation across mice/slices, not memorisation of a particular FOV. Uniqueness key is `plane0_path` rather than `recording_ID` (post-2026-05-12 schema) so two recordings whose human-readable ids collide get treated as distinct.
+- `split_by_roi(df, val_frac=0.20)` — default (`split="roi"`). Random per-ROI split, stratified on label so val keeps the class balance. Looser test of generalisation but works with one or two labelled recordings.
 
-`train.py` currently calls `split_by_roi` (the lab's labelled set is small enough that recording-level splits leave too few per side). Swap the import in `train.py` once you have enough recordings to support a clean recording-level holdout.
+`train.main()` defaults to `split="roi"` (small labelled sets leave too few recordings per side for a recording-level split; the Tab 3 Retrain button always uses this default). Pass `split="recording"` (CLI `--split recording`) once you have enough recordings for a clean recording-level holdout; the trainer raises `ValueError` rather than train if either side of that split lacks a class (validation AUROC would be undefined, so no `best.pt` would ever be written).
 
 ---
 
@@ -286,24 +286,34 @@ Each `.pt` is `{model: state_dict, epoch: int, val_auc: float}`.
 
 ### 4.6b Warm-start, missing data, and the compare driver
 
-`main()` takes four optional args so you can retrain when the original data is partly or fully gone:
+`main()` takes five optional args so you can retrain when the original data is partly or fully gone:
 
 - `skip_missing=True` (default) drops any label row whose `plane0_path` no longer holds a `stat.npy`, with a loud warning listing the dropped recordings. A retrain after data has moved/been deleted proceeds on the surviving subset instead of crashing in the loader. Pass `--keep-missing` on the CLI to disable.
 - `warm_start=<ckpt>` initialises the model from an existing checkpoint (fine-tuning / transfer learning) instead of random init. **A public user with none of the original training data points this at the bundled `src/calliope/data/cellfilter_best.pt` and trains on their own labelled ROIs** — the shipped model adapts to their rig.
 - `lr` overrides `config.LR`; use something small (~1e-4) when warm-starting so fine-tuning doesn't wipe the pretrained weights.
 - `ckpt_dir` redirects the `best.pt`/`last.pt`/`train_log.csv` outputs so a run doesn't clobber the live checkpoint.
+- `split` picks the validation split (`"roi"` default, `"recording"`; see §3.8).
+
+The Tab 3 popout's **Retrain cell filter** button follows this advice: it warm-starts from the checkpoint selected in Tab 3 (the bundled one by default) at `config.WARM_START_LR = 1e-4` (§7.3).
 
 `main()` returns the best val AUROC, so a driver can compare two runs. CLI:
 
 ```bash
 # fine-tune the bundled model onto whatever labels exist on disk
-python -m src.calliope.core.cellfilter.train --warm-start src/calliope/data/cellfilter_best.pt --lr 1e-4
+python -m calliope.core.cellfilter.train --warm-start src/calliope/data/cellfilter_best.pt --lr 1e-4
 ```
 
-`scripts/retrain_cellfilter_compare.py` runs scratch vs warm-start side by side (each into its own `CHECKPOINT_DIR/compare_*` folder) and copies the higher-AUROC `best.pt` to `CHECKPOINT_DIR/best.pt`:
+To compare scratch vs warm-start, train each into its own `ckpt_dir` (same labels, same seed, same split) and keep the run with the higher returned AUROC:
 
-```bash
-python -m scripts.retrain_cellfilter_compare        # default warm-from = bundled ckpt, warm-lr = 1e-4
+```python
+from pathlib import Path
+from calliope.core.cellfilter import config as C, train
+
+bundled = Path("src/calliope/data/cellfilter_best.pt")
+scratch_auc = train.main(ckpt_dir=C.CHECKPOINT_DIR / "compare_scratch")
+warm_auc = train.main(warm_start=bundled, lr=1e-4,
+                      ckpt_dir=C.CHECKPOINT_DIR / "compare_warm")
+# copy the better run's best.pt to C.CHECKPOINT_DIR / "best.pt"
 ```
 
 ### 4.7 Windows OpenMP shim
@@ -320,7 +330,7 @@ These three lines must run **before** numpy/torch import. NumPy-MKL and PyTorch 
 
 ## 5. Inference (`predict.py`)
 
-### 5.1 `predict_recording(rec_id, model, device, plane0=None)`
+### 5.1 `predict_recording(rec_id, model, device, plane0=None, size_outlier_z=SIZE_OUTLIER_Z)`
 
 The hot path called by Tab 3 and the standalone curation app:
 
@@ -330,21 +340,23 @@ if plane0 is None:
 rec = _RecordingCache(Path(plane0))                       # mmap dF/F + load images
 N   = rec.N
 probs = zeros(N, float32)
-for roi in range(N):
-    patch    = rec.get_patch(roi, 32)                     # (3, 32, 32)
-    trace    = rec.get_trace(roi)                         # (T,)
-    spatial  = torch.from_numpy(patch)[None].to(device)
-    trace_t  = torch.from_numpy(trace)[None, None].to(device)  # (1, 1, T)
-    logit    = model(spatial, trace_t)
-    probs[roi] = torch.sigmoid(logit).item()
+for s in range(0, N, 256):                                # BATCH = 256 ROIs
+    e = min(s + 256, N)
+    patches = stack([rec.get_patch(r, 32) for r in range(s, e)])   # (B, 3, 32, 32)
+    traces  = stack([rec.get_trace(r) for r in range(s, e)])       # (B, T)
+    logits  = model(torch.from_numpy(patches).to(device),
+                    torch.from_numpy(traces)[:, None, :].to(device))
+    probs[s:e] = torch.sigmoid(logits).cpu().numpy()
 
 np.save(plane0/'predicted_cell_prob.npy', probs)
-np.save(plane0/'predicted_cell_mask.npy', probs >= 0.5)
+mask = probs >= 0.5
+mask &= ~size_outlier_mask(rec.stat, mask, size_outlier_z)   # 0 = gate off
+np.save(plane0/'predicted_cell_mask.npy', mask)
 ```
 
 `rec_id` is now only used for the log line at the end; the actual feature loading is keyed on `plane0`. Callers without a clean recording id can pass `infer_recording_id(plane0)` or `plane0.parent.name`.
 
-Per-ROI loop, batch size 1 (the temporal branch handles variable `T` per recording, so naive batching across recordings would need padding/masking we don't bother with). Empirically takes ~1 s per ROI on CPU and < 0.1 s on GPU.
+ROIs are scored in batches of 256 *within* one recording (every ROI shares the patch shape and trace length `T`, so they stack without padding; `model.eval()` makes BatchNorm use running stats, so this is numerically identical to one ROI at a time). Recordings are never batched together, since `T` differs between them. Callers that expose `size_outlier_z` (Tab 3, Tab 0 batch, the popout's post-Retrain re-predict, the CLI's `--size-outlier-z`, the curation app's `--size-outlier-z`) pass the user's value; everything else gets `config.SIZE_OUTLIER_Z`.
 
 `load_model_from_checkpoint(ckpt_path, device)` builds a fresh `CellFilter`, calls `torch.load` + `load_state_dict` + `.eval()`, and returns the model. Shared between the CLI here, the Tab 3 popout's auto-repredict-after-retrain path, and the standalone curation app's auto-predict-on-open path so all three paths use the same loader.
 
@@ -355,9 +367,11 @@ The convolutional + global-pool architecture handles arbitrary `T`. Cropping at 
 ### 5.3 CLI usage
 
 ```
-python -m calliope.core.cellfilter.predict --plane0 D:/data/.../suite2p/plane0 [...]
+python -m calliope.core.cellfilter.predict --plane0 D:/data/.../suite2p/plane0 [...] \
+    [--ckpt PATH] [--size-outlier-z Z]
     # one or more plane0 directories; the checkpoint is loaded once
-    # and the model is reused across recordings in the batch
+    # and the model is reused across recordings in the batch.
+    # --size-outlier-z defaults to config.SIZE_OUTLIER_Z (4.0); 0 = off
 ```
 
 Tab 3 invokes the function form (`predict_recording(rec_id, model, device, plane0=plane0)`) not the CLI.
@@ -370,7 +384,7 @@ In each `plane0/`:
 - `predicted_cell_prob.npy` — `(N,) float32`, sigmoid score in `[0, 1]`.
 - `predicted_cell_mask.npy` — `(N,) bool`, `prob >= 0.5`, then minus large-area outliers: a kept ROI whose robust z of `log(npix)` (median/MAD over the kept ROIs, one-sided) exceeds `size_outlier_z` (default `4.0`, `0` = off) is dropped as a sparsery blob artifact.
 
-Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`utils._load_keep_mask`), with `iscell.npy` as a final fallback if the predicted files are missing.
+Downstream tabs do **not** read `predicted_cell_mask.npy` directly. Tab 3 resolves the *live* keep mask with `utils.resolve_live_mask` (`predicted_cell_mask.npy` → `iscell.npy[:, 0]` → keep all), column-slices the filtered dF/F memmaps (`r0p7_filtered_*.memmap.float32`) to it, and freezes that exact mask next to them as `r0p7_cell_mask_bool.npy`. Tabs 4–8 size those memmaps through `utils.resolve_filtered_mask`, which is anchored to the frozen mask / file size, so a later change to `predicted_cell_mask.npy` (re-predict, Retrain, curation) only reaches them once the filtered memmap is rewritten — by re-running Tab 3's filtered-dF/F step, or automatically after **Promote to filter mask** / a successful **Retrain** in the curation popout.
 
 ---
 
@@ -380,11 +394,11 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 |---|---|---|
 | `LABELS_CSV` | `src/calliope/data/cellfilter_labels.csv` (in-project) | Hand-labelled training data. Created lazily on the first curation flip. Gitignored so per-curator labels don't conflict. |
 | `LABELS_CSV_COLUMNS` | `(plane0_path, recording_ID, ROI_number, user_defined_cell, timestamp_iso)` | Canonical CSV schema. `plane0_path` is the trainer's source of truth -- no more `DATA_ROOT` resolution. |
-| `CHECKPOINT_DIR` | `~/.calliope/cellfilter_checkpoints/` | Where retrained `best.pt`, `last.pt`, `train_log.csv` from `cellfilter.train` land. The default ckpt Tab 3 loads is the bundled `src/calliope/data/cellfilter_best.pt` (small enough to ship in the wheel); users who retrain point Tab 3's Browse... field at their new file here. |
+| `CHECKPOINT_DIR` | `~/.calliope/cellfilter_checkpoints/` | Where retrained `best.pt`, `last.pt`, `train_log.csv` from `cellfilter.train` land. The default ckpt Tab 3 loads is the bundled `src/calliope/data/cellfilter_best.pt` (small enough to ship in the wheel); a successful **Retrain** in the Tab 3 curation popout switches Tab 3's checkpoint field to the new `best.pt` here; command-line retrains point Tab 3's Browse... field at it by hand. |
 | `DFF_PREFIX` | `r0p7_` | Memmap prefix the cache reads from `plane0`. |
 | `PATCH_SIZE` | 32 | Spatial patch edge in pixels. |
 | `TRACE_CROP_LEN` | 2000 | Random crop length for training. |
-| `VAL_FRAC` | 0.20 | Validation fraction. |
+| `VAL_FRAC` | 0.20 | Validation fraction (of ROIs for `split="roi"`, of recordings for `split="recording"`). |
 | `RANDOM_SEED` | 0 | Determinism. |
 | `TEMPORAL_CHANNELS` | (16, 32, 64) | Conv1d channel widths. |
 | `SPATIAL_CHANNELS` | (16, 32, 64) | Conv2d channel widths. |
@@ -392,7 +406,8 @@ Both are picked up by **every** downstream tab (4–7) via `_load_keep_mask` (`u
 | `DENSE_DIM` | 64 | Hidden width of the MLP head. |
 | `DROPOUT` | 0.3 | Dropout in the head. |
 | `BATCH_SIZE` | 32 | Training batch size. |
-| `LR` | 1e-3 | Adam learning rate. |
+| `LR` | 1e-3 | Adam learning rate (training from random init). |
+| `WARM_START_LR` | 1e-4 | Adam learning rate the Tab 3 Retrain button uses when fine-tuning the selected checkpoint. |
 | `WEIGHT_DECAY` | 1e-5 | Adam weight decay. |
 | `EPOCHS` | 40 | Max training epochs. |
 | `EARLY_STOP_PATIENCE` | 8 | Epochs without val-AUROC improvement before stopping. |
@@ -416,7 +431,7 @@ Both write to the same `cellfilter_labels.csv` via the same `_upsert_label` func
 ### 7.2 Standalone app
 
 ```bash
-python -m calliope.scripts.roi_curation_app [plane0 ...] [--sort MODE] [--repredict] [--ckpt PATH]
+python -m calliope.scripts.roi_curation_app [plane0 ...] [--sort MODE] [--repredict] [--ckpt PATH] [--size-outlier-z Z]
 ```
 
 Tk window with a `Listbox` of plane0 paths plus **Add plane0...** / **Remove** / **Open curation** / **Re-predict selected** / sort dropdown. Add several plane0s up front (or drip-feed via Add plane0 as you go). Selecting an entry:
@@ -438,17 +453,19 @@ After every flip the popout auto-advances to the next sorted ROI — `1`/`0` is 
 
 ### 7.3 Retrain loop (auto re-predict)
 
-The Tab 3 popout's **Retrain cell filter** button (greyed until ≥1 flip in the current session) does:
+The Tab 3 popout's **Retrain cell filter** button (greyed until ≥1 flip in the current session) asks for confirmation (the dialog lists every side effect below), then in a worker thread does:
 
-1. `cellfilter.train.main()` — reads the labels CSV, writes new `best.pt` + `last.pt` to `CHECKPOINT_DIR`.
-2. `predict_recording(rec_id, model, device, plane0=self._plane0)` — scores every ROI in the *current* recording against the fresh checkpoint.
-3. Refreshes the popout's own `_probs` cache; pings parent Tab 3 via `on_iscell_changed(-1, -1)` so panels 2 + 3 repaint against the new mask without a manual re-detect.
+1. `cellfilter.train.main(warm_start=<Tab 3's selected checkpoint>, lr=config.WARM_START_LR)` — reads the labels CSV, writes new `best.pt` + `last.pt` to `CHECKPOINT_DIR`. The selected checkpoint is the bundled `cellfilter_best.pt` unless the user browsed to another one; if the field is empty or the file is missing, it trains from random init at `config.LR`. Flip buttons stay enabled; flips made during training go into the next round.
+2. `predict_recording(rec_id, model, device, plane0=self._plane0, size_outlier_z=<Tab 3's live value>)` — scores every ROI in the *current* recording against the fresh checkpoint with the same size gate the detection run uses (`0` = off is honoured).
+3. Back on the Tk thread: switches Tab 3's checkpoint field to the new `best.pt` (so later **Run detection** passes use it), refreshes the popout's own `_probs` cache, and fires `on_iscell_changed(-1, -1)` — the same sentinel as **Promote to filter mask**. Tab 3 then reloads the keep mask, repaints panels 2 + 3, and rewrites the filtered dF/F memmap to the new cell set (`_regenerate_after_promote`: releases downstream memmap handles first). Already-computed downstream results (events, clusters, cross-correlation) still need a re-run.
 
-Three result states:
+Result states:
 
 - `("ok", msg)` — both train and re-predict succeeded; new mask on disk and visible.
-- `("warn", msg)` — train succeeded but re-predict failed (e.g., the active plane0 was moved). New `best.pt` is still on disk; the curator can run `predict.py --plane0 ...` manually.
+- `("warn", msg)` — train succeeded but re-predict failed (e.g., the active plane0 was moved). New `best.pt` is still on disk and selected in Tab 3; the curator can run `python -m calliope.core.cellfilter.predict --plane0 ... --size-outlier-z Z` manually. Also used when validation AUROC was never defined (validation split lacks a class): no `best.pt` was written, so nothing is re-predicted or selected.
 - `("err", msg)` — training itself failed; old checkpoint untouched.
+
+The standalone curation app passes its `--size-outlier-z` to the popout but no checkpoint hook, so its Retrain trains from random init and leaves checkpoint selection to `--ckpt`.
 
 ### 7.4 How many labels for a robust classifier?
 
@@ -484,9 +501,9 @@ For tissue-identity experiments (e.g., the cortex+hippocampus stitch test), get 
    - Head: concat 128-d → `Linear(64) → ReLU → Dropout(0.3) → Linear(1)` → squeeze.
 3. **Loss.** `BCEWithLogitsLoss(pos_weight = N_neg / N_pos)`. Adam(lr=1e-3, wd=1e-5).
 4. **Metrics.** Accuracy at 0.5 + AUROC via Mann–Whitney U with avg-rank tie handling. Pick the checkpoint with the highest **validation AUROC**.
-5. **Splits.** Prefer `split_by_recording` when you have >= ~5 labelled recordings; fall back to stratified per-ROI split otherwise.
-6. **Training augmentation.** Random temporal crop only — no spatial flip/rotation (the model would have to be equivariant to FOV orientation, which isn't worth the extra training data here).
-7. **Inference.** Full traces, batch size 1, `model.eval()` + `@torch.no_grad`. Save `predicted_cell_prob.npy` and `predicted_cell_mask.npy = prob >= 0.5` in `plane0/`.
+5. **Splits.** Prefer `split_by_recording` (`--split recording`) when you have >= ~5 labelled recordings; fall back to the stratified per-ROI split (the default) otherwise.
+6. **Training augmentation.** Random 2000-frame temporal crop, plus (train split only) dihedral-group spatial transforms — H/V flips and 90/180/270° rotations — and mild additive Gaussian trace noise (`config.AUG_*`, §3.7b). Validation uses the centred 2000-frame crop with no augmentation.
+7. **Inference.** Full traces, ROIs scored in batches of 256 (`model.eval()` + `@torch.no_grad`; BatchNorm uses running stats, so batching is numerically identical to one-at-a-time). Save `predicted_cell_prob.npy` and `predicted_cell_mask.npy = (prob >= 0.5)` minus large-area outliers (`size_outlier_mask`, robust z of log npix > `size_outlier_z`, default 4.0, 0 = off; §5.4) in `plane0/`.
 8. **Windows OpenMP shim.** Set `KMP_DUPLICATE_LIB_OK=TRUE`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1` *before* importing numpy/torch when running on Windows with both numpy-MKL and PyTorch installed.
 
 That's the whole filter. Small model, small dataset, high impact downstream — every kept ROI is a feature in the clustering and cross-correlation tabs, so a 10% reduction in false positives here cleans up Tabs 5–7 substantially.

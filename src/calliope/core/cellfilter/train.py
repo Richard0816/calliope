@@ -2,21 +2,23 @@
 
 What this file does
 -------------------
-This is the offline training script that produces the checkpoint
-``predict.py`` later loads. The GUI does not invoke this; lab members
-run it from the command line on a GPU box once they've curated a new
-batch of ROIs in the labelling spreadsheet.
+This is the training script that produces the checkpoint
+``predict.py`` later loads. Two entry points: the command line (below),
+and the Tab 3 curation popout's **Retrain cell filter** button, which
+calls ``main()`` in a worker thread (warm-started from Tab 3's
+selected checkpoint) after a curator has flipped ROI labels.
 
 Steps performed
 ---------------
 1. Load the curation CSV (``LABELS_CSV`` in ``config.py``) and split
-   by ROI into train + validation sets (``split_by_roi``, stratified
-   on label -- roughly a stratified ``createDataPartition`` in R).
-   NOTE: this is a per-ROI split, so ROIs from the same recording can
-   land on both sides (recording-level leakage). It is an intentional
-   tradeoff for the lab's small labelled set; switch the import to
-   ``split_by_recording`` once you have >= ~5 labelled recordings for a
-   leak-free holdout (see README).
+   into train + validation sets. Default ``split="roi"``
+   (``split_by_roi``, stratified on label -- roughly a stratified
+   ``createDataPartition`` in R). NOTE: this is a per-ROI split, so
+   ROIs from the same recording can land on both sides
+   (recording-level leakage). It is an intentional tradeoff for small
+   labelled sets; pass ``split="recording"`` (CLI ``--split
+   recording``, ``split_by_recording``) once you have >= ~5 labelled
+   recordings for a leak-free holdout (see README).
 2. Build two ``ROIDataset`` instances and wrap them in
    ``torch.utils.data.DataLoader`` for batched, shuffled iteration.
 3. Instantiate ``CellFilter``, the optimiser (Adam) and the loss
@@ -33,7 +35,8 @@ Steps performed
 
 Usage
 -----
-    python -m src.calliope.core.cellfilter.train
+    python -m calliope.core.cellfilter.train [--warm-start CKPT] [--lr LR]
+        [--ckpt-dir DIR] [--split {roi,recording}] [--keep-missing]
 
 Outputs
 -------
@@ -61,7 +64,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from . import config as C
-from .dataset import ROIDataset, load_labels, split_by_roi
+from .dataset import ROIDataset, load_labels, split_by_recording, split_by_roi
 from .model import CellFilter
 
 
@@ -206,10 +209,37 @@ def _drop_missing_recordings(df):
     return df
 
 
+SPLITS = ("roi", "recording")
+
+
+def _split_labels(df, split: str):
+    """Train/val split by ``split`` ("roi" or "recording").
+
+    The recording-level split is refused (``ValueError``) when either
+    side lacks one of the two classes: validation AUROC would be
+    undefined every epoch, so no ``best.pt`` would ever be written.
+    """
+    if split == "roi":
+        return split_by_roi(df, C.VAL_FRAC, C.RANDOM_SEED)
+    if split != "recording":
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+    train_df, val_df = split_by_recording(df, C.VAL_FRAC, C.RANDOM_SEED)
+    for name, part in (("train", train_df), ("validation", val_df)):
+        classes = set(part["user_defined_cell"].astype(int).unique())
+        if classes != {0, 1}:
+            raise ValueError(
+                f"split='recording' left the {name} set with "
+                f"{len(part)} ROI(s) and classes {sorted(classes)}; it "
+                f"needs both cell (1) and not-cell (0) labels. Label "
+                f"more recordings or use split='roi'.")
+    return train_df, val_df
+
+
 def main(warm_start: "Path | str | None" = None,
          lr: "float | None" = None,
          ckpt_dir: "Path | None" = None,
-         skip_missing: bool = True):
+         skip_missing: bool = True,
+         split: str = "roi"):
     """Top-level training driver.
 
     Parameters
@@ -231,6 +261,11 @@ def main(warm_start: "Path | str | None" = None,
     skip_missing : bool
         Drop label rows whose recording is gone from disk (default
         True). Lets a retrain proceed on the surviving subset.
+    split : {"roi", "recording"}
+        Validation split. ``"roi"`` (default) = stratified per-ROI
+        ``split_by_roi``; ``"recording"`` = whole-recording holdout via
+        ``split_by_recording`` (leak-free; needs >= ~5 labelled
+        recordings and raises ``ValueError`` if a side lacks a class).
 
     Steps:
         1. Seed RNGs + select GPU/CPU device.
@@ -270,10 +305,10 @@ def main(warm_start: "Path | str | None" = None,
     print(f"  positives: {(df['user_defined_cell']==1).sum()}   "
           f"negatives: {(df['user_defined_cell']==0).sum()}")
 
-    # Stratified per-ROI split. ``split_by_recording`` would be more
-    # rigorous but with our small recording count produces empty
-    # train sets when the val side gets unlucky.
-    train_df, val_df = split_by_roi(df, C.VAL_FRAC, C.RANDOM_SEED)
+    # Default: stratified per-ROI split. ``split="recording"`` is more
+    # rigorous but with a small recording count can leave one side
+    # without a class; ``_split_labels`` refuses that case loudly.
+    train_df, val_df = _split_labels(df, split)
     print(f"train: {len(train_df)} ROIs  ({train_df['recording_ID'].nunique()} recs)  "
           f"pos={(train_df['user_defined_cell']==1).sum()}  "
           f"neg={(train_df['user_defined_cell']==0).sum()}")
@@ -416,6 +451,10 @@ if __name__ == "__main__":
     ap.add_argument("--keep-missing", action="store_true",
                     help="do NOT drop label rows whose recording is gone "
                          "(default is to skip them)")
+    ap.add_argument("--split", choices=SPLITS, default="roi",
+                    help="validation split: 'roi' (stratified per-ROI, "
+                         "default) or 'recording' (whole-recording "
+                         "holdout; needs >= ~5 labelled recordings)")
     args = ap.parse_args()
     main(warm_start=args.warm_start, lr=args.lr, ckpt_dir=args.ckpt_dir,
-         skip_missing=not args.keep_missing)
+         skip_missing=not args.keep_missing, split=args.split)

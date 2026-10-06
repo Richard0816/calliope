@@ -102,6 +102,61 @@ def _read_event_windows(plane0: Path) -> Optional[np.ndarray]:
     return np.column_stack([starts, ends])
 
 
+def _load_len_n(path: Path, n: int) -> Optional[np.ndarray]:
+    """Load a 1-D per-ROI ``.npy`` if it exists and has ``n`` entries."""
+    if not path.exists():
+        return None
+    try:
+        arr = np.asarray(np.load(path, allow_pickle=False)).ravel()
+    except (OSError, ValueError) as exc:
+        print(f"[nwb] could not read {path.name} ({exc}); skipping")
+        return None
+    return arr if arr.size == n else None
+
+
+def _cell_columns(plane0: Path, iscell: Optional[np.ndarray], n: int):
+    """``(name, description, values)`` for the PlaneSegmentation per-ROI
+    cell columns that can be built from what is on disk."""
+    cols = []
+    if iscell is not None and iscell.ndim == 2 and iscell.shape[0] == n:
+        cols.append((
+            "iscell",
+            "suite2p accept label (iscell.npy column 0; 1 = cell), "
+            "including manual curation flips",
+            (iscell[:, 0] > 0).astype(np.uint8).tolist(),
+        ))
+        if iscell.shape[1] >= 2:
+            cols.append((
+                "iscell_prob",
+                "suite2p classifier probability P(cell) (iscell.npy column 1)",
+                np.asarray(iscell[:, 1], dtype=np.float32).tolist(),
+            ))
+    elif iscell is not None and iscell.ndim == 1 and iscell.size == n:
+        cols.append((
+            "iscell",
+            "suite2p accept label (iscell.npy; 1 = cell)",
+            (iscell > 0).astype(np.uint8).tolist(),
+        ))
+    prob = _load_len_n(plane0 / "predicted_cell_prob.npy", n)
+    if prob is not None:
+        cols.append((
+            "cellfilter_prob",
+            "CalLIOPE cell-filter CNN probability P(cell) "
+            "(predicted_cell_prob.npy)",
+            prob.astype(np.float32).tolist(),
+        ))
+    for fname in ("r0p7_cell_mask_bool.npy", "predicted_cell_mask.npy"):
+        mask = _load_len_n(plane0 / fname, n)
+        if mask is not None:
+            cols.append((
+                "kept",
+                f"1 = ROI kept for downstream analysis (keep mask {fname})",
+                mask.astype(bool).astype(np.uint8).tolist(),
+            ))
+            break
+    return cols
+
+
 def export_recording_to_nwb(
     plane0: PathLike,
     out_path: PathLike,
@@ -117,18 +172,29 @@ def export_recording_to_nwb(
     Parameters
     ----------
     plane0 : path
-        A populated ``suite2p/plane0`` folder (must contain at least
-        ``stat.npy``, ``F.npy`` and ``ops.npy``).
+        A populated ``suite2p/plane0`` folder. Must contain ``stat.npy``,
+        ``F.npy`` and ``Fneu.npy``; ``Ly``/``Lx`` come from ``ops.npy``
+        (via ``utils.load_plane_view``), so in practice ``ops.npy`` is
+        needed too.
     out_path : path
         Destination ``.nwb`` file.
     recording_id : str, optional
         Human-readable id; inferred from the path when omitted.
+    session_description : str
+        Free-text NWB ``session_description``.
     include_events : bool
         When True, add population event windows from
         ``calliope_summary.xlsx`` (if present) as an NWB TimeIntervals
         table named ``events``.
     overwrite : bool
         Overwrite an existing ``out_path``.
+    subject_metadata : dict, optional
+        Real NWB ``Subject`` fields (``subject_id``, ``species``, ``sex``,
+        ``age``, ``date_of_birth``, ...) overriding the placeholder Subject
+        (species "unknown", sex "U", no age). Library-only: the Tab 3
+        Export NWB button and the batch export do not pass it, so their
+        files carry the placeholder, which nwbinspector flags for DANDI.
+        Pass it from your own script for DANDI-bound exports.
 
     Returns
     -------
@@ -183,7 +249,8 @@ def export_recording_to_nwb(
     Ly = int(view.get("Ly"))
     Lx = int(view.get("Lx"))
 
-    # frame rate: meta.json first, then notes lookup default
+    # frame rate: meta.json dff.fps first, then ops.npy['fs'] (falling
+    # back to utils.DEFAULT_FPS) via get_fps_from_notes
     fps = meta.get("dff", {}).get("fps")
     if not fps or float(fps) <= 0:
         fps = float(utils.get_fps_from_notes(str(plane0)))
@@ -280,15 +347,15 @@ def export_recording_to_nwb(
     for s in stat:
         plane_seg.add_roi(image_mask=_build_image_mask(s, Ly, Lx))
 
-    if iscell is not None:
-        cell_prob = (
-            iscell[:, 0] if iscell.ndim == 2 else iscell.astype(np.float32)
-        )
-        plane_seg.add_column(
-            name="iscell_prob",
-            description="cellfilter / classifier P(cell)",
-            data=np.asarray(cell_prob, dtype=np.float32).tolist(),
-        )
+    # Per-ROI cell columns. suite2p's iscell.npy is (N, 2): column 0 is
+    # the binary accept label (classifier decision, flipped by manual
+    # curation), column 1 the classifier probability. The CalLIOPE cell
+    # filter writes its own predicted_cell_prob.npy, and the ROIs the
+    # downstream stages actually used are the frozen keep mask
+    # r0p7_cell_mask_bool.npy (predicted_cell_mask.npy before Tab 3 has
+    # written filtered memmaps).
+    for col_name, desc, values in _cell_columns(plane0, iscell, N):
+        plane_seg.add_column(name=col_name, description=desc, data=values)
     # per-ROI source tag, if present
     sources = [str(s.get("_source", "")) for s in stat]
     if any(sources):

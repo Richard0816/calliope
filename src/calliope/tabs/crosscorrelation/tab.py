@@ -39,12 +39,13 @@ What the user sees
 - A progress bar driven by the worker's progress callback.
 - A live console at the bottom showing per-batch timing.
 - Two extra buttons:
-    * **Show violins** opens a separate window summarising the
+    * **Violin plot** opens a separate window summarising the
       per-pair best-lag and zero-lag distributions across cluster
       pairs as violin plots, with a sign-flip permutation test for
       "is this lead-lag significantly nonzero".
     * **Single-pair preview** plots the cross-correlation curve for
-      one ROI pair you pick from a dropdown -- handy for sanity
+      one ROI pair you type into the ROI A / ROI B boxes (the event
+      to crop to is picked from a dropdown) -- handy for sanity
       checks.
 
 Outputs
@@ -64,15 +65,15 @@ process boundary: the Abort button sets a spawn ``Event``
 (``core.offload.make_abort_event``); the child's progress callback polls
 it between batches and raises ``XcorrAborted`` (in
 ``core.crosscorrelation``), so a run stops cleanly *between* the
-incremental per-pair writes. The legacy in-thread ``RunAborted`` class
-below is retained only for backward reference and is no longer raised.
+incremental per-pair writes. The child then returns its normal ``done``
+payload with ``aborted=True``, which ``_on_xc_done`` routes to the abort
+handler.
 """
 
 from __future__ import annotations
 
 import queue
 import re
-import threading
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -108,9 +109,19 @@ DEFAULT_FULL_OUTPUT_SUBDIR = "cross_correlation_full"
 POLL_MS = 100
 
 
+def _as_bool(v) -> bool:
+    """Batch-row truthiness: JSON gives real bools, but a hand-edited or
+    CSV-sourced row may carry "false" / "0" strings, which ``bool()``
+    would read as True."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 # ---------------------------------------------------------------------------
-# Violin-plot helpers (mirrors fig6_real_paper.plot_violin so the standalone
-# paper figure script and this tab stay visually consistent).
+# Violin-plot helpers. Shared with the headless batch figure export
+# (core.crosscorrelation._save_violin_pair) so the GUI and batch violins
+# look the same.
 # ---------------------------------------------------------------------------
 
 
@@ -186,15 +197,6 @@ def _sign_flip_pvalue(values: np.ndarray, n_perm: int = 10000,
     return hits / n_perm
 
 
-def _add_significance(ax, positions, arrays) -> None:
-    pvals = [_sign_flip_pvalue(arr) for arr in arrays]
-    ymax = ax.get_ylim()[1]
-    for i, p in enumerate(pvals):
-        if p < 0.05:
-            ax.text(positions[i], ymax * 0.93, "*",
-                    ha="center", va="bottom", fontsize=14)
-
-
 def _significance_marker(p: float) -> str:
     if p < 0.001:
         return "***"
@@ -211,8 +213,7 @@ _LAG_COLOR = "#E87B73"    # red    - mean lag sig. < 0  (ROI A lags)
 _NS_COLOR = "#CFCFCF"     # gray   - not significant
 
 
-def _plot_violin(ax, labels, arrays, ylabel: str, title: str,
-                 show_sig: bool = False) -> None:
+def _plot_violin(ax, labels, arrays, ylabel: str, title: str) -> None:
     # matplotlib's violinplot raises "need at least one data array" on an
     # empty list. A recording whose ROIs all collapse into a single
     # cluster produces zero pairs and thus no arrays -- render an
@@ -233,8 +234,6 @@ def _plot_violin(ax, labels, arrays, ylabel: str, title: str,
     ax.axhline(0, linestyle="--", linewidth=1)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    if show_sig:
-        _add_significance(ax, pos, arrays)
 
 
 def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str,
@@ -541,7 +540,6 @@ class ViolinWindow(ctk.CTkToplevel):
                 self.ax_corr, corr_labels, corr_arrays,
                 "Zero-lag correlation",
                 f"Per-pair zero-lag correlation  ({title_suffix})",
-                show_sig=False,
             )
         else:
             self.ax_corr.set_axis_off()
@@ -674,7 +672,12 @@ class CrossCorrelationTab(ctk.CTkFrame):
 
     def apply_batch_row(self, params: dict, log=None) -> None:
         """Apply a batch row's xcorr Tk-var knobs (no PARAM_SPEC; everything
-        flows through ``_gather_params`` reading Tk vars).
+        flows through ``_gather_params`` reading Tk vars). Honours
+        ``max_lag_seconds``, ``zero_lag``, ``use_gpu``, ``n_shuffles`` and
+        ``compute_partial``. Tab 0 always passes the row's full effective
+        params (batch defaults filled in), so every key is set on every
+        row; only a direct caller passing a partial dict leaves the
+        widgets for absent keys untouched.
 
         Public seam the Tab 0 batch runner calls instead of poking this
         tab's internals.
@@ -683,9 +686,22 @@ class CrossCorrelationTab(ctk.CTkFrame):
         if "max_lag_seconds" in p:
             self.maxlag_var.set(str(p["max_lag_seconds"]))
         if "zero_lag" in p:
-            self.zero_lag_var.set(bool(p["zero_lag"]))
+            self.zero_lag_var.set(_as_bool(p["zero_lag"]))
         if "use_gpu" in p:
-            self.gpu_var.set(bool(p["use_gpu"]))
+            self.gpu_var.set(_as_bool(p["use_gpu"]))
+        # Shuffle-null size and partial-correlation toggle: honoured when
+        # the row carries them (including explicit 0 / False); otherwise
+        # the Tab 7 widget values stay in effect.
+        if "n_shuffles" in p:
+            try:
+                n = max(0, int(p["n_shuffles"]))
+            except (TypeError, ValueError):
+                if log is not None:
+                    log(f"[xcorr] ignoring bad n_shuffles={p['n_shuffles']!r}")
+            else:
+                self.n_shuffles_var.set(str(n))
+        if "compute_partial" in p:
+            self.partial_corr_var.set(_as_bool(p["compute_partial"]))
 
     # -- UI ----------------------------------------------------------------
 
@@ -1317,7 +1333,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
         # Force the next preview/run to reopen the memmap.
         self._dff_cache = None
         self._dff_cache_key = None
-        # Re-resolve fps from notes, re-check inputs, and refresh events.
+        # Re-resolve fps (ops.npy['fs'], else DEFAULT_FPS), re-check
+        # inputs, and refresh events.
         self._set_plane0(Path(plane0))
         self._log(f"[reload] dF/F + clusters refreshed for {plane0}")
 
@@ -1448,10 +1465,9 @@ class CrossCorrelationTab(ctk.CTkFrame):
             messagebox.showinfo("Busy", "A run is already in progress.")
             return
         params = self._gather_params()
-        # Per-event runner accepts n_shuffles for API symmetry but the
-        # current implementation does not compute the shuffle null per
-        # event (would require per-window jitter). Strip it to make the
-        # no-op explicit and avoid a misleading n_shuffles= in the log.
+        # The per-event runner has no shuffle null (it would need
+        # per-window jitter) and takes no n_shuffles kwarg. Strip it so
+        # the call is valid and the log doesn't show a misleading value.
         n_shuf = params.pop("n_shuffles", 0)
         if n_shuf:
             self._log(f"[per-event] note: n_shuffles={n_shuf} ignored "

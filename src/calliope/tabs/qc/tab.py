@@ -49,6 +49,7 @@ Class layout
 
 from __future__ import annotations
 
+import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -70,7 +71,7 @@ from PIL import Image, ImageTk
 from . import logic as preprocessing
 from .logic import PreprocessResult
 
-from ...gui_common import AppState, attach_fig_toolbar
+from ...gui_common import AppState, attach_fig_toolbar, drain_queue
 
 
 class QcTab(ctk.CTkFrame):
@@ -108,8 +109,19 @@ class QcTab(ctk.CTkFrame):
         # User-driven play/pause switch. Default ON (playing).
         self._gif_animate_var = tk.BooleanVar(value=True)
 
+        # "Reload from folder..." regenerates an archived recording's
+        # shifted TIFF in a child process: re-shifting the raw can take a
+        # minute and must not freeze the Tk thread.
+        self._reload_job = None
+        self._reload_q: "queue.Queue" = queue.Queue()
+
         # Build the widgets...
         self._build_ui()
+        drain_queue(self, self._reload_q,
+                    {"log": self._on_reload_log,
+                     "done": self._on_reload_done,
+                     "error": self._on_reload_error},
+                    poll_ms=150)
         # ...and subscribe to the preprocess result channel. The
         # callback will fire when Tab 1 publishes its result, even
         # if that happens long before the user clicks over to this
@@ -182,14 +194,43 @@ class QcTab(ctk.CTkFrame):
             title="Select an already-preprocessed recording folder")
         if not path:
             return
-        result = preprocessing.load_existing_preprocess(path)
+        if self._reload_job is not None and self._reload_job.running():
+            messagebox.showinfo("Busy", "Still reloading the previous "
+                                "folder; wait for it to finish.")
+            return
+        # Cheap probe first: never regenerates on the Tk thread.
+        result = preprocessing.load_existing_preprocess(
+            path, regenerate_shifted=False)
         if result is None:
             messagebox.showwarning(
                 "No outputs",
                 f"Folder {path} doesn't contain the expected "
                 "shifted tiff / qc.gif / mean.npy.")
             return
+        if result.shifted_paths or not result.raw_paths:
+            # Shifted TIFF present, or nothing to regenerate it from
+            # (view-only result): publish straight away.
+            self.state.set_result(result)
+            return
+        # Archived run: regenerate the shifted movie in a child process
+        # so Tab 3 can re-detect from it, as before.
+        from ...core import preprocessing as _core_pre
+        from ...core.offload import run_offloaded
+        self.header_var.set(f"Reloading {Path(path).name} "
+                            "(regenerating the shifted movie)...")
+        self._reload_job = run_offloaded(
+            self, self._reload_q, _core_pre.load_existing_offload,
+            args=(str(path),), progress_kind="log")
+
+    def _on_reload_log(self, msg) -> None:
+        self.header_var.set(str(msg))
+
+    def _on_reload_done(self, result) -> None:
         self.state.set_result(result)
+
+    def _on_reload_error(self, msg) -> None:
+        self.header_var.set("Reload failed.")
+        messagebox.showwarning("Reload failed", str(msg))
 
     # -- AppState listener --------------------------------------------------
 
@@ -366,7 +407,8 @@ class QcTab(ctk.CTkFrame):
         self.ax.clear()
         self.ax.set_axis_off()
         from ...core import utils as _u
-        vmax = float(np.quantile(mean, _u.DISPLAY_CLIP_HIGH_PCT / 100.0))
-        self.ax.imshow(mean, cmap="gray", vmax=vmax)
+        vmin, vmax = (float(v) for v in np.percentile(
+            mean, [_u.DISPLAY_CLIP_LOW_PCT, _u.DISPLAY_CLIP_HIGH_PCT]))
+        self.ax.imshow(mean, cmap="gray", vmin=vmin, vmax=vmax)
         self.ax.set_title("Mean image")
         self.canvas.draw_idle()

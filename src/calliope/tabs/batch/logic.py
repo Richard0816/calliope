@@ -62,24 +62,26 @@ SCRATCH_PRUNE_FILE_PATTERNS: tuple[str, ...] = (
     "**/*.lock",
 )
 
-# Subdirectories of each recording's scratch folder that are
-# detection intermediates. ``sparse_plus_cellpose.run`` writes them
-# directly under the recording folder (NOT under a ``detection/``
-# subfolder) and ``merge_and_extract`` consumes their stat/F/Fneu/
-# spks arrays into ``final/`` -- nothing in the pipeline reads them
-# after that point. The hardlinked ``data.bin`` is deduped at the
-# destination via the mirror's per-inode map, but per-pass
-# ``F.npy`` / ``Fneu.npy`` / ``spks.npy`` / ``stat.npy`` add
-# ~300-500 MB per recording of redundant arrays.
+# Defensive: detection-pass folder names dropped if they ever appear
+# directly under the recording folder (an older flat layout). The
+# current pipeline never writes there -- Tab 3 runs
+# ``sparse_plus_cellpose.run`` with ``save_root = <rec>/detection``, so
+# the real per-pass folders are ``<rec>/detection/sparsery_pass`` etc.
+# and are handled by ``SCRATCH_DETECTION_KEEP_DIRS`` below. No-op on
+# the current layout.
 SCRATCH_RECORDING_INTERMEDIATE_DIRS: tuple[str, ...] = (
     "sparsery_pass",
     "cellpose_pass",
 )
 
-# Defensive: same drop policy applied under a ``<rec>/detection/``
-# layer too, in case a future code path uses that nesting (Tab 3's
-# README documents this layout historically). No-op when the
-# subfolder doesn't exist.
+# The live rule. Tab 3 writes every detection artefact under
+# ``<rec>/detection/``: ``_shared_reg/`` (registration) and ``final/``
+# (merged suite2p outputs) are kept; every other child --
+# ``sparsery_pass/``, ``cellpose_pass/``, ``cellpose_sam_pass/`` -- is a
+# per-pass intermediate whose stat/F/Fneu/spks arrays
+# ``merge_and_extract`` already folded into ``final/`` (~300-500 MB of
+# redundant arrays per recording), so it is dropped. The hardlinked
+# ``data.bin`` survives via ``_shared_reg/`` + ``final/``.
 SCRATCH_DETECTION_KEEP_DIRS: frozenset = frozenset({
     "_shared_reg",
     "final",
@@ -124,14 +126,15 @@ def prune_scratch_tree(
 
     * suite2p's pre-registration movie cache (``data_raw*.bin``) --
       superseded once the registered ``data.bin`` is on disk.
-    * ``sparsery_pass/`` + ``cellpose_pass/`` -- intermediate
+    * Every ``<rec>/detection/<X>/`` subdirectory whose name isn't
+      ``_shared_reg`` or ``final`` -- i.e. ``sparsery_pass/``,
+      ``cellpose_pass/``, ``cellpose_sam_pass/``, the intermediate
       detection outputs that ``merge_and_extract`` already folded
       into ``final/``. The hardlinked ``data.bin`` survives via
       ``_shared_reg/`` + ``final/``; the per-pass F/Fneu/spks/stat
       arrays are pure clutter (~300-500 MB per recording).
-    * Defensively, any ``<rec>/detection/<X>/`` subdirectory whose
-      name isn't ``_shared_reg`` or ``final`` -- no current code
-      path uses that nesting, but earlier docstrings reference it.
+    * Defensively, ``sparsery_pass/`` / ``cellpose_pass/`` directly
+      under ``<rec>/`` (an older flat layout; no-op today).
     * ``.tmp`` / ``.lock`` partial-write artefacts.
 
     The Tab 0 "What to save" toggles add two opt-out drops on top of
@@ -200,10 +203,9 @@ def prune_scratch_tree(
         # hardlink) the surviving final-output copies must go too.
         if final_rec is not None and Path(final_rec).exists():
             _prune_patterns(Path(final_rec), extra_patterns)
-    # Directory-level prune: ``sparsery_pass/`` + ``cellpose_pass/``
-    # live directly under the recording folder (NOT under a
-    # ``detection/`` layer); this is the path layout
-    # ``sparse_plus_cellpose.run`` actually writes.
+    # Directory-level prune, defensive: per-pass folders directly
+    # under the recording folder (older flat layout; the current
+    # pipeline nests them under ``detection/``, handled below).
     for sub in SCRATCH_RECORDING_INTERMEDIATE_DIRS:
         p = scratch / sub
         if not p.is_dir():
@@ -215,8 +217,9 @@ def prune_scratch_tree(
             bytes_freed += sz
         except OSError:
             continue
-    # Defensive: same drop policy applied if anything ever lands at
-    # ``<rec>/detection/<X>/`` for ``X not in {_shared_reg, final}``.
+    # The live rule: drop every ``<rec>/detection/<X>/`` for
+    # ``X not in {_shared_reg, final}`` -- this is where Tab 3 writes
+    # ``sparsery_pass/`` / ``cellpose_pass/`` / ``cellpose_sam_pass/``.
     det = scratch / "detection"
     if det.is_dir():
         for child in det.iterdir():
@@ -282,10 +285,15 @@ def is_scratch_mirror_skippable(
     - ``data_raw.bin`` / ``data_raw_chan2.bin`` -- suite2p's
       pre-registration cache, redundant once ``data.bin`` is on disk
     - ``*.tmp`` / ``*.lock`` -- partial writes
-    - Anything under ``sparsery_pass/`` or ``cellpose_pass/`` --
-      detection-pass intermediates folded into ``final/`` already
     - Anything under ``<rec>/detection/<X>/`` for X not in
-      {``_shared_reg``, ``final``} -- defensive (legacy layout)
+      {``_shared_reg``, ``final``} (``sparsery_pass/``,
+      ``cellpose_pass/``, ``cellpose_sam_pass/``) -- detection-pass
+      intermediates folded into ``final/`` already
+    - Anything under a top-level ``sparsery_pass/`` or
+      ``cellpose_pass/`` -- defensive (older flat layout)
+
+    ``scratch_rec`` is unused (only ``rel_path`` is inspected); it is
+    kept so existing positional callers keep working.
 
     The Tab 0 "What to save" opt-outs extend the skip set (defaults
     keep, matching current behavior): ``keep_registration=False``
@@ -610,13 +618,20 @@ def build_batch_param_spec() -> list:
     """Assemble the union PARAM_SPEC.
 
     Entries are emitted in pipeline order (preprocess -> detection ->
-    low-pass -> events -> clustering -> xcorr -> pipeline-wide) and
+    low-pass -> events -> clustering -> xcorr -> pipeline-wide ->
+    output) and
     each source group's label is rewritten with a numbered stage
     prefix so the Advanced dialog reads top-to-bottom in operation
     order. Tab 4's "Low-pass" cutoff knob (which Tab 4 binds to a
     slider, not a PARAM_SPEC entry) is inserted alongside the
     rest of the low-pass section.
+
+    Tab 4's slider-bound entries (``cutoff_min`` / ``cutoff_max``) are
+    left out: only Tab 4's own Advanced dialog applies them (to the
+    slider range), so a batch value would have no effect.
     """
+    # Source PARAM_SPEC entries with no effect in a batch run.
+    batch_excluded = {"cutoff_min", "cutoff_max"}
     # Original-group -> renamed-group. Anything not in the map keeps
     # its native label.
     rename = {
@@ -626,16 +641,17 @@ def build_batch_param_spec() -> list:
         "Sparsery": "2. Detection - Sparsery",
         "Cellpose": "2. Detection - Cellpose",
         "Merge": "2. Detection - Merge",
+        "Cellpose-SAM (Tier 2)": "2. Detection - Cellpose-SAM",
         "Cell filter": "2. Detection - Cell filter",
+        "Re-detect": "2. Detection - Re-detect",
+        "QC": "2. Detection - QC",
         "dF/F": "2. Detection - dF/F",
-        "Default low-pass": "2. Detection - Default low-pass",
         "Pixel scale": "2. Detection - Pixel scale",
         "GPU": "2. Detection - GPU",
-        # 3. Low-pass + derivative (Tab 4)
-        "Low-pass": "3. Low-pass - Cutoff",
+        # 3. Low-pass + derivative (Tab 4). The cutoff entry is
+        # synthesized below with its final group label.
         "Low-pass filter": "3. Low-pass - Butterworth",
         "Derivative": "3. Low-pass - SG derivative",
-        "Slider bounds": "3. Low-pass - Slider bounds",
         # 4. Event detection (Tab 5)
         "Per-ROI hysteresis": "4. Events - Per-ROI hysteresis",
         "Display": "4. Events - Display",
@@ -649,7 +665,8 @@ def build_batch_param_spec() -> list:
             "4. Events - Population boundaries",
         "Population events - gaussian fit":
             "4. Events - Population Gaussian fit",
-        # 5. Clustering / 6. Xcorr / 7. Pipeline-wide added below
+        # 5. Clustering / 6. Xcorr / 7. Pipeline-wide / 8. Output
+        # are synthesized below
     }
 
     spec: list = []
@@ -658,7 +675,7 @@ def build_batch_param_spec() -> list:
     def _extend(items):
         for entry in items:
             name = entry.get("name")
-            if not name or name in seen:
+            if not name or name in seen or name in batch_excluded:
                 continue
             new = dict(entry)
             grp = new.get("group", "Parameters")
@@ -713,22 +730,9 @@ def build_batch_param_spec() -> list:
     except Exception:
         pass
 
-    # NWB / DANDI export: write a .nwb per recording at the end of the
-    # pipeline (so it picks up the event windows). Pipeline-wide flag
-    # consumed by the batch orchestrator's per-row finalize, not a tab.
-    spec.append({
-        "name": "export_nwb",
-        "label": "Export NWB file",
-        "type": "bool",
-        "default": False,
-        "group": "8. Output",
-        "help": "write a Neurodata Without Borders <rec>.nwb after the run "
-                "(needs the optional [nwb] extra)",
-    })
-    seen.add("export_nwb")
-
     # 3. Low-pass: cutoff first (binds to the slider value), then the
-    # Tab 4 PARAM_SPEC entries for filter / derivative / slider bounds.
+    # Tab 4 PARAM_SPEC entries for filter / derivative (slider bounds
+    # are excluded, see above).
     spec.append({
         "name": "cutoff_hz", "label": "Low-pass cutoff (Hz)",
         "type": "float", "default": 1.0,
@@ -794,6 +798,16 @@ def build_batch_param_spec() -> list:
         {"name": "use_gpu", "label": "Use GPU for xcorr",
          "type": "bool", "default": True,
          "group": "6. Cross-correlation"},
+        {"name": "n_shuffles", "label": "xcorr shuffles (0 = off)",
+         "type": "int", "default": 500,
+         "group": "6. Cross-correlation",
+         "help": "circular-shift null draws per ROI pair; 0 skips the "
+                 "p-value columns"},
+        {"name": "compute_partial", "label": "xcorr partial correlation",
+         "type": "bool", "default": False,
+         "group": "6. Cross-correlation",
+         "help": "population partial-correlation column + heatmap "
+                 "(full-recording run; needs N < T/2)"},
     ])
 
     # 7. Pipeline-wide -- Tab 3's dF/F baseline (suite2p detection).
@@ -810,5 +824,20 @@ def build_batch_param_spec() -> list:
          "type": "float", "default": 2.0, "group": "7. Pipeline-wide",
          "help": "first-N-min baseline length when dff_baseline_mode=first_n"},
     ])
+
+    # 8. Output -- NWB / DANDI export: write a .nwb per recording at
+    # the end of the pipeline (so it picks up the event windows).
+    # Pipeline-wide flag consumed by the batch orchestrator's per-row
+    # finalize, not a tab.
+    spec.append({
+        "name": "export_nwb",
+        "label": "Export NWB file",
+        "type": "bool",
+        "default": False,
+        "group": "8. Output",
+        "help": "write a Neurodata Without Borders <rec>.nwb after the run "
+                "(needs the optional [nwb] extra)",
+    })
+    seen.add("export_nwb")
 
     return spec
