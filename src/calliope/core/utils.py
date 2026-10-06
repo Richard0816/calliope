@@ -640,16 +640,17 @@ def find_recording_root(path) -> Path:
        folder whose name matches the canonical recording-id regex
        (``YYYY-MM-DD_#####`` or ``+``-joined groups). First match
        wins -- works for both old and new layouts.
-    2. **Fallback for arbitrary user-named recordings**: if step 1
-       fails, look for the deepest ancestor whose name is *not*
-       part of the standard suite2p chain (``suite2p``, ``plane0``,
-       ``detection``, ``final``, ``shared_reg``, ``sparsery_pass``,
-       ``cellpose_pass``). Returns that as the best guess.
-    3. **Last resort**: legacy two-parents-up if ``path`` ends in
-       ``suite2p/plane0``.
-    4. **Otherwise**: return ``path`` unchanged so callers always get
-       a Path back (the ``recording id`` they end up displaying may
-       be wrong, but at least nothing crashes).
+    2. **Fallback for arbitrary user-named recordings**: walk up from
+       ``path`` itself to the deepest folder of the standard suite2p
+       chain (``plane0``, ``suite2p``, ``final``, ``detection``,
+       ``_shared_reg``, ``sparsery_pass``, ``cellpose_pass``,
+       ``merged``), then keep walking up past the rest of that chain;
+       the first folder above it is the recording root. Anything
+       *below* ``plane0`` (e.g. ``plane0/<cluster_results>/C1/...``) is
+       skipped this way, so it can't be mistaken for the recording.
+    3. **Otherwise** (no chain folder anywhere in ``path``): ``path``
+       itself is taken to be the recording folder (its parent if
+       ``path`` is a file).
     """
     p = Path(path).resolve()
 
@@ -658,26 +659,26 @@ def find_recording_root(path) -> Path:
     if hit is not None:
         return hit
 
-    # Strategy 2: skip past well-known intermediate folder names and
-    # take the next one up. Ordered from "deepest" to "shallowest"
-    # so we land on the user-named recording folder.
+    # Strategy 2: anchor on the suite2p output chain.
     INTERMEDIATE_NAMES = {
         "plane0", "suite2p",                # Suite2p output structure
         "final", "detection",               # sparse_plus_cellpose layout
         "_shared_reg", "sparsery_pass",
         "cellpose_pass", "merged",          # legacy multi-pass layout
     }
-    for ancestor in p.parents:
-        if ancestor.name not in INTERMEDIATE_NAMES:
-            return ancestor
-        # Keep walking; e.g. plane0 -> suite2p -> final -> detection -> rec.
+    chain = [p] + list(p.parents)           # deepest -> shallowest
+    for i, folder in enumerate(chain):
+        if folder.name in INTERMEDIATE_NAMES:
+            # Skip the rest of the chain (plane0 -> suite2p -> final ->
+            # detection -> ...) and return the first folder above it.
+            for above in chain[i + 1:]:
+                if above.name not in INTERMEDIATE_NAMES:
+                    return above
+            return chain[-1]
 
-    # Strategy 3: legacy "<rec>/suite2p/plane0" assumption.
-    if p.name == "plane0" and p.parent.name == "suite2p":
-        return p.parent.parent
-
-    # Last resort.
-    return p
+    # Strategy 3: no suite2p chain in the path -- the path is the
+    # recording folder itself.
+    return p.parent if p.is_file() else p
 
 
 def infer_recording_id(path) -> str:

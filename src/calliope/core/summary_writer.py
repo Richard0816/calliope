@@ -21,7 +21,8 @@ Why a workbook and not just NumPy files?
 Sheet conventions
 -----------------
 - ``Recording``: single key/value table (recording_id, plane0, prefix,
-  fps, T, N, generated_at). Updated by every tab.
+  fps, T, N, generated_at). Refreshed by Tab 3 (detection), Tab 5
+  (event detection) and Tab 6 (clustering), GUI and headless paths.
 - ``ROIs``: one row per ROI from the Suite2p detection tab.
 - ``FilterParams``: filter knobs from the Low-pass tab (key/value).
   RESERVED -- ``write_filter_params_sheet`` exists but is not currently
@@ -115,8 +116,8 @@ def write_sheet(
     -------------------
     pandas' ``ExcelWriter`` with ``mode="a"`` + ``if_sheet_exists=
     "replace"`` lets us write **one** sheet without trampling other
-    sheets that another tab wrote earlier. So Tab 4 stamping the
-    FilterParams sheet doesn't erase the ROIs sheet that Tab 3
+    sheets that another tab wrote earlier. So Tab 5 writing the
+    EventWindows sheet doesn't erase the ROIs sheet that Tab 3
     wrote.
 
     Caller is responsible for retrying on ``PermissionError`` if
@@ -178,8 +179,9 @@ def update_recording_meta(
 ) -> Path:
     """Write/update the "Recording" sheet (key/value pairs).
 
-    Every tab calls this on completion -- the sheet acts as a single-
-    row description of the recording and a "last touched" timestamp.
+    Tabs 3, 5 and 6 (and their headless runners) call this on
+    completion -- the sheet acts as a single-row description of the
+    recording and a "last touched" timestamp.
     Subsequent calls overwrite the sheet rather than append, so the
     Recording sheet always reflects the most recent state.
 
@@ -225,10 +227,9 @@ def _infer_recording_id(plane0: Path) -> str:
 
     Defer to ``utils.infer_recording_id`` (in ``core/utils.py``) for
     the robust resolution: it tries the canonical date-pattern regex
-    first, falls back to skipping known intermediate folder names
-    (``suite2p`` / ``plane0`` / ``detection`` / ``final`` /
-    ``_shared_reg`` / etc.), and finally to the legacy two-parents-up
-    behaviour.
+    first, then falls back to the first folder above the suite2p
+    output chain (``plane0`` / ``suite2p`` / ``final`` / ``detection``
+    / ``_shared_reg`` / etc.).
     """
     from .utils import infer_recording_id
     return infer_recording_id(plane0)
