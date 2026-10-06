@@ -15,16 +15,25 @@ threshold along the dendrogram. The output is per-cell cluster
 labels -- the same colours then drive both the dendrogram and a
 spatial map of the FOV.
 
-This module mixes two layers:
+This module mixes three layers:
 
 * Palette + plotting + threshold helpers (``resolve_palette``,
   ``count_clusters``, ``auto_choose_threshold``, ``plot_dendrogram``,
-  ``plot_spatial``) used by both the interactive Tab 6 and the
-  headless ``run_clustering`` below.
+  ``plot_spatial``). ``resolve_palette`` / ``count_clusters`` /
+  ``auto_choose_threshold`` are shared with the interactive Tab 6;
+  the two plotters are used only by the headless ``run_clustering``
+  (Tab 6 draws its own interactive figures).
+* Tk-free data helpers shared with Tab 6 (``tabs/clustering/logic.py``
+  re-exports them): ``ward_linkage``, ``load_filtered_dff``,
+  ``stat_for_prefix`` and ``filtered_to_suite2p_indices``. Filtered
+  readers size the keep mask via ``utils.resolve_filtered_mask``
+  (anchored to the memmap's on-disk column count), never the live
+  ``predicted_cell_mask``/``iscell``.
 * The headless orchestrator ``run_clustering(plane0, params, ...)``
   that drives the linkage + threshold pick + label remap + cluster
-  export + summary writer end-to-end so Tab 0's batch runner can
-  reproduce Tab 6's output without opening a Tk window.
+  export + summary writer end-to-end, so callers without a Tk window
+  (``core.batch_pipeline.run_recording``, figure-regeneration scripts)
+  reproduce Tab 6's output.
 
 Where to look in the source if you've never used SciPy clustering
 -----------------------------------------------------------------
@@ -40,15 +49,22 @@ Where to look in the source if you've never used SciPy clustering
 
 Public surface
 --------------
-``run_clustering(traces, ...)``
-    The end-to-end "compute one clustering" function Tab 6's Render
-    button calls.
-``recluster_branch(linkage_Z, branch_id, ...)``
-    Re-cluster a single dendrogram branch in isolation, used when
-    the user picks one fat cluster and asks for a finer split.
-``auto_choose_threshold(linkage_Z, target_n_clusters)``
-    Heuristic for "find a height that splits the dendrogram into ~N
-    clusters". Used as the default when the user hits Render.
+``run_clustering(plane0, params, *, figures_dir=None, write_summary=True)``
+    Headless "compute one clustering" entry point: linkage, cut,
+    ``C*_rois.npy`` export, optional figures + summary sheet. Tab 6's
+    Run button does NOT call it (it offloads
+    ``tabs.clustering.logic.compute_clustering_offload`` and drives
+    the cut interactively).
+``auto_choose_threshold(Z, target_counts=(4, 5), start, stop, step)``
+    Heuristic for "find a cut fraction that splits the dendrogram into
+    one of ``target_counts`` clusters". Default cut for Tab 6's Run and
+    for ``run_clustering`` when ``params['threshold']`` is None.
+``ward_linkage`` / ``load_filtered_dff`` / ``stat_for_prefix`` /
+``filtered_to_suite2p_indices``
+    Shared data helpers (see above).
+
+Branch re-clustering ("Recluster within branch") lives in the GUI
+(``tabs.clustering.logic.ReclusterWindow``), not here.
 
 Designed as a backend for GUI integration: each step is a small
 function that accepts parameters and returns plain data, so the GUI
@@ -160,47 +176,14 @@ def resolve_palette(palette: PaletteLike, n_colors: int = 10) -> list[str]:
     ]
 
 
-def _resolve_pix_to_um(root: Path, ops: dict) -> Optional[float]:
-    """Read the µm-per-pixel scale that Tab 3 stored on ``ops``.
-
-    Thin wrapper around :func:`calliope.core.scale.resolve_pix_to_um`
-    kept here for backward compatibility -- callers in this module
-    pass the recording root by convention but the new resolver only
-    needs the ops dict (Tab 3 is responsible for writing
-    ``ops['pix_to_um']`` based on the user's zoom or direct
-    calibration). ``root`` is unused.
-    """
-    del root  # historical signature; ops carries the scale now
-    return resolve_pix_to_um(ops)
-
-
-def count_leaf_color_groups(Z: np.ndarray, color_threshold: float) -> int:
-    """Count how many distinct branch colours the dendrogram would
-    use at the given cut height fraction.
-
-    ``color_threshold`` is a fraction of ``max(Z[:, 2])`` -- the
-    deepest merge -- so that a single "cut depth" parameter scales
-    naturally across recordings.
-
-    Used internally by ``auto_choose_threshold`` to find a height
-    that produces a target cluster count. ``no_plot=True`` makes
-    ``dendrogram`` skip the actual rendering and just return its
-    metadata.
-    """
-    r = dendrogram(Z, no_plot=True, color_threshold=color_threshold * np.max(Z[:, 2]))
-    # ``set(...)`` deduplicates the per-leaf colour assignment to
-    # give a colour count.
-    return len(set(r["leaves_color_list"]))
-
-
 def count_clusters(Z: np.ndarray, color_threshold: float) -> int:
     """Number of distinct flat clusters below ``color_threshold *
     max(linkage)``.
 
-    Differs from ``count_leaf_color_groups`` because matplotlib's
-    dendrogram renderer can chunk small clusters into a single
-    "above_threshold_color" group; ``fcluster`` gives the actual
-    cluster count.
+    Counts ``fcluster`` labels rather than dendrogram branch colours:
+    matplotlib's dendrogram renderer can chunk small clusters into a
+    single "above_threshold_color" group, so a colour count
+    under-reports; ``fcluster`` gives the actual cluster count.
     """
     # A degenerate (0-merge) linkage has no tree to cut -- there is at
     # most one observation, i.e. exactly one trivial cluster.
@@ -232,8 +215,8 @@ def auto_choose_threshold(
     Tab 6 calls this on first Render so the user sees something
     reasonable without having to touch the slider.
 
-    Counts via ``count_clusters`` (i.e. ``fcluster``) not
-    ``count_leaf_color_groups``. Matplotlib's dendrogram renderer
+    Counts via ``count_clusters`` (i.e. ``fcluster``), not by counting
+    dendrogram leaf colours. Matplotlib's dendrogram renderer
     bundles small clusters under a single ``above_threshold_color``
     group, so the colour-group count under-reports the true
     fcluster count on fragmented recordings -- the auto-pick would
@@ -333,23 +316,32 @@ def plot_dendrogram(
     return colors
 
 
-def _stat_for_prefix(root: Path, prefix: str) -> tuple[list, Optional[np.ndarray]]:
+def stat_for_prefix(plane0: Path, prefix: str) -> tuple[list, Optional[np.ndarray]]:
+    """Stat list aligned with the columns of the ``<prefix>`` dF/F memmap.
+
+    For filtered prefixes (e.g. ``r0p7_filtered_``), restrict ``stat`` to
+    the keep mask so the i-th stat entry matches the i-th dF/F column.
+    Returns ``(stat_list, original_indices_or_None)``.
+
+    The mask is resolved the same way :func:`load_filtered_dff` resolves
+    it -- anchored to the filtered memmap's on-disk column count via
+    ``utils.resolve_filtered_mask`` -- not read blindly from
+    ``r0p7_cell_mask_bool.npy`` or the live ``predicted_cell_mask`` /
+    ``iscell``. Otherwise, when curation drifts those files after the
+    memmap was written, stat is sliced to a different count than the
+    dF/F columns and ROI colours land on the wrong cells.
     """
-    Match the filtered-ROI convention used by hierarchical_clustering.py:
-    when the prefix signals a filtered set (e.g. 'r0p7_filtered_'),
-    restrict stat to ROIs kept by the cell mask so indices align with
-    the filtered ΔF/F used during clustering.
-    """
-    root = Path(root)
-    stat = list(np.load(root / "stat.npy", allow_pickle=True))
+    plane0 = Path(plane0)
+    full_stat = list(np.load(plane0 / "stat.npy", allow_pickle=True))
     if utils.is_filtered_prefix(prefix):
-        mask_path = root / "r0p7_cell_mask_bool.npy"
-        if mask_path.exists():
-            mask = np.load(mask_path)
-            used = np.where(mask)[0]
-            return [stat[i] for i in used], used
-        print(f"⚠️ {mask_path} not found; painting against unfiltered stat.npy.")
-    return stat, None
+        dff_path = plane0 / f"{prefix}dff.memmap.float32"
+        F = np.load(plane0 / "F.npy", mmap_mode="r")
+        N_total, T = F.shape
+        mask, _ = utils.resolve_filtered_mask(
+            plane0, N_total, memmap_path=dff_path, T=T)
+        return ([s for s, keep in zip(full_stat, mask) if keep],
+                np.where(mask)[0])
+    return full_stat, None
 
 
 def plot_spatial(
@@ -368,7 +360,8 @@ def plot_spatial(
 
     If `used_indices` is provided, stat is restricted to those rows.
     Otherwise, if `prefix` indicates a filtered ROI set, stat is restricted
-    via the cell mask so `order` aligns with clustering indices.
+    via :func:`stat_for_prefix` (memmap-anchored keep mask) so `order`
+    aligns with clustering indices.
     """
     root = Path(root)
     view = utils.load_plane_view(root)
@@ -378,7 +371,7 @@ def plot_spatial(
         full_stat = list(np.load(root / "stat.npy", allow_pickle=True))
         stat = [full_stat[i] for i in used_indices]
     else:
-        stat, _ = _stat_for_prefix(root, prefix)
+        stat, _ = stat_for_prefix(root, prefix)
 
     link_colors = list(link_colors)
     roi_rgb = np.zeros((len(stat), 3))
@@ -393,7 +386,7 @@ def plot_spatial(
     coverage = utils.paint_spatial(np.ones(len(stat)), stat, Ly, Lx)
     img[coverage == 0] = np.nan
 
-    pix_to_um = _resolve_pix_to_um(root, view)
+    pix_to_um = resolve_pix_to_um(view)
     if pix_to_um is not None:
         extent = [0, Lx * pix_to_um, 0, Ly * pix_to_um]
         xlabel, ylabel = "X (µm)", "Y (µm)"
@@ -419,34 +412,20 @@ def plot_spatial(
 
 
 # ---------------------------------------------------------------------------
-# Headless orchestrator -- the entry point Tab 0's batch runner calls.
+# Tk-free data helpers (shared with tabs/clustering/logic.py)
 # ---------------------------------------------------------------------------
-#
-# The interactive Tab 6 builds its linkage / threshold / cluster export
-# inline from the tab class because it also has to drive a bunch of Tk
-# widgets between steps. For the headless batch path we want a single
-# function with no Tk dependency. Everything below is a straight lift of
-# the orchestration logic the tab runs after the user clicks Render.
 
 
-# Cluster .npy files are written directly into
-# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder.
+def load_filtered_dff(plane0: Path, prefix: str):
+    """Open ``<prefix>dff.memmap.float32`` against the cell-filter mask.
 
+    For a "filtered" prefix (e.g. ``r0p7_filtered_``) the memmap was
+    written at the size of the keep mask live at Tab 3 time, so we need
+    that exact mask to interpret the column count. For an unfiltered
+    prefix, the memmap holds every Suite2p ROI.
 
-def _load_filter_mask(plane0: Path) -> Optional[np.ndarray]:
-    pred_path = plane0 / "predicted_cell_mask.npy"
-    if pred_path.exists():
-        return np.load(pred_path).astype(bool)
-    iscell_path = plane0 / "iscell.npy"
-    if iscell_path.exists():
-        ic = np.load(iscell_path)
-        return ((ic[:, 0] > 0) if ic.ndim == 2 else (ic > 0)).astype(bool)
-    return None
-
-
-def _load_filtered_dff(plane0: Path, prefix: str):
-    """Open ``<prefix>dff.memmap.float32`` against the cell-filter
-    mask. Returns (dff_array, T, N_kept, keep_mask).
+    Returns ``(dff_array, T, N_kept, keep_mask)``. ``keep_mask`` is
+    ``None`` when the prefix is unfiltered.
     """
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
@@ -473,18 +452,58 @@ def _load_filtered_dff(plane0: Path, prefix: str):
     return dff, T, N_kept, mask
 
 
-def _ward_linkage(dff: np.ndarray,
-                  method: str = "ward") -> np.ndarray:
+def filtered_to_suite2p_indices(plane0: Path, prefix: str) -> Optional[np.ndarray]:
+    """Translator from kept-ROI (dF/F column) position to Suite2p ROI index.
+
+    Returns ``np.where(mask)[0]`` for a filtered prefix and ``None`` for an
+    unfiltered one (where column position already *is* the Suite2p index).
+
+    Like :func:`stat_for_prefix`, the mask is resolved against the filtered
+    memmap's on-disk column count via ``utils.resolve_filtered_mask`` so the
+    translator stays the exact length of the linkage's leaves even after
+    curation drifts ``predicted_cell_mask``/``iscell``. Export / ROI-id
+    callsites previously read the live mask and silently fell back to
+    emitting filtered-list positions (not Suite2p ids) whenever
+    ``mask.sum()`` no longer matched the leaf count.
+    """
+    if not utils.is_filtered_prefix(prefix):
+        return None
+    plane0 = Path(plane0)
+    dff_path = plane0 / f"{prefix}dff.memmap.float32"
+    F = np.load(plane0 / "F.npy", mmap_mode="r")
+    N_total, T = F.shape
+    mask, _ = utils.resolve_filtered_mask(
+        plane0, N_total, memmap_path=dff_path, T=T)
+    return np.where(np.asarray(mask, dtype=bool))[0].astype(int)
+
+
+def ward_linkage(dff: np.ndarray, method: str = "ward") -> np.ndarray:
     """Ward linkage on z-scored ROI traces with Euclidean distance.
 
-    Z-scoring kills amplitude, so squared Euclidean and (1 - Pearson r)
-    rank pairs identically (``||x - y||^2 = 2T * (1 - r)``); we use
-    Euclidean because scipy's Ward implementation requires it. Ward
-    minimises within-cluster sum-of-squares and produces compact,
-    balanced clusters -- the shape lab members want.
+    Z-scoring each ROI to ``(mean=0, std=1)`` flattens amplitude so
+    two cells with very different baseline brightness or scale but
+    the same activity *shape* land close together. With z-scoring
+    applied, squared Euclidean distance and (1 - Pearson r) are
+    equivalent up to a constant (``||x - y||^2 = 2T * (1 - r)``)
+    so the *pair-ranking* is identical to correlation distance --
+    we just use Euclidean because scipy's Ward implementation
+    requires a Euclidean metric. The resulting merge heights (and
+    therefore every cut threshold) are absolute Ward distances, not
+    ``1 - r`` values.
 
-    Mirrors ``tabs.clustering.tab._ward_linkage`` but without the Tk
-    import chain. See that function's docstring for the full history.
+    Why Ward and not average:
+    - Ward minimises within-cluster sum-of-squares (Lance-Williams).
+      Produces compact, roughly balanced clusters -- the typical
+      "4-5 modes" shape lab members find useful.
+    - Average linkage merges by mean pairwise distance. On
+      unbalanced data it can collapse to "1 huge cluster + a few
+      tiny outliers", which is what triggered the earlier
+      cluster-fragmentation guard on cross-correlation.
+
+    History: the pre-2026-05-11 GUI used average + correlation
+    here. Switched to Ward after noting that z-scoring already kills
+    amplitude differences, so the "Ward needs Euclidean" objection
+    no longer applied.
     """
     n_roi = int(np.asarray(dff).shape[1]) if np.asarray(dff).ndim == 2 else 0
     if n_roi < 2:
@@ -500,10 +519,22 @@ def _ward_linkage(dff: np.ndarray,
     return linkage(dist, method=method)
 
 
+# ---------------------------------------------------------------------------
+# Headless orchestrator -- run_clustering
+# ---------------------------------------------------------------------------
+#
+# The interactive Tab 6 drives its linkage / threshold / cluster export
+# from the tab class because it also has to update Tk widgets between
+# steps. For callers without a Tk window we want a single function with
+# no Tk dependency; run_clustering below reproduces the same outputs.
+# Cluster .npy files are written directly into
+# ``<plane0>/<prefix>cluster_results/`` -- no extra subfolder.
+
+
 def _visual_cluster_map(Z: np.ndarray, T: float) -> dict[int, int]:
     """Map visual cluster index (1..n, dendrogram left-to-right) to
-    the raw fcluster label. Matches Tab 6's
-    ``_compute_visual_cluster_map``.
+    the raw fcluster label. Same traversal as Tab 6's memoised
+    ``ClusteringTab._compute_visual_cluster_map``.
     """
     info = dendrogram(Z, no_plot=True, color_threshold=T,
                       above_threshold_color="gray")
@@ -559,9 +590,9 @@ def run_clustering(
     method = str(params.get("method", "ward"))
     target_counts = tuple(params.get("target_counts", (4, 5)))
 
-    dff, T, N_kept, _mask = _load_filtered_dff(plane0, prefix)
+    dff, T, N_kept, keep_mask = load_filtered_dff(plane0, prefix)
     dff_arr = np.asarray(dff)
-    Z = _ward_linkage(dff_arr, method=method)
+    Z = ward_linkage(dff_arr, method=method)
 
     threshold_param = params.get("threshold")
     if threshold_param is None:
@@ -577,12 +608,22 @@ def run_clustering(
     export_dir = plane0 / f"{prefix}cluster_results"
     export_dir.mkdir(parents=True, exist_ok=True)
 
+    # Translate filtered dF/F column positions to Suite2p ROI ids with the
+    # SAME memmap-anchored mask load_filtered_dff just used to size the
+    # matrix -- never the live predicted_cell_mask/iscell, which drifts
+    # after curation (the old live-mask length check then failed and
+    # filtered positions were exported under the _indices_are_suite2p
+    # marker). For an unfiltered prefix, positions already are Suite2p ids.
     filtered_to_suite2p: Optional[np.ndarray] = None
-    if utils.is_filtered_prefix(prefix):
-        mask = _load_filter_mask(plane0)
-        if mask is not None and int(mask.sum()) == len(labels):
-            filtered_to_suite2p = np.where(
-                np.asarray(mask, dtype=bool))[0].astype(int)
+    if keep_mask is not None:
+        filtered_to_suite2p = np.where(
+            np.asarray(keep_mask, dtype=bool))[0].astype(int)
+        if filtered_to_suite2p.size != len(labels):
+            raise ValueError(
+                f"{plane0}: keep mask selects {filtered_to_suite2p.size} "
+                f"ROIs but the linkage has {len(labels)} leaves; refusing "
+                f"to export cluster ROI ids that cannot be translated to "
+                f"Suite2p indices.")
 
     for stale in export_dir.glob("C*_rois.npy"):
         stale.unlink()
@@ -597,6 +638,9 @@ def run_clustering(
     np.save(export_dir / "linkage.npy", Z)
     np.save(export_dir / "threshold_used.npy",
             np.array([threshold], dtype=float))
+    # Every C*_rois.npy above holds Suite2p ids (translated for a filtered
+    # prefix, identity for an unfiltered one), so the marker telling
+    # core.crosscorrelation to skip its legacy translation is now true.
     (export_dir / "_indices_are_suite2p").write_text("1")
 
     _base_colors = resolve_palette(palette, n_colors=max(1, n_clusters))
