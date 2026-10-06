@@ -644,6 +644,7 @@ def build_batch_param_spec() -> list:
         "Cellpose-SAM (Tier 2)": "2. Detection - Cellpose-SAM",
         "Cell filter": "2. Detection - Cell filter",
         "Re-detect": "2. Detection - Re-detect",
+        "QC": "2. Detection - QC",
         "dF/F": "2. Detection - dF/F",
         "Default low-pass": "2. Detection - Default low-pass",
         "Pixel scale": "2. Detection - Pixel scale",
