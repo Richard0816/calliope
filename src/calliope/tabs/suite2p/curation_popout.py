@@ -777,6 +777,13 @@ class CurationPopout(ctk.CTkToplevel):
         else:
             init_line = (f"Trains from random init (lr {_cfg.LR:g}); no "
                          f"selected checkpoint to warm-start from.")
+        # Tab 3 (the only parent that supplies the checkpoint hook)
+        # also rewrites the filtered dF/F memmap on the (-1, -1)
+        # sentinel and selects the new best.pt.
+        parent_line = (
+            " Tab 3 then rewrites the filtered dF/F memmap to the new "
+            "cell set and selects the new best.pt as its checkpoint."
+            if self._on_checkpoint_trained is not None else "")
         if not messagebox.askyesno(
                 "Retrain cell filter",
                 f"Retrain the cell filter now?\n\n"
@@ -788,10 +795,9 @@ class CurationPopout(ctk.CTkToplevel):
                 f"labels CSV when it starts, so flips made during "
                 f"training go into the next round.\n\n"
                 f"When it finishes, this recording is re-predicted "
-                f"(size_outlier_z={size_z:g}), "
-                f"{_cfg.PREDICTED_MASK_NAME} is overwritten, the "
-                f"filtered dF/F memmap is rewritten to the new cell set, "
-                f"and the new best.pt becomes the selected checkpoint."):
+                f"(size_outlier_z={size_z:g}) and "
+                f"{_cfg.PREDICTED_MASK_NAME} is overwritten."
+                f"{parent_line}"):
             return
         self._retrain_btn.configure(state="disabled")
         self._train_status_var.set("Training... see console for epoch log")

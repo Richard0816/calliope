@@ -215,3 +215,24 @@ def test_split_labels_recording_refuses_single_class_side():
 def test_split_labels_rejects_unknown_split():
     with pytest.raises(ValueError):
         T._split_labels(_labels(2, lambda r: [0, 1]), "bogus")
+
+
+def test_retrain_dialog_describes_threaded_training(tmp_path, monkeypatch):
+    seen = {}
+
+    def _ask(title, text):
+        seen["text"] = text
+        return False                      # cancel: nothing is started
+
+    monkeypatch.setattr(CP.messagebox, "askyesno", _ask)
+    pop = _bare_popout(tmp_path, get_size_outlier_z=lambda: 0,
+                       on_checkpoint_trained=lambda p: None)
+    pop._train_thread = None
+    pop._csv_path = tmp_path / "labels.csv"
+    pop._on_retrain()
+    text = seen["text"]
+    assert "synchronous" not in text and "block" not in text
+    assert "Flip buttons stay enabled" in text
+    assert "size_outlier_z=0" in text
+    assert "filtered dF/F memmap" in text
+    assert pop._train_thread is None
