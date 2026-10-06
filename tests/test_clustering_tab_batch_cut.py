@@ -87,3 +87,26 @@ def test_reload_enables_export_figures(monkeypatch, tmp_path):
             "N": 6, "T": 5, "cluster_dir": str(tmp_path)}
     ClusteringTab._on_reloaded(s, data)
     s.export_figs_btn.configure.assert_called_with(state="normal")
+
+
+def test_batch_threshold_zero_disables_slider():
+    s = _stub(zmax=10.0)
+    ClusteringTab.apply_batch_row(s, {"threshold": 0})
+    s.threshold_scale.config.assert_called_with(state="disabled")
+
+
+def test_run_clustering_refuses_untranslatable_ids(monkeypatch, tmp_path):
+    # keep mask count != linkage leaves -> refuse rather than export
+    # filtered column positions as if they were Suite2p ids.
+    import numpy as np
+    import pytest
+    from calliope.core import clustering
+
+    rng = np.random.default_rng(0)
+    dff = rng.normal(size=(50, 6)).astype(np.float32)
+    bad_mask = np.array([1, 1, 1, 0, 0, 0, 0, 0], dtype=bool)  # 3 != 6
+    monkeypatch.setattr(clustering, "load_filtered_dff",
+                        lambda plane0, prefix: (dff, 50, 6, bad_mask))
+    with pytest.raises(ValueError, match="cannot be translated"):
+        clustering.run_clustering(tmp_path, {"threshold": 1.0},
+                                  write_summary=False)

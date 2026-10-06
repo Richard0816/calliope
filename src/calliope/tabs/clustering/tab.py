@@ -252,6 +252,11 @@ class ClusteringTab(ctk.CTkFrame):
                     # batch row left behind so auto_choose_threshold drives.
                     self._batch_threshold = None
                     self.manual_var.set(False)
+                    # Mirror _on_manual_toggle: auto mode has no slider.
+                    try:
+                        self.threshold_scale.config(state="disabled")
+                    except Exception:
+                        pass
 
     def _build_ui(self) -> None:
         head = ctk.CTkFrame(self)
@@ -685,9 +690,11 @@ class ClusteringTab(ctk.CTkFrame):
         n_clusters = int(np.unique(
             fcluster(self._Z, t=self._current_threshold(),
                      criterion="distance")).size)
+        cut_desc = (f"batch cut={self._manual_T:.3g}" if batch_cut
+                    else f"auto cut={auto_frac:.2f}xmax")
         self.status_var.set(
             f"OK. N_rois={data['N']}  T={data['T']}  "
-            f"auto cut={auto_frac:.2f}xmax  -> {n_clusters} clusters. "
+            f"{cut_desc}  -> {n_clusters} clusters. "
             f"Toggle 'Manual threshold' + slider to tune.")
         self._refresh_reload_btn()
 

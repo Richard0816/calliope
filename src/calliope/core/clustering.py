@@ -568,8 +568,9 @@ def run_clustering(
         :func:`auto_choose_threshold`),
         ``target_counts`` (default ``(4, 5)``),
         ``palette`` (default ``"tab10"``),
-        ``method`` (default ``"ward"``),
-        ``metric`` (default ``"euclidean"``).
+        ``method`` (default ``"ward"``). The distance is always
+        Euclidean (:func:`ward_linkage` computes it; Ward requires it),
+        so a ``metric`` key is ignored.
     figures_dir : Path or None
         If set, saves ``dendrogram.png`` and ``spatial_clusters.png``
         under that directory.
@@ -739,7 +740,7 @@ def run_clustering(
                 cluster_colors=cluster_colors,
                 threshold=threshold,
                 method=method,
-                metric=str(params.get("metric", "euclidean")),
+                metric="euclidean",  # what ward_linkage actually used
                 roi_indices=roi_indices,
             )
         except Exception as e:
