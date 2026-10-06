@@ -8,9 +8,10 @@ Toplevel opens with two stacked panels for that ROI's cluster:
     [ Filtered lowpass dF/F heatmap, one row per ROI ]
     [ Event raster, same row order, one dot per onset ]
 
-Plus a status row that names the cluster, lists the cluster's
-Suite2p ROI ids, and highlights the row corresponding to the clicked
-ROI with a yellow tick on the y-axis.
+Plus a status row that names the cluster and lists its members as
+*filtered-list positions* (columns of Tab 6's dF/F, not Suite2p ROI
+ids -- Tab 6's "ROIs in picked clusters" box shows Suite2p ids). The
+row of the clicked ROI is highlighted with a yellow tick on the y-axis.
 
 Data sources
 ------------
@@ -28,7 +29,10 @@ Data sources
   is kept as forward-compatible "Phase 1" scaffolding: it activates only
   if a future payload supplies a ``"raster"`` whose column count matches
   the heatmap (row-alignment to Tab 6's filtered stat list still has to
-  be established before it can be trusted).
+  be established before it can be trusted). Building a real onset raster
+  from ``event_results['onsets_by_roi']`` instead is an open owner
+  decision (it changes what the panel shows), so the branch is left in
+  place rather than finished or removed.
 
 Single-instance pattern
 -----------------------
@@ -93,6 +97,11 @@ def _slice_state_raster(event_results: Optional[dict],
     """Return the raster from ``event_results`` if its column count
     matches ``dff_T`` (so per-ROI rows can be sliced 1:1 with the
     heatmap), else ``None``.
+
+    Currently always ``None`` in the GUI: Tab 5 pops ``"raster"`` from
+    the payload before publishing ``AppState.event_results``, and its
+    raster is downsampled (~2000 columns) and sorted most-active-first,
+    so it would fail the shape check anyway. See the module docstring.
     """
     if not event_results:
         return None
@@ -178,16 +187,16 @@ class ClusterPopout(ctk.CTkToplevel):
         stat : list
             Filtered stat list (one entry per kept ROI).
         cluster_color : str
-            Hex color of the cluster -- used to tint the panel border
-            and the cluster summary line so the popout matches the
-            Tab 6 spatial map.
+            Hex color of the cluster -- used to tint the heatmap title
+            background so the popout matches the Tab 6 spatial map.
         fps : float
             Sampling rate for the time axis. Falls back to frame
             indices when fps <= 0.
         event_results : dict, optional
-            Tab 5's render payload; if its raster shape aligns with
-            ``dff``, the popout shows real onsets instead of the
-            derivative-threshold fallback.
+            Tab 5's published payload. Would supply real onsets if it
+            carried a ``"raster"`` aligned with ``dff``; today it never
+            does (see ``_slice_state_raster``), so the
+            derivative-threshold fallback is shown.
         """
         self._dff = np.asarray(dff)
         self._labels = np.asarray(labels)
