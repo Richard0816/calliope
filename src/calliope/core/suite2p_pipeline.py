@@ -34,9 +34,9 @@ The pipeline has three layers:
    so we can union its ROIs with sparsery's set.
 
 Settings routing helpers (``set_setting`` / ``get_setting`` /
-``apply_settings_overrides`` / ``apply_db_overrides``) translate flat legacy ops keys (the format
-suite2p 0.x used and the GUI tabs still produce in PARAM_SPEC) to
-the nested 1.0 schema.
+``apply_settings_overrides`` / ``apply_db_overrides``) translate flat
+legacy ops keys (the format suite2p 0.x used and the GUI tabs still
+produce in PARAM_SPEC) to the nested 1.0 schema.
 
 One monkey-patch is installed:
 :func:`_patch_suite2p_estimate_spatial_scale` (coerce suite2p's broken
