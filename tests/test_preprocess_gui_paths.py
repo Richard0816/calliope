@@ -123,5 +123,7 @@ def test_load_existing_offload_regenerates(tmp_path):
 def test_tab1_qc_keys_match_core():
     tab_mod = pytest.importorskip("calliope.tabs.preprocess.tab")
     assert set(tab_mod.PreprocessTab._qc_keys()) == set(pp._QC_KEYS)
+    # Every "QC gif" knob is forwarded; a non-QC Tab 1 knob would not be.
     assert set(tab_mod.PreprocessTab._qc_keys()) == {
-        s["name"] for s in tab_mod.PreprocessTab.PARAM_SPEC}
+        s["name"] for s in tab_mod.PreprocessTab.PARAM_SPEC
+        if s.get("group") == "QC gif"}
