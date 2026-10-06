@@ -583,8 +583,11 @@ class BatchTab(ctk.CTkFrame):
         # externally. Defaults preserve today's behavior exactly:
         # registration + shifted TIFF kept, raw compression off. The
         # preset bulk-sets the three checkboxes; users can still tweak
-        # each one afterward. Read at finalize (see _finalize_recording_row
-        # / _start_continuous_mirror), never persisted -- matches
+        # each one afterward. Read by the continuous mirror
+        # (_start_mirror_for_row), the row-end finalize
+        # (_finalize_via_mirror_async / its _finalize_worker) and the
+        # Tab 3 save-policy push (_apply_save_policy_to_detection_tab);
+        # never persisted -- matches
         # save_figures_var, which is also session-only.
         self.keep_registration_var = tk.BooleanVar(value=True)
         self.keep_shifted_var = tk.BooleanVar(value=True)
@@ -1424,11 +1427,13 @@ class BatchTab(ctk.CTkFrame):
         # report are guaranteed to exist on disk.
         self._batch_finalize_threads: list[threading.Thread] = []
         self._finalize_waiting = False
-        # Continuous-mirror state when scratch is on a different
-        # physical drive from the output folder: one daemon thread
+        # Continuous-mirror state whenever scratch routing is on
+        # (single- and two-drive layouts alike): one daemon thread
         # per row that polls scratch and copies new files to HDD
         # while the pipeline is still computing. See
-        # ``_start_mirror_for_row`` / ``_drain_mirror_for_row``.
+        # ``_start_mirror_for_row`` (start) and
+        # ``_finalize_via_mirror_async`` / ``_retry_row_conservative``
+        # (stop + drain).
         self._mirror_workers: dict[str, dict] = {}
         # True iff scratch and output are on different physical
         # drives -- only set when scratch routing is enabled.
@@ -2698,12 +2703,12 @@ class BatchTab(ctk.CTkFrame):
         The worker polls every 2 s when nothing's changed, every
         0.2 s after a copy lands (to drain bursts quickly). Skips
         files whose mtime is < 1 s old (in-flight writes) and
-        anything ``_is_scratch_mirror_skippable`` says is an
+        anything ``logic.is_scratch_mirror_skippable`` says is an
         intermediate the row-end prune would have dropped.
 
         Tracked in ``self._mirror_workers[ident]`` as a dict of
-        ``{thread, stop, synced, seen, inode_to_dst,
-        throttle_provider}`` so ``_finalize_via_mirror_async``
+        ``{thread, stop, synced, seen, inode_to_dst}`` so
+        ``_finalize_via_mirror_async``
         can signal stop + wait for the final pass to complete.
         """
         if self._batch_scratch_root is None:
@@ -2792,7 +2797,6 @@ class BatchTab(ctk.CTkFrame):
             "synced": synced_evt,
             "seen": seen,
             "inode_to_dst": inode_to_dst,
-            "throttle_provider": throttle_provider,
         }
         t.start()
         self._batch_finalize_threads.append(t)
@@ -2803,7 +2807,8 @@ class BatchTab(ctk.CTkFrame):
                                    *,
                                    row=None,
                                    base_status: str = "") -> None:
-        """Two-drive finalize: stop the row's continuous mirror,
+        """Row-end finalize (both single- and two-drive layouts):
+        stop the row's continuous mirror,
         wait for it to drain, then repoint AppState + rmtree
         scratch. Runs in a daemon thread so the orchestrator can
         advance to the next row immediately.
@@ -3015,8 +3020,8 @@ class BatchTab(ctk.CTkFrame):
         path rewrite shouldn't have side effects, so we just swap
         the values in place.
 
-        Tab-local ``_plane0`` / ``_final_plane0`` / ``_plane0_path``
-        caches get the same direct rewrite. We touch every tab the
+        Tab-local ``_plane0`` / ``_final_plane0`` caches get the
+        same direct rewrite. We touch every tab the
         pipeline_gui exposes -- a stale cache on any one of them
         would survive the AppState swap.
         """
@@ -3056,14 +3061,12 @@ class BatchTab(ctk.CTkFrame):
             if new_p is not None:
                 evr["plane0"] = new_p
 
-        # ``AppState.result`` is the PreprocessResult dataclass.
-        # Phase 1 (``_repoint_preprocess_result``) may have already
-        # swapped the four file paths during the row; this row-end
-        # pass also rewrites the ``out_dir`` field (left at scratch
-        # during the row because Tabs 4-8 were still writing there).
-        # Idempotent: if Phase 1 already ran, the four file paths
-        # are already at HDD and ``_rewrite`` returns ``None`` for
-        # them (no-op).
+        # ``AppState.result`` is the PreprocessResult dataclass. Its
+        # paths stay at scratch for the whole row (Tabs 4-8 are still
+        # writing there), so this row-end pass rewrites ``out_dir``
+        # and the three file paths together. Idempotent: a field
+        # already outside ``scratch`` makes ``_rewrite`` return
+        # ``None`` (no-op).
         pre_result = getattr(state, "result", None)
         if pre_result is not None:
             for fld in ("out_dir", "shifted_tiff", "qc_gif",
@@ -3082,8 +3085,7 @@ class BatchTab(ctk.CTkFrame):
         tab_attrs = ("preprocess_tab", "qc_tab", "detection_tab",
                      "lowpass_tab", "event_tab", "clustering_tab",
                      "xcorr_tab", "spatial_tab")
-        plane0_fields = ("_plane0", "_final_plane0", "_plane0_path",
-                         "_current_plane0", "plane0")
+        plane0_fields = ("_plane0", "_final_plane0")
         for tab_attr in tab_attrs:
             tab = getattr(app, tab_attr, None)
             if tab is None:
