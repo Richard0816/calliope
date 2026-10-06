@@ -1494,10 +1494,9 @@ def circular_shift_null_prominences(
     (:func:`compute_candidate_prominences`). The pooled distribution is
     the noise floor a real population event must clear.
 
-    This is the shared engine behind both the
-    ``scripts/null_prominence_audit.py`` experiment and Tab 5's
-    prominence-popout null-floor overlay, so the GUI and the audit see
-    the exact same null.
+    This is the shared engine behind Tab 5's prominence-popout null-floor
+    overlay and the ``auto_min_prominence`` floor, so what the popout
+    shows is exactly the null that sets the floor.
 
     ``progress_cb(done, total)`` is invoked after each shuffle when
     given (the CLI audit uses it for a rate/ETA readout).
