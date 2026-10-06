@@ -157,8 +157,11 @@ def detect_zdrift(
     the pipeline arrays.
 
     Returns ``{detected, n_steps, step_frames, pc1_var_explained,
-    figure_path}``. Returns a zeroed result (``detected=False``) when the
-    dF/F memmap is missing or too short.
+    figure_path, csv_path}`` (``csv_path`` is the per-frame PC1 CSV,
+    written when ``write_csv`` is true, else ``None``). Returns a zeroed
+    result (``detected=False``) when ``plane0/F.npy`` (used to size the
+    memmap) or the ``r0p7_dff.memmap.float32`` dF/F memmap is missing or
+    unreadable, or the recording is too short (``T < 10`` or ``N < 2``).
     """
     plane0 = Path(plane0)
     result = {

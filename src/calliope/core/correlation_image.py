@@ -5,12 +5,15 @@ Why this module exists
 Suite2p 1.0 produces a correlation image ``Vcorr`` as part of its detection
 pass and stores it in ``plane0/detect_outputs.npy``. The Sparsery detector
 fed by that pass already consumes it internally. The Cellpose-SAM second-
-pass detector (audit Tier 2 #13) needs the same image, but it runs on the
-*registration-only* output (before Sparsery), so Vcorr may not be available
-yet -- and on legacy plane folders predating suite2p 1.0 the file may not
-exist at all.
+pass detector (audit Tier 2 #13) needs the same image. Its only caller,
+``sparse_plus_cellpose`` (SAM-on-Vcorr branch), runs *after* the Sparsery
+pass and points :func:`load_or_compute_vcorr` at Sparsery's plane0, so in
+normal runs Vcorr is read straight from ``detect_outputs.npy`` (or a cached
+``Vcorr.npy``) and nothing is recomputed.
 
-``compute_vcorr`` is the fallback: it reads ``data.bin`` in chunks, computes
+``compute_vcorr`` is a defensive fallback for when that lookup comes up
+empty (Sparsery's plane0 is missing, or its ``detect_outputs.npy`` lacks
+``Vcorr``): it reads ``data.bin`` in chunks, computes
 per-pixel Pearson correlation against the local 4-neighbour mean, and writes
 a ``Vcorr.npy`` snapshot to the plane folder. The audit's recommendation
 (2026-05-25 §2.4) is that this is the right input for the SAM pass because:
