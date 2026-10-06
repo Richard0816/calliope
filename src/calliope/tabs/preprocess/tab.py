@@ -164,7 +164,10 @@ class PreprocessTab(ctk.CTkFrame):
         Public seam the Tab 0 batch runner calls before this tab's run
         method fires, instead of poking ``_params`` directly. Consumes
         only the keys this tab owns (the 5 QC-gif knobs) and ignores the
-        rest; keys the row didn't override leave tab state untouched.
+        rest. Tab 0 always passes the row's full effective params (batch
+        defaults filled in), so a key the row didn't override gets the
+        batch default; only a direct caller passing a partial dict leaves
+        tab state for absent keys untouched.
         """
         p = params or {}
         for k in self._qc_keys():

@@ -674,8 +674,10 @@ class CrossCorrelationTab(ctk.CTkFrame):
         """Apply a batch row's xcorr Tk-var knobs (no PARAM_SPEC; everything
         flows through ``_gather_params`` reading Tk vars). Honours
         ``max_lag_seconds``, ``zero_lag``, ``use_gpu``, ``n_shuffles`` and
-        ``compute_partial``; keys the row doesn't carry leave the widgets
-        untouched.
+        ``compute_partial``. Tab 0 always passes the row's full effective
+        params (batch defaults filled in), so every key is set on every
+        row; only a direct caller passing a partial dict leaves the
+        widgets for absent keys untouched.
 
         Public seam the Tab 0 batch runner calls instead of poking this
         tab's internals.
