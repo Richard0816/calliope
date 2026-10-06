@@ -17,17 +17,19 @@ Layout
                                 shared by every tab
 - ``calliope.tabs.<name>``   - one subfolder per notebook tab. Each
                                 holds ``tab.py`` (the GUI widgets) and
-                                ``logic.py`` (a thin re-export shim
-                                pointing at calculations in ``core``)
+                                ``logic.py`` (mostly re-exports of
+                                calculations in ``core``; batch,
+                                clustering and suite2p also keep
+                                tab-level logic there)
 - ``calliope.core``          - pure-Python algorithms shared across
                                 tabs (preprocessing, dF/F, lowpass,
                                 event detection, hierarchical
                                 clustering palettes, cross-correlation,
                                 cellpose-based detection, the
                                 cell-filter PyTorch model)
-- ``calliope.data``          - bundled resource files (Suite2p ``ops``
-                                JSON, the pretrained cell-filter
-                                checkpoint, etc.)
+- ``calliope.data``          - bundled resource files (the
+                                pretrained cell-filter checkpoint
+                                ``cellfilter_best.pt``)
 
 Run the GUI with::
 
