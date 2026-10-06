@@ -268,8 +268,9 @@ class EventDetectionTab(ctk.CTkFrame):
         {"name": "merge_gap_s", "label": "Merge gap (s)",
          "type": "float", "default": 0.0,
          "group": "Population events - boundaries",
-         "help": "legacy overlap-merge gap; ignored when watershed-split "
-                 "is enabled"},
+         "help": "legacy overlap-merge gap; currently has NO effect "
+                 "(merge path disabled 2026-05-01, also with "
+                 "watershed-split off)"},
         {"name": "use_gaussian_boundary",
          "label": "Use Gaussian-fit boundary",
          "type": "bool", "default": False,

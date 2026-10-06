@@ -958,11 +958,24 @@ class EventDetectionParams:
     with the listed default. R's nearest equivalent is
     ``setRefClass(..., fields=list(...))``.
 
-    NOTE (short-event rework, 2026-05-01): defaults were retuned to match
-    event_detection_short.py. Epileptiform events should be < ~0.5 s long;
-    wide windows from the OLD merge logic are now broken up via a watershed
-    split + hard duration clamp. The OLD defaults are kept commented out
-    next to each field for easy revert.
+    NOTE (short-event rework, 2026-05-01): defaults were retuned for
+    short epileptiform events (< ~0.5 s long); wide windows from the OLD
+    merge logic are now broken up via a watershed split + hard duration
+    clamp. The OLD defaults are kept commented out next to each field for
+    reference.
+
+    These dataclass defaults are NOT the Tab 5 GUI defaults. The GUI's
+    ``PARAM_SPEC`` (``tabs/event_detection/tab.py``) is the source of truth
+    for real runs and ``_build_event_params`` writes it over these values;
+    two differ on purpose: GUI ``bin_sec=0.05`` (here 0.025) and GUI
+    ``max_event_duration_s=1.3`` (here 0.5). Code that builds a bare
+    ``EventDetectionParams()`` gets the values below, so pass those two
+    explicitly if you need to reproduce a GUI run.
+
+    ``merge_gap_s`` currently has NO effect in any configuration: its only
+    consumer (the overlap-merge block in ``_boundaries_from_peaks``) was
+    disabled on 2026-05-01 and is kept commented out. The field stays so
+    saved parameter sets and the Tab 5 Advanced dialog keep working.
     """
     # Density construction
     bin_sec: float = 0.025                 # OLD: 0.05
@@ -997,8 +1010,10 @@ class EventDetectionParams:
     max_walk_duration_s: float = 2.0       # NEW: cap on one-sided walk distance from peak (s).
     max_event_duration_s: float = 0.5      # OLD: 10.0  (now: hard physiological cap on FINAL event duration)
 
-    # Overlap merging  (DISABLED in favour of watershed split below)
-    merge_gap_s: float = 0.0  # OLD path: merge events closer than this
+    # Overlap merging -- currently INERT: the merge code that read this was
+    # disabled on 2026-05-01 (see _boundaries_from_peaks), so the value has
+    # no effect whether or not watershed split is enabled.
+    merge_gap_s: float = 0.0
 
     # NEW: watershed split + hard duration cap  ----------------------------
     enable_watershed_split: bool = True
@@ -1035,7 +1050,8 @@ def detect_event_windows(
     ----------
     onsets_by_roi : list of 1D arrays
         Per-ROI onset times in SECONDS (already in recording time, not frames).
-        Equivalent to the output of _event_onsets_by_roi / extract_onsets_by_roi.
+        As built by ``core.event_detection_run.run_event_detection`` (per-ROI
+        hysteresis onsets divided by fps).
         Length = number of ROIs (post cell-mask filtering, if any).
     T : int
         Number of frames in the recording.
@@ -1119,7 +1135,7 @@ def detect_event_windows(
             pass  # keep the static fallback
 
     # NEW: pass prominence_wlen_s through so prominence is measured
-    # locally (matches event_detection_short.py behaviour). We need
+    # locally (within a window around each peak). We need
     # this in *bin* units, so we convert seconds -> bins via
     # ``prominence_wlen_s / bin_sec``. ``| 1`` forces an odd number
     # because scipy.signal.find_peaks's ``wlen`` parameter wants odd.
@@ -1526,8 +1542,7 @@ def _detect_density_peaks(
 
     ``wlen_bins`` (optional) makes the prominence calculation
     *local*: instead of "the deepest valley anywhere on the trace",
-    use the deepest valley within ``wlen_bins`` of the peak. Matches
-    the behaviour of ``event_detection_short.py``.
+    use the deepest valley within ``wlen_bins`` of the peak.
 
     Returns
     -------
@@ -1822,6 +1837,10 @@ def _boundaries_from_peaks(
     # OLD: merge overlapping / touching events (DISABLED 2026-05-01).
     # Replaced by watershed split below so closely-spaced epileptiform
     # events stay separate instead of being fused into one wide window.
+    # This was the only reader of ``params.merge_gap_s``, so that field is
+    # inert in every configuration -- turning watershed split off does NOT
+    # bring merging back (overlapping windows are then left as walked).
+    # Kept commented out as the reference for a possible future restore.
     # ------------------------------------------------------------------
     # merge_gap_samples = max(0, int(round(params.merge_gap_s / dt)))
     # keep = np.ones(peaks.size, dtype=bool)
