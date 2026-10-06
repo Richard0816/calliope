@@ -228,6 +228,13 @@ class CellFilter(nn.Module):
     def predict_proba(self, spatial: torch.Tensor, trace: torch.Tensor) -> torch.Tensor:
         """Inference convenience: returns sigmoid(forward(...)).
 
+        Kept as public API for ad-hoc / notebook scoring. The
+        pipeline itself does not call it: ``predict.predict_recording``
+        and ``train._run_epoch`` apply ``torch.sigmoid`` to the batched
+        logits directly. Call ``model.eval()`` first (as
+        ``predict.load_model_from_checkpoint`` does); this method does
+        not switch modes.
+
         The ``@torch.no_grad()`` decorator turns off gradient tracking
         for the whole call, saving memory and CPU when we don't need
         the backward pass -- always the case at inference time.
