@@ -145,3 +145,16 @@ def test_qc_reload_offloads_archived_regeneration(tmp_path, monkeypatch):
     archived.shifted_paths = [tmp_path / "shifted_a.tif"]
     qc_tab.QcTab._reload_from_folder(stub)
     assert published == [archived] and "offloaded" not in calls
+
+
+# ---- standalone curation app: (-1, -1) sentinel is not a flip ----
+
+def test_curation_app_does_not_advance_on_sentinel():
+    import types
+    from calliope.scripts import roi_curation_app as app
+    steps = []
+    stub = types.SimpleNamespace(_step=steps.append)
+    app.CurationApp._on_flipped(stub, -1, -1)
+    assert steps == []
+    app.CurationApp._on_flipped(stub, 3, 1)
+    assert steps == [1]

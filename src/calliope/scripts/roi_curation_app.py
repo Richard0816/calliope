@@ -573,7 +573,12 @@ class CurationApp:
         current sort order so the curator can label many ROIs in a
         row without touching the arrow keys. Wraps around at the
         end of the sorted list -- matches what Right-arrow would do.
+
+        ``(-1, -1)`` is the popout's "keep set changed" sentinel (after
+        Promote / Retrain), not a flip: stay on the current ROI.
         """
+        if _roi_idx < 0:
+            return
         self._step(+1)
 
     def _step(self, delta: int) -> None:
