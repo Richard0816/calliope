@@ -17,7 +17,6 @@ import queue
 import sys
 import threading
 import types
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
