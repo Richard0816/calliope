@@ -11,10 +11,13 @@ functions.
 
 Public surface
 --------------
-``run_detection(tiff_folder, save_folder, params, *, ckpt_path=None,
-                rec_id=None, baseline_mode='first_n', baseline_min=2.0,
-                figures_dir=None, progress_cb=None)``
-    End-to-end Tab 3 pipeline. Returns ``{plane0, output_files}``.
+``run_detection(tiff_folder, save_folder, params, *, path_to_ops=None,
+                tau_override=None, ckpt_path=None, rec_id=None,
+                baseline_mode='first_n', baseline_min=2.0,
+                figures_dir=None, raw_paths=None, archive_root=None,
+                dest_root=None, write_summary=True, progress_cb=None)``
+    End-to-end Tab 3 pipeline. Returns ``{plane0, fps, T, N,
+    pix_to_um, figures}``.
 ``compute_dff_memmaps(plane0, params, ...)``
     The dF/F + low-pass + derivative loop.
 ``compute_filtered_dff(plane0)``
@@ -24,7 +27,16 @@ Public surface
     Run the cell-filter CNN. Optional step.
 ``stamp_pix_to_um(plane0, params)``
     Resolve ``params['scope_zoom']`` / ``params['um_per_pixel']`` and
-    write ``ops['pix_to_um']`` for downstream tabs.
+    write ``<plane0>/calliope_calibration.npy`` (via
+    ``utils.save_pix_to_um``) for downstream tabs.
+
+Headless-only params
+--------------------
+``run_detection`` also reads two ``params`` keys that have no Tab 3
+Advanced entry: ``zdrift_qc`` (default True; False skips the
+post-detection z-drift QC) and ``keep_registration_cache`` (default
+False; True keeps ``_shared_reg/.../data.bin`` so a re-detect skips
+registration).
 """
 
 from __future__ import annotations
@@ -55,9 +67,13 @@ from . import preprocessing as _pre
 # ~26 GB/recording until the save drive fills (observed at recording
 # 13 in the 2026-05-12 batch).
 #
-# This mirrors ``BatchTab._prune_scratch_tree`` but runs unconditionally
-# at the tail of every detection -- including direct-run agents and
-# headless drivers that don't route through BatchTab's row state machine.
+# This mirrors ``tabs/batch/logic.py::prune_scratch_tree`` but runs
+# unconditionally at the tail of every detection -- including direct-run
+# agents and headless drivers that don't route through the batch tab's
+# row state machine. The two tuples below must stay equal to
+# ``SCRATCH_PRUNE_FILE_PATTERNS`` / ``SCRATCH_RECORDING_INTERMEDIATE_DIRS``
+# there (core cannot import from tabs); tests/test_detection_core_fixes.py
+# checks that they do.
 _PRUNE_FILE_PATTERNS: tuple[str, ...] = (
     "**/data_raw.bin",
     "**/data_raw_chan2.bin",
@@ -524,7 +540,8 @@ def compute_dff_memmaps(
                 "baseline_mode": baseline_mode,
                 "baseline_percentile": perc,
                 "baseline_window_sec": win_sec,
-                "baseline_min_sec": float(baseline_min),
+                # ``baseline_min`` is in minutes; the key is seconds.
+                "baseline_min_sec": float(baseline_min) * 60.0,
                 "fps": fps,
             },
             lowpass={
@@ -688,30 +705,22 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
 
 
 def _build_sparsery_ops(params: dict) -> dict:
-    """Mirror ``Suite2pTab._run_pipeline`` Sparsery dict assembly."""
-    return {
-        "high_pass":         params.get("high_pass", 100),
-        "preclassify":       params.get("preclassify", 0.0),
-        "smooth_sigma":      params.get("smooth_sigma", 1.0),
-        "sparse_mode":       True,
-        "spatial_scale":     params.get("spatial_scale", 0),
-        "threshold_scaling": params.get("threshold_scaling", 0.85),
-        "max_iterations":    params.get("max_iterations", 1500),
-    }
+    """Mirror ``Suite2pTab._run_pipeline`` Sparsery dict assembly.
+
+    Defaults come from ``sparse_plus_cellpose.SPARSERY_OPS``;
+    ``sparse_mode`` is always True.
+    """
+    ops = {k: params.get(k, v) for k, v in spc.SPARSERY_OPS.items()}
+    ops["sparse_mode"] = True
+    return ops
 
 
 def _build_cellpose_cfg(params: dict) -> dict:
-    return {
-        "cellpose_model_type":
-            params.get("cellpose_model_type", "cyto2"),
-        "cellpose_diameter":
-            params.get("cellpose_diameter", 0),
-        "cellpose_flow_threshold":
-            params.get("cellpose_flow_threshold", 0.8),
-        "cellpose_cellprob_threshold":
-            params.get("cellpose_cellprob_threshold", -1.0),
-        "cellpose_channel_input": "meanImg",
-    }
+    """Cellpose pass config; defaults from ``sparse_plus_cellpose.CELLPOSE_CFG``.
+    The input channel is always the mean image."""
+    cfg = {k: params.get(k, v) for k, v in spc.CELLPOSE_CFG.items()}
+    cfg["cellpose_channel_input"] = "meanImg"
+    return cfg
 
 
 def archive_offload(save_folder_str: str, params: dict, *,
@@ -851,12 +860,15 @@ def run_detection(
 
     Steps:
       1. ``sparse_plus_cellpose.run`` -> plane0.
-      2. Stamp ``ops['pix_to_um']`` from ``params['scope_zoom']`` /
-         ``params['um_per_pixel']``.
+      2. ``stamp_pix_to_um`` -> ``calliope_calibration.npy`` from
+         ``params['scope_zoom']`` / ``params['um_per_pixel']``.
       3. ``compute_dff_memmaps`` -> r0p7_dff* memmaps.
       4. ``predict_cell_filter`` -> predicted_cell_mask.npy / prob.
          (skipped when ``ckpt_path`` is None or empty)
       5. ``compute_filtered_dff`` -> r0p7_filtered_dff.memmap.
+      6. z-drift QC (skip with ``params['zdrift_qc'] = False``), prune
+         intermediates (``params['keep_registration_cache']`` keeps the
+         registered movie), archive, summary sheets, figures.
 
     Returns ``{plane0: Path, fps: float, T: int, N: int,
     pix_to_um: float|None, figures: list[str]}``.
@@ -865,8 +877,9 @@ def run_detection(
         progress_cb("[detection] running sparse_plus_cellpose...")
     sparsery_ops = _build_sparsery_ops(params)
     cellpose_cfg = _build_cellpose_cfg(params)
-    hard_cap = int(params.get("hard_cap", 60000))
-    max_overlap = float(params.get("max_overlap", 0.3))
+    hard_cap = int(params.get("hard_cap", spc.HARD_CAP))
+    max_overlap = float(params.get("max_overlap",
+                                   spc.CELLPOSE_MERGE_MAX_OVERLAP))
     # User's FPS override (0 = unset) so suite2p's deconvolution / spike
     # timing run at the real acquisition rate rather than the baked-in
     # fallback; the same value drives the dF/F fps in compute_dff_memmaps.
