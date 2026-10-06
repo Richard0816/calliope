@@ -1,10 +1,13 @@
-"""End-to-end batch pipeline orchestrator (Tab 0).
+"""Headless (no-GUI) end-to-end pipeline orchestrator.
 
-Drives one recording through Tabs 3-8 in sequence:
+Drives one recording through the Tabs 1 + 3-8 stages in sequence:
 
-    detection  -> low-pass  -> event detection  -> clustering
-                                                -> cross-correlation
-                                                -> spatial figures
+    preprocess -> detection -> low-pass -> event detection
+               -> clustering -> cross-correlation -> spatial figures
+
+This is a scripting entry point. The GUI's Tab 0 batch runner does
+NOT call it -- Tab 0 drives the GUI tabs themselves -- and the two
+paths are not kept in lock-step.
 
 All figures from each stage are saved under
 ``<save_folder>/calliope_figures/<stage>/`` so the user has a full
@@ -12,9 +15,10 @@ visual record without opening the GUI.
 
 Public surface
 --------------
-``run_recording(tiff_folder, save_folder, params, *, ckpt_path=None,
-                tau_override=None, baseline_mode='first_n',
-                baseline_min=2.0, recording_id=None, progress_cb=None)``
+``run_recording(src_tiffs, save_folder, params, *, path_to_ops=None,
+                ckpt_path=None, tau_override=None,
+                baseline_mode='first_n', baseline_min=2.0,
+                recording_id=None, final_root=None, progress_cb=None)``
     Run the full pipeline for one recording. Returns a dict whose
     ``status`` is ``"ok"`` (everything succeeded), ``"partial"``
     (some stages failed but detection completed) or ``"failed"``
@@ -47,8 +51,8 @@ def _figures_dir_for(save_folder: Path, stage: str) -> Path:
 
 
 # ROI-survival / kept-count resolution is shared with the GUI batch
-# runner via ``utils`` so the skip policy can't drift between the two
-# entry points. These thin wrappers keep the module-local names.
+# runner (Tab 0) via ``utils`` so the skip policy can't drift between
+# the two entry points. These thin wrappers keep the module-local names.
 def _no_rois_survive(plane0: Path) -> bool:
     return utils.no_rois_survive(plane0)
 
@@ -323,7 +327,8 @@ def run_recording(
                 event_windows=event_windows,
                 figures_dir=_figures_dir_for(save_folder,
                                              "crosscorrelation"),
-                progress_cb=lambda done, total: _emit(
+                # crosscorrelation calls progress_cb(done, total, label).
+                progress_cb=lambda done, total, *_: _emit(
                     f"crosscorrelation: {done}/{total}"),
             )
             stages["crosscorrelation"].update(

@@ -2121,6 +2121,9 @@ class BatchTab(ctk.CTkFrame):
         ``clustering_cmap.auto_choose_threshold``; guard removed.)
         """
         xc = self._app.xcorr_tab
+        # Diagnostic / test-observable marker of which xcorr step is in
+        # flight. The state machine itself runs on the ``fired`` flags
+        # below; nothing in production branches on this attribute.
         self._xcorr_step = "full"
         fired = [False, False]   # one slot per step, shared via closure
         unsubs: list = []
