@@ -2174,8 +2174,18 @@ _silence_classifier_load_deprecation()
 def change_batch_according_to_free_ram() -> int:
     """Legacy linear fit on currently-available RAM (no frame-size input).
 
-    Kept as a fallback when no TIFF folder is available to peek at the
-    frame shape. Tuned empirically:
+    Two uses today:
+
+    * the registration ``batch_size`` fallback inside
+      :func:`pick_batch_size` when no TIFF frame shape can be read;
+    * a free-RAM scale for the dF/F writers' ROI chunk:
+      ``detection_run`` and the Tab 3 GUI use
+      ``max(8, change_batch_according_to_free_ram() * 20)`` as the
+      number of ROIs processed per block when filling the dF/F memmaps.
+      That second use only borrows the RAM curve; the numbers below
+      are registration frames, not ROIs.
+
+    Tuned empirically:
 
         16 GiB available  -> batch_size 150
         200 GiB available -> batch_size 4000
@@ -2367,7 +2377,6 @@ class PeakMemoryMonitor:
 
         with PeakMemoryMonitor() as mon:
             run_long_thing()
-        print(mon.peak_fraction)       # max(cpu, gpu)
         print(mon.cpu_peak_fraction)   # system RAM only
         print(mon.gpu_peak_fraction)   # GPU only, or 0.0 if no CUDA
 
@@ -2377,12 +2386,14 @@ class PeakMemoryMonitor:
     torch's allocator tracks high-water-mark across the window
     natively, so we just reset it at __enter__ and read at __exit__.
 
-    ``peak_fraction`` returns ``max(cpu, gpu)`` -- the adaptive sizer
-    uses this so the closed loop scales against whichever resource
-    actually pressured. Without it, suite2p would happily oversize
-    batch_size against a 6 GiB GPU on a workstation with 32 GiB CPU
-    RAM (which is exactly the regression that crashed registration
-    with batch_size=5524 + 512x512 frames).
+    The adaptive sizer is fed the two peaks separately
+    (``update_from_peak(cpu_peak=..., gpu_peak=...)``) and binds on
+    whichever resource is closest to its target, so the closed loop
+    scales against whichever resource actually pressured. Without
+    that, suite2p would happily oversize batch_size against a 6 GiB
+    GPU on a workstation with 32 GiB CPU RAM (which is exactly the
+    regression that crashed registration with batch_size=5524 +
+    512x512 frames).
     """
 
     def __init__(self, sample_interval: float = 0.5):
@@ -2391,11 +2402,6 @@ class PeakMemoryMonitor:
         self._cpu_peak = 0.0
         self._gpu_peak = 0.0
         self._thread: Optional[threading.Thread] = None
-
-    @property
-    def peak_fraction(self) -> float:
-        """The tighter of CPU and GPU peak. Drives the closed loop."""
-        return max(self._cpu_peak, self._gpu_peak)
 
     @property
     def cpu_peak_fraction(self) -> float:
@@ -2492,8 +2498,6 @@ class AdaptiveBatchSizer:
         self._last_batch_size: Optional[int] = None
         self._last_cpu_peak: Optional[float] = None
         self._last_gpu_peak: Optional[float] = None
-        # (batch_size, cpu_peak, gpu_peak) per learning step.
-        self.history: list[tuple[int, float, float]] = []
         # Multiplier applied to every ``pick()`` result. Stays 1.0 in
         # normal operation; the batch runner drops it (e.g. 0.5, 0.25)
         # when re-running a recording that hit a RAM out-of-memory error,
@@ -2580,18 +2584,15 @@ class AdaptiveBatchSizer:
         return new_bs
 
     def update_from_peak(self,
-                         peak_fraction: Optional[float] = None,
                          *,
                          cpu_peak: Optional[float] = None,
                          gpu_peak: Optional[float] = None,
                          batch_size: Optional[int] = None) -> None:
         """Record the observed peak(s) from a completed suite2p run.
 
-        Preferred call shape: pass ``cpu_peak`` and ``gpu_peak``
-        explicitly so the loop can bind to whichever resource was
-        tighter. Legacy single-``peak_fraction`` callers are still
-        supported -- the value is recorded as the CPU peak and GPU
-        peak stays unknown.
+        Pass ``cpu_peak`` and ``gpu_peak`` so the loop can bind to
+        whichever resource was tighter; omit ``gpu_peak`` when it is
+        not meaningful (the GPU peak then stays unknown).
 
         ``batch_size`` lets the caller pin the value that was actually
         used (in case suite2p clamped or :meth:`pick` and the
@@ -2600,22 +2601,16 @@ class AdaptiveBatchSizer:
         """
         if cpu_peak is not None:
             self._last_cpu_peak = float(cpu_peak)
-        elif peak_fraction is not None and self._last_cpu_peak is None:
-            self._last_cpu_peak = float(peak_fraction)
         if gpu_peak is not None:
             self._last_gpu_peak = float(gpu_peak)
         if batch_size is not None:
             self._last_batch_size = int(batch_size)
-        self.history.append((int(self._last_batch_size or 0),
-                             float(self._last_cpu_peak or 0.0),
-                             float(self._last_gpu_peak or 0.0)))
 
     def reset(self) -> None:
         """Wipe learned state. Call at the start of a fresh queue."""
         self._last_batch_size = None
         self._last_cpu_peak = None
         self._last_gpu_peak = None
-        self.history.clear()
         self.conservative_scale = 1.0
 
 
@@ -2630,12 +2625,8 @@ def get_adaptive_sizer() -> AdaptiveBatchSizer:
     return _global_sizer
 
 
-def reset_adaptive_sizer(target_fraction: Optional[float] = None) -> None:
-    """Wipe the singleton's learned state. Optionally retune the
-    target fraction in the same call.
-    """
-    if target_fraction is not None:
-        _global_sizer.target_fraction = float(target_fraction)
+def reset_adaptive_sizer() -> None:
+    """Wipe the singleton's learned state (incl. ``conservative_scale``)."""
     _global_sizer.reset()
 
 
@@ -2644,9 +2635,10 @@ def _peek_tiff_frame_shape(tiff_folder: str):
 
     "Peek" because we don't read pixel data -- we only open the file
     and look at the page header to find the height and width. Used
-    by ``change_nbinned_according_to_free_ram`` to size things
-    appropriately for the recording's FOV without spending the time
-    or RAM to actually load a frame.
+    by ``pick_batch_size``, ``change_nbinned_according_to_free_ram``
+    and ``suite2p_pipeline`` to size things appropriately for the
+    recording's FOV without spending the time or RAM to actually load
+    a frame.
     """
     try:
         import tifffile
