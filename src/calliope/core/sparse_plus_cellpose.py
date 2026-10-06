@@ -255,17 +255,28 @@ def inert_sparsery_op_notes(sparsery_ops: dict, base_settings: dict) -> list:
       reuses the shared registration (built from the base settings) and
       skips registration, so only a value that differs from the
       registration's ``smooth_sigma`` is worth flagging.
+
+    A value equal to the ``SPARSERY_OPS`` default is not flagged: the GUI
+    always passes both keys, so flagging defaults would print the same
+    notes on every run and they would stop meaning anything.
     """
     from .suite2p_pipeline import get_setting
     notes = []
-    if 'max_iterations' in sparsery_ops:
+
+    def _is_default(key):
+        try:
+            return float(sparsery_ops[key]) == float(SPARSERY_OPS[key])
+        except (TypeError, ValueError, KeyError):
+            return False
+
+    if 'max_iterations' in sparsery_ops and not _is_default('max_iterations'):
         max_rois = (base_settings.get('detection', {})
                     .get('sparsery_settings', {}).get('max_ROIs'))
         notes.append(
             f"note: max_iterations={sparsery_ops['max_iterations']} has no "
             f"effect on sparsery (sourcery-only); sparsery stops at "
             f"sparsery_settings.max_ROIs={max_rois}")
-    if 'smooth_sigma' in sparsery_ops:
+    if 'smooth_sigma' in sparsery_ops and not _is_default('smooth_sigma'):
         reg = get_setting(base_settings, 'smooth_sigma')
         try:
             differs = float(sparsery_ops['smooth_sigma']) != float(reg)

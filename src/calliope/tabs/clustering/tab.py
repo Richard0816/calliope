@@ -19,7 +19,7 @@ those ensembles by:
    ROIs coloured by cluster. The two stay in sync as the user slides
    the threshold.
 
-The colour palette can be a built-in seaborn / matplotlib palette
+The colour palette can be a built-in matplotlib palette
 (categorical or continuous) or a per-cluster hand-picked set via a
 small colour-picker dialog.
 

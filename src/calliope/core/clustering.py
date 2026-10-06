@@ -124,8 +124,8 @@ def resolve_palette(palette: PaletteLike, n_colors: int = 10) -> list[str]:
     Why we need this
     ----------------
     Tab 6 lets the user pick a palette from a dropdown that mixes
-    continuous matplotlib colormaps ("viridis"), categorical seaborn
-    palettes ("tab10"), and explicit user-supplied colour lists.
+    continuous matplotlib colormaps ("viridis"), categorical matplotlib
+    colormaps ("tab10"), and explicit user-supplied colour lists.
     Each of those needs slightly different handling. This helper
     swallows them all and emits a flat list of ``n_colors`` hex
     strings spanning the palette's full range -- so the FIRST and

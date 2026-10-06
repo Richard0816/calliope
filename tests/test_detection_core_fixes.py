@@ -86,12 +86,16 @@ def test_inert_sparsery_op_notes():
     base = cs.build_base_settings()
     reg_sigma = base["registration"]["smooth_sigma"]
     notes = spc.inert_sparsery_op_notes(
-        {"max_iterations": 1500, "smooth_sigma": reg_sigma + 0.5}, base)
+        {"max_iterations": 2000, "smooth_sigma": reg_sigma + 0.5}, base)
     assert any("max_iterations" in n and "max_ROIs" in n for n in notes)
     assert any("smooth_sigma" in n and "registration" in n for n in notes)
     # A smooth_sigma equal to what registration used is not flagged.
     notes = spc.inert_sparsery_op_notes({"smooth_sigma": reg_sigma}, base)
     assert notes == []
+    # The GUI's defaults are not flagged either (they ride every run).
+    defaults = {k: spc.SPARSERY_OPS[k]
+                for k in ("max_iterations", "smooth_sigma")}
+    assert spc.inert_sparsery_op_notes(defaults, base) == []
 
 
 # --- #226: meta.json detection block records the sparsery-pass values ---
@@ -131,6 +135,8 @@ def test_count_leaves():
 
 def test_spc_import_does_not_touch_sys_path():
     assert not hasattr(spc, "WORKTREE")
+    import inspect
+    assert "sys.path.insert" not in inspect.getsource(spc)
     core_dir = str(spc.__file__).rsplit("sparse_plus_cellpose", 1)[0].rstrip("\\/")
     assert all(p.rstrip("\\/") != core_dir for p in sys.path)
 

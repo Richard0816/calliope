@@ -537,7 +537,8 @@ def single_pair_xcorr_curve(sigA, sigB, fps, max_lag_seconds):
 
 def _open_dff_memmap(plane0: Path, prefix: str):
     """Open the {prefix}dff memmap. Honours the cell-filter mask when the
-    prefix contains ``filtered`` (matches clustering_tab._load_filtered_dff).
+    prefix contains ``filtered``, sized via ``utils.resolve_filtered_mask``
+    like every other filtered-memmap reader.
 
     Returns (dff_memmap, T, N).
     """

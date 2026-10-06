@@ -62,13 +62,16 @@ this tab is shielded from:
 2. Registration / detection progress moved from `print()` to
    `logging.getLogger('suite2p')`.
 
-`core/adaptive_detection.py` carries the translation: the
-`_OPS_TO_SETTINGS` + `_OPS_RENAMES` tables map flat keys to their new
-nested locations, `_coerce_to_default_type` converts legacy
+`core/suite2p_pipeline.py` carries the translation:
+`apply_settings_overrides` / `set_setting` place flat keys at their
+nested locations (`_LEGACY_KEY_ALIASES` renames the few whose 1.0 name
+differs, e.g. `high_pass` → `highpass_time`, and `_DB_KEYS` routes
+runtime/path keys to the `db` dict via `apply_db_overrides`),
+`_coerce_to_default_type` converts legacy
 float-stored bools (`two_step_registration`, `nonrigid`,
 `do_bidiphase`, `look_one_level_down`, …) to real `bool`/`int` so
-`range(1 + settings['two_step_registration'])` doesn't crash, and an
-empty-list normalisation rewrites `subfolders=[]` / `file_list=[]`
+`range(1 + settings['two_step_registration'])` doesn't crash, and
+`apply_db_overrides` rewrites `subfolders=[]` / `file_list=[]`
 to `None` so the new `get_file_list` doesn't shortcut into "no files
 found". `_ensure_s2p_logger` rebinds the suite2p logger's stream to
 the current `sys.stderr` on each `_run_s2p` call so registration
@@ -381,8 +384,8 @@ it finds anything that fired enough to stand out from a high-pass-filtered movie
 |---|---|---|---|
 | `threshold_scaling` | `0.85` | Scales Suite2p's per-iteration detection threshold; an ROI's peak must clear `threshold_scaling × noise` to be accepted. | The master sensitivity dial. **Lower → more ROIs** (more permissive, more junk/dim cells); **raise → fewer, higher-confidence ROIs.** First thing to touch if you are over- or under-detecting. The cell-filter CNN cleans up false positives downstream, so erring low is usually safe. |
 | `high_pass` | `100` (frames) | Frame-domain rolling-mean subtraction window applied before detection to flatten slow drift (photobleaching, swelling). | Leave at 100 for typical recordings. **Shorten** if slow baseline waves are masking events; **lengthen** for very short recordings where a 100-frame window eats real slow signal. Too small a window on a long recording is what blew up the temporal high-pass with an OOM in the 2026-06-09 sparsery crash — keep it sane. |
-| `smooth_sigma` | `1.0` | **No effect.** In suite2p 1.0 `smooth_sigma` is a *registration* setting; the sparsery pass reuses the shared registration and skips registration, so this value is never applied. Registration uses `registration.smooth_sigma` (1.15 in `calliope_settings`). | To change registration smoothing, edit `registration.smooth_sigma` in **Edit suite2p settings…** (a new registration only runs when `_shared_reg/` has no `data.bin`). The log prints a `note:` when this field differs from the registration value. |
-| `max_iterations` | `1500` | **No effect with sparsery.** suite2p routes it to `sourcery_settings`; sparsery's peel-off loop is bounded by `detection.sparsery_settings.max_ROIs` (10000 in `calliope_settings`). | To bound sparsery's ROI count, edit `detection.sparsery_settings.max_ROIs` in **Edit suite2p settings…**. |
+| `smooth_sigma` | `1.0` | **No effect.** In suite2p 1.0 `smooth_sigma` is a *registration* setting; the sparsery pass reuses the shared registration and skips registration, so this value is never applied. Registration uses `registration.smooth_sigma` (1.15 in `calliope_settings`). | To change registration smoothing, edit `registration.smooth_sigma` in **Edit suite2p settings…** (a new registration only runs when `_shared_reg/` has no `data.bin`). The log prints a `note:` when this field is changed from its default and differs from the registration value. |
+| `max_iterations` | `1500` | **No effect with sparsery.** suite2p routes it to `sourcery_settings`; sparsery's peel-off loop is bounded by `detection.sparsery_settings.max_ROIs` (10000 in `calliope_settings`). | To bound sparsery's ROI count, edit `detection.sparsery_settings.max_ROIs` in **Edit suite2p settings…**. Changing it from the default prints a `note:` in the log. |
 | `spatial_scale` | `0` (auto) | Suite2p's coarse-to-fine cell-size scale (0 = auto-estimate; 1–4 ≈ 6/12/24/48 px). | Leave at 0 unless auto-estimation is clearly wrong (e.g. detecting at the wrong size). Set 1–4 to pin the expected soma scale. |
 | `preclassify` | `0.0` | Probability threshold for Suite2p's built-in pre-detection classifier; 0 disables it. | Keep at 0 — CalLIOPE does its own classification with the cell-filter CNN, so the built-in preclassifier is redundant and would silently drop ROIs before our filter ever sees them. |
 | `hard_cap` | `60000` | **Not enforced.** The old mid-detection abort hooked `print` in suite2p's sparsery, but suite2p 1.0 logs progress through `logging`, so it never fired; the hook (and its `HARD_CAP_ABORTED.txt` marker) has been removed. The real bound is `detection.sparsery_settings.max_ROIs` (10000). | Edit `max_ROIs` in **Edit suite2p settings…** instead. Setting `hard_cap` below `max_ROIs` prints a `[warn]` line saying it is not enforced. |

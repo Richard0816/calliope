@@ -245,16 +245,23 @@ class Suite2pTab(ctk.CTkFrame):
         {"name": "high_pass", "label": "high_pass (frames)",
          "type": "int", "default": 100, "group": "Sparsery"},
         {"name": "smooth_sigma", "label": "smooth_sigma",
-         "type": "float", "default": 1.0, "group": "Sparsery"},
+         "type": "float", "default": 1.0, "group": "Sparsery",
+         "help": "no effect on the sparsery pass (registration setting; "
+                 "edit registration.smooth_sigma via 'Edit suite2p "
+                 "settings...'); a non-default value is noted in the log"},
         {"name": "max_iterations", "label": "max_iterations",
-         "type": "int", "default": 1500, "group": "Sparsery"},
+         "type": "int", "default": 1500, "group": "Sparsery",
+         "help": "no effect on sparsery (sourcery-only; sparsery stops at "
+                 "sparsery_settings.max_ROIs); a non-default value is "
+                 "noted in the log"},
         {"name": "spatial_scale", "label": "spatial_scale (0=auto)",
          "type": "int", "default": 0, "group": "Sparsery"},
         {"name": "preclassify", "label": "preclassify",
          "type": "float", "default": 0.0, "group": "Sparsery"},
         {"name": "hard_cap", "label": "ROI hard cap",
          "type": "int", "default": 60000, "group": "Sparsery",
-         "help": "abort sparsery if it exceeds this many ROIs"},
+         "help": "not enforced with suite2p 1.0 (sparsery is bounded by "
+                 "sparsery_settings.max_ROIs); kept for older runs"},
         # Cell filter: hard size gate after the CNN
         {"name": "size_outlier_z", "label": "Size-outlier z (0=off)",
          "type": "float", "default": SIZE_OUTLIER_Z, "group": "Cell filter",
@@ -897,15 +904,17 @@ class Suite2pTab(ctk.CTkFrame):
         gcamp_label: Optional[str] = None,
     ) -> None:
         writer = QueueWriter(self._log_queue)
-        params = dict(self._params)
+        # PARAM_SPEC defaults fill any key missing from _params, so the
+        # spec stays the single source of the GUI's defaults.
+        params = {**spec_defaults(Suite2pTab.PARAM_SPEC), **self._params}
         sparsery_ops = {
-            "high_pass":         params.get("high_pass", 100),
-            "preclassify":       params.get("preclassify", 0.0),
-            "smooth_sigma":      params.get("smooth_sigma", 1.0),
+            "high_pass":         params["high_pass"],
+            "preclassify":       params["preclassify"],
+            "smooth_sigma":      params["smooth_sigma"],
             "sparse_mode":       True,
-            "spatial_scale":     params.get("spatial_scale", 0),
-            "threshold_scaling": params.get("threshold_scaling", 0.85),
-            "max_iterations":    params.get("max_iterations", 1500),
+            "spatial_scale":     params["spatial_scale"],
+            "threshold_scaling": params["threshold_scaling"],
+            "max_iterations":    params["max_iterations"],
         }
         cellpose_cfg = {
             "cellpose_model_type":

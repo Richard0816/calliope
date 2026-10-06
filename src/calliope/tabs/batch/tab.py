@@ -2126,7 +2126,7 @@ class BatchTab(ctk.CTkFrame):
         could land at "5 clusters visible" while fcluster returned
         30+, producing the over-fragmented input the guard was
         catching. Bug fixed 2026-05-11 in
-        ``clustering_cmap.auto_choose_threshold``; guard removed.)
+        ``core.clustering.auto_choose_threshold``; guard removed.)
         """
         xc = self._app.xcorr_tab
         # Diagnostic / test-observable marker of which xcorr step is in
