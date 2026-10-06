@@ -102,3 +102,66 @@ def test_compute_lowpass_missing_source_raises_clear_error(tmp_path):
     np.save(plane0 / "F.npy", np.zeros((N, T), dtype=np.float32))
     with pytest.raises(FileNotFoundError, match="r0p7_filtered_dff"):
         lowpass_run.compute_lowpass_and_dt(plane0, fps=FPS, cutoff_hz=1.0)
+
+
+# ---- Tab 5 "Export figures" dispatch (#111) -------------------------------
+
+class _Var:
+    def __init__(self):
+        self.value = None
+
+    def set(self, v):
+        self.value = v
+
+
+class _Btn:
+    def configure(self, **kw):
+        self.kw = kw
+
+
+class _StubTab:
+    """Just enough of EventDetectionTab for _on_export_figures."""
+
+    def __init__(self, plane0):
+        self._plane0 = plane0
+        self._params = {}
+        self._render_job = None
+        self._export_job = None
+        self._render_queue = None
+        self.POLL_MS = 80
+        self.status_var = _Var()
+        self.export_btn = _Btn()
+
+    def update_idletasks(self):
+        pass
+
+
+def test_tab5_interactive_export_is_offloaded(tmp_path, monkeypatch):
+    """A click must hand the work to run_offloaded (child process), not run
+    detection on the Tk thread."""
+    from calliope.core import offload
+    from calliope.tabs.event_detection.tab import EventDetectionTab
+
+    calls = []
+    monkeypatch.setattr(offload, "run_offloaded",
+                        lambda *a, **kw: calls.append((a, kw)) or "job")
+    monkeypatch.setattr(edr, "run_event_detection",
+                        lambda *a, **kw: pytest.fail("ran inline"))
+    stub = _StubTab(tmp_path / "suite2p" / "plane0")
+    EventDetectionTab._on_export_figures(stub, quiet=False)
+    assert len(calls) == 1
+    args, kw = calls[0]
+    assert args[2] is edr.export_event_figures_offload
+    assert kw["done_kind"] == "export_done"
+    assert kw["error_kind"] == "export_error"
+    assert stub._export_job == "job"
+
+
+def test_tab5_quiet_export_runs_inline_without_monotonicity(tmp_path):
+    from calliope.tabs.event_detection.tab import EventDetectionTab
+
+    plane0 = _make_plane0(tmp_path)
+    lowpass_run.compute_lowpass_and_dt(plane0, fps=FPS, cutoff_hz=1.0)
+    stub = _StubTab(plane0)
+    EventDetectionTab._on_export_figures(stub, quiet=True)
+    assert stub.status_var.value.startswith("Exported event figures")
