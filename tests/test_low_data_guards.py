@@ -14,7 +14,6 @@ All exercised against lightweight stubs / temp dirs -- no Tk, no suite2p.
 
 from __future__ import annotations
 
-import types
 
 import numpy as np
 import pytest

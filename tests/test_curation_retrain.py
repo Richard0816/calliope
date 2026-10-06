@@ -6,7 +6,6 @@ set only the attributes the methods under test touch -- no Tk display.
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
