@@ -55,9 +55,9 @@ cellpose model (~1 GB, one time).
 
 ## Pipeline stages
 
-1. **Preprocess** — rigid registration + intensity normalization.
-2. **QC preview** — inspect the registered recording before heavy compute.
-3. **Detection** — Suite2p + Cellpose ROI extraction, dF/F, cell-filter model.
+1. **Preprocess** — intensity shift to a non-negative uint16 TIFF, mean image, QC GIF.
+2. **QC preview** — inspect the QC movie and mean image before heavy compute.
+3. **Detection** — Suite2p registration + Suite2p/Cellpose ROI extraction, dF/F, cell-filter model.
 4. **Low-pass filter** — Butterworth low-pass + Savitzky-Golay derivative.
 5. **Event detection** — per-ROI onsets and population event windows.
 6. **Clustering** — hierarchical clustering of filtered traces.

@@ -16,8 +16,9 @@ python -c "import platform; print(platform.python_version(), platform.architectu
 ```
 
 If it isn't `3.12.x` (or `3.11.x`) `64bit`, install a 3.12 release and
-rebuild the venv: `deactivate; Remove-Item -Recurse -Force .venv;
-py -3.12 -m venv .venv`.
+rebuild the venv: `deactivate; Remove-Item -Recurse -Force venv;
+py -3.12 -m venv venv`. (The pip install in the README uses `venv`; if
+you installed with `uv sync`, the folder is `.venv` instead.)
 
 **`AssertionError` deep in `pip`'s `_install_wheel` (after everything
 downloads), or `Cache entry deserialization failed` warnings.**
@@ -29,8 +30,8 @@ shares.
 **`PowerShell ... Activate.ps1 cannot be loaded because running scripts
 is disabled`.**
 Run `Set-ExecutionPolicy -Scope Process RemoteSigned` once in that window,
-then re-run the activate line. Or use `.\.venv\Scripts\activate.bat` from
-`cmd`.
+then re-run the activate line. Or use `venv\Scripts\activate.bat` from
+`cmd` (`.venv\Scripts\activate.bat` for a `uv sync` install).
 
 ## Detection (Tab 3) fails
 
@@ -80,7 +81,7 @@ cell-filter checkpoint is bundled and needs no download.
 
 `pip install -e ".[gpu-cuda11]"` / `".[gpu-cuda12]"` only helps on a
 machine with a working NVIDIA GPU and a matching CUDA runtime; it adds
-CuPy for the cross-correlation step. Without one, CalLIOPE falls back to
+CuPy for Tab 3's GPU dF/F path and Tab 7's cross-correlation. Without one, CalLIOPE falls back to
 NumPy automatically — the extra is harmless but does nothing. Note the
 default `requirements.txt` `torch` is the **CPU** build; for GPU compute
 also reinstall the CUDA wheel:
