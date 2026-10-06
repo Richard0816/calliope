@@ -36,7 +36,7 @@ The list of rows + per-row params is serialised to
 re-opening the GUI restores the queue.
 
 After every Run All, ``<output>/batch_report.csv`` is written with
-``recording_id, status, plane0, total_s, <stage>_status,
+``recording_id, status, plane0, total_s, error, <stage>_status,
 <stage>_duration_s`` columns for downstream analysis.
 """
 
@@ -64,13 +64,11 @@ from ...gui_common import (
 )
 from ...core.detection_run import archive_recording_post_detection
 from .logic import (
-    BATCH_JSON_NAME, BATCH_REPORT_NAME, SCRATCH_DETECTION_KEEP_DIRS,
-    SCRATCH_PRUNE_FILE_PATTERNS, SCRATCH_RECORDING_INTERMEDIATE_DIRS,
+    BATCH_JSON_NAME, BATCH_REPORT_NAME,
     SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC, TIFF_GLOBS,
-    build_batch_param_spec, copy_one_dedup, is_scratch_mirror_skippable,
-    is_scratch_owned, mark_scratch_owned, measure_tree, mirror_sync_pass,
-    prune_scratch_tree, scratch_root_problem, synchronous_final_sweep,
-    throttled_copy2,
+    build_batch_param_spec, is_scratch_owned, mark_scratch_owned,
+    measure_tree, mirror_sync_pass, prune_scratch_tree,
+    scratch_root_problem, synchronous_final_sweep,
 )
 
 
@@ -187,7 +185,6 @@ class BatchTab(ctk.CTkFrame):
         self.default_params: dict = spec_defaults(self.PARAM_SPEC)
 
         self._log_queue: queue.Queue = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
         self._abort_flag = threading.Event()
 
         # Deferred-cleanup janitor: a long-lived daemon thread that
@@ -225,9 +222,7 @@ class BatchTab(ctk.CTkFrame):
 
         self._build_ui()
         drain_queue(self, self._log_queue,
-                    {"log": self._on_log_payload,
-                     "status": self._on_status_payload,
-                     "done": self._on_batch_done},
+                    {"log": self._on_log_payload},
                     poll_ms=self.POLL_MS)
 
     # ---- Scratch capacity pre-flight ----------------------------------
@@ -2026,9 +2021,14 @@ class BatchTab(ctk.CTkFrame):
 
         Tab 7 needs the per-cluster ROI lists Tab 6 writes via the
         Export button -- without them, _on_run_full bails because the
-        cluster folder doesn't exist. Tab 6's _on_export is synchronous
-        (no worker), so we just run it inline after the analysis
-        publishes set_clusters_ready and before advancing to xcorr.
+        cluster folder doesn't exist. The export is synchronous (no
+        worker), so we run it inline after the analysis publishes
+        set_clusters_ready and before advancing to xcorr.
+
+        This calls Tab 6's raising ``_export_clusters`` rather than the
+        button handler ``_on_export``: the handler swallows write errors
+        behind a modal dialog, so the batch would log success and
+        advance with no ROI lists on disk.
         """
         cl = self._app.clustering_tab
         fired = [False]
@@ -2047,14 +2047,25 @@ class BatchTab(ctk.CTkFrame):
             fired[0] = True
             _cleanup()
             try:
-                cl._on_export()
+                out_dir = cl._export_clusters()
             except Exception as e:
                 self._append_log(
                     f"  [clustering] export FAILED: {e}\n"
                     f"{traceback.format_exc()}")
-                self.after(0, lambda: self._fail_stage(
-                    "clustering", e))
+                self.after(0, lambda exc=e: self._fail_stage(
+                    "clustering", exc))
                 return
+            # Same best-effort summary write + status text as Tab 6's
+            # Export button handler (_on_export).
+            try:
+                cl._write_summary()
+            except Exception as e:
+                self._append_log(
+                    f"  [clustering] cluster summary write failed: {e}")
+            try:
+                cl.status_var.set(f"Exported clusters to {out_dir}")
+            except Exception:
+                pass
             self._append_log(
                 "  [clustering] cluster ROI lists exported")
             self.after(0, lambda: self._on_stage_done(
@@ -3277,16 +3288,6 @@ class BatchTab(ctk.CTkFrame):
 
     def _on_log_payload(self, payload) -> None:
         self._append_log(str(payload))
-
-    def _on_status_payload(self, payload) -> None:
-        row, status = payload
-        if row in self._rows:
-            row.set_status(str(status))
-
-    def _on_batch_done(self, _payload) -> None:
-        self.run_btn.configure(state="normal")
-        self.abort_btn.configure(state="disabled")
-        self._append_log("[batch] all rows processed.")
 
     def _append_log(self, text: str) -> None:
         if not text:
