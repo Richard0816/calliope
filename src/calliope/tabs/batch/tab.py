@@ -1743,9 +1743,24 @@ class BatchTab(ctk.CTkFrame):
 
         self._begin_stage("preprocess")
 
+    def _effective_row_params(self, row: "BatchRow") -> dict:
+        """Full param dict for ``row``: union-spec defaults, overlaid by
+        ``default_params``, overlaid by the row's own ``params``.
+
+        Rows added in the GUI already carry a full copy of
+        ``default_params``, but rows loaded from a CSV / JSON may carry
+        only some keys (or none). Filling the gaps here means a blank
+        key means "batch default" rather than "whatever the previous
+        row left in the tab".
+        """
+        merged = spec_defaults(self.PARAM_SPEC)
+        merged.update(self.default_params or {})
+        merged.update(getattr(row, "params", None) or {})
+        return merged
+
     def _apply_row_params_to_tabs(self, row: "BatchRow") -> None:
-        """Push ``row.params`` into each pipeline tab BEFORE its run
-        method fires.
+        """Push the row's effective params into each pipeline tab BEFORE
+        its run method fires.
 
         The orchestrator drives each tab via its native ``_on_run`` /
         ``_on_compute`` / ``_on_render`` / ``_start_run``, every one of
@@ -1756,15 +1771,14 @@ class BatchTab(ctk.CTkFrame):
 
         Each tab owns a public ``apply_batch_row(params, log=...)`` that
         consumes only the keys it cares about (PARAM_SPEC fields and/or its
-        own Tk vars) and ignores the rest; keys the row didn't override
-        leave that tab's state untouched. The batch runner no longer
+        own Tk vars) and ignores the rest. Every row pushes the full
+        effective dict (see ``_effective_row_params``), so no key can
+        carry over from the previous row. The batch runner no longer
         reaches into any tab's private attributes / Tk vars -- so a rename
         inside a tab is a normal (loud) error there, not a silent no-op
         here.
         """
-        p = row.params or {}
-        if not p:
-            return
+        p = self._effective_row_params(row)
         app = self._app
         # Order is cosmetic (tabs are independent); kept pipeline-order for
         # readability. ``log`` carries tab-side notices (e.g. Tab 3's GCaMP
@@ -1779,9 +1793,9 @@ class BatchTab(ctk.CTkFrame):
         """Translate the "What to save" toggles into Tab 3's
         post-detection archive params.
 
-        Separate from ``_apply_row_params_to_tabs`` because that method
-        early-returns when a row has no per-row overrides, whereas the
-        save policy must apply to EVERY batch run. Tab 3's
+        Separate from ``_apply_row_params_to_tabs`` because the save
+        policy comes from the Tab 0 "What to save" toggles, not from row
+        params, and must apply to EVERY batch run. Tab 3's
         ``_archive_recording`` runs at the tail of detection in both
         scratch and non-scratch mode, defaulting to compress + delete
         shifted + delete data.bin. Left untouched it would (a) ignore
@@ -1839,8 +1853,8 @@ class BatchTab(ctk.CTkFrame):
                 f"[{ident}] WARN: failed to apply per-row params: {e}")
 
         # "What to save" archive policy -- applies to every run, not just
-        # rows with per-row overrides, so it lives outside
-        # _apply_row_params_to_tabs (which early-returns on empty params).
+        # rows with per-row overrides; it is driven by the Tab 0 toggles,
+        # not row params, so it lives outside _apply_row_params_to_tabs.
         try:
             self._apply_save_policy_to_detection_tab()
         except Exception as e:

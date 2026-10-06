@@ -41,40 +41,42 @@ untouched.
 
 ## How a row gets processed
 
-The Run-all worker iterates rows in queue order. For each row:
+The Run-all orchestrator iterates rows in queue order on the Tk main
+thread. It does **not** call a headless backend: it drives the GUI tabs
+themselves, one stage at a time. For each row:
 
-1. Snapshot effective params: start from `BatchTab.default_params`, layer the
-   row's `params` dict on top.
-2. Build the per-recording save folder at `<output>/<identifier>/` and
-   resolve the TIFF list (raw paths from the row, no staging — Tab 1's
+1. Build the per-recording save folder at `<output>/<identifier>/` (or
+   `<scratch>/<identifier>/` when a scratch dir is set) and resolve the
+   TIFF list (raw paths from the row, no staging — Tab 1's
    `preprocess_tiff_group` accepts files from arbitrary parents and
    concatenates them in trailing-index order).
-3. Call `core.batch_pipeline.run_recording(src_tiffs, save_folder, params,
-   ...)`. The orchestrator chains the per-stage headless entry points
-   (`run_preprocess` lives in `core/preprocessing.py`, `run_clustering`
-   in `core/clustering.py`, `run_crosscorrelation` in
-   `core/crosscorrelation.py`, `render_spatial_event_figures` in
-   `core/spatial.py`; the three stages with no math counterpart live in
-   their own `*_run.py` modules):
+2. For each stage in
+   `preprocess -> detection -> lowpass -> event_detection -> clustering
+   -> crosscorrelation -> spatial_propagation`, `_begin_stage(stage)`:
+   - pushes the row's effective params into every tab via
+     `_apply_row_params_to_tabs` (see *How per-row editing works* below)
+     and the "What to save" policy into Tab 3;
+   - dispatches to `_stage_<stage>`, which switches the notebook to that
+     tab, arms a one-shot listener on the AppState channel the tab
+     publishes on completion (`set_result`, `set_plane0`,
+     `set_lowpass_ready`, `set_event_results`, `set_clusters_ready`,
+     `set_xcorr_ready`) plus the stage-error channel, and calls the
+     tab's own run method (`_on_run` / `_on_compute` / `_on_render` /
+     `_on_run_full` ...);
+   - on the completion publish, `_on_stage_done` records the timing and
+     advances; on an error, `_fail_stage` records it and ends the row.
 
-   ```
-   preprocessing.run_preprocess -> detection_run -> lowpass_run
-       -> event_detection_run -> clustering.run_clustering
-       -> crosscorrelation.run_crosscorrelation
-       -> spatial.render_spatial_event_figures
-   ```
+   Detection runs through Tab 3's own `_on_run`, so the batch produces
+   the same per-recording artifacts as an interactive run (the
+   `<plane0>/meta.json` provenance sidecar, z-drift QC outputs, etc.).
+3. Update the row's status label (`queued` → `running <stage>` → `ok` /
+   `failed` / `aborted` / `no_rois`). Any stage failure ends that row
+   (its remaining stages are not run); the queue continues with the next
+   row.
 
-   Each stage is wrapped in its own try/except. If a non-detection stage
-   fails, the recording is marked **partial** and the worker moves on.
-   Detection failure is fatal for that row only; the queue continues.
-
-   The detection stage produces the same per-recording artifacts as the
-   GUI: the `<plane0>/meta.json` provenance sidecar (with the
-   `gcamp_variant` label stamped for parity) and the z-drift QC outputs
-   (`zdrift_qc.png` / `zdrift_pc1.csv` plus the `qc` fields in
-   `meta.json`) are written headlessly on every batch row too.
-4. Update the row's status label (`queued` → `running` → `ok` / `partial` /
-   `failed` / `aborted` / `no_rois`).
+`core.batch_pipeline.run_recording` is a separate, headless (no-GUI)
+orchestrator kept as a scripting entry point. Tab 0 does not call it,
+and it is not kept in lock-step with the GUI path.
 
 #### Zero-ROI ("genuinely noise") recordings
 
@@ -89,8 +91,9 @@ memmap present → ROIs exist; else count `predicted_cell_mask` / `iscell`).
 If zero, `_skip_row_no_rois` marks `lowpass … spatial_propagation` as
 **skipped**, sets the row status to **`no_rois`**, and finalizes the row
 normally — so the detection folder + figures that *were* produced are
-kept. The headless orchestrator `core.batch_pipeline.run_recording`
-applies the same guard (`_no_rois_survive`) and returns `status="no_rois"`.
+kept. The separate headless orchestrator
+`core.batch_pipeline.run_recording` (not used by Tab 0) applies the same
+guard (`_no_rois_survive`) and returns `status="no_rois"`.
 
 ### Abort behavior
 
@@ -130,9 +133,12 @@ please wait" and short-circuits.
 
 ### Scratch keep-set (what survives the SSD→HDD copy)
 
-`_prune_scratch_tree(scratch)` runs immediately before
-`_copytree_dedup_hardlinks` and deletes known-redundant files so the
-HDD copy doesn't waste bandwidth on artefacts the GUI can't reach.
+`logic.is_scratch_mirror_skippable` keeps the continuous mirror from
+copying known-redundant artefacts to HDD in the first place, and
+`logic.prune_scratch_tree(scratch_rec, ...)` deletes them from scratch
+in the row-end finalize worker (after the mirror drains, before the
+final sweep and rmtree), so the output folder never receives artefacts
+the GUI can't reach.
 
 **Dropped:**
 
@@ -140,19 +146,22 @@ HDD copy doesn't waste bandwidth on artefacts the GUI can't reach.
   pre-registration movie cache (written when `keep_movie_raw=True`).
   Same size as the registered `data.bin` (~8 GB on a 10-minute
   recording) but fully superseded once registration completes.
-- `<rec>/sparsery_pass/` — sparsery's detection-pass folder.
-  `sparse_plus_cellpose.run` writes per-pass `F.npy`, `Fneu.npy`,
-  `spks.npy`, `stat.npy` here, then `merge_and_extract` folds the
-  stat list into `final/` and re-extracts traces from the registered
-  binary. Nothing reads the per-pass arrays after merge — ~300-500 MB
-  of pure clutter per recording.
-- `<rec>/cellpose_pass/` — cellpose's detection-pass folder (`stat.npy`
-  + `cellpose_masks.npy`). Same story: consumed by `merge_and_extract`
-  into `final/`, not read after. Small (~5-10 MB) but still pointless
-  to copy.
-- `<rec>/detection/<X>/` where `X` is not `_shared_reg` or `final` —
-  defensive policy applied if a future code path ever uses this
-  nesting (no-op on the current layout).
+- `<rec>/detection/<X>/` for every `X` other than `_shared_reg` and
+  `final` (`SCRATCH_DETECTION_KEEP_DIRS`). Tab 3 runs
+  `sparse_plus_cellpose.run` with `save_root = <rec>/detection`, so
+  this covers the per-pass folders it writes there:
+  - `detection/sparsery_pass/` — per-pass `F.npy`, `Fneu.npy`,
+    `spks.npy`, `stat.npy`; `merge_and_extract` folds the stat list
+    into `final/` and re-extracts traces from the registered binary.
+    Nothing reads the per-pass arrays after merge — ~300-500 MB of
+    pure clutter per recording.
+  - `detection/cellpose_pass/` (and `detection/cellpose_sam_pass/`
+    when the Tier-2 pass is on) — `stat.npy` + masks, likewise
+    consumed by `merge_and_extract` and not read after.
+- `<rec>/sparsery_pass/` / `<rec>/cellpose_pass/` directly under the
+  recording folder (`SCRATCH_RECORDING_INTERMEDIATE_DIRS`) — a
+  defensive rule for an older flat layout; the current pipeline never
+  writes there, so it is a no-op today.
 - `**/*.tmp`, `**/*.lock` — suite2p partial-write artefacts.
 
 **Kept:**
@@ -188,8 +197,9 @@ archive step. If a future workflow needs it (`load_existing_preprocess`
 for QC reload, or a fresh `do_registration=True` rerun), it is
 regenerated on demand from the compressed raw in ~1 min per 9 GB.
 
-The patterns + keep set live in `SCRATCH_PRUNE_FILE_PATTERNS` and
-`SCRATCH_DETECTION_KEEP_DIRS` at the top of `tab.py`. Add to them if
+The patterns + keep set live in `SCRATCH_PRUNE_FILE_PATTERNS`,
+`SCRATCH_RECORDING_INTERMEDIATE_DIRS` and `SCRATCH_DETECTION_KEEP_DIRS`
+in `tabs/batch/logic.py`. Add to them if
 a future stage starts writing more redundant intermediates; nothing
 in the keep set should ever need explicit listing because the
 default is "preserve".
@@ -273,7 +283,7 @@ mirror's copy operations are bandwidth-throttled:
   drive): **stage-aware throttle**. The mirror runs at full
   speed during every stage EXCEPT preprocess; during preprocess
   it caps at `SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC`
-  (10 MB/s by default) via `_throttled_copy2`. Rationale:
+  (10 MB/s by default) via `logic.throttled_copy2`. Rationale:
   preprocess is the one stage that reads source TIFFs from the
   shared drive — everything else (detection / lowpass / events
   / clustering / xcorr / spatial) operates on scratch files +
@@ -300,21 +310,21 @@ mirror's copy operations are bandwidth-throttled:
    Tab 3 writes plane0 outputs to scratch, Tabs 4-8 write
    memmaps and figures. After each write the mirror's next
    poll picks up the new file and copies it to HDD.
-3. Each mirror pass via `_mirror_sync_pass(scratch, final,
+3. Each mirror pass via `logic.mirror_sync_pass(scratch, final,
    seen, inode_to_dst, throttle_bytes_per_sec=...)`:
    - Walks `scratch`, dedups already-synced files via the
      `(size, mtime)` cache in `seen`.
    - Skips intermediates the row-end prune would have dropped:
      `data_raw*.bin`, `sparsery_pass/`, `cellpose_pass/`,
-     `detection/<not-keep>/`, `*.tmp`, `*.lock` (see
-     `_is_scratch_mirror_skippable`).
+     `detection/<not-keep>/` (e.g. `detection/sparsery_pass/`),
+     `*.tmp`, `*.lock` (see `logic.is_scratch_mirror_skippable`).
    - Defers files whose mtime is < 1 s old — likely mid-write
      (suite2p flushing `data.bin` incrementally). The next pass
      catches them once writes stabilise.
-   - Uses `_copy_one_dedup` so `_shared_reg/data.bin` ↔
+   - Uses `logic.copy_one_dedup` so `_shared_reg/data.bin` ↔
      `final/data.bin` arrive at HDD as a hardlinked pair.
      Throttle (when set) paces each non-hardlink copy via
-     `_throttled_copy2`.
+     `logic.throttled_copy2`.
    - Returns True iff anything was copied; the worker sleeps
      0.2 s after a busy pass (drain bursts) and 2 s when idle.
 4. `_on_row_done` calls `_finalize_via_mirror_async(ident,
@@ -322,21 +332,27 @@ mirror's copy operations are bandwidth-throttled:
    a. Sets the mirror's `stop_event`. The mirror does ONE more
       pass with `stability_window_s=0.0` so files written
       milliseconds before stop still get caught.
-   b. Waits on the mirror's `synced_event` (5 min timeout).
-      Usually completes in seconds in two-drive mode; may
-      take a few minutes in throttled single-drive mode if
+   b. Waits on the mirror worker's `synced` event (30 min
+      timeout). Usually completes in seconds in two-drive mode;
+      may take a few minutes in throttled single-drive mode if
       a lot of data landed late in the pipeline.
-   c. Runs `_prune_scratch_tree` defensively (catches any
-      `data_raw.bin` that landed late, etc.).
-   d. Marshals `_repoint_pipeline_after_copy` to the Tk main
+   c. Runs `logic.prune_scratch_tree` (catches any
+      `data_raw.bin` that landed late, applies the keep toggles).
+   d. Runs `logic.synchronous_final_sweep` — a size-checked
+      copy of anything the mirror missed, so every output is at
+      HDD before scratch is deleted — and, when **Archive raw
+      TIFF** is on, the compressed-raw archive.
+   e. Marshals `_repoint_pipeline_after_copy` to the Tk main
       thread; blocks on a 30 s timeout.
-   e. `shutil.rmtree(scratch_rec)` — scratch fully freed.
+   f. `shutil.rmtree(scratch_rec)` — scratch fully freed.
       First attempt runs after a `gc.collect()` to release any
       memmap handles in the just-finished pipeline worker.
 
-      The `_repoint_pipeline_after_copy` step (d above) does two
+      The `_repoint_pipeline_after_copy` step (e above) does two
       things that matter for the rmtree: (1) rewrite path-string
-      attributes (`_plane0`, `_lowpass_plane0`, etc.) on every tab
+      attributes (each tab's `_plane0` / `_final_plane0`, plus the
+      AppState `plane0` / `lowpass_plane0` / `event_results` /
+      `result` paths)
       so future reloads land on HDD, and (2) invoke each tab's
       opt-in `_repoint_after_copy(scratch, final)` hook. The hook
       handles two responsibilities the attribute walker can't:
@@ -385,8 +401,8 @@ disk speed. Preprocess typically lasts 1-5 minutes on a
 single-drive setup, during which the mirror copies at most
 ~30-150 MB before unthrottling. The rest of the row's
 SSD->HDD work happens at saturated bandwidth. Tune
-`SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC` at the top of
-`tab.py` if you want a different preprocess-time rate; the
+`SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC` in
+`tabs/batch/logic.py` if you want a different preprocess-time rate; the
 non-preprocess passes ignore it.
 
 **Trade-offs / failure modes:**
@@ -395,8 +411,9 @@ non-preprocess passes ignore it.
   mid-row might be copied multiple times (once per poll
   interval where its mtime advanced) until writes stabilise.
   Worst case is wasted HDD bandwidth, not data loss.
-- Mirror drain timeout (5 min): logs and proceeds with rmtree
-  anyway; any unfinalized scratch files are lost.
+- Mirror drain timeout (30 min): logs and proceeds; the
+  synchronous final sweep still copies anything left before the
+  rmtree.
 - Repoint timeout (30 s): logs and proceeds with rmtree;
   user retries via Browse if they hit a stale AppState path.
 - `_mirror_workers[ident]` carries the state until
@@ -555,66 +572,20 @@ scratch copy. The model is:
 - Read each source TIFF once from the slow drive (during preprocess).
 - Write the shifted uint16 TIFF, the suite2p binary, all per-pass
   detection outputs, dF/F memmaps, and figures to scratch.
-- After the row finishes (success, partial, or failure),
-  `_finalize_to_disk_async(ident, scratch_rec, final_rec)` spawns a
-  daemon thread that runs four phases interleaved with one
-  Tk-marshalled callback. Files are split by *semantic role* via
-  `_is_background_path(rel)`: anything the live GUI reloads (Tab 1
-  shifted TIFF + QC outputs, all of `plane0/`, dF/F memmaps,
-  cluster export, summary workbook, etc.) is **pipeline-loading**;
-  anything only consumed by manual suite2p re-runs or the
-  post-batch report viewer is **background** (currently `data.bin`,
-  `data_chan2.bin`, and anything under `calliope_figures/`).
-  1. **Copy pipeline-loading.** `_phase_copy_files(include=
-     not _is_background_path)` writes every pipeline-loading file
-     to HDD with sources intact. Preserves intra-tree hardlinks
-     via the persistent `(st_dev, st_ino)` map (the map carries
-     over to the background phase so straddling hardlinks still
-     work).
-  2. **Repoint.** `self.after(0, _repoint_pipeline_after_copy)`
-     marshals to the Tk main thread and rewrites any in-memory
-     plane0 reference under `scratch` to its HDD twin —
-     `AppState.plane0`, `AppState.lowpass_plane0`,
-     `AppState.event_results["plane0"]`, and every tab's local
-     `_plane0` / `_final_plane0` / `_plane0_path` cache. Direct
-     attribute writes (no `set_plane0` call) so we don't re-fire
-     subscribers and accidentally trigger Tab 4's lowpass
-     recompute on a path rewrite. Worker blocks on a
-     `threading.Event` until the repoint completes (30 s timeout
-     as a safety valve). **Every file a reactive tab might read
-     is at HDD by this point, so the user can start interacting
-     with the just-finished recording immediately** — the
-     background copy continues invisibly afterwards.
-  3. **Delete pipeline-loading sources.**
-     `_phase_delete_source_files(include=not _is_background_path)`
-     walks scratch bottom-up and unlinks every pipeline-loading
-     source. Scratch shrinks by ~plane0 + shifted-TIFF total
-     (~10-20 GB in a typical recording).
-  4. **Copy + delete background.**
-     `_phase_copy_files(include=_is_background_path)` then
-     `_phase_delete_source_files(include=_is_background_path)`.
-     The GUI doesn't read these (`data.bin` is only for manual
-     suite2p re-runs; figures only for batch reports), so any
-     in-flight reload can't race the copy/delete pair.
-  - **Safety-net rmtree.** `shutil.rmtree(scratch, ignore_errors=True)`
-    catches any empty dirs the per-file unlinks couldn't clear
-    (antivirus locks, race with a Windows handle, etc.).
-
-  Why semantic priority and not size: the user can be reading the
-  recording the moment the repoint fires (Step 2), regardless of
-  whether the slow ~8 GB `data.bin` has finished transferring.
-  Scratch-freeing is a side benefit — Step 3 still frees the bulk
-  of scratch (shifted TIFF is the biggest pipeline-loading file)
-  before Step 4 even starts.
-- An earlier move-as-you-go variant (`_move_tree_dedup_hardlinks`)
-  copied + immediately unlinked each source file to free scratch
-  progressively, with no copy/delete split. It got reverted
-  because every file in the tree spent some window between
-  source-deleted and destination-still-being-copied where a GUI
-  reload could fail. The phased version above bounds that risk
-  to the small-file phase, where the window is <1 s. The
-  unconditional move helper is kept in the module for non-scratch
-  contexts.
+- While the row runs, the continuous mirror (see *Continuous mirror*
+  above) copies finished files from scratch to the output folder.
+- After the row finishes (success or failure), `_on_row_done` calls
+  `_finalize_via_mirror_async(ident, scratch_rec, final_rec)`, which
+  spawns a daemon thread that stops the mirror and waits for its final
+  pass, prunes redundant artefacts, runs the synchronous final sweep,
+  marshals `_repoint_pipeline_after_copy` to the Tk main thread (every
+  in-memory plane0 reference under `scratch` is rewritten to its HDD
+  twin — `AppState.plane0`, `AppState.lowpass_plane0`,
+  `AppState.event_results["plane0"]`, the `AppState.result` paths, and
+  every tab's `_plane0` / `_final_plane0` cache — by direct attribute
+  writes, so no subscriber re-fires), and finally rmtrees scratch.
+  Anything still locked goes to the scratch janitor. The full
+  sequence is under *Continuous mirror* above.
 - The orchestrator advances to the next row immediately after
   `_on_row_done` spawns the worker, so the SSD-bound preprocess
   of recording N+1 overlaps with the HDD-bound copy of recording
@@ -713,7 +684,7 @@ queue).
 dialog (defaults → checked rows) are the *same* `AdvancedDialog`
 every stage tab uses — they just open it against a **union**
 PARAM_SPEC, `BatchTab.PARAM_SPEC = build_batch_param_spec()`
-(`tabs/batch/logic.py:540`), that concatenates each stage tab's own
+(in `tabs/batch/logic.py`), that concatenates each stage tab's own
 PARAM_SPEC. So most knobs in this dialog are documented in the
 per-tab READMEs; only a handful of keys are genuinely batch-owned
 (synthesized in `build_batch_param_spec` because they have no native
@@ -721,25 +692,28 @@ PARAM_SPEC entry on their tab).
 
 ### How per-row editing works (mechanism)
 
-- A row's `Edit params…` button calls `BatchRow._on_edit_params`
-  (`tab.py:161`): it layers `row.params` on top of
-  `BatchTab.default_params`, opens `open_advanced(...,
-  self.tab.PARAM_SPEC, merged)`, and on OK stores the edited dict
-  back as `row.params`. The dict is **deltas, not a full snapshot** —
-  it round-trips through `calliope_batch.json` as `"params": {…
-  overrides only …}`.
-- `Apply settings to selected` calls `BatchTab._on_edit_defaults`
-  (`tab.py:954`): it opens the dialog against a copy of
+- A row's `Edit params…` button calls `BatchRow._on_edit_params`:
+  it layers `row.params` on top of `BatchTab.default_params`, opens
+  `open_advanced(..., self.tab.PARAM_SPEC, merged)`, and on OK stores
+  the edited dict back as `row.params`. Rows added in the GUI start
+  from a full copy of `default_params`; rows loaded from a CSV or JSON
+  may carry only some keys (or none). The dict round-trips through
+  `calliope_batch.json` as `"params": {…}`.
+- `Apply settings to selected` calls `BatchTab._on_edit_defaults`:
+  it opens the dialog against a copy of
   `default_params`, then writes the result into `default_params` and
   `merge_defaults(...)` onto every **checked** row. Use `Select all`
   first to hit every row.
 - Edited values only take effect at run time because
-  `_apply_row_params_to_tabs` (`tab.py:1704`) dispatches `row.params`
-  to each tab's public `apply_batch_row(params, log=…)` seam right
-  before that tab's `_on_run` fires. Keys a row didn't override leave
-  that tab's live state untouched. The batch runner never pokes tab
-  internals — a rename inside a tab surfaces as a loud error there,
-  not a silent no-op here.
+  `_apply_row_params_to_tabs` dispatches the row's **effective**
+  params to each tab's public `apply_batch_row(params, log=…)` seam
+  right before that tab's run method fires. Effective params are the
+  union-spec defaults, overlaid by `BatchTab.default_params`, overlaid
+  by `row.params`, so a key a row doesn't set (a blank or partial CSV
+  `params` cell) means "batch default" — it never inherits the
+  previous row's value. The batch runner never pokes tab internals —
+  a rename inside a tab surfaces as a loud error there, not a silent
+  no-op here.
 - Group labels are renamed with a numbered stage prefix
   (`1. Preprocess - QC GIF`, `2. Detection - dF/F`,
   `3. Low-pass - Butterworth`, …) so the dialog reads top-to-bottom
@@ -928,15 +902,18 @@ motion-corrected TIFF*, and *Archive raw TIFF (compressed)*, plus the
 ```
 tabs/batch/
 ├── __init__.py    ← re-exports BatchTab
-├── tab.py         ← BatchTab (queue + worker), BatchRow, _pick_tiffs_dialog
+├── tab.py         ← BatchTab (queue + GUI-driving orchestrator), BatchRow
+├── logic.py       ← scratch prune / mirror / copy helpers, build_batch_param_spec
 └── README.md      ← (this file)
 ```
 
-The orchestrator and per-stage compute modules live in `core/`:
+Tab 0 drives the GUI tabs, which call into the per-stage compute
+modules in `core/`. `core/batch_pipeline.py` is a separate headless
+orchestrator that Tab 0 does not use:
 
 ```
 core/
-├── batch_pipeline.py            ← run_recording (driver)
+├── batch_pipeline.py            ← run_recording (headless; not used by Tab 0)
 ├── preprocessing.py             ← Tab 1 (math + run_preprocess)
 ├── detection_run.py             ← Tab 3 pipeline
 ├── lowpass_run.py               ← Tab 4
@@ -964,7 +941,7 @@ math counterpart — the algorithm lives in `core/utils.py` /
   defaults into `calliope_batch.json` alongside per-row overrides, so the
   JSON is the canonical record of what was actually run.
 - **`batch_report.csv` is the audit log.** Re-run only the rows whose
-  status is `failed` or `partial`; the others have all their figures and
+  status is `failed` or `aborted`; the others have all their figures and
   per-tab outputs on disk already. Rows with status `no_rois` were
   genuinely noise (zero ROIs survived the cell filter) — their downstream
   stages are intentionally `skipped`, so there is nothing to re-run.
@@ -1002,10 +979,11 @@ math counterpart — the algorithm lives in `core/utils.py` /
   likely in detection/suite2p; preprocess itself is largely OOM-safe
   (single-TIFF shift auto-falls-back to streaming; the grouped path is
   already streaming), so re-running from preprocess is safe.
-- **Failures in one stage don't poison the next.** Detection failure
-  short-circuits the rest of that row; lowpass / events / clustering /
-  xcorr / spatial each fail independently. Spatial-propagation figures
-  silently skip when event detection produced no event windows.
+- **A failed stage ends only its own row.** Any stage failure marks the
+  row `failed` (the failing stage's error goes into the report's `error`
+  column) and skips that row's remaining stages; the next row starts
+  normally. Spatial-propagation figures silently skip when event
+  detection produced no event windows.
 - **<2 ROIs => clustering + xcorr are skipped, not crashed.** Clustering
   needs at least two ROIs (hierarchical linkage is undefined for a single
   trace — `pdist` on one column raises "empty distance matrix"). A
@@ -1016,7 +994,7 @@ math counterpart — the algorithm lives in `core/utils.py` /
   marked `skipped` and the row jumps to spatial propagation (which only
   needs events), so it still finishes with its event/spatial output.
   `core.clustering._ward_linkage` / `tabs.clustering.logic.ward_linkage`
-  also raise a clear `ValueError` for this case, and the headless
+  also raise a clear `ValueError` for this case, and the separate headless
   `batch_pipeline.run_recording` applies the same `_kept_roi_count` skip.
 - **No events => per-event xcorr is skipped, not stalled.** When event
   detection finds zero population events, the xcorr tab's
