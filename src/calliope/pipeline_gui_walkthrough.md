@@ -178,7 +178,7 @@ The cell-filter step gives you a reproducible "is this really a cell?" decision 
 2. The **raw** dF/F trace.
 3. The **low-pass-filtered** dF/F trace at the chosen cutoff.
 
-When you click *Compute*, it writes per-cell low-pass and derivative arrays to disk for Tab 5.
+When you click *Compute*, it writes per-cell low-pass and derivative arrays to disk for Tab 5, and records the cutoff, filter order, derivative window and frame rate it used in the recording's `meta.json` (`lowpass_filtered`). Tab 5 reads that record, so its onset timing and onset-backtrack window match the filter you actually applied. *Compute* needs Tab 3's filtered dF/F; if only the unfiltered trace is on disk the panels still preview it, but *Compute* stays disabled and the status line says why.
 
 **Why it matters biologically.** GCaMP has slow kinetics (rise ~50–200 ms, decay ~hundreds of ms to seconds), so calcium events look like smoothed bumps regardless of how briefly the underlying spikes fired. We want to:
 
@@ -203,6 +203,8 @@ The first **derivative** of the low-pass trace (Savitzky-Golay smoothed) is what
 2. **Population events.** Once you have onsets for every cell, you build a histogram across time (`bin_sec=0.025` → 25 ms bins), Gaussian-smooth it (`sigma=1.5 bins`), then `find_peaks` on the smoothed density to find moments where many cells fired in a narrow window. Around each peak, the algorithm walks outward until the density falls back to baseline + `k·noise`, then enforces a hard physiological cap (default `0.5 s` — anything longer than this in epileptiform recordings is probably two events fused). If two walked windows overlap, they get *watershed-split* at the local minimum between their peaks.
 
 The three panels show: (1) sorted-by-activity heatmap of the low-pass dF/F, (2) sorted event raster (one dot per onset), (3) the smoothed density with detected event windows shaded.
+
+Each per-ROI onset is walked back to the foot of its rise on the low-pass trace before pooling. With `onset_backtrack_s = 0` (auto) the look-back window is `max(tau, 0.8 / cutoff)`, using the cutoff Tab 4 recorded in `meta.json`. *Render* and *Export figures* both run in a background process, so the window stays responsive while they work.
 
 A **Prominence distribution...** button opens a popout with the histogram of every candidate peak's prominence (re-runs `find_peaks` against the cached smoothed density with the prominence floor lifted to ~0). Drag the slider along the X axis to preview where `min_prominence` cuts the distribution — the bimodality between noise ripples (near zero) and real events (clearly higher) is usually obvious, and the slider lets the user drop the threshold into the valley between the two modes. Apply re-renders Tab 5 automatically.
 

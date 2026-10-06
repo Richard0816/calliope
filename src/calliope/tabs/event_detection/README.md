@@ -16,18 +16,38 @@ From `plane0/` (after Tabs 3 + 4):
 - `F.npy` — `(N_total, T)` (used only for the shape).
 - `r0p7_filtered_dff_lowpass.memmap.float32` — `(T, N_kept)` low-pass dF/F.
 - `r0p7_filtered_dff_dt.memmap.float32` — `(T, N_kept)` SG-smoothed first derivative.
-- `predicted_cell_mask.npy` (or `iscell.npy` fallback) for the keep mask.
+- The keep mask, resolved by `core.utils.resolve_filtered_mask` against the
+  memmap's on-disk size: the frozen `r0p7_cell_mask_bool.npy` written next to
+  the filtered memmaps by Tab 3 first, then `predicted_cell_mask.npy` →
+  `iscell.npy` → all-ones, whichever matches the file's column count.
+- `meta.json` `lowpass_filtered` (stamped by Tab 4 when it wrote the two
+  memmaps above): the cutoff that drives the auto onset-backtrack window and
+  the frame rate onsets are timed at (see `onset_backtrack_s` in §4).
 
 ---
 
 ## 2. Pipeline steps
 
-The render worker (`EventDetectionTab._compute_render_data`) delegates the
-entire compute body to
+*Render* runs `core.event_detection_run.run_event_detection_offload` in a
+child process (via `core.offload.run_offloaded`, so the pure-Python per-ROI
+loop can't freeze the GUI), which delegates the entire compute body to
 `core.event_detection_run.run_event_detection(plane0, params, *,
-figures_dir=None, write_summary=True, progress_cb=None)`. The same call
-is what Tab 0's batch worker invokes — there's a single source of truth
-for the per-ROI hysteresis + population-event detection.
+figures_dir=None, write_summary=True, progress_cb=None,
+compute_monotonicity=True)`. The same call is what Tab 0's batch worker
+invokes — there's a single source of truth for the per-ROI hysteresis +
+population-event detection.
+
+*Export figures* re-runs detection through
+`core.event_detection_run.export_event_figures_offload` with
+`compute_monotonicity=False` (the figures don't use the 10,000-shuffle sweep)
+and writes the PNG + SVG figures plus the manifest. A click runs it in a child
+process like *Render*; the Tab 0 batch toggle calls it synchronously, so the
+row only advances once the files are on disk.
+
+**Frame rate.** Onsets are timed at, in order: an explicit `fps_override`
+(batch rows), else the `fps` Tab 4 stamped into `meta.json`
+`lowpass_filtered` (the rate the memmaps were filtered at, so Tabs 4 and 5
+agree), else `ops.npy['fs']`, else `DEFAULT_FPS`.
 
 When `figures_dir` is set, `run_event_detection` saves
 `heatmap.png` / `raster.png` / `event_detection.png` (the same three
@@ -39,7 +59,9 @@ batch; False inside the interactive tab, since the tab triggers its own
 per event (`event_id, n_active, theta_star_deg, rho_obs, p_value,
 p_value_fdr, n_shuffles, u_x, u_y`) computed by
 `core.spatial.directional_monotonicity_spearman` — the same Spearman-
-rank propagation-direction test Tab 8's bottom panel renders.
+rank propagation-direction test Tab 8's bottom panel renders (Tab 8 re-runs
+it itself, because its plots need the full ρ(θ) curve and null distribution
+that these per-event rows don't carry).
 `p_value_fdr` is the Benjamini-Hochberg-adjusted q-value across the
 per-event tests in this recording (compare against your target FDR,
 typically 0.05). The correction is applied automatically by
@@ -108,8 +130,8 @@ Then merge onsets closer than `min_sep_s · fps` frames into the earliest of the
 #### `refine_onsets(onsets, lp, fps, min_rise_dff, backtrack_s)` — foot backtrack + optional rise gate
 
 The Schmitt trigger fires partway *up* the rise (where the derivative robust-z
-crosses `z_enter`), not at its foot. `refine_onsets` (`utils.py:458`, called at
-`event_detection_run.py:366`) walks each crossing back along the low-pass dF/F
+crosses `z_enter`), not at its foot. `refine_onsets` (`core/utils.py`, called per ROI
+in `run_event_detection`) walks each crossing back along the low-pass dF/F
 to the local minimum that starts the rise, so the reported frame lands at event
 **onset**. Two crossings on one rise collapse to a single foot.
 
@@ -200,7 +222,7 @@ After all `(start_s, end_s)` pairs are walked:
 - **Hard duration cap** (`max_event_duration_s = 1.3 s`): if `end_s − start_s > 1.3`, clamp it to centred-on-peak ±0.65 s.
 - **Symmetric clamp** (`enforce_symmetric_clamp=False` by default): if true, *every* window becomes peak ± `max_event_duration_s/2` (0.65 s at the default cap), not just the ones that exceed the cap. Useful for stereotyping but loses the natural boundaries.
 
-The `merge_gap_s` parameter is kept (and stays editable) for compatibility but currently has **no effect in any configuration**: the overlap-merge code that read it was disabled on 2026-05-01 and is kept commented out in `_boundaries_from_peaks`. Turning `enable_watershed_split` off does not bring merging back — overlapping windows are then simply left as walked.
+The `merge_gap_s` parameter is kept editable for compatibility but **currently has no effect**: the legacy overlap-merge block was disabled on 2026-05-01 (watershed split replaced it), so it is not applied even with `enable_watershed_split=False`.
 
 #### 3e — Activation matrix
 
@@ -224,7 +246,7 @@ The "Save Data…" buttons next to the heatmap and raster panels write **full-re
 
 Both prepend a `time_s` column = `frame_index / fps` and a header comment with `fps`, `frame_seconds`, `n_frames`, `n_rois_kept`.
 
-Per-pair summary export goes to `summary_writer.write_events_sheets`, which writes `EventWindows` and `Onsets` sheets to `<rec>_summary.xlsx`.
+The summary export goes to `summary_writer.write_events_sheets`, which writes the `EventWindows`, `EventOnsets` and `RoiEventTimes` sheets to `<plane0>/calliope_summary.xlsx`; the tab's `_write_summary` then adds the `EventMonotonicity` sheet (§2).
 
 ---
 
@@ -232,22 +254,31 @@ Per-pair summary export goes to `summary_writer.write_events_sheets`, which writ
 
 In-memory only (no new on-disk arrays beyond the summary sheets and optional CSVs). Tabs 6 and 7 read the same memmaps and re-derive what they need.
 
-The `summary_writer.write_events_sheets` writes:
-- **EventWindows** sheet: columns `event_id, start_s, end_s, duration_s, peak_s` etc.
-- **Onsets** sheet: long format — one row per `(roi, onset_s)` pair.
+`<plane0>/calliope_summary.xlsx` gets:
+- **EventWindows** sheet (`summary_writer.write_events_sheets`): one row per
+  event — `event_id, start_s, end_s, duration_s, n_active_rois`.
+- **EventOnsets** sheet (same writer): long format — one row per in-event
+  onset, `event_id, roi, onset_s, t_relative_s`.
+- **RoiEventTimes** sheet (same writer): wide table, one `roi_<i>` column per
+  ROI listing every onset time (NaN-padded), in or out of an event.
+- **EventMonotonicity** sheet (`summary_writer.write_event_monotonicity_sheet`):
+  one row per event with the directional-monotonicity scalars (§2).
+
+Rendering also updates the workbook's **Recording** sheet (`fps`, `T`, `N`)
+via `summary_writer.update_recording_meta`.
 
 ---
 
 ## 4. Advanced settings (`Advanced…` dialog)
 
-Every knob below lives in the 32-entry `PARAM_SPEC` at `tab.py:136`. The
+Every knob below lives in the 32-entry `EventDetectionTab.PARAM_SPEC` (`tab.py`). The
 *Advanced…* button opens a generated dialog (`gui_common.open_advanced`);
 defaults are primed via `spec_defaults(PARAM_SPEC)` into `self._params`.
 Twenty-six of these map 1:1 to `core.utils.EventDetectionParams` (the
-`_EVENT_DETECTION_FIELDS` tuple, `event_detection_run.py:44`); the other six
+`_EVENT_DETECTION_FIELDS` tuple in `event_detection_run.py`); the other six
 (`z_enter`, `z_exit`, `min_sep_s`, `min_rise_dff`, `onset_backtrack_s`,
 `time_cols_target`) are consumed directly by the run worker. **Defaults below are exactly the GUI `PARAM_SPEC` values**,
-which `_build_event_params` (`event_detection_run.py:192`) writes over the
+which `_build_event_params` (`event_detection_run.py`) writes over the
 dataclass defaults before detection — so they are the source of truth. In a
 couple of cases the GUI value differs from the *live* `EventDetectionParams`
 default: GUI `bin_sec=0.05` vs dataclass `0.025`, and GUI
@@ -261,9 +292,9 @@ match the `PARAM_SPEC` `group` field.
 ### Per-ROI hysteresis
 
 The Schmitt-trigger onset detector. Per kept ROI the worker computes
-`z = mad_z(derivative)` (`utils.py:380`) then
+`z = mad_z(derivative)` (`core/utils.py`) then
 `hysteresis_onsets(z, z_enter, z_exit, fps, min_sep_s)`
-(`utils.py:405`, called at `event_detection_run.py:359`). Operates in robust-z
+(`core/utils.py`, called per ROI in `run_event_detection`). Operates in robust-z
 units on the SG derivative, so values are comparable across cells regardless of
 raw dF/F scale.
 
@@ -287,7 +318,7 @@ raw dF/F scale.
 - **Min separation (`min_sep_s`) — default `0.1`.**
   - *What it does:* post-merge dead-time, seconds. Onsets within
     `min_sep_s · fps` frames of the previously kept onset are dropped
-    (`utils.py:446`). `0` disables merging.
+    (inside `hysteresis_onsets`). `0` disables merging.
   - *What it means to you:* the refractory floor on a single cell. Raise it to
     collapse onset bursts into one event (fewer onsets); lower it toward 0 to
     keep every up-crossing. Interacts with `z_exit`: both gate how fast one cell
@@ -295,7 +326,7 @@ raw dF/F scale.
 - **Min onset rise (`min_rise_dff`) — default `0.0` (off).**
   - *What it does:* after the foot backtrack, drops any onset whose foot→peak
     rise on the low-pass dF/F is below this many **absolute dF/F** units
-    (`refine_onsets`, `utils.py:458`). `0` disables the gate (backtrack only).
+    (`refine_onsets`). `0` disables the gate (backtrack only).
   - *What it means to you:* an opt-in floor that removes noise-amplitude onsets
     on flat / low-SNR cells. It is absolute (not robust-z) by design — a per-ROI
     normalised floor can't tell a phantom cell from a real one. A typical
@@ -307,7 +338,10 @@ raw dF/F scale.
     to the foot of its rise (and forward to the peak for the rise gate). The
     foot is the `argmin` over the look-back, but the walk never crosses a sample
     already as high as the onset itself, so it can't reach back into a separate
-    earlier bump. `0` = **auto**: `max(tau, 0.8/cutoff_hz)` per recording.
+    earlier bump. `0` = **auto**: `max(tau, 0.8/cutoff_hz)` per recording,
+    where `cutoff_hz` is the batch row's value, else the cutoff Tab 4 stamped
+    into `meta.json` `lowpass_filtered` when it wrote the memmaps, else 1 Hz
+    (`_resolve_cutoff_hz`).
   - *What it means to you:* the foot lives on the **low-pass** dF/F, so the rise
     timescale is the *slower* of the indicator decay `tau` and the low-pass
     period `1/cutoff` — not the (sub-second) spike. Fast indicator → the
@@ -319,7 +353,7 @@ raw dF/F scale.
 - **Heatmap time columns (`time_cols_target`) — default `1200`.**
   - *What it does:* target column count for the downsampled heatmap and raster.
     The worker sets `downsample = max(1, T // time_cols_target)` and bin-means
-    the low-pass into `T // downsample` columns (`event_detection_run.py:317`).
+    the low-pass into `T // downsample` columns (`run_event_detection`).
     Display-only — does **not** touch detection or the full-resolution CSV
     export.
   - *What it means to you:* purely cosmetic/performance. Raise it for finer
@@ -328,7 +362,7 @@ raw dF/F scale.
 
 ### Population events — density
 
-The smoothed onset-density curve (`_build_density`, `utils.py:1185`) that
+The smoothed onset-density curve (`_build_density` in `core/utils.py`) that
 peak-picking runs on.
 
 - **Density bin (`bin_sec`) — default `0.05`.**
@@ -350,7 +384,7 @@ peak-picking runs on.
     may mistake for events.
 - **Normalize by ROI count (`normalize_by_num_rois`) — default `True`.**
   - *What it does:* divides counts by the number of ROIs, turning the density
-    into "fraction of cells firing per bin" (`utils.py:1234`).
+    into "fraction of cells firing per bin" (`_build_density`).
   - *What it means to you:* keep on so a fixed `min_prominence` means the same
     thing across recordings with different cell counts. Turn off only if you
     deliberately want raw counts — then prominence/baseline thresholds become
@@ -359,14 +393,14 @@ peak-picking runs on.
 ### Population events — peaks
 
 Peak detection on the smoothed density (`_detect_density_peaks` →
-`scipy.signal.find_peaks`, `utils.py:1411`). The prominence floor is either
+`scipy.signal.find_peaks`). The prominence floor is either
 auto-derived from the per-recording circular-shift null or fixed — see below.
 
 - **Auto min prominence (`auto_min_prominence`) — default `True`.**
   - *What it does:* when on, the effective prominence floor is the
     `auto_min_prominence_percentile` of that recording's circular-shift null
     (`null_prominence_percentiles` → `circular_shift_null_prominences`,
-    `utils.py:1319`; applied at `utils.py:1008`). Each ROI's onset train is
+    applied in `detect_event_windows`). Each ROI's onset train is
     independently circular-shifted to destroy cross-cell coincidence, the
     density is rebuilt with the *same* pipeline, and every candidate peak's
     prominence is pooled. A degenerate/empty null falls back to the fixed
@@ -419,7 +453,7 @@ auto-derived from the per-recording circular-shift null or fixed — see below.
     Scales with `bin_sec`.
 - **Prominence window (`prominence_wlen_s`) — default `1.0`.**
   - *What it does:* local window (seconds → odd bin count via
-    `prominence_wlen_s/bin_sec | 1`, `utils.py:1028`) for the `wlen=` prominence
+    `prominence_wlen_s/bin_sec | 1`, in `detect_event_windows`) for the `wlen=` prominence
     calculation, so a small peak next to a big one is measured against the
     nearby valley, not the big peak's full descent.
   - *What it means to you:* raise it toward whole-trace behaviour if you want
@@ -429,7 +463,7 @@ auto-derived from the per-recording circular-shift null or fixed — see below.
 ### Population events — baseline
 
 Baseline + noise estimation that sets the boundary-walk threshold
-(`_estimate_rolling_baseline` / `_estimate_noise_from_quiet`, `utils.py:1473`).
+(`_estimate_rolling_baseline` / `_estimate_noise_from_quiet` in `core/utils.py`).
 
 - **Baseline mode (`baseline_mode`) — default `rolling`** (choices: `rolling`, `global`).
   - *What it does:* `rolling` = per-bin `baseline_percentile` over a
@@ -453,7 +487,7 @@ Baseline + noise estimation that sets the boundary-walk threshold
     long and it over-smooths through bursts (windows balloon).
 - **Quiet percentile (noise) (`noise_quiet_percentile`) — default `40.0`.**
   - *What it does:* only density residuals below this percentile feed the MAD
-    noise estimate (`utils.py:1512`) — the "what does dispersion look like when
+    noise estimate (`_estimate_noise_from_quiet`) — the "what does dispersion look like when
     nothing is happening" set.
   - *What it means to you:* lower it if active bins are leaking into the noise
     estimate (inflating it, shrinking windows); raise it if too few quiet bins
@@ -468,17 +502,17 @@ Baseline + noise estimation that sets the boundary-walk threshold
 ### Population events — boundaries
 
 Walking each peak outward to a window, then splitting/clamping
-(`_boundaries_from_peaks`, `utils.py:1647`).
+(`_boundaries_from_peaks` in `core/utils.py`).
 
 - **End threshold k (`end_threshold_k`) — default `1.5`.**
   - *What it does:* boundary level = `baseline + k · noise`
-    (`utils.py:1695`); the walk stops when the density drops below it.
+    (`end_threshold_trace` in `_boundaries_from_peaks`); the walk stops when the density drops below it.
   - *What it means to you:* the width knob for individual events. Lower it →
     walk continues further down toward baseline → wider windows; raise it →
     windows clip closer to the peak. Pairs with `baseline_percentile`/noise.
 - **Max walk duration (`max_walk_duration_s`) — default `2.0`.**
   - *What it does:* hard cap (seconds) on how far each one-sided walk may travel
-    from the peak before stopping (`walk_steps`, `utils.py:1715`). A search
+    from the peak before stopping (`walk_steps` in `_boundaries_from_peaks`). A search
     radius, not the final duration.
   - *What it means to you:* a safety rail so a never-crossing threshold can't
     run a window to the recording edge. Keep it comfortably above
@@ -487,33 +521,33 @@ Walking each peak outward to a window, then splitting/clamping
 - **Max event duration (`max_event_duration_s`) — default `1.3`.**
   - *What it does:* the physiological hard cap on the **final** window. Any
     window longer than this is clamped to peak ± `max_event_duration_s/2`
-    (`utils.py:1810`; 0.65 s each side at the default).
+    (duration cap in `_boundaries_from_peaks`; 0.65 s each side at the default).
   - *What it means to you:* the dominant duration constraint — set it to the
     longest event you consider one event. Too small and genuine long events get
     truncated; too large and merged/runaway windows survive. Interacts with
     `enforce_symmetric_clamp`.
 - **Watershed-split overlaps (`enable_watershed_split`) — default `True`.**
   - *What it does:* when two walked windows overlap, cut both at the
-    minimum-density valley between their peaks (`utils.py:1748`), so close events
+    minimum-density valley between their peaks (watershed block in `_boundaries_from_peaks`), so close events
     stay separate.
   - *What it means to you:* keep on for distinct back-to-back epileptiform
-    events. Turning it off does **not** restore the old merge-overlapping
-    behaviour (that code is disabled, so `merge_gap_s` is inert): overlapping
-    walked windows are left overlapping.
+    events. Turning it off leaves overlapping windows as walked -- the old
+    merge-overlapping path was disabled on 2026-05-01, so `merge_gap_s` does
+    not kick in either.
 - **Force symmetric clamp (`enforce_symmetric_clamp`) — default `False`.**
   - *What it does:* when on, **every** window is forced to peak ±
     `max_event_duration_s/2`, not just the ones exceeding the cap
-    (`utils.py:1816`).
+    (duration-cap block in `_boundaries_from_peaks`).
   - *What it means to you:* turn on to stereotype all events to a fixed width
     (handy for averaging/alignment) at the cost of each event's natural
     boundaries. Leave off to keep walked widths up to the cap.
 - **Merge gap (`merge_gap_s`) — default `0.0`.**
   - *What it does:* legacy overlap-merge gap (seconds). **Currently has no
-    effect in any configuration**, with or without watershed split: the merge
-    block that read it was disabled on 2026-05-01 and is kept commented out in
-    `_boundaries_from_peaks` (`core/utils.py`) for a possible future restore.
-  - *What it means to you:* nothing today. It stays in the dialog so saved
-    parameter sets keep loading; changing it does not change results.
+    effect**: the merge block in `_boundaries_from_peaks` was disabled on
+    2026-05-01 when watershed split replaced it, so the value is ignored
+    whether or not `enable_watershed_split` is on.
+  - *What it means to you:* nothing today -- kept editable (and saved in
+    manifests / batch rows) for compatibility only.
 
 ### Population events — gaussian fit
 
@@ -523,7 +557,7 @@ replace it). Kept editable for reverting to the older heuristic.
 - **Use Gaussian-fit boundary (`use_gaussian_boundary`) — default `False`.**
   - *What it does:* when on, fits a moments-based Gaussian to each peak and uses
     its `gaussian_quantile` cut as the boundary, intersected with the walked
-    window (`utils.py:1775`).
+    window (`_fit_gaussian_to_peak`, applied in `_boundaries_from_peaks`).
   - *What it means to you:* an alternative to baseline-walk boundaries for
     smooth, well-isolated peaks. Off in short-event mode; flip on (and consider
     disabling watershed split) only to reproduce the legacy boundary behaviour.
@@ -556,10 +590,9 @@ popout) to fall back to fixed `min_prominence`, or nudge
 is recorded in the diagnostics dict.
 
 The Gaussian-fit group is inactive in the default short-event configuration
-but stays editable so you can revert to the older Gaussian boundary heuristic
-(set `use_gaussian_boundary` on) without leaving the GUI. `merge_gap_s` also
-stays editable but is inert (see above); the old merge-overlapping behaviour
-cannot currently be re-enabled from the GUI.
+but stays editable so you can revert to the older boundary heuristics (set
+`use_gaussian_boundary` on and/or `enable_watershed_split` off) without leaving
+the GUI. `merge_gap_s` is also still editable but currently inert (see above).
 
 **Manual subset (UI-only, not in `PARAM_SPEC`).** A header checkbox
 (`manual_subset_var`) + text entry (`manual_roi_var`, format `0,3,5-9`) restrict
@@ -588,7 +621,10 @@ in the *Advanced…* dialog.
 8. **Activation matrix:** for each event, mark every ROI that has at least one onset inside `[start_s, end_s]`; record the earliest such onset.
 9. The display heatmap is per-ROI 1st/99.5th-percentile-normalised `lp_ds` with rows sorted by event count (descending). The raster is binary onsets at downsampled bin resolution.
 
-The full annotated reference is in `core/utils.py` lines ~250–820.
+The full annotated reference is in `core/utils.py` (`mad_z`,
+`hysteresis_onsets`, `refine_onsets`, `EventDetectionParams`,
+`detect_event_windows` and the `_build_density` / `_detect_density_peaks` /
+`_boundaries_from_peaks` helpers).
 
 
 ## UI affordances

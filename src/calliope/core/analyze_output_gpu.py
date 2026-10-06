@@ -1,7 +1,19 @@
 """GPU-accelerated dF/F computation using CuPy.
 
 Mirrors the CPU path in detection_run.compute_dff_memmaps but runs batched
-over all ROIs on GPU.  The public surface is:
+over all ROIs on GPU.
+
+Note on the ``<prefix>dff_lowpass`` / ``<prefix>dff_dt`` outputs: they are
+still written (here and on the CPU path) but have no current in-repo
+readers -- Tab 4 / ``core.lowpass_run`` rebuild the filtered
+``r0p7_filtered_dff_lowpass`` / ``_dt`` memmaps from ``r0p7_filtered_dff``,
+and those are what event detection reads. Their low-pass start-up also
+differs slightly from the CPU path: here ``sosfilt`` runs from a zero state
+over a block of repeated first samples prepended to the trace, whereas the
+CPU ``utils.lowpass_causal_1d`` initialises both SOS state entries to
+``x[0]``. Only ``<prefix>dff`` is consumed downstream.
+
+The public surface is:
 
     _CUPY_OK : bool  — True when CuPy + a CUDA device are available
     process_suite2p_traces_gpu(F, Fneu, fps, *, r, baseline_sec, cutoff_hz,
