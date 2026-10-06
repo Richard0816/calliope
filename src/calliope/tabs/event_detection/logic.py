@@ -15,7 +15,11 @@ Tab 5 needs:
 
 The tab module imports this as ``utils`` (yes, despite also being
 named ``logic`` -- the ``as`` rename keeps the math-y call sites
-short).
+short). Today the tab itself only calls ``plot_event_detection``,
+``shade_event_windows`` and ``summary_writer`` through it; the detection
+helpers stay re-exported for compatibility. ``core.event_detection_run``
+imports them from ``core.utils`` directly, so core never depends on this
+GUI-layer shim.
 
 See ``calliope.tabs.preprocess.logic`` for the shim pattern overview.
 """
