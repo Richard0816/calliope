@@ -675,6 +675,9 @@ Across the whole batch:
 <stage>_status, <stage>_duration_s` for each `stage` in
 `(preprocess, detection, lowpass, event_detection, clustering,
 crosscorrelation, spatial_propagation)`.
+`error` is the row-level failure reason; when a stage fails it reads
+`<stage>: <exception text>` (including the OOM "gave up after N
+retries" suffix).
 
 ---
 

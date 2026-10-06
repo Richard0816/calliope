@@ -2539,6 +2539,10 @@ class BatchTab(ctk.CTkFrame):
             "error": err,
         }
         self._row_results["status"] = "failed"
+        # Surface the failure in batch_report.csv's row-level ``error``
+        # column (_write_report never writes the per-stage errors).
+        if not self._row_results.get("error"):
+            self._row_results["error"] = f"{stage}: {err}"
         self._append_log(
             f"  [{stage}] FAILED: {exc}\n{traceback.format_exc()}")
         self._on_row_done()
