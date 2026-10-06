@@ -102,8 +102,9 @@ from scipy.cluster.hierarchy import dendrogram, fcluster
 
 from .logic import (
     ABOVE_CUT_COLOR, CustomColorDialog, DEFAULT_PALETTE, DEFAULT_PREFIX,
-    ReclusterWindow, build_label_image, compute_clustering_offload,
-    filtered_to_suite2p_indices, load_filtered_dff, reload_clustering_offload,
+    LINKAGE_ROI_IDS_FILE, ReclusterWindow, build_label_image,
+    compute_clustering_offload, linkage_roi_ids, load_filtered_dff,
+    reload_clustering_offload,
     render_spatial_map, spatial_image, stat_for_prefix, summary_writer, utils,
     ward_linkage,
 )
@@ -148,6 +149,12 @@ class ClusteringTab(ctk.CTkFrame):
         # Analysis cache (filled on Run analysis).
         self._dff: Optional[np.ndarray] = None
         self._Z: Optional[np.ndarray] = None
+        # Ordered Suite2p ROI ids of the linkage leaves + the plane0 they
+        # came from. Export / copy / summary check these against the
+        # current filtered dF/F (identity, not just count) before mapping
+        # leaf positions to ROI ids.
+        self._roi_ids: Optional[np.ndarray] = None
+        self._linkage_plane0: Optional[Path] = None
         self._stat = None
         self._Lx: int = 0
         self._Ly: int = 0
@@ -523,6 +530,48 @@ class ClusteringTab(ctk.CTkFrame):
                     popout._dff = None
             except Exception:
                 pass
+        # The filtered dF/F is about to be regenerated, so the linkage no
+        # longer describes it. Drop it rather than let Export / Copy map
+        # its leaves onto the new kept-ROI set.
+        self._invalidate_linkage()
+
+    def _invalidate_linkage(self) -> None:
+        """Forget the in-memory linkage and disable everything that reads
+        it, until the next Run analysis / Reload clusters."""
+        if self._Z is None:
+            return
+        self._Z = None
+        self._roi_ids = None
+        self._linkage_plane0 = None
+        for btn in (self.export_btn, self.export_figs_btn, self.summary_btn,
+                    self.recluster_btn, self.cluster_menu_btn,
+                    self.copy_rois_btn):
+            try:
+                btn.configure(state="disabled")
+            except Exception:
+                pass
+        try:
+            self.roi_list_var.set("")
+            self.status_var.set(
+                "Filtered dF/F changed; re-run clustering.")
+        except Exception:
+            pass
+
+    def _linkage_ids_current(self) -> Optional[np.ndarray]:
+        """Ordered Suite2p ids of the linkage leaves, or ``None`` when the
+        current filtered dF/F no longer holds exactly those ROIs (in that
+        order) -- e.g. a promotion swapped kept ROIs at the same count."""
+        if (self._roi_ids is None or self._plane0 is None
+                or self._linkage_plane0 is None
+                or Path(self._plane0) != Path(self._linkage_plane0)):
+            return None
+        try:
+            current = linkage_roi_ids(self._plane0, self._prefix)
+        except Exception:
+            return None
+        if not np.array_equal(np.asarray(current), self._roi_ids):
+            return None
+        return self._roi_ids
 
     def _set_plane0(self, plane0: Path) -> None:
         self._plane0 = plane0
@@ -656,6 +705,8 @@ class ClusteringTab(ctk.CTkFrame):
         self._stat, _ = stat_for_prefix(plane0, self._prefix)
 
         self._Z = data["Z"]
+        self._roi_ids = np.asarray(data["roi_ids"], dtype=int)
+        self._linkage_plane0 = plane0
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(np.max(self._Z[:, 2]))
@@ -718,6 +769,8 @@ class ClusteringTab(ctk.CTkFrame):
         self._stat, _ = stat_for_prefix(plane0, self._prefix)
 
         self._Z = data["Z"]
+        self._roi_ids = np.asarray(data["roi_ids"], dtype=int)
+        self._linkage_plane0 = plane0
         self._Lx = data["Lx"]
         self._Ly = data["Ly"]
         self._zmax = float(data["zmax"])
@@ -1110,18 +1163,13 @@ class ClusteringTab(ctk.CTkFrame):
         local_mask = np.isin(
             labels, np.array(target_labels, dtype=labels.dtype))
         local_idx = np.where(local_mask)[0].astype(int)
-        # Translate filtered-list positions to Suite2p ROI ids when the
-        # active prefix is filtered (mirrors _export_clusters).
-        if (utils.is_filtered_prefix(self._prefix)
-                and self._plane0 is not None):
-            translator = filtered_to_suite2p_indices(
-                self._plane0, self._prefix)
-            if translator is None or translator.size != len(labels):
-                # Stale linkage vs the rewritten memmap: positions can't be
-                # mapped to Suite2p ids, so offer none rather than wrong ids.
-                return []
-            return sorted(int(i) for i in translator[local_idx])
-        return sorted(int(i) for i in local_idx)
+        # Translate leaf positions to Suite2p ROI ids (mirrors
+        # _export_clusters). A linkage whose ROI set no longer matches the
+        # filtered dF/F offers no ids rather than wrong ones.
+        ids = self._linkage_ids_current()
+        if ids is None or ids.size != len(labels):
+            return []
+        return sorted(int(i) for i in ids[local_idx])
 
     def _refresh_roi_list_var(self) -> None:
         ids = self._picked_cluster_roi_ids()
@@ -1381,23 +1429,17 @@ class ClusteringTab(ctk.CTkFrame):
         # Defensive: ensure the visual mapping is current with this T.
         self._visual_to_label = self._compute_visual_cluster_map(T)
 
-        # If clustering was run on a filter-restricted dF/F view, build a
-        # filtered-position -> Suite2p ROI index translator from the same
-        # mask the loaders use.
-        filtered_to_suite2p: Optional[np.ndarray] = None
-        if utils.is_filtered_prefix(self._prefix):
-            translator = filtered_to_suite2p_indices(
-                self._plane0, self._prefix)
-            if translator is None or translator.size != len(labels):
-                # Same rule as core.clustering.run_clustering: never write
-                # filtered positions under the Suite2p-id marker. Only a
-                # linkage from before the memmap was rewritten gets here.
-                got = None if translator is None else translator.size
-                raise ValueError(
-                    f"The keep mask selects {got} ROIs but the linkage has "
-                    f"{len(labels)} leaves (the filtered dF/F changed since "
-                    f"this clustering ran). Re-run clustering, then export.")
-            filtered_to_suite2p = translator
+        # Leaf position -> Suite2p ROI id, but only if the filtered dF/F
+        # still holds exactly the ROIs the linkage was built on. Checking
+        # the count alone let a promotion that swapped kept ROIs at the
+        # same count ([0,1,3] -> [0,2,3]) reassign cluster memberships.
+        roi_ids = self._linkage_ids_current()
+        if roi_ids is None or roi_ids.size != len(labels):
+            raise ValueError(
+                f"The kept ROIs in the filtered dF/F are not the "
+                f"{len(labels)} ROIs this clustering was built on (the "
+                f"filtered dF/F changed since this clustering ran). "
+                f"Re-run clustering, then export.")
 
         out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1407,12 +1449,10 @@ class ClusteringTab(ctk.CTkFrame):
         for vid in range(1, len(self._visual_to_label) + 1):
             lbl = int(self._visual_to_label[vid])
             local_idx = np.where(labels == lbl)[0].astype(int)
-            if filtered_to_suite2p is not None:
-                roi_idx = filtered_to_suite2p[local_idx]
-            else:
-                roi_idx = local_idx
-            np.save(out_dir / f"C{vid}_rois.npy", roi_idx.astype(int))
+            np.save(out_dir / f"C{vid}_rois.npy",
+                    roi_ids[local_idx].astype(int))
         np.save(out_dir / "linkage.npy", self._Z)
+        np.save(out_dir / LINKAGE_ROI_IDS_FILE, roi_ids.astype(int))
         np.save(out_dir / "threshold_used.npy", np.array([T], dtype=float))
         # Marker so the xcorr runner knows the .npy files contain Suite2p
         # ROI indices directly and skips the filtered-position translation
@@ -1484,15 +1524,14 @@ class ClusteringTab(ctk.CTkFrame):
         # of cluster_labels refers to the i-th *kept* ROI. Translate to
         # Suite2p ROI indices so the Clusters sheet's `roi` column lines
         # up with the ROIs sheet (where `roi` is the Suite2p index).
-        if utils.is_filtered_prefix(self._prefix):
-            translator = filtered_to_suite2p_indices(
-                self._plane0, self._prefix)
-            if translator is not None and translator.size == len(labels):
-                roi_indices = translator.tolist()
-            else:
-                roi_indices = None
-        else:
-            roi_indices = None
+        # Skip the write when the ROI set changed since the linkage was
+        # built: positions would be labelled with the wrong ROIs.
+        ids = self._linkage_ids_current()
+        if ids is None or ids.size != len(labels):
+            print("[GUI] cluster summary skipped: filtered dF/F ROI set "
+                  "changed since clustering ran; re-run clustering.")
+            return None
+        roi_indices = ids.tolist()
 
         # ops.npy['fs'] (detection fps) or the warned DEFAULT_FPS fallback;
         # get_fps_from_notes never raises without a notes_root.

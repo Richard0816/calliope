@@ -82,7 +82,8 @@ def test_reload_enables_export_figures(monkeypatch, tmp_path):
     s = _stub()
     s.path_var = _Var(str(tmp_path))
     s._prefix = "r0p7_"
-    data = {"Z": Z, "Lx": 4, "Ly": 4, "zmax": float(Z[:, 2].max()),
+    data = {"Z": Z, "roi_ids": np.arange(6),
+            "Lx": 4, "Ly": 4, "zmax": float(Z[:, 2].max()),
             "saved_threshold": float(Z[:, 2].max()) / 2,
             "N": 6, "T": 5, "cluster_dir": str(tmp_path)}
     ClusteringTab._on_reloaded(s, data)
@@ -123,7 +124,11 @@ def test_gui_export_refuses_mismatched_translator(monkeypatch, tmp_path):
     s._plane0 = tmp_path
     s._prefix = "r0p7_filtered_"
     s._current_threshold = lambda: 1.0
-    monkeypatch.setattr(ctab, "filtered_to_suite2p_indices",
+    s._roi_ids = np.arange(4)
+    s._linkage_plane0 = tmp_path
+    s._linkage_ids_current = (
+        lambda: ctab.ClusteringTab._linkage_ids_current(s))
+    monkeypatch.setattr(ctab, "linkage_roi_ids",
                         lambda p0, pre: np.arange(3))   # 3 != 4 leaves
     with pytest.raises(ValueError, match="Re-run clustering"):
         ctab.ClusteringTab._export_clusters(s)

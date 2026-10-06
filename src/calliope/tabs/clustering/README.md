@@ -23,8 +23,8 @@ The user can change the prefix in the GUI to operate on `r0p7_dff.memmap.float32
 > params, *, figures_dir=None, write_summary=True)` runs the linkage,
 > picks a threshold (auto via `clustering.auto_choose_threshold` when
 > `params['threshold']` is `None`), cuts to flat clusters, exports
-> `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `threshold_used.npy` +
-> `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
+> `C{i}_rois.npy` (Suite2p ids) + `linkage.npy` + `linkage_roi_ids.npy` +
+> `threshold_used.npy` + `_indices_are_suite2p`, and (optionally) renders `dendrogram.png` +
 > `spatial_clusters.png`. Filtered-position → Suite2p translation uses the
 > same memmap-anchored keep mask `load_filtered_dff` sized the matrix with
 > (not the live `predicted_cell_mask`/`iscell`), so the marker is always
@@ -183,7 +183,7 @@ The button is enabled only when both files exist for the active prefix:
 1. `Z = np.load(linkage.npy)` — the saved linkage matrix.
 2. `thr = float(np.load(threshold_used.npy)[0])` — the cut at which the user clicked Export.
 3. `_, T, N, _ = load_filtered_dff(...)` — only to read the current column count.
-4. **Validation:** `Z.shape[0] + 1 == N`. If the cell-filter mask has changed since export, leaf count and ROI count won't match — the reload aborts with a clear error rather than silently misaligning ROIs to dendrogram leaves.
+4. **Validation:** `Z.shape[0] + 1 == N`, and the ordered Suite2p ids the linkage was built on (`linkage_roi_ids.npy`; for older exports, the sorted union of the `C*_rois.npy` files when the `_indices_are_suite2p` marker is present) must equal the current kept ids (`core.clustering.linkage_roi_ids`). A promotion can swap kept ROIs at the same count (`[0,1,3]` → `[0,2,3]`), so the count alone is not enough. On a mismatch the reload aborts with a clear error rather than silently misaligning ROIs to dendrogram leaves.
 5. `Lx`, `Ly` from `utils.load_plane_view`.
 6. `zmax = max(Z[:, 2])` for slider calibration.
 
@@ -208,13 +208,14 @@ Only picklable data crosses the process boundary; `_on_reloaded` re-opens the dF
 ├── C2_rois.npy
 ├── ...
 ├── linkage.npy           ← the full Z matrix
+├── linkage_roi_ids.npy   ← ordered Suite2p ids of the linkage leaves
 ├── threshold_used.npy    ← the threshold at which the cut was made
 └── _indices_are_suite2p  ← marker file: "1"
 ```
 
 Cluster numbering matches the dendrogram's left-to-right visual order (C1, C2, … = leftmost branch, second branch, …). The `_indices_are_suite2p` marker tells Tab 7 that the indices in `C*_rois.npy` are positions in `stat.npy` / `F.npy` (Suite2p indices), not positions in the kept-only memmap.
 
-For the filtered prefix, the export translates from filtered-position to Suite2p index using `filtered_to_suite2p_indices(plane0, prefix)` (the file-size-anchored translator — see Step 4's keep-mask note). For an unfiltered prefix it's a no-op.
+The export translates leaf positions to Suite2p ids with the ordered ids recorded when the linkage was computed (or reloaded). Export, the picked-cluster ROI list and the summary sheet first check that the current kept ids (`core.clustering.linkage_roi_ids`, which uses the file-size-anchored `filtered_to_suite2p_indices` — see Step 4's keep-mask note) are exactly those ids in the same order; if not, Export refuses with "Re-run clustering", the ROI list stays empty and the summary write is skipped. When Tab 3 regenerates the filtered dF/F after a promotion (`AppState.release_memmaps`), Tab 6 drops its in-memory linkage and disables Export / Recluster / Save summary until you re-run.
 
 Stale `C*_rois.npy` files are deleted before writing, so re-export with fewer clusters doesn't leave ghost files behind.
 
@@ -308,11 +309,11 @@ return start                                  # nothing hit the band → fall ba
 6. **Recluster:** for selected branches, slice dF/F to those ROIs, re-run `ward_linkage`, open a sub-window with its own slider and palette.
 7. **Export format:**
    - One `C{i}_rois.npy` per cluster, indices = Suite2p ROI indices.
-   - `linkage.npy` (full `Z`), `threshold_used.npy` (single-element float).
+   - `linkage.npy` (full `Z`), `linkage_roi_ids.npy` (ordered Suite2p ids of the leaves), `threshold_used.npy` (single-element float).
    - Marker file `_indices_are_suite2p` to disambiguate from the legacy filtered-position layout.
 8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
-9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate filtered-list positions to Suite2p ROI ids using the keep mask if the prefix is filtered, sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
-10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept`, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
+9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate leaf positions to Suite2p ROI ids with the ids the linkage was built on (empty if the current kept ids differ), sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
+10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept` and that `linkage_roi_ids.npy` equals the current kept ids, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
 
 
 ## UI affordances

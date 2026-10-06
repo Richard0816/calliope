@@ -187,7 +187,7 @@ the GUI can't reach.
   `r0p7_cell_mask_bool.npy`, `calliope_calibration.npy`,
   `calliope_summary.xlsx`). Note: `data.bin` is **no longer kept**
   — the archive step drops it because nothing downstream reads it.
-- `r0p7_filtered_cluster_results/` — `C*_rois.npy`, `linkage.npy`,
+- `r0p7_filtered_cluster_results/` — `C*_rois.npy`, `linkage.npy`, `linkage_roi_ids.npy`,
   `threshold_used.npy`, `_indices_are_suite2p` marker.
 - `calliope_figures/<stage>/` — every batch-report PNG.
 - `qc.gif`, `mean.npy` — Tab 1 outputs at the recording root.

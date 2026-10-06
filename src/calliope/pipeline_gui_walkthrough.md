@@ -229,7 +229,7 @@ The user can:
 - Pick a categorical or continuous palette, or set per-cluster colors manually.
 - **Click any ROI on the spatial map** to open a popout showing the heatmap + event raster restricted to that ROI's cluster (per-row min-max ΔF/F + a derivative-threshold event raster; Tab 5's published payload carries no precomputed raster today). The clicked ROI is highlighted with a yellow row marker.
 - "Recluster" a selected branch (or branches) in a separate window — useful when one cluster is huge and looks heterogeneous.
-- Export each cluster's ROI ids to `.npy` files for Tab 7.
+- Export each cluster's ROI ids to `.npy` files for Tab 7. The export also saves the ordered Suite2p ids the linkage was built on (`linkage_roi_ids.npy`); Export, Copy and Reload refuse when the kept ROIs have changed since (e.g. a Tab 3 promotion swapped cells), and regenerating the filtered dF/F drops the in-memory linkage until you re-run.
 
 **Why it matters biologically.** Cells in a slice are not independent. They form **functional ensembles**: groups whose firing patterns are tightly correlated, often because they share inputs or are synaptically coupled. Identifying these ensembles is half of what circuit neuroscience cares about.
 

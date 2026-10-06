@@ -477,6 +477,46 @@ def filtered_to_suite2p_indices(plane0: Path, prefix: str) -> Optional[np.ndarra
     return np.where(np.asarray(mask, dtype=bool))[0].astype(int)
 
 
+# Ordered Suite2p ROI ids of the linkage leaves, saved next to linkage.npy
+# so a reload / export can check that the leaves still mean the same ROIs.
+LINKAGE_ROI_IDS_FILE = "linkage_roi_ids.npy"
+
+
+def linkage_roi_ids(plane0: Path, prefix: str) -> np.ndarray:
+    """Ordered Suite2p ROI ids of the current ``<prefix>`` dF/F columns.
+
+    These are the ids a linkage computed now would have as leaves: the
+    memmap-anchored keep mask (:func:`filtered_to_suite2p_indices`) for
+    a filtered prefix, ``0..N_total-1`` otherwise.
+    """
+    ids = filtered_to_suite2p_indices(plane0, prefix)
+    if ids is not None:
+        return ids
+    F = np.load(Path(plane0) / "F.npy", mmap_mode="r")
+    return np.arange(int(F.shape[0]), dtype=int)
+
+
+def saved_linkage_roi_ids(cluster_dir: Path) -> Optional[np.ndarray]:
+    """Ordered Suite2p ROI ids a saved ``linkage.npy`` was built on.
+
+    Reads ``linkage_roi_ids.npy``. Exports written before that file
+    existed but with the ``_indices_are_suite2p`` marker still pin the
+    id set: every leaf is in exactly one ``C*_rois.npy``, and leaves are
+    in ascending id order, so the sorted union is the ordered id list.
+    Returns ``None`` when neither is available (identity unknown).
+    """
+    cluster_dir = Path(cluster_dir)
+    p = cluster_dir / LINKAGE_ROI_IDS_FILE
+    if p.exists():
+        return np.asarray(np.load(p), dtype=int).ravel()
+    if (cluster_dir / "_indices_are_suite2p").exists():
+        files = sorted(cluster_dir.glob("C*_rois.npy"))
+        if files:
+            return np.unique(np.concatenate(
+                [np.asarray(np.load(f), dtype=int).ravel() for f in files]))
+    return None
+
+
 def ward_linkage(dff: np.ndarray, method: str = "ward") -> np.ndarray:
     """Ward linkage on z-scored ROI traces with Euclidean distance.
 
@@ -641,6 +681,9 @@ def run_clustering(
             roi_idx = local_idx
         np.save(export_dir / f"C{vid}_rois.npy", roi_idx.astype(int))
     np.save(export_dir / "linkage.npy", Z)
+    np.save(export_dir / LINKAGE_ROI_IDS_FILE,
+            (filtered_to_suite2p if filtered_to_suite2p is not None
+             else np.arange(len(labels))).astype(int))
     np.save(export_dir / "threshold_used.npy",
             np.array([threshold], dtype=float))
     # Every C*_rois.npy above holds Suite2p ids (translated for a filtered

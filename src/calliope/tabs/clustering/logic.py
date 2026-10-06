@@ -49,8 +49,8 @@ from ...core import clustering, summary_writer, utils
 # headless core.clustering.run_clustering, so a mask-resolution fix
 # only has to land once.
 from ...core.clustering import (
-    filtered_to_suite2p_indices, load_filtered_dff, stat_for_prefix,
-    ward_linkage,
+    LINKAGE_ROI_IDS_FILE, filtered_to_suite2p_indices, linkage_roi_ids,
+    load_filtered_dff, saved_linkage_roi_ids, stat_for_prefix, ward_linkage,
 )
 from ...gui_common import (
     apply_dark_to_tk_widget, attach_fig_toolbar, install_scroll_router,
@@ -74,6 +74,9 @@ __all__ = [
     "load_filtered_dff",
     "stat_for_prefix",
     "filtered_to_suite2p_indices",
+    "LINKAGE_ROI_IDS_FILE",
+    "linkage_roi_ids",
+    "saved_linkage_roi_ids",
     "build_label_image",
     "spatial_image",
     "render_spatial_map",
@@ -105,8 +108,12 @@ def compute_clustering_offload(plane0_str: str, prefix: str, *,
     view = utils.load_plane_view(plane0)
     Lx, Ly = int(view["Lx"]), int(view["Ly"])
     auto_frac = clustering.auto_choose_threshold(Z, target_counts=(4, 5))
+    # Ordered Suite2p ids of the leaves, so export / copy can later check
+    # the filtered dF/F still holds exactly these ROIs (not just as many).
+    roi_ids = linkage_roi_ids(plane0, prefix)
     return {
-        "Z": Z, "dff_shape": tuple(int(x) for x in dff_mm.shape),
+        "Z": Z, "roi_ids": roi_ids,
+        "dff_shape": tuple(int(x) for x in dff_mm.shape),
         "Lx": Lx, "Ly": Ly, "auto_frac": float(auto_frac),
         "T": int(T), "N": int(N),
     }
@@ -137,11 +144,21 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
             f"Saved linkage has {n_leaves} leaves but the current "
             f"dF/F memmap has {N} columns. Re-run analysis instead "
             f"of reloading.")
+    # Same count is not enough: a promotion can swap kept ROIs
+    # ([0,1,3] -> [0,2,3]) and the leaves would silently mean other cells.
+    roi_ids = linkage_roi_ids(plane0, prefix)
+    saved_ids = saved_linkage_roi_ids(cluster_dir)
+    if saved_ids is not None and not np.array_equal(saved_ids, roi_ids):
+        raise ValueError(
+            "The saved clustering was built on a different set of kept "
+            "ROIs than the current filtered dF/F (same count, different "
+            "Suite2p ids). Re-run analysis instead of reloading.")
     view = utils.load_plane_view(plane0)
     Lx, Ly = int(view["Lx"]), int(view["Ly"])
     zmax = float(np.max(Z[:, 2]))
     return {
-        "Z": Z, "Lx": Lx, "Ly": Ly, "saved_threshold": thr,
+        "Z": Z, "roi_ids": roi_ids, "Lx": Lx, "Ly": Ly,
+        "saved_threshold": thr,
         "zmax": zmax, "T": int(T), "N": int(N),
         "cluster_dir": str(cluster_dir),
     }
