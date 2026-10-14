@@ -194,6 +194,19 @@ def test_auto_cut_does_not_count_singletons():
     assert n_real == 4 and per_group == [1, 1, 1, 1]
 
 
+# --- finding 16: missing tkinter gives an install hint, not a traceback ---
+
+def test_missing_tkinter_exits_with_hint():
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable, "-c", "import sys; sys.modules['tkinter'] = None; "
+                               "import calliope.pipeline_gui"],
+        capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1
+    assert "needs tkinter" in r.stderr and "Traceback" not in r.stderr
+
+
 def test_call_in_child_survives_killed_child():
     from calliope.core.offload import call_in_child
     with pytest.raises(RuntimeError, match=r"exit code 137.*out of memory"):
