@@ -197,6 +197,22 @@ def _sign_flip_pvalue(values: np.ndarray, n_perm: int = 10000,
     return hits / n_perm
 
 
+def _roi_level_lag_pvalue(pair: str, df: pd.DataFrame) -> float:
+    """Sign-flip p-value for "cluster A leads/lags cluster B", with one
+    value per ROI of A (its mean best lag over B's ROIs) rather than one
+    per pair -- pairs reuse the same cells, so testing them directly is
+    pseudo-replication (UX audit finding 6). Within-cluster pairs (CnxCn)
+    have no lead/lag direction (each i < j pair's sign is arbitrary), so
+    they get no test (NaN)."""
+    nums = re.findall(r"\d+", pair)
+    if len(nums) >= 2 and nums[0] == nums[1]:
+        return float("nan")
+    if "roiA" not in df.columns or "best_lag_sec" not in df.columns:
+        return float("nan")
+    per_roi = df.groupby("roiA")["best_lag_sec"].mean().dropna().to_numpy()
+    return _sign_flip_pvalue(per_roi) if per_roi.size >= 2 else float("nan")
+
+
 def _significance_marker(p: float) -> str:
     if p < 0.001:
         return "***"
@@ -241,7 +257,8 @@ def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str,
     """Lead/Lag-styled violin plot for per-pair best-lag distributions.
 
     Each violin is coloured by the sign of its mean and the sign-flip
-    permutation p-value:
+    permutation p-value (callers pass ROI-level p-values from
+    :func:`_roi_level_lag_pvalue`; NaN = not tested):
       * blue  - mean > 0 and p < 0.05 (Lead)
       * red   - mean < 0 and p < 0.05 (Lag)
       * gray  - not significant
@@ -556,7 +573,7 @@ class ViolinWindow(ctk.CTkToplevel):
             for label, arr in zip(lag_labels, lag_arrays):
                 p = self._pval_cache.get(label)
                 if p is None:
-                    p = _sign_flip_pvalue(arr)
+                    p = _roi_level_lag_pvalue(label, pair_data[label])
                     self._pval_cache[label] = p
                 lag_pvals.append(p)
             _plot_lag_violin(

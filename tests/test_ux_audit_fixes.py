@@ -4,6 +4,7 @@ Headless: no suite2p run, no GPU, no real recording.
 """
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from calliope.core import suite2p_pipeline as sp
@@ -126,6 +127,48 @@ def test_fill_prefers_raw_tiff_and_keeps_user_value(tmp_path):
     kept = acquisition.fill_from_metadata({"fps_override": 12.5}, rec,
                                           log=logs.append)
     assert kept["fps_override"] == 12.5
+
+
+# --- finding 6: within-cluster xcorr uses distinct pairs only ---
+
+def test_within_cluster_xcorr_has_no_self_or_duplicate_pairs(tmp_path):
+    import numpy as np
+    import pandas as pd
+    from calliope.core import crosscorrelation as xc
+    prefix, T, N = "r0p7_filtered_", 300, 5
+    plane0 = tmp_path / "plane0"
+    plane0.mkdir()
+    np.save(plane0 / "F.npy", np.zeros((N, T), np.float32))
+    np.save(plane0 / "r0p7_cell_mask_bool.npy", np.ones(N, bool))
+    mm = np.memmap(plane0 / f"{prefix}dff.memmap.float32", dtype="float32",
+                   mode="w+", shape=(T, N))
+    mm[:] = np.random.default_rng(0).standard_normal((T, N))
+    mm.flush()
+    del mm
+    cdir = plane0 / f"{prefix}cluster_results"
+    cdir.mkdir()
+    (cdir / "_indices_are_suite2p").touch()
+    np.save(cdir / "C1_rois.npy", np.array([0, 1, 2]))
+    np.save(cdir / "C2_rois.npy", np.array([3]))        # singleton
+    out = xc.run_cluster_xcorr_full_fast(
+        plane0, prefix, 15.0, "", max_lag_seconds=0.5, use_gpu=False,
+        n_shuffles=20)
+    df = pd.read_csv(out / "C1xC1" / "C1xC1_summary.csv")
+    assert sorted(zip(df["roiA"], df["roiB"])) == [(0, 1), (0, 2), (1, 2)]
+    assert df["p_value_fdr"].notna().all()
+    assert not (out / "C1xC2").exists() and not (out / "C2xC2").exists()
+
+
+def test_lag_significance_is_roi_level():
+    import pandas as pd
+    from calliope.tabs.crosscorrelation.tab import _roi_level_lag_pvalue
+    within = pd.DataFrame({"roiA": [0, 0, 1], "roiB": [1, 2, 2],
+                           "best_lag_sec": [0.2, 0.2, 0.2]})
+    assert np.isnan(_roi_level_lag_pvalue("C1xC1", within))
+    # One ROI of A paired with 26 ROIs of B is one observation, not 26.
+    one_cell = pd.DataFrame({"roiA": [7] * 26, "roiB": range(26),
+                             "best_lag_sec": [0.3] * 26})
+    assert np.isnan(_roi_level_lag_pvalue("C1xC2", one_cell))
 
 
 def test_call_in_child_survives_killed_child():
