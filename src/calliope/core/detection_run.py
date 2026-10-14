@@ -572,6 +572,7 @@ def compute_dff_memmaps(
             baseline_min=baseline_min, fps=fps,
             r=r, F=F, Fneu=Fneu,
             progress_cb=progress_cb):
+        _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
@@ -609,7 +610,35 @@ def compute_dff_memmaps(
                 f"dF/F batch {i0}-{i1 - 1}/{N - 1} "
                 f"({time.time() - t0:.1f}s)")
     del dff_mm
+    _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
+
+
+# |median dF/F| over the last 10% of the recording above which the
+# baseline is flagged as not tracking slow drift (e.g. photobleaching).
+DFF_DRIFT_WARN = 0.05
+
+
+def _warn_dff_drift(plane0: Path, T: int, N: int, baseline_mode: str,
+                    progress_cb) -> Optional[float]:
+    """Warn when dF/F has drifted away from 0 by the end of the recording
+    -- the first-N-minutes baseline doesn't follow photobleaching, so
+    late dF/F sinks below 0 (UX audit papercut). Returns the late median
+    (or None if it couldn't be read). Never raises."""
+    try:
+        mm = np.memmap(str(plane0 / "r0p7_dff.memmap.float32"),
+                       dtype="float32", mode="r", shape=(T, N))
+        late = float(np.nanmedian(np.median(mm[int(T * 0.9):], axis=0)))
+        del mm
+    except Exception:
+        return None
+    if abs(late) > DFF_DRIFT_WARN:
+        msg = (f"[dF/F] WARNING: median dF/F over the last 10% of the "
+               f"recording is {late:+.3f}, not ~0 -- the {baseline_mode} "
+               f"baseline isn't following slow drift (photobleaching?). "
+               f"Consider the rolling-percentile baseline.")
+        (progress_cb or print)(msg)
+    return late
 
 
 def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,

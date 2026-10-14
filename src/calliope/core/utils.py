@@ -2209,6 +2209,13 @@ def _silence_classifier_load_deprecation() -> None:
         "ignore",
         message=r".*align should be passed as Python or NumPy boolean.*",
     )
+    # suite2p's extraction trips three harmless PyTorch UserWarnings on
+    # every run (sparse-tensor beta notices + a read-only memmap view);
+    # they buried the warnings that matter in Tab 3's console (UX audit).
+    for msg in (r"Sparse invariant checks are implicitly disabled",
+                r"Sparse CSR tensor support is in beta state",
+                r"The given NumPy array is not writable"):
+        warnings.filterwarnings("ignore", message=msg, category=UserWarning)
 
 
 _silence_classifier_load_deprecation()

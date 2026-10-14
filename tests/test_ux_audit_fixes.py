@@ -391,6 +391,49 @@ def test_cellpose_load_failure_explains_itself(tmp_path, monkeypatch):
         sp.run_cellpose_pass(tmp_path / "cp", plane0, {}, verbose=False)
 
 
+# --- papercuts ---
+
+def test_dff_drift_warning(tmp_path):
+    from calliope.core.detection_run import _warn_dff_drift
+    T, N = 100, 3
+    mm = np.memmap(tmp_path / "r0p7_dff.memmap.float32", dtype="float32",
+                   mode="w+", shape=(T, N))
+    mm[:] = np.linspace(0, -0.1, T)[:, None]       # bleaching-like sag
+    mm.flush()
+    del mm
+    msgs = []
+    late = _warn_dff_drift(tmp_path, T, N, "first_n", msgs.append)
+    assert late < -0.05 and msgs and "photobleaching" in msgs[0]
+
+
+@pytest.mark.parametrize("sub, expected", [("data/raw", "data"),
+                                           ("proj/raw", "proj/data")])
+def test_tab1_default_output_root(tmp_path, sub, expected):
+    from types import SimpleNamespace
+    from calliope.tabs.preprocess.tab import PreprocessTab
+    wd = tmp_path / sub
+    wd.mkdir(parents=True)
+    store = {}
+
+    class _Var:
+        def __init__(self):
+            self.v = ""
+
+        def get(self):
+            return self.v
+
+        def set(self, v):
+            self.v = v
+
+    stub = SimpleNamespace(dir_var=_Var(), data_root_var=_Var(),
+                           state=SimpleNamespace(working_dir=None),
+                           tiff_listbox=SimpleNamespace(size=lambda: 0),
+                           _refresh_tiffs=lambda: store.setdefault("r", 1))
+    PreprocessTab._use_dir(stub, str(wd))   # a typed path, not Browse
+    assert stub.data_root_var.get() == str(tmp_path / expected)
+    assert store == {"r": 1} and stub.state.working_dir == wd
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():

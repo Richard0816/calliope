@@ -720,6 +720,8 @@ class Suite2pTab(ctk.CTkFrame):
                 md.get("fps"), md.get("um_per_px"),
                 f"from {md['source']}" if md.get("fps") else
                 "frame rate not in the TIFF metadata - enter it")
+        self.recording_var.set(
+            f"Recording: {result.out_dir.name} (not detected yet)")
         self.run_btn.configure(state="normal")
         existing = candidate_plane0(result)
         if existing is not None and plane0_has_outputs(existing):

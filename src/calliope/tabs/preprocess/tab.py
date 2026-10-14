@@ -197,8 +197,13 @@ class PreprocessTab(ctk.CTkFrame):
             padx=8, pady=(6, 4))
 
         self.dir_var = tk.StringVar()
-        ctk.CTkEntry(dir_frame, textvariable=self.dir_var).grid(
-            row=1, column=0, sticky="ew", padx=(8, 6), pady=(0, 4))
+        dir_entry = ctk.CTkEntry(dir_frame, textvariable=self.dir_var)
+        dir_entry.grid(row=1, column=0, sticky="ew", padx=(8, 6), pady=(0, 4))
+        # A typed / pasted path works like Browse (UX audit papercut).
+        dir_entry.bind("<Return>", lambda _e: self._use_dir(
+            self.dir_var.get().strip()))
+        dir_entry.bind("<FocusOut>", lambda _e: self._use_dir(
+            self.dir_var.get().strip()))
         ctk.CTkButton(dir_frame, text="Browse...", width=90,
                       command=self._browse_dir).grid(
             row=1, column=1, padx=(0, 8), pady=(0, 4))
@@ -349,12 +354,27 @@ class PreprocessTab(ctk.CTkFrame):
 
     def _browse_dir(self) -> None:
         path = filedialog.askdirectory(title="Select working directory")
-        if not path:
+        if path:
+            self._use_dir(path)
+
+    def _use_dir(self, path: str) -> None:
+        """Adopt ``path`` as the working directory (Browse, or a typed /
+        pasted path on Enter / focus-out): fill the TIFF list and a
+        default output root."""
+        if not path or not Path(path).is_dir():
             return
+        if (self.dir_var.get().strip() == path
+                and self.state.working_dir == Path(path)
+                and self.tiff_listbox.size()):
+            return  # unchanged; keep the user's TIFF selection
         self.dir_var.set(path)
         self.state.working_dir = Path(path)
         if not self.data_root_var.get():
-            default = Path(path).parent / "data"
+            parent = Path(path).parent
+            # TIFFs already under ".../data/<x>" -> outputs in ".../data",
+            # not ".../data/data".
+            default = parent if parent.name.lower() == "data" \
+                else parent / "data"
             self.data_root_var.set(str(default))
         self._refresh_tiffs()
 
@@ -598,9 +618,9 @@ class PreprocessTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
         self.rerun_btn.configure(state="normal")
-        n_frames_str = (f"{result.n_frames} frames"
-                        if result.n_frames > 0 else "n_frames=?")
-        self.status_var.set(f"Done - {n_frames_str}.")
+        self.status_var.set(f"Done - {result.n_frames} frames."
+                            if result.n_frames > 0
+                            else "Loaded existing outputs.")
         self._append_log(
             f"Outputs: {result.qc_gif.name}, "
             f"{result.shifted_tiff.name}, mean.npy")
