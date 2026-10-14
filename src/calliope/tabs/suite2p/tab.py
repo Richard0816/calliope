@@ -939,9 +939,13 @@ class Suite2pTab(ctk.CTkFrame):
 
         with contextlib.redirect_stdout(writer), \
                 contextlib.redirect_stderr(writer):
-            print("[GUI] running sparse_plus_cellpose...")
+            print("[GUI] running sparse_plus_cellpose in a child process...")
             from ...core import sparse_plus_cellpose as spc
-            final_plane0 = spc.run(
+            from ...core.offload import call_in_child
+            # Child process, not this thread: registration + detection can
+            # exhaust RAM, and an OS out-of-memory kill must take down the
+            # worker rather than the whole GUI (UX audit finding 1).
+            final_plane0 = Path(call_in_child(spc.run_offload, dict(
                 tiff_folder=str(tiff_folder),
                 save_folder=str(save_folder),
                 # path_to_ops omitted: in-source defaults from
@@ -960,7 +964,9 @@ class Suite2pTab(ctk.CTkFrame):
                 enable_sam_vcorr_pass=enable_sam,
                 sam_vcorr_cfg=sam_cfg,
                 verbose=True,
-            )
+            ), on_progress=print, died_hint=(
+                "Detection most likely ran out of memory. Lower batch_size "
+                "(and nbins) in 'Edit suite2p settings...' and re-run.")))
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
             self._log_queue.put(("plane0", final_plane0))
 

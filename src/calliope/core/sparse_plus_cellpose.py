@@ -54,6 +54,8 @@ Standalone use (edit ``TIFF_FOLDER`` / ``SAVE_FOLDER`` below first)::
 from __future__ import annotations
 
 # ``time`` is used for ad-hoc timing prints during long-running steps.
+import contextlib
+import io
 import time
 from pathlib import Path
 
@@ -889,6 +891,41 @@ def run(
         print(f'  stat.npy:  {len(stat_arr)} ROIs')
         print(f'  F/Fneu/spks/iscell saved')
     return final_plane0
+
+
+class _LineCallbackWriter(io.TextIOBase):
+    """stdout/stderr stand-in that hands each complete line to ``cb``."""
+
+    def __init__(self, cb) -> None:
+        self._cb, self._buf = cb, ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            self._cb(line)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._cb(self._buf)
+            self._buf = ""
+
+
+def run_offload(progress_q=None, **kwargs) -> str:
+    """Picklable :func:`calliope.core.offload.call_in_child` target for
+    Tab 3: runs :func:`run` in a child process so an out-of-memory kill
+    takes down the worker, not the GUI. Everything the run prints is
+    streamed back line by line as progress; returns the plane0 path.
+    """
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q) or (lambda _line: None)
+    writer = _LineCallbackWriter(cb)
+    with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+        try:
+            return str(run(**kwargs))
+        finally:
+            writer.flush()
 
 
 # ============================================================================

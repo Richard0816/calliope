@@ -2246,6 +2246,19 @@ def change_batch_according_to_free_ram() -> int:
     return int(20 * available_mem - 170)
 
 
+def _ram_budget_bytes(fraction: float, headroom_gib: float) -> float:
+    """RAM budget for one suite2p working set: the smaller of
+    ``fraction * total - headroom`` (stable across runs) and
+    ``fraction * available`` (what is actually free right now -- other
+    programs, the GUI, and a previous recording's leftovers all count).
+    Budgeting off total alone OOM-killed Tab 3 on a busy 16 GB machine
+    (UX audit finding 1).
+    """
+    vm = psutil.virtual_memory()
+    return min(vm.total * float(fraction) - float(headroom_gib) * 1024 ** 3,
+               vm.available * float(fraction))
+
+
 def pick_batch_size(
     tiff_folder: Optional[str] = None,
     *,
@@ -2258,7 +2271,9 @@ def pick_batch_size(
     """Frame-size-aware Suite2p ``batch_size`` for a target RAM fraction.
 
     Computes the largest batch_size whose modelled peak memory footprint
-    fits in ``target_fraction * total_RAM - headroom_gib``. The model:
+    fits in :func:`_ram_budget_bytes` -- the smaller of
+    ``target_fraction * total_RAM - headroom_gib`` and
+    ``target_fraction * available_RAM``. The model:
 
         peak_bytes_per_frame = Ly * Lx * 2 * overhead_multiplier
         batch_size           = budget_bytes // peak_bytes_per_frame
@@ -2275,7 +2290,7 @@ def pick_batch_size(
 
     shape = _peek_tiff_frame_shape(tiff_folder) if tiff_folder else None
     total_bytes = psutil.virtual_memory().total
-    budget = (total_bytes * float(target)) - (float(headroom) * (1024 ** 3))
+    budget = _ram_budget_bytes(target, headroom)
 
     if shape is None or budget <= 0:
         # No frame shape -- legacy linear fit on available RAM.
@@ -2293,7 +2308,8 @@ def pick_batch_size(
     cpu_capped = max(floor, min(ceiling, bs_cpu))
     total_gib = total_bytes / (1024 ** 3)
     cpu_proj_gib = cpu_capped * per_frame_bytes / (1024 ** 3)
-    print(f"[batch_size] CPU: total={total_gib:.1f}GiB target={target:.0%} "
+    print(f"[batch_size] CPU: total={total_gib:.1f}GiB "
+          f"budget={budget / 1024 ** 3:.1f}GiB target={target:.0%} "
           f"headroom={headroom:.1f}GiB frame={Ly}x{Lx} -> "
           f"batch_size={cpu_capped} (peak~{cpu_proj_gib:.2f}GiB)")
 
@@ -2730,12 +2746,10 @@ def change_nbinned_according_to_free_ram(tiff_folder: str,
     if headroom_gib is None:
         headroom_gib = RAM_HEADROOM_GIB
 
-    # Switch from "available" to "total - headroom" so the budget is
-    # stable across runs regardless of OS cache state. Matches
-    # ``pick_batch_size``.
+    # Same budget rule as ``pick_batch_size``: the tighter of the
+    # total-RAM and currently-available-RAM budgets.
     total_bytes = psutil.virtual_memory().total
-    budget = (total_bytes * float(ram_fraction)
-              - float(headroom_gib) * (1024 ** 3))
+    budget = _ram_budget_bytes(ram_fraction, headroom_gib)
 
     shape = _peek_tiff_frame_shape(tiff_folder)
     if shape is None:
