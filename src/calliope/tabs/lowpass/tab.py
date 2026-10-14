@@ -367,7 +367,9 @@ class LowpassTab(ctk.CTkFrame):
 
         f3 = ctk.CTkFrame(body)
         f3.grid(row=2, column=0, sticky="nsew")
-        ctk.CTkLabel(f3, text="3. Low-pass dF/F",
+        ctk.CTkLabel(f3, text="3. Low-pass dF/F  (preview: zero-phase, "
+                              "aligned with panel 2; Compute writes the "
+                              "causal filter)",
                      font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
         self.lp_fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
@@ -700,7 +702,8 @@ class LowpassTab(ctk.CTkFrame):
         ax.plot(t, y, lw=0.7, color="tab:blue")
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_ylabel(f"{ylabel} low-pass @ {cutoff:.2f} Hz", fontsize=8)
-        ax.set_title(f"Low-pass - {self._trace_label}", fontsize=9)
+        ax.set_title(f"Low-pass preview (zero-phase) - {self._trace_label}",
+                     fontsize=9)
         ax.tick_params(labelsize=7)
         ax.set_xlim(0, t[-1] if t.size else 1.0)
         self.lp_canvas.draw_idle()

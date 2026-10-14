@@ -551,7 +551,9 @@ class ViolinWindow(ctk.CTkToplevel):
             ax.clear()
             ax.set_axis_on()
 
-        title_suffix = self._recording_label
+        mode = ("per-event windows" if "per_event" in self._xcorr_root.name
+                else "full recording")
+        title_suffix = f"{self._recording_label}, {mode}"
         if corr_arrays:
             _plot_violin(
                 self.ax_corr, corr_labels, corr_arrays,
