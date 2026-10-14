@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import queue
 import re
+import time
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -1451,6 +1452,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         params = self._gather_params()
         plane0 = self._plane0
         self._disable_run()
+        self._xc_t0 = time.time()
         self.progress.set(0)
         self.status_var.set("Running full-recording cross-correlation...")
         self._log(f"\n[full] plane0={plane0}")
@@ -1506,6 +1508,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         plane0 = self._plane0
         evts = list(self._event_windows)
         self._disable_run()
+        self._xc_t0 = time.time()
         self._set_progress(0, len(evts))
         self.status_var.set(
             f"Running per-event cross-correlation ({len(evts)} events)...")
@@ -1535,7 +1538,12 @@ class CrossCorrelationTab(ctk.CTkFrame):
     def _on_xc_progress(self, payload) -> None:
         done, total, label = payload
         self._set_progress(done, total)
-        self.status_var.set(f"{label} ({done}/{total})")
+        # Elapsed / ETA from the per-item rate so far (UX audit papercut:
+        # a 6-minute full run gave no sense of how long was left).
+        elapsed = time.time() - getattr(self, "_xc_t0", time.time())
+        eta = elapsed / done * (total - done) if done else 0.0
+        self.status_var.set(f"{label} ({done}/{total})  elapsed "
+                            f"{elapsed:.0f}s, ~{eta:.0f}s left")
 
     def _on_xc_done_full(self, payload: str) -> None:
         self._set_progress(1, 1)
