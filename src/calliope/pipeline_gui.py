@@ -220,7 +220,7 @@ class _Sidebar(ctk.CTkFrame):
     """
 
     def __init__(self, master, labels, on_select, on_open_run=None,
-                 width=210):
+                 on_import_suite2p=None, width=210):
         # ``super()`` reaches the parent class (``ctk.CTkFrame``);
         # forwarding the relevant kwargs lets it set up its own widget
         # state before we add ours.
@@ -252,6 +252,11 @@ class _Sidebar(ctk.CTkFrame):
             ctk.CTkButton(
                 self, text="\U0001F4C2  Open run folder…",
                 height=30, corner_radius=6, command=on_open_run,
+            ).pack(fill="x", padx=8, pady=(0, 4))
+        if on_import_suite2p is not None:
+            ctk.CTkButton(
+                self, text="\U0001F4E5  Import Suite2p output…",
+                height=30, corner_radius=6, command=on_import_suite2p,
             ).pack(fill="x", padx=8, pady=(0, 4))
 
         # "Now viewing" indicator -- set by ``set_run_label`` after a run
@@ -404,7 +409,8 @@ class PipelineApp(ctk.CTk):
         ]
         self._sidebar = _Sidebar(self, labels=tab_labels,
                                  on_select=self._show_tab,
-                                 on_open_run=self._on_open_run)
+                                 on_open_run=self._on_open_run,
+                                 on_import_suite2p=self._on_import_suite2p)
         self._sidebar.grid(row=0, column=0, sticky="nsw")
 
         # Content host: every tab body is grided into row 0 / col 0 of
@@ -550,7 +556,56 @@ class PipelineApp(ctk.CTk):
          self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
             self._tabs_in_order
 
-    def _on_open_run(self) -> None:
+    def _on_import_suite2p(self) -> None:
+        """Build a CalLIOPE run from an existing Suite2p result (a plane0
+        folder, picked via its ops.npy, or a Fall.mat), then open it like
+        "Open run folder" (UX audit finding 14). The conversion + dF/F +
+        cell filter run in a child process."""
+        import queue
+        from tkinter import filedialog, messagebox
+        from .core import suite2p_import
+        from .core.offload import run_offloaded
+        from .gui_common import drain_queue
+
+        src = filedialog.askopenfilename(
+            title="Pick a Suite2p Fall.mat, or ops.npy inside a plane0 folder",
+            filetypes=[("Suite2p output", "Fall.mat ops.npy *.mat"),
+                       ("All files", "*.*")])
+        if not src:
+            return
+        src_p = Path(src)
+        if src_p.name.lower() == "ops.npy":
+            src_p = src_p.parent
+            name = (src_p.parent.parent.name if src_p.name == "plane0"
+                    else src_p.name)
+        else:
+            name = src_p.parent.name
+        dest = filedialog.askdirectory(
+            title="Where should the CalLIOPE run folder be created?")
+        if not dest:
+            return
+        run = Path(dest) / f"{name or 'suite2p'}_calliope"
+        if run.exists() and any(run.iterdir()):
+            messagebox.showerror(
+                "Folder exists", f"{run} already exists and is not empty.")
+            return
+        self._sidebar.set_run_label(f"Importing {src_p.name}…")
+        q: queue.Queue = queue.Queue()
+
+        def _failed(msg):
+            self._sidebar.set_run_label("")
+            messagebox.showerror("Import failed", str(msg).split("\n")[0])
+
+        drain_queue(self, q, {
+            "done": lambda p: self._on_open_run(Path(p)),
+            "error": _failed,
+            "progress": lambda m: print(m)}, poll_ms=200)
+        run_offloaded(self, q, suite2p_import.import_suite2p,
+                      args=(str(src_p), str(run)),
+                      kwargs={"ckpt_path": str(
+                          self.detection_tab.DEFAULT_CKPT_PATH)})
+
+    def _on_open_run(self, folder=None) -> None:
         """Point the whole app at one finished recording folder and
         repopulate every tab in dependency order, without rerunning the
         pipeline.
@@ -565,8 +620,9 @@ class PipelineApp(ctk.CTk):
         from tkinter import filedialog, messagebox
         from .core import run_loader
 
-        folder = filedialog.askdirectory(
-            title="Select a CalLIOPE run (recording) folder")
+        if folder is None:
+            folder = filedialog.askdirectory(
+                title="Select a CalLIOPE run (recording) folder")
         if not folder:
             return
         run_folder = Path(folder)

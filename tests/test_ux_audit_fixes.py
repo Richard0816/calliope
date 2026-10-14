@@ -321,6 +321,47 @@ def test_group_multipart_tiffs(tmp_path):
     assert got["s75_PTZexp1_00001_00003"] == ["s75_PTZexp1_00001_00003.tif"]
 
 
+# --- finding 14: import an existing Suite2p result ---
+
+def _fake_suite2p(n=4, T=600, fs=30.0):
+    rng = np.random.default_rng(0)
+    stat = [{"ypix": np.arange(3) + 5 * i, "xpix": np.arange(3) + 5 * i,
+             "lam": np.ones(3, np.float32), "med": [5 * i + 1, 5 * i + 1],
+             "npix": 3, "radius": 1.0} for i in range(n)]
+    F = (100 + rng.standard_normal((n, T))).astype(np.float32)
+    ops = {"fs": fs, "Ly": 32, "Lx": 32, "meanImg": np.ones((32, 32))}
+    return {"F": F, "Fneu": F * 0.5, "spks": np.zeros_like(F),
+            "iscell": np.c_[np.ones(n), np.ones(n)], "stat": stat, "ops": ops}
+
+
+@pytest.mark.parametrize("kind", ["plane0", "fall_mat"])
+def test_import_suite2p_builds_a_loadable_run(tmp_path, kind):
+    import scipy.io as sio
+    from calliope.core import run_loader, suite2p_import
+    d = _fake_suite2p()
+    if kind == "plane0":
+        src = tmp_path / "s2p" / "suite2p" / "plane0"
+        src.mkdir(parents=True)
+        for k in ("F", "Fneu", "spks", "iscell"):
+            np.save(src / f"{k}.npy", d[k])
+        np.save(src / "stat.npy", np.array(d["stat"], dtype=object),
+                allow_pickle=True)
+        np.save(src / "ops.npy", d["ops"], allow_pickle=True)
+    else:
+        src = tmp_path / "Fall.mat"
+        sio.savemat(src, {**{k: d[k] for k in ("F", "Fneu", "spks",
+                                                "iscell", "ops")},
+                          "stat": np.array(d["stat"], dtype=object)})
+    run = tmp_path / "run"
+    suite2p_import.import_suite2p(str(src), str(run), ckpt_path="",
+                                  progress_q=None)
+    inv = run_loader.scan_run(run)
+    assert inv.has_detection
+    plane0 = run_loader.plane0_for(run)
+    assert (plane0 / "r0p7_filtered_dff.memmap.float32").is_file()
+    assert np.load(plane0 / "ops.npy", allow_pickle=True).item()["fs"] == 30
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():
