@@ -12,8 +12,8 @@ were used:
 | `rec_noise.tif` (synthetic) | Noise only, no cells | The batch "no cells" path |
 | `s75_PTZexp1` (real) | Suite2p `Fall.mat` from [Stern-MA/2PCISz_RecDetect](https://github.com/Stern-MA/2PCISz_RecDetect) ExampleData: mouse PTZ seizure, 512x512, 30 Hz, 36,030 frames (20 min), 138 ROIs | Real seizure dynamics in Tabs 4 to 8. The zip has no raw movie, so Tabs 1 to 3 could not use it. |
 
-`make_fake_recordings.py` regenerates the synthetic data and its
-`*_truth.npz` ground truth (`python make_fake_recordings.py <out_dir>`).
+`tools/make_fake_recordings.py` regenerates the synthetic data and its
+`*_truth.npz` ground truth (`python tools/make_fake_recordings.py <out_dir>`). `tools/gui_driver.py` + `tools/send.py` drive the GUI one command at a time; `tools/import_fall_mat.py` bridges a Suite2p `Fall.mat` into a CalLIOPE run folder.
 
 Environment: Linux, Python 3.12, 4 CPU cores, 15.7 GB RAM, no GPU.
 
