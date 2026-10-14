@@ -298,6 +298,29 @@ def test_rebuild_analysis_tabs_replaces_tabs_and_listeners():
         app.destroy()
 
 
+# --- finding 13: batch Scan groups multi-part recordings ---
+
+def test_group_multipart_tiffs(tmp_path):
+    from pathlib import Path
+    from calliope.tabs.batch.logic import group_multipart_tiffs
+    a, b = tmp_path / "a", tmp_path / "b"
+    paths = ([a / f"s75_PTZexp1_00001_{i:05d}.tif" for i in (2, 1, 10)]
+             + [a / "rec_split_part002.tif", a / "rec_split_part001.tif",
+                a / "rec_00018.tif", a / "rec_00019.tif",   # separate acqs
+                b / "s75_PTZexp1_00001_00003.tif"])          # other folder
+    got = {ident: [Path(p).name for p in parts]
+           for ident, parts in group_multipart_tiffs(paths)}
+    assert got["s75_PTZexp1_00001"] == [
+        "s75_PTZexp1_00001_00001.tif", "s75_PTZexp1_00001_00002.tif",
+        "s75_PTZexp1_00001_00010.tif"]
+    assert got["rec_split"] == ["rec_split_part001.tif",
+                                "rec_split_part002.tif"]
+    assert got["rec_00018"] == ["rec_00018.tif"]
+    assert got["rec_00019"] == ["rec_00019.tif"]
+    # A lone part in another folder stays its own row.
+    assert got["s75_PTZexp1_00001_00003"] == ["s75_PTZexp1_00001_00003.tif"]
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():

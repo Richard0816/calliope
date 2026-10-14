@@ -26,6 +26,7 @@ tested or reused outside the GUI without dragging in customtkinter.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -39,6 +40,39 @@ from typing import Optional
 BATCH_JSON_NAME = "calliope_batch.json"
 BATCH_REPORT_NAME = "batch_report.csv"
 TIFF_GLOBS = ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
+
+# Unambiguous multi-part TIFF names: ScanImage "<acq>_<NNNNN>_<NNNNN>"
+# (last index = file chunk of one acquisition) and "<name>_partNNN".
+# A single trailing index ("rec_00018") is NOT grouped: that is usually
+# a separate acquisition, so merging stays a manual choice there.
+_PART_RE = re.compile(r"^(?P<base>.+_\d+)_(?P<idx>\d+)$|"
+                      r"^(?P<pbase>.+)_part(?P<pidx>\d+)$", re.IGNORECASE)
+
+
+def group_multipart_tiffs(paths) -> list:
+    """Group TIFF paths that are parts of one recording (UX audit
+    finding 13). Returns ``[(identifier, [paths in part order]), ...]``
+    in input order; groups need >= 2 parts in the same folder, everything
+    else stays one row per file with its stem as identifier."""
+    groups: dict = {}
+    for p in map(Path, paths):
+        m = _PART_RE.match(p.stem)
+        if m:
+            base = m.group("base") or m.group("pbase")
+            idx = int(m.group("idx") or m.group("pidx"))
+            key = (str(p.parent), base)
+        else:
+            key, idx = (str(p), None), 0
+        groups.setdefault(key, []).append((idx, p))
+    out = []
+    for (_folder, base), parts in groups.items():
+        if len(parts) >= 2:
+            out.append((base, [p for _i, p in sorted(parts,
+                                                     key=lambda x: x[0])]))
+        else:
+            for _i, p in parts:
+                out.append((p.stem, [p]))
+    return out
 
 
 # ---------------------------------------------------------------------------
