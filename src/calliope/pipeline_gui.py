@@ -29,13 +29,25 @@ live in ``calliope.gui_common``. Each tab is wrapped by
 # stay cheap even when the file imports a lot of heavy modules.
 from __future__ import annotations
 
-# ``sys`` is only used for ``sys.platform`` -- we sniff it to apply a
-# Windows-only taskbar workaround below.
+# ``sys`` is used for ``sys.platform`` (a Windows-only taskbar
+# workaround below) and the missing-tkinter exit message.
 import sys
 
 # ``Path`` is used by the "Open run folder…" handler to derive a run's
 # on-disk layout.
 from pathlib import Path
+
+# Tk ships separately from Python on many Linux distros; pip can't
+# install it, so say how instead of dying with a bare ModuleNotFoundError
+# (UX audit finding 16).
+try:
+    import tkinter  # noqa: F401
+except ModuleNotFoundError:
+    sys.exit("CalLIOPE needs tkinter, which this Python was installed "
+             "without.\nInstall it with your system package manager, e.g. "
+             f"'sudo apt install python{sys.version_info[0]}."
+             f"{sys.version_info[1]}-tk' (Debian/Ubuntu) or 'sudo dnf "
+             "install python3-tkinter' (Fedora), then run calliope again.")
 
 # customtkinter is a third-party re-skin of Tk. ``ctk.CTk`` is its
 # themed root window; we subclass it for ``PipelineApp`` so the whole

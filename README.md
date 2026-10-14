@@ -32,6 +32,11 @@ The first line must use Python 3.11 or 3.12 — on Windows,
 `py -3.12 -m venv venv` picks it explicitly. Check with
 `python --version` after activating.
 
+**Linux:** install Tk first (`sudo apt install python3.12-tk`, matching
+your Python), since pip can't. The steps above pull a ~5.5 GB CUDA build
+of PyTorch on Linux; for a small CPU-only install see
+[docs/install.md](docs/install.md).
+
 **3. Run.**
 
 ```bash
