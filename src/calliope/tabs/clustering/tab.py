@@ -1486,6 +1486,9 @@ class ClusteringTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] cluster summary write failed: {e}")
         self.status_var.set(f"Exported clusters to {out_dir}")
+        # Tell Tab 7 the cluster files now exist (UX audit finding 10).
+        if self._plane0 is not None:
+            self.state.set_clusters_ready(self._plane0)
 
     # -- Summary export ----------------------------------------------------
 

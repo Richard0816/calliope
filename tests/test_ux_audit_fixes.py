@@ -245,6 +245,23 @@ def _child_raises(progress_q=None):
     raise ValueError("bad input")
 
 
+# --- finding 10: Tab 6 Export tells Tab 7 the cluster files exist ---
+
+def test_cluster_export_publishes_clusters_ready(tmp_path):
+    from types import SimpleNamespace
+    from calliope.gui_common import AppState
+    from calliope.tabs.clustering.tab import ClusteringTab
+    state, seen = AppState(), []
+    state.subscribe_clusters_ready(seen.append)
+    stub = SimpleNamespace(
+        state=state, _plane0=tmp_path,
+        _export_clusters=lambda: tmp_path / "out",
+        _write_summary=lambda: None,
+        status_var=SimpleNamespace(set=lambda v: None))
+    ClusteringTab._on_export(stub)
+    assert seen == [tmp_path]
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():

@@ -675,6 +675,10 @@ class CrossCorrelationTab(ctk.CTkFrame):
             try:
                 state.subscribe_plane0(self._on_plane0_broadcast)
                 state.subscribe_lowpass_ready(self._on_plane0_broadcast)
+                # Tab 6 publishes this after analysis and after Export
+                # writes the *_rois.npy files, so Run enables without a
+                # manual reload (UX audit finding 10).
+                state.subscribe_clusters_ready(self._on_plane0_broadcast)
                 state.subscribe_event_results(
                     self._on_event_results_broadcast)
                 state.subscribe_release_memmaps(self._release_dff_cache)
