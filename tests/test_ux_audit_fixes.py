@@ -262,6 +262,42 @@ def test_cluster_export_publishes_clusters_ready(tmp_path):
     assert seen == [tmp_path]
 
 
+# --- finding 11: "Open run folder" starts every analysis tab fresh ---
+
+def test_rebuild_analysis_tabs_replaces_tabs_and_listeners():
+    import traceback
+    import customtkinter as ctk
+    from calliope.pipeline_gui import PipelineApp
+    ctk.set_appearance_mode("dark")
+    app = PipelineApp()
+    app.withdraw()
+    errors = []
+    app.report_callback_exception = lambda *e: errors.append(
+        "".join(traceback.format_exception(*e)))
+    try:
+        app._show_tab(8)
+        st = app.state_obj
+        counts = {k: len(v) for k, v in vars(st).items()
+                  if k.endswith("_listeners")}
+        old_tabs = list(app._tabs_in_order)
+        app.qc_tab.status_marker = "previous recording"
+        app._rebuild_analysis_tabs()
+        app._show_tab(2)
+        for _ in range(5):
+            app.update()
+        assert app.batch_tab is old_tabs[0]
+        assert all(new is not old for new, old in
+                   zip(app._tabs_in_order[1:], old_tabs[1:]))
+        assert not hasattr(app.qc_tab, "status_marker")
+        assert not old_tabs[8].winfo_exists()
+        # Fresh tabs re-subscribed exactly once; no stale callbacks remain.
+        assert {k: len(v) for k, v in vars(st).items()
+                if k.endswith("_listeners")} == counts
+        assert errors == []
+    finally:
+        app.destroy()
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():

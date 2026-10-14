@@ -529,6 +529,27 @@ class PipelineApp(ctk.CTk):
 
     # -- Open a finished run -------------------------------------------------
 
+    def _rebuild_analysis_tabs(self) -> None:
+        """Destroy and recreate Tabs 1-8 so nothing drawn for the previous
+        recording survives into the next (UX audit finding 11): a stage the
+        new run lacks then shows an empty tab, not the old recording.
+        Tab 0 (batch queue) is kept; it only subscribes during a run."""
+        self.state_obj.release_memmaps()
+        self.state_obj.clear_listeners()
+        if self._current_tab_index > 0:
+            self._current_tab_index = -1  # outgoing container is destroyed
+        for i in range(1, len(self._tabs_in_order)):
+            cls = type(self._tabs_in_order[i])
+            self._tab_containers[i].destroy()
+            container, tab = _make_scrollable_tab(
+                self._content, cls, self.state_obj)
+            self._tabs_in_order[i] = tab
+            self._tab_containers[i] = container
+        (self.batch_tab, self.preprocess_tab, self.qc_tab,
+         self.detection_tab, self.lowpass_tab, self.event_tab,
+         self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
+            self._tabs_in_order
+
     def _on_open_run(self) -> None:
         """Point the whole app at one finished recording folder and
         repopulate every tab in dependency order, without rerunning the
@@ -557,10 +578,17 @@ class PipelineApp(ctk.CTk):
                 f"qc.gif / mean.npy and no "
                 f"detection/final/suite2p/plane0 outputs found.")
             return
+        if getattr(self.batch_tab, "_batch_active", False):
+            messagebox.showinfo(
+                "Batch running",
+                "A batch is running. Wait for it to finish (or abort it) "
+                "before opening another run folder.")
+            return
 
-        # Start from a clean bus so a stage missing from this run can't
-        # inherit the previous run's value.
+        # Start from a clean bus and fresh tabs so a stage missing from
+        # this run can't inherit the previous run's value or drawing.
         self.state_obj.reset()
+        self._rebuild_analysis_tabs()
         params = run_loader.manifest_params(run_folder)
         loaded: list[str] = []
         skipped: list[str] = []
@@ -635,9 +663,10 @@ class PipelineApp(ctk.CTk):
             except Exception as e:
                 skipped.append(f"cross-correlation ({e})")
 
-        # Trust signals: a persistent "now viewing" label, land on QC.
+        # Trust signals: a persistent "now viewing" label, land on the
+        # first stage that actually loaded (QC, else detection).
         self._sidebar.set_run_label(f"▶ {run_folder.name}")
-        self._show_tab(2)
+        self._show_tab(2 if inv.has_preprocess else 3)
         self._report_open_run(run_folder, inv, params, loaded, skipped)
 
     def _rehydrate_events(self, params: dict) -> bool:
