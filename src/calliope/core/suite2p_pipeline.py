@@ -868,6 +868,10 @@ def load_base_settings(config: Suite2pPipelineConfig):
     db['nchannels'] = 1
     db['nplanes'] = 1
 
+    # batch_size the user set explicitly (legacy ops file or popout edit);
+    # None means auto-pick it from RAM below.
+    user_bs = None
+
     # --- Step 1: optional legacy override file (back-compat) ---
     # Applied BEFORE the popout edits so an explicit per-session edit
     # always wins over a saved file.
@@ -883,14 +887,17 @@ def load_base_settings(config: Suite2pPipelineConfig):
         #       updated_settings.npy) -- deep-merge directly.
         if _looks_like_nested_settings(loaded):
             _deep_merge(settings, loaded)
+            user_bs = get_setting(loaded, 'batch_size')
         else:
             apply_db_overrides(db, loaded)
             apply_settings_overrides(settings, loaded)
+            user_bs = loaded.get('batch_size')
 
     # --- Step 2: optional Tab 3 popout overrides (per-session edits) ---
     settings_override = getattr(config, 'settings_override', None)
     if settings_override:
         _deep_merge(settings, settings_override)
+        user_bs = get_setting(settings_override, 'batch_size', user_bs)
 
     # --- Pipeline-required settings, applied unconditionally.
     # NOTE: preclassify is intentionally NOT forced here -- it is a
@@ -929,9 +936,15 @@ def load_base_settings(config: Suite2pPipelineConfig):
     # Recordings 2..N: scaled by the previous run's observed peak RAM
     # so we converge on ``utils.RAM_TARGET_FRACTION``. Single-shot Tab 3
     # calls just get the initial estimate every time (no feedback loop
-    # because there's no recording 2 to apply it to).
-    set_setting(settings, 'batch_size',
-                utils.get_adaptive_sizer().pick(config.tiff_folder))
+    # because there's no recording 2 to apply it to). A batch_size the user
+    # set explicitly always wins.
+    if user_bs:
+        set_setting(settings, 'batch_size', int(user_bs))
+        print(f"[batch_size] using user-set batch_size={int(user_bs)} "
+              f"(auto-pick skipped)")
+    else:
+        set_setting(settings, 'batch_size',
+                    utils.get_adaptive_sizer().pick(config.tiff_folder))
 
     # --- nbins (legacy nbinned) capped to RAM budget ---
     safe_nbinned = utils.change_nbinned_according_to_free_ram(config.tiff_folder)
