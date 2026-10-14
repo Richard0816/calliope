@@ -134,6 +134,11 @@ CELLPOSE_CFG = {
     'cellpose_flow_threshold':     0.8,
     'cellpose_cellprob_threshold': -1.0,
     'cellpose_channel_input':      'meanImg',
+    # False = Sparsery only (e.g. offline rig with no Cellpose model).
+    'cellpose_enabled':            True,
+    # Local model file; '' = cellpose's cached cpsam (downloaded on
+    # first use from huggingface.co into ~/.cellpose/models).
+    'cellpose_model_path':         '',
 }
 
 # Default ``hard_cap`` for :func:`run`. Not enforced with suite2p 1.0 (see
@@ -794,9 +799,15 @@ def run(
         print(f'[s+cp] cellpose pass (meanImg)')
     cp_dir = save_root / 'cellpose_pass'
     t_cp = time.time()
-    cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
-        cp_dir, shared_plane0, cp_cfg, verbose=verbose,
-    )
+    if cp_cfg.get('cellpose_enabled', True):
+        cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
+            cp_dir, shared_plane0, cp_cfg, verbose=verbose,
+        )
+    else:
+        cp_stat = []
+        if verbose:
+            print('[s+cp] cellpose pass skipped (cellpose_enabled=False); '
+                  'Sparsery ROIs only')
     if verbose:
         print(f'[s+cp] cellpose: {len(cp_stat)} ROIs '
               f'({time.time() - t_cp:.1f}s)')

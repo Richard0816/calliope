@@ -268,6 +268,14 @@ class Suite2pTab(ctk.CTkFrame):
          "help": "drop kept ROIs whose robust z of log(area) exceeds "
                  "this (sparsery blob artifacts); 0 disables"},
         # Cellpose
+        {"name": "cellpose_enabled", "label": "Run Cellpose pass",
+         "type": "bool", "default": True, "group": "Cellpose",
+         "help": "off = Sparsery ROIs only (e.g. no Cellpose model on an "
+                 "offline rig)"},
+        {"name": "cellpose_model_path", "label": "Cellpose model file",
+         "type": "str", "default": "", "group": "Cellpose",
+         "help": "local model file; blank = cellpose's cpsam, downloaded "
+                 "on first use from huggingface.co"},
         {"name": "cellpose_model_type", "label": "model_type",
          "type": "choice", "choices": ["cyto", "cyto2", "nuclei"],
          "default": "cyto2", "group": "Cellpose"},
@@ -862,6 +870,21 @@ class Suite2pTab(ctk.CTkFrame):
                     f"(Hz)' first."):
                 return
 
+        # Cellpose model preflight (UX audit finding 9): know about a
+        # missing model now, not after registration + Sparsery.
+        from ...core.suite2p_pipeline import cellpose_model_problem
+        problem = cellpose_model_problem(
+            {**spec_defaults(self.PARAM_SPEC), **self._params})
+        if problem and "not found" in problem:
+            messagebox.showerror("Cellpose model", problem)
+            return
+        if problem and not in_batch and not messagebox.askyesno(
+                "Cellpose model download",
+                f"{problem}\n\nDownload it during this run? Choose No to "
+                f"cancel; to run without it, untick 'Run Cellpose pass' "
+                f"in Advanced (Sparsery only)."):
+            return
+
         baseline_mode = self.baseline_var.get()
         baseline_min = 2.0
         if baseline_mode == "first_n":
@@ -1002,6 +1025,9 @@ class Suite2pTab(ctk.CTkFrame):
             "cellpose_cellprob_threshold":
                 params.get("cellpose_cellprob_threshold", -1.0),
             "cellpose_channel_input": "meanImg",
+            "cellpose_enabled": bool(params.get("cellpose_enabled", True)),
+            "cellpose_model_path": str(params.get("cellpose_model_path", "")
+                                       or ""),
         }
         hard_cap = int(params.get("hard_cap", 60000))
         max_overlap = float(params.get("max_overlap", 0.3))

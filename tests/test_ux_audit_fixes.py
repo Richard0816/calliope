@@ -362,6 +362,35 @@ def test_import_suite2p_builds_a_loadable_run(tmp_path, kind):
     assert np.load(plane0 / "ops.npy", allow_pickle=True).item()["fs"] == 30
 
 
+# --- finding 9: Cellpose model preflight, skip option, local model ---
+
+def test_cellpose_model_problem(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp._cp_models, "MODEL_DIR", tmp_path)
+    assert sp.cellpose_model_problem({"cellpose_enabled": False}) is None
+    assert "not downloaded" in sp.cellpose_model_problem({})
+    assert "not found" in sp.cellpose_model_problem(
+        {"cellpose_model_path": str(tmp_path / "nope")})
+    (tmp_path / "cpsam").write_bytes(b"x")
+    assert sp.cellpose_model_problem({}) is None
+    assert sp.cellpose_model_problem(
+        {"cellpose_model_path": str(tmp_path / "cpsam")}) is None
+
+
+def test_cellpose_load_failure_explains_itself(tmp_path, monkeypatch):
+    plane0 = tmp_path / "shared"
+    plane0.mkdir()
+    np.save(plane0 / "ops.npy", {"meanImg": np.random.rand(32, 32),
+                                 "Ly": 32, "Lx": 32}, allow_pickle=True)
+
+    def blocked(*a, **k):
+        raise OSError("<urlopen error Tunnel connection failed: 403>")
+
+    monkeypatch.setattr(sp._cp_models, "CellposeModel", blocked)
+    monkeypatch.setattr(sp, "cellpose_model_problem", lambda cfg: None)
+    with pytest.raises(RuntimeError, match="huggingface.co.*Sparsery only"):
+        sp.run_cellpose_pass(tmp_path / "cp", plane0, {}, verbose=False)
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():

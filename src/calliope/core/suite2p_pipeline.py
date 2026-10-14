@@ -1377,6 +1377,28 @@ def cellpose_sam_available() -> bool:
     return not hasattr(_cp_models, "Cellpose")
 
 
+def cellpose_model_problem(cfg: dict) -> Optional[str]:
+    """Why the Cellpose pass can't start straight away, or ``None``.
+
+    Checked before Run (Tab 3) so a missing model is known up front
+    instead of after registration + Sparsery (UX audit finding 9):
+    a user-set model file that doesn't exist (cellpose would otherwise
+    silently swap in cpsam), or the default cpsam model not downloaded
+    yet (it will download ~1.2 GB from huggingface.co mid-run).
+    """
+    if not cfg.get("cellpose_enabled", True) or not cellpose_sam_available():
+        return None
+    model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
+    if model_path:
+        return (None if Path(model_path).is_file() else
+                f"Cellpose model file not found: {model_path}")
+    if not (Path(_cp_models.MODEL_DIR) / "cpsam").is_file():
+        return (f"The Cellpose model (cpsam, ~1.2 GB) is not downloaded yet; "
+                f"detection will fetch it from huggingface.co into "
+                f"{_cp_models.MODEL_DIR}.")
+    return None
+
+
 def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
     """Convert a cellpose integer label mask into suite2p-style stat dicts.
 
@@ -1559,7 +1581,22 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
         # which is how the downstream ``_source`` tag tells the
         # cyto2-on-meanImg pass apart from the sam-on-Vcorr pass even
         # though they share an underlying weight checkpoint.
-        model = _cp_models.CellposeModel(gpu=True)
+        problem = cellpose_model_problem(cfg)
+        if problem and "not found" in problem:
+            raise RuntimeError(problem)
+        model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
+        try:
+            model = (_cp_models.CellposeModel(gpu=True,
+                                              pretrained_model=model_path)
+                     if model_path else _cp_models.CellposeModel(gpu=True))
+        except Exception as e:
+            raise RuntimeError(
+                f"Couldn't load the Cellpose model ({e}). On first use it "
+                f"downloads (~1.2 GB) from huggingface.co into "
+                f"{_cp_models.MODEL_DIR}. If this machine is offline or "
+                f"behind a proxy/firewall, copy a 'cpsam' model file there "
+                f"or set 'Cellpose model file' in Tab 3's Advanced, or "
+                f"untick 'Run Cellpose pass' to use Sparsery only.") from e
         eval_kwargs = dict(
             diameter=diameter,
             flow_threshold=flow_threshold,
