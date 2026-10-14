@@ -71,6 +71,63 @@ def test_call_in_child_returns_and_streams_progress():
     assert seen == ["hello"]
 
 
+# --- finding 3: frame rate / pixel size come from the TIFF metadata ---
+
+def test_imagej_and_ome_metadata(tmp_path):
+    import numpy as np
+    import tifffile
+    from calliope.core import acquisition
+    mov = np.zeros((4, 8, 8), np.uint16)
+    ij = tmp_path / "ij.tif"
+    tifffile.imwrite(ij, mov, imagej=True, resolution=(2.0, 2.0),
+                     metadata={"axes": "TYX", "finterval": 1 / 30,
+                               "unit": "micron"})
+    md = acquisition.read_tiff_metadata(ij)
+    assert md["fps"] == pytest.approx(30.0)
+    assert md["um_per_px"] == pytest.approx(0.5)
+    assert "ImageJ" in md["source"]
+    ome = tmp_path / "ome.ome.tif"
+    tifffile.imwrite(ome, mov, ome=True,
+                     metadata={"axes": "TYX", "TimeIncrement": 0.05,
+                               "PhysicalSizeX": 1.25})
+    md = acquisition.read_tiff_metadata(ome)
+    assert md["fps"] == pytest.approx(20.0)
+    assert md["um_per_px"] == pytest.approx(1.25)
+    assert acquisition.read_tiff_metadata(tmp_path / "missing.tif") == {}
+
+
+def test_scanimage_rate_divides_by_averaging():
+    from types import SimpleNamespace
+    from calliope.core import acquisition
+    tf = SimpleNamespace(scanimage_metadata={"FrameData": {
+        "SI.hRoiManager.scanFrameRate": 30.0,
+        "SI.hScan2D.logAverageFactor": 2}})
+    assert acquisition._scanimage(tf) == {"fps": 15.0}
+
+
+def test_fill_prefers_raw_tiff_and_keeps_user_value(tmp_path):
+    import numpy as np
+    import tifffile
+    from calliope.core import acquisition, preprocessing
+    raw = tmp_path / "raw" / "rec.tif"
+    raw.parent.mkdir()
+    tifffile.imwrite(raw, np.zeros((4, 8, 8), np.int16), imagej=True,
+                     metadata={"axes": "TYX", "finterval": 1 / 30})
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    # The shifted TIFF carries no acquisition metadata.
+    tifffile.imwrite(rec / "rec_shifted.tif", np.zeros((4, 8, 8), np.uint16))
+    preprocessing.write_raw_paths_sidecar(rec, [raw])
+    logs = []
+    out = acquisition.fill_from_metadata({"fps_override": 0.0}, rec,
+                                         log=logs.append)
+    assert out["fps_override"] == pytest.approx(30.0)
+    assert any("30 Hz" in m for m in logs)
+    kept = acquisition.fill_from_metadata({"fps_override": 12.5}, rec,
+                                          log=logs.append)
+    assert kept["fps_override"] == 12.5
+
+
 def test_call_in_child_survives_killed_child():
     from calliope.core.offload import call_in_child
     with pytest.raises(RuntimeError, match=r"exit code 137.*out of memory"):

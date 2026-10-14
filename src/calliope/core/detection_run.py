@@ -853,6 +853,11 @@ def run_detection(
     Returns ``{plane0: Path, fps: float, T: int, N: int,
     pix_to_um: float|None, figures: list[str]}``.
     """
+    # Frame rate / pixel size from the raw TIFF metadata when the caller
+    # left them at 0 (UX audit finding 3).
+    from . import acquisition
+    params = acquisition.fill_from_metadata(params, tiff_folder,
+                                            log=progress_cb or print)
     if progress_cb is not None:
         progress_cb("[detection] running sparse_plus_cellpose...")
     sparsery_ops = _build_sparsery_ops(params)

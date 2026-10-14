@@ -437,6 +437,8 @@ class Suite2pTab(ctk.CTkFrame):
         except (TypeError, ValueError):
             _ct = 0.0
         self.custom_tau_var.set(f"{_ct:g}" if _ct > 0 else "")
+        # Row's frame rate / µm-per-px (0 = read from TIFF metadata).
+        self._acq_fields_from_params()
 
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
@@ -514,6 +516,33 @@ class Suite2pTab(ctk.CTkFrame):
                   "the suite2p tau. A custom τ overrides the dropdown."),
             text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left")
+
+        # ---- Acquisition: frame rate + pixel size (UX audit finding 3) ----
+        # Mirrors the fps_override / um_per_pixel params. Filled from the
+        # raw TIFF metadata when a recording loads unless the user typed a
+        # value; blank = unknown (Run then asks before using the fallback).
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(row, text="Frame rate (Hz):", width=110,
+                     anchor="w").pack(side="left")
+        self.fps_var = tk.StringVar(value="")
+        ctk.CTkEntry(row, textvariable=self.fps_var, width=80).pack(
+            side="left", padx=(0, 12))
+        ctk.CTkLabel(row, text="µm/px:", anchor="w").pack(
+            side="left", padx=(0, 4))
+        self.umpx_var = tk.StringVar(value="")
+        ctk.CTkEntry(row, textvariable=self.umpx_var, width=80).pack(
+            side="left", padx=(0, 8))
+        self.acq_src_var = tk.StringVar(value="")
+        ctk.CTkLabel(row, textvariable=self.acq_src_var, text_color="gray",
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
+        # True while the field values came from metadata (not typed), so
+        # the next recording's metadata may replace them.
+        self._acq_from_md = True
+        for _v in (self.fps_var, self.umpx_var):
+            _v.trace_add("write", lambda *_a: setattr(
+                self, "_acq_from_md", False))
 
         row = ctk.CTkFrame(header, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=2)
@@ -668,7 +697,21 @@ class Suite2pTab(ctk.CTkFrame):
         if path:
             self.ckpt_var.set(path)
 
+    def _set_acq_fields(self, fps, um_px, source: str) -> None:
+        """Programmatic fill of the frame-rate / µm-per-px fields."""
+        self.fps_var.set(f"{float(fps):g}" if fps else "")
+        self.umpx_var.set(f"{float(um_px):g}" if um_px else "")
+        self.acq_src_var.set(source)
+        self._acq_from_md = True
+
     def _on_preprocess_result(self, result: PreprocessResult) -> None:
+        if self._acq_from_md or not self.fps_var.get().strip():
+            from ...core import acquisition
+            md = acquisition.recording_metadata(result.out_dir)
+            self._set_acq_fields(
+                md.get("fps"), md.get("um_per_px"),
+                f"from {md['source']}" if md.get("fps") else
+                "frame rate not in the TIFF metadata - enter it")
         self.run_btn.configure(state="normal")
         existing = candidate_plane0(result)
         if existing is not None and plane0_has_outputs(existing):
@@ -714,9 +757,34 @@ class Suite2pTab(ctk.CTkFrame):
         except Exception as e:
             self._append_log(f"[GUI] plane0 publish error: {e}")
 
+    def _acq_fields_to_params(self) -> Optional[str]:
+        """Copy the frame-rate / µm-per-px fields into ``_params`` (blank
+        -> 0 = unset). Returns an error message for a bad entry."""
+        for var, key, label in ((self.fps_var, "fps_override", "Frame rate"),
+                                (self.umpx_var, "um_per_pixel", "µm/px")):
+            raw = var.get().strip()
+            try:
+                val = float(raw) if raw else 0.0
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                return f"{label} must be a positive number (got {raw!r})."
+            self._params[key] = val
+        return None
+
+    def _acq_fields_from_params(self) -> None:
+        """Show ``_params``' frame rate / µm-per-px in the fields; a set
+        (non-zero) value counts as typed, so metadata won't replace it."""
+        fps = float(self._params.get("fps_override", 0) or 0)
+        um = float(self._params.get("um_per_pixel", 0) or 0)
+        self._set_acq_fields(fps, um, "set by you" if fps or um else "")
+        self._acq_from_md = not (fps or um)
+
     def _on_advanced(self) -> None:
+        self._acq_fields_to_params()  # a bad entry is reported on Run
         if open_advanced(self, "Suite2p Detection - Advanced parameters",
                          self.PARAM_SPEC, self._params):
+            self._acq_fields_from_params()
             self._append_log(
                 "[GUI] Advanced parameters updated. Re-run detection "
                 "to apply.")
@@ -774,6 +842,25 @@ class Suite2pTab(ctk.CTkFrame):
             self._append_log(
                 f"[GUI] No cell-filter checkpoint at {ckpt_path}; "
                 "the third panel will fall back to suite2p's iscell.")
+
+        err = self._acq_fields_to_params()
+        if err:
+            messagebox.showerror("Invalid acquisition setting", err)
+            return
+        in_batch = getattr(getattr(self.winfo_toplevel(), "batch_tab", None),
+                           "_batch_active", False)
+        if not self._params.get("fps_override") and not in_batch:
+            from ...core import acquisition
+            from ...core.calliope_settings import DEFAULT_FPS
+            if not acquisition.recording_metadata(
+                    result.out_dir).get("fps") and not messagebox.askyesno(
+                    "Frame rate unknown",
+                    f"No frame rate was found in the TIFF metadata and none "
+                    f"is set.\n\nRun assuming {DEFAULT_FPS:g} Hz? Every event "
+                    f"time and duration will be wrong if your acquisition "
+                    f"rate differs.\n\nChoose No to enter it in 'Frame rate "
+                    f"(Hz)' first."):
+                return
 
         baseline_mode = self.baseline_var.get()
         baseline_min = 2.0
@@ -890,6 +977,12 @@ class Suite2pTab(ctk.CTkFrame):
         # PARAM_SPEC defaults fill any key missing from _params, so the
         # spec stays the single source of the GUI's defaults.
         params = {**spec_defaults(Suite2pTab.PARAM_SPEC), **self._params}
+        # Frame rate / pixel size from the raw TIFF metadata when left at 0
+        # (UX audit finding 3); drives suite2p fs, dF/F, z-drift and scale.
+        from ...core import acquisition
+        params = acquisition.fill_from_metadata(
+            params, tiff_folder,
+            log=lambda m: self._log_queue.put(("log", m)))
         sparsery_ops = {
             "high_pass":         params["high_pass"],
             "preclassify":       params["preclassify"],

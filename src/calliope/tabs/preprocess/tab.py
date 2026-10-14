@@ -604,6 +604,13 @@ class PreprocessTab(ctk.CTkFrame):
         self._append_log(
             f"Outputs: {result.qc_gif.name}, "
             f"{result.shifted_tiff.name}, mean.npy")
+        from ...core import acquisition
+        md = acquisition.recording_metadata(result.out_dir)
+        self._append_log(
+            f"Frame rate: {md['fps']:g} Hz ({md['source']}); edit it in "
+            f"Tab 3 if wrong." if md.get("fps") else
+            "Frame rate: NOT in the TIFF metadata - enter it in Tab 3 "
+            "before running detection.")
         self.state.set_result(result)
 
     def _on_error(self, msg: str) -> None:
