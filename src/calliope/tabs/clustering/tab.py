@@ -744,14 +744,15 @@ class ClusteringTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] cluster summary write failed: {e}")
 
-        n_clusters = int(np.unique(
-            fcluster(self._Z, t=self._current_threshold(),
-                     criterion="distance")).size)
+        labels = fcluster(self._Z, t=self._current_threshold(),
+                          criterion="distance")
+        n_clusters = int(np.unique(labels).size)
         cut_desc = (f"batch cut={self._manual_T:.3g}" if batch_cut
                     else f"auto cut={auto_frac:.2f}xmax")
         self.status_var.set(
             f"OK. N_rois={data['N']}  T={data['T']}  "
-            f"{cut_desc}  -> {n_clusters} clusters. "
+            f"{cut_desc}  -> {n_clusters} clusters "
+            f"({self._cluster_sizes_text(labels)} ROIs). "
             f"Toggle 'Manual threshold' + slider to tune.")
         self._refresh_reload_btn()
 
@@ -1043,6 +1044,13 @@ class ClusteringTab(ctk.CTkFrame):
         self._vmap_cache_T = T
         self._vmap_cache = result
         return result
+
+    def _cluster_sizes_text(self, labels: np.ndarray) -> str:
+        """ROI count per cluster in visual order (C1/C2/...), e.g.
+        "29/26/15/1", so tiny clusters are visible at a glance."""
+        sizes = np.bincount(labels)
+        return "/".join(str(int(sizes[lbl])) for _v, lbl in
+                        sorted(self._visual_to_label.items()))
 
     def _build_label_color_map(self, n_clusters: int) -> dict[int, str]:
         """Map each fcluster label to the color the user expects for that
@@ -1402,7 +1410,8 @@ class ClusteringTab(ctk.CTkFrame):
             self._spatial_label_key = label_key
         render_spatial_map(
             self.s_ax, img, self._Lx, self._Ly, self._resolve_pix_to_um(),
-            f"{n_clusters} clusters  -- click an ROI for cluster panel")
+            f"{n_clusters} clusters ({self._cluster_sizes_text(labels)})"
+            f"  -- click an ROI for cluster panel")
         self.s_canvas.draw_idle()
 
         # Cluster numbering / ROI->cluster assignment may have changed

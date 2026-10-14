@@ -171,6 +171,29 @@ def test_lag_significance_is_roi_level():
     assert np.isnan(_roi_level_lag_pvalue("C1xC2", one_cell))
 
 
+# --- finding 7: the auto cut ignores tiny clusters when counting ---
+
+def test_auto_cut_does_not_count_singletons():
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from calliope.core.clustering import auto_choose_threshold
+    rng = np.random.default_rng(0)
+    centres = [(0, 0), (10, 0), (0, 10), (10, 10)]
+    X = np.vstack([rng.normal(c, 0.5, (10, 2)) for c in centres]
+                  + [[[100.0, 100.0]]])                # one far outlier
+    Z = linkage(X, "ward")
+
+    def groups(frac):
+        labels = fcluster(Z, t=frac * Z[:, 2].max(), criterion="distance")
+        return [len(set(labels[i * 10:(i + 1) * 10])) for i in range(4)], \
+            len(set(labels[:40]))
+
+    # Old behaviour: stop at 4 clusters = outlier + 3 (two groups merged).
+    _, n_real_old = groups(auto_choose_threshold(Z, min_cluster_size=1))
+    assert n_real_old == 3
+    per_group, n_real = groups(auto_choose_threshold(Z))
+    assert n_real == 4 and per_group == [1, 1, 1, 1]
+
+
 def test_call_in_child_survives_killed_child():
     from calliope.core.offload import call_in_child
     with pytest.raises(RuntimeError, match=r"exit code 137.*out of memory"):

@@ -203,9 +203,13 @@ def auto_choose_threshold(
     start: float = 0.90,
     stop: float = 0.05,
     step: float = 0.01,
+    min_cluster_size: int = 3,
 ) -> float:
     """Heuristic: walk the cut fraction down from ``start`` until the
-    fcluster count lands in ``target_counts``.
+    number of fcluster clusters with at least ``min_cluster_size`` ROIs
+    lands in ``target_counts``. Smaller clusters (lone outlier ROIs,
+    pairs) don't count toward the target, so the cut no longer stops on
+    e.g. 29/26/15/1 (UX audit finding 7); they still exist as clusters.
 
     The default targets (4, 5) match what the lab finds visually
     useful for typical brain-slice recordings. Returns the fractional
@@ -225,46 +229,20 @@ def auto_choose_threshold(
     a downstream user; switching to ``count_clusters`` makes the
     auto-pick match what the user sees on the spatial map.
     """
-    # ``set(...)`` for fast ``in`` lookup below.
     target_counts = set(target_counts)
-    if not target_counts:
+    if not target_counts or Z is None or len(Z) < 1:
         return start
-    lo_target = min(target_counts)
-    hi_target = max(target_counts)
-
-    # The candidate grid is the same descending ``start -> stop`` sweep as
-    # before (``stop - 1e-9`` so np.arange actually visits ``stop``), so we
-    # return a value identical to the original linear scan.
-    grid = np.arange(start, stop - 1e-9, -step)
-    if len(grid) == 0:
-        return start
-
-    # ``count_clusters`` is monotonically non-decreasing along this grid:
-    # the cut height shrinks as the fraction drops, which can only split
-    # clusters (never merge), so the count only grows. That lets us binary
-    # search for the first grid index whose count reaches ``lo_target``
-    # instead of re-running fcluster at every one of the ~85 steps.
-    n = len(grid)
-    lo, hi = 0, n
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if count_clusters(Z, float(grid[mid])) >= lo_target:
-            hi = mid
-        else:
-            lo = mid + 1
-
-    # From the first index that reaches the target band, the original scan
-    # returned the first grid point whose count is actually in the set.
-    # Counts are monotonic, so a short forward scan (bounded by hi_target)
-    # reproduces that exactly -- and handles a non-contiguous target set.
-    i = lo
-    while i < n:
-        c = count_clusters(Z, float(grid[i]))
-        if c in target_counts:
-            return float(grid[i])
-        if c > hi_target:
-            break
-        i += 1
+    zmax = float(np.max(Z[:, 2]))
+    # Descending ``start -> stop`` sweep (``stop - 1e-9`` so np.arange
+    # visits ``stop``). Linear, not a binary search: the sized-cluster
+    # count is not monotonic along the grid (a split can turn one big
+    # cluster into two small ones), and ~85 fcluster calls are cheap.
+    for frac in np.arange(start, stop - 1e-9, -step):
+        labels = fcluster(Z, t=float(frac) * zmax, criterion="distance")
+        sizes = np.bincount(labels)
+        if int(np.sum(sizes >= max(1, int(min_cluster_size)))) \
+                in target_counts:
+            return float(frac)
     return start
 
 
