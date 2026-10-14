@@ -648,10 +648,14 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
     fps = data["fps"]; T = data["T"]; ds = data["downsample"]
     bin_ms = ds * 1000.0 / fps if fps > 0 else 0.0
 
+    def _extent(m):  # x axis in seconds rather than display bins
+        return (0.0, m.shape[1] * ds / fps if fps > 0 else m.shape[1],
+                m.shape[0], 0)
+
     fig = plt.Figure(figsize=(9, 4), tight_layout=True)
     ax = fig.add_subplot(111)
-    ax.imshow(hm, aspect="auto", interpolation="nearest")
-    ax.set_xlabel(f"Time (downsampled bins ~{bin_ms:.0f} ms)")
+    ax.imshow(hm, aspect="auto", interpolation="nearest", extent=_extent(hm))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
     ax.set_ylabel("ROIs (most active at top)")
     ax.set_title("Low-pass dF/F heatmap")
     p = figures_dir / "heatmap.png"
@@ -662,8 +666,9 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
 
     fig = plt.Figure(figsize=(9, 4), tight_layout=True)
     ax = fig.add_subplot(111)
-    ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys")
-    ax.set_xlabel(f"Time (downsampled bins ~{bin_ms:.0f} ms)")
+    ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys",
+              extent=_extent(rs))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
     ax.set_ylabel("ROIs (most active at top)")
     ax.set_title("Onset raster")
     p = figures_dir / "raster.png"

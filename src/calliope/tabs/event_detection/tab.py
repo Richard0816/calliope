@@ -776,10 +776,17 @@ class EventDetectionTab(ctk.CTkFrame):
         N = data["N_kept"]; T = data["T"]
         ds = data["downsample"]; fps = data["fps"]
 
+        # x in seconds, not downsampled bins whose width changes per
+        # recording (UX audit papercut).
+        def _extent(m):
+            return (0.0, m.shape[1] * ds / fps if fps > 0 else m.shape[1],
+                    m.shape[0], 0)
+
         ax = self.hm_ax
         ax.clear(); ax.set_axis_on()
-        ax.imshow(hm, aspect="auto", interpolation="nearest")
-        ax.set_xlabel(f"Time (downsampled bins ~{ds * 1000.0 / fps:.0f} ms)",
+        ax.imshow(hm, aspect="auto", interpolation="nearest",
+                  extent=_extent(hm))
+        ax.set_xlabel(f"Time (s)  [{ds * 1000.0 / fps:.0f} ms bins]",
                       fontsize=8)
         ax.set_ylabel("ROIs (most active at top)", fontsize=8)
         ax.tick_params(labelsize=7)
@@ -787,8 +794,9 @@ class EventDetectionTab(ctk.CTkFrame):
 
         ax = self.er_ax
         ax.clear(); ax.set_axis_on()
-        ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys")
-        ax.set_xlabel(f"Time (downsampled bins ~{ds * 1000.0 / fps:.0f} ms)",
+        ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys",
+                  extent=_extent(rs))
+        ax.set_xlabel(f"Time (s)  [{ds * 1000.0 / fps:.0f} ms bins]",
                       fontsize=8)
         ax.set_ylabel("ROIs (most active at top)", fontsize=8)
         ax.tick_params(labelsize=7)
