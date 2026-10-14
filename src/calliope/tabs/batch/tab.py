@@ -2349,7 +2349,9 @@ class BatchTab(ctk.CTkFrame):
                 f"  [detection] ROI-count check failed ({e}); "
                 f"continuing to lowpass."))
 
-    def _skip_row_no_rois(self) -> None:
+    def _skip_row_no_rois(
+            self, reason: str = "0 ROIs survive the cell filter -- "
+                                "recording is noise") -> None:
         """Finish the current row when detection found no ROIs (the
         recording is noise): mark every stage after detection as skipped
         and hand off to ``_on_row_done``.
@@ -2360,8 +2362,8 @@ class BatchTab(ctk.CTkFrame):
         ``"no_rois"`` status set here survives into the batch report.
         """
         self._append_log(
-            "  [detection] 0 ROIs survive the cell filter -- recording is "
-            "noise. Skipping lowpass + downstream analysis.")
+            f"  [detection] {reason}. Skipping lowpass + downstream "
+            f"analysis.")
         try:
             start = self.STAGES.index("detection") + 1
         except ValueError:
@@ -2570,6 +2572,17 @@ class BatchTab(ctk.CTkFrame):
         t.start()
 
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
+        # Neither detector found an ROI: the recording is noise, which is
+        # a result (no_rois), not a failure (UX audit finding 12).
+        if stage == "detection" and "NoRoisDetected" in str(exc):
+            self._row_results["stages"][stage] = {
+                "status": "no_rois",
+                "duration_s": time.time() - self._stage_t0,
+                "error": None,
+            }
+            self._skip_row_no_rois(
+                "Sparsery and Cellpose found no ROIs -- recording is noise")
+            return
         # RAM out-of-memory auto-retry: re-run the whole recording with
         # conservative resources before giving up (RAM only -- disk-full
         # isn't fixable by smaller batches, so it falls through to failure).
@@ -2700,9 +2713,11 @@ class BatchTab(ctk.CTkFrame):
             self._current_row.set_status(f"{status} (transferring)")
         else:
             self._current_row.set_status(status)
+        why = self._row_results.get("error") if status != "ok" else None
         self._append_log(
             f"--- '{self._current_row.identifier}' "
-            f"{status} in {elapsed:.1f}s ---")
+            f"{status} in {elapsed:.1f}s"
+            + (f": {why}" if why else "") + " ---")
         self.after(0, self._batch_next_row)
 
     def _start_mirror_for_row(self, ident: str,

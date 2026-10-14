@@ -519,7 +519,10 @@ def call_in_child(fn: Callable, kwargs: Optional[dict] = None,
             elif tag == _DONE:
                 return payload
             else:
-                raise RuntimeError(payload)
+                # Exception line first: callers (batch log, report) keep
+                # only the message's first line.
+                lines = str(payload).strip().splitlines() or ["(no detail)"]
+                raise RuntimeError(f"{lines[-1]}\n{payload}")
     finally:
         _LIVE_CHILDREN.discard(p)
         p.join(timeout=5)

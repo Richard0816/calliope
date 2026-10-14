@@ -145,6 +145,12 @@ HARD_CAP = 60000
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
 
+class NoRoisDetected(RuntimeError):
+    """Neither detector found any ROI -- the recording is noise. Batch
+    runners finish the row as ``no_rois`` instead of ``failed`` (matched
+    by class name when the error crosses a process boundary as text)."""
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -443,7 +449,8 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
               f"{len(combined_raw)} total ROIs")
 
     if not combined_raw:
-        raise RuntimeError('merge produced 0 ROIs — nothing to extract')
+        raise NoRoisDetected('Sparsery and Cellpose found no ROIs '
+                             '(merge produced 0 ROIs) -- nothing to extract')
 
     # Build the flat ops dict that suite2p's extract.create_masks_and_extract
     # still consumes. Start from the shared-registration's view and overlay

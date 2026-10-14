@@ -194,6 +194,57 @@ def test_auto_cut_does_not_count_singletons():
     assert n_real == 4 and per_group == [1, 1, 1, 1]
 
 
+# --- finding 12: zero merged ROIs is no_rois, not failed ---
+
+def test_headless_batch_zero_merged_rois_is_no_rois(tmp_path, monkeypatch):
+    import types
+    from calliope.core import batch_pipeline as bp
+    from calliope.core.sparse_plus_cellpose import NoRoisDetected
+    monkeypatch.setattr(
+        bp.preprocessing, "run_preprocess",
+        lambda **kw: types.SimpleNamespace(shifted_folder=tmp_path,
+                                           raw_paths=[]))
+
+    def no_rois(**kw):
+        raise NoRoisDetected("Sparsery and Cellpose found no ROIs")
+
+    monkeypatch.setattr(bp.detection_run, "run_detection", no_rois)
+    out = bp.run_recording([tmp_path / "a.tif"], str(tmp_path / "rec"), {})
+    assert out["status"] == "no_rois"
+    assert out["stages"]["detection"]["status"] == "no_rois"
+    assert out["stages"]["lowpass"]["status"] == "skipped"
+
+
+def test_gui_batch_zero_merged_rois_is_no_rois():
+    import time
+    from types import SimpleNamespace
+    from calliope.tabs.batch.tab import BatchTab
+    s = SimpleNamespace(STAGES=BatchTab.STAGES, logs=[], done=False,
+                        _stage_t0=time.time(),
+                        _row_results={"stages": {}, "status": "running"})
+    s._append_log = s.logs.append
+    s._on_row_done = lambda: setattr(s, "done", True)
+    s._skip_row_no_rois = lambda reason: BatchTab._skip_row_no_rois(s, reason)
+    # What Tab 3 reports when the detection child raises NoRoisDetected.
+    BatchTab._fail_stage(s, "detection", RuntimeError(
+        "calliope.core.sparse_plus_cellpose.NoRoisDetected: Sparsery and "
+        "Cellpose found no ROIs"))
+    assert s._row_results["status"] == "no_rois" and s.done
+    assert s._row_results["stages"]["detection"]["status"] == "no_rois"
+    assert any("found no ROIs" in m for m in s.logs)
+
+
+def test_child_error_message_leads_with_exception_line():
+    from calliope.core.offload import call_in_child
+    with pytest.raises(RuntimeError) as ei:
+        call_in_child(_child_raises)
+    assert str(ei.value).splitlines()[0] == "ValueError: bad input"
+
+
+def _child_raises(progress_q=None):
+    raise ValueError("bad input")
+
+
 # --- finding 16: missing tkinter gives an install hint, not a traceback ---
 
 def test_missing_tkinter_exits_with_hint():
