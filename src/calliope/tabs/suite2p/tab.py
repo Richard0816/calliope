@@ -859,6 +859,12 @@ class Suite2pTab(ctk.CTkFrame):
             return
         in_batch = getattr(getattr(self.winfo_toplevel(), "batch_tab", None),
                            "_batch_active", False)
+        if not in_batch:
+            # A one-off run keeps the raw/shifted TIFFs and data.bin; only
+            # batch archives (UX audit finding 15). The batch sets this
+            # key itself on every stage, so a value it left behind must
+            # not leak into an interactive run.
+            self._params["archive_post_detection"] = False
         if not self._params.get("fps_override") and not in_batch:
             from ...core import acquisition
             from ...core.calliope_settings import DEFAULT_FPS
@@ -1361,10 +1367,14 @@ class Suite2pTab(ctk.CTkFrame):
             self._finish_detection(plane0)
             return
 
-        self.status_var.set("Detection complete -- archiving raw data "
-                            "(compressing) in the background...")
-        self._append_log("[GUI] archiving raw data in a background "
-                         "process (GUI stays responsive)...")
+        if ctx["params"].get("archive_post_detection", True):
+            self.status_var.set("Detection complete -- archiving raw data "
+                                "(compressing) in the background...")
+            self._append_log("[GUI] archiving raw data in a background "
+                             "process (GUI stays responsive)...")
+        else:
+            self.status_var.set("Detection complete -- tidying up "
+                                "intermediates...")
         from ...core.offload import run_offloaded
         from ...core import detection_run as _dr
         self._archive_job = run_offloaded(
