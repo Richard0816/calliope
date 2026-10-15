@@ -1061,10 +1061,16 @@ class EventDetectionParams:
     max_walk_duration_s: float = 2.0       # NEW: cap on one-sided walk distance from peak (s).
     max_event_duration_s: float = 0.5      # OLD: 10.0  (now: hard physiological cap on FINAL event duration)
 
-    # Overlap merging -- currently INERT: the merge code that read this was
-    # disabled on 2026-05-01 (see _boundaries_from_peaks), so the value has
-    # no effect whether or not watershed split is enabled.
+    # Back-to-back merge (UX audit finding 5): after the duration cap,
+    # windows separated by <= merge_gap_s are joined into one event, so a
+    # seizure is one long event instead of dozens of capped windows.
+    # 0 = off (bare-dataclass default; the Tab 5 GUI default is 1.0 s).
     merge_gap_s: float = 0.0
+    # Event classes: >= seizure_min_duration_s -> "seizure-like"; shorter
+    # events are "population burst" when >= population_fraction of ROIs
+    # fire in them, else "local burst".
+    seizure_min_duration_s: float = 5.0
+    population_fraction: float = 0.5
 
     # NEW: watershed split + hard duration cap  ----------------------------
     enable_watershed_split: bool = True
@@ -1216,6 +1222,7 @@ def detect_event_windows(
 
     # ``np.column_stack`` glues two 1-D arrays into a 2-D array
     # column-wise: shape becomes (n_events, 2) with [start, end].
+    boundaries = _merge_back_to_back(boundaries, float(params.merge_gap_s))
     event_windows = np.column_stack([boundaries["start_s"], boundaries["end_s"]])
 
     # 4) Activation matrix + first_time per event
@@ -1224,6 +1231,10 @@ def detect_event_windows(
     # Used downstream by Tab 5 (heatmap sort), Tab 7 (per-event
     # cross-correlation cropping) and Tab 8 (activation-order maps).
     A, first_time = _activation_matrix_from_windows(onsets_by_roi, event_windows)
+    event_class = classify_events(
+        event_windows[:, 1] - event_windows[:, 0],
+        A.mean(axis=0) if A.shape[0] else np.zeros(A.shape[1]),
+        params.seizure_min_duration_s, params.population_fraction)
 
     if not return_diagnostics:
         return event_windows, A, first_time
@@ -1248,8 +1259,50 @@ def detect_event_windows(
         "prominence": boundaries["prominence"],
         "duration_s": boundaries["duration_s"],
         "min_prominence_used": effective_min_prominence,
+        "event_class": event_class,
     }
     return event_windows, A, first_time, diagnostics
+
+
+EVENT_CLASSES = ("local burst", "population burst", "seizure-like")
+
+
+def classify_events(durations_s, active_fraction, seizure_min_duration_s=5.0,
+                    population_fraction=0.5) -> list:
+    """One of :data:`EVENT_CLASSES` per event (see EventDetectionParams)."""
+    return [EVENT_CLASSES[2] if d >= seizure_min_duration_s
+            else EVENT_CLASSES[1] if f >= population_fraction
+            else EVENT_CLASSES[0]
+            for d, f in zip(np.asarray(durations_s, float),
+                            np.asarray(active_fraction, float))]
+
+
+def _merge_back_to_back(b: dict, gap_s: float) -> dict:
+    """Join consecutive windows whose gap is <= ``gap_s``. Per-event fields
+    keep the tallest peak of each merged group so they stay 1:1 with the
+    windows; start/end/duration span the group."""
+    start, end = np.asarray(b["start_s"]), np.asarray(b["end_s"])
+    n = start.size
+    if gap_s <= 0 or n < 2:
+        return b
+    groups, cur = [], [0]
+    for i in range(1, n):
+        if start[i] - end[cur[-1]] <= gap_s:
+            cur.append(i)
+        else:
+            groups.append(cur); cur = [i]
+    groups.append(cur)
+    if len(groups) == n:
+        return b
+    top = [g[int(np.argmax(np.asarray(b["peak_height"])[g]))] for g in groups]
+    out = dict(b)
+    for k, v in b.items():
+        if isinstance(v, np.ndarray) and v.shape[:1] == (n,):
+            out[k] = v[top]
+    out["start_s"] = np.array([start[g[0]] for g in groups])
+    out["end_s"] = np.array([end[g].max() for g in groups])
+    out["duration_s"] = out["end_s"] - out["start_s"]
+    return out
 
 
 # ---------- plotting helper ----------
@@ -1327,7 +1380,12 @@ def plot_event_detection(
     return fig
 
 
-def shade_event_windows(ax: plt.Axes, event_windows: np.ndarray, color="C1", alpha=0.20):
+CLASS_COLORS = {"local burst": "C1", "population burst": "C3",
+                 "seizure-like": "C4"}
+
+
+def shade_event_windows(ax: plt.Axes, event_windows: np.ndarray, color="C1",
+                        alpha=0.20, classes=None):
     """Overlay shaded event windows onto an existing axis.
 
     Tab 5 calls this after ``plot_event_detection`` to highlight
@@ -1339,8 +1397,18 @@ def shade_event_windows(ax: plt.Axes, event_windows: np.ndarray, color="C1", alp
     # ``for s, e in event_windows:`` destructures each row of the
     # (n_events, 2) array into two scalars at once -- equivalent to
     # ``for ev in event_windows: s, e = ev[0], ev[1]``.
-    for s, e in event_windows:
-        ax.axvspan(s, e, color=color, alpha=alpha)
+    if classes is None:
+        for s, e in event_windows:
+            ax.axvspan(s, e, color=color, alpha=alpha)
+        return
+    # Colour by event class, one legend entry per class present.
+    seen = set()
+    for (s, e), c in zip(event_windows, classes):
+        ax.axvspan(s, e, color=CLASS_COLORS.get(c, color), alpha=alpha,
+                   label=None if c in seen else c)
+        seen.add(c)
+    if seen:
+        ax.legend(loc="upper right", fontsize=7)
 
 
 # =====================================================================

@@ -491,3 +491,21 @@ def test_keep_rule_threshold_and_iscell_fallback(tmp_path):
     assert info == {"kept": 3, "total": 4, "iscell": 3}
     assert np.load(tmp_path / "predicted_cell_mask.npy").tolist() == \
         [True, True, True, False]
+
+
+def test_back_to_back_windows_merge_and_classes():
+    """Finding 5: a seizure cut into capped windows becomes one event."""
+    from calliope.core.utils import _merge_back_to_back, classify_events
+    b = {"start_s": np.array([10.0, 11.4, 12.8, 30.0]),
+         "end_s": np.array([11.3, 12.7, 16.0, 30.5]),
+         "peak_height": np.array([1.0, 3.0, 2.0, 1.0]),
+         "peak_s": np.array([10.5, 12.0, 13.5, 30.2]),
+         "baseline_noise": 0.1}
+    m = _merge_back_to_back(b, 1.0)
+    assert m["start_s"].tolist() == [10.0, 30.0]
+    assert m["end_s"].tolist() == [16.0, 30.5]
+    assert m["peak_s"].tolist() == [12.0, 30.2]      # tallest peak kept
+    assert m["duration_s"].tolist() == [6.0, 0.5]
+    assert _merge_back_to_back(b, 0.0) is b          # 0 = off
+    assert classify_events([6.0, 0.5, 0.5], [0.2, 0.7, 0.1]) == [
+        "seizure-like", "population burst", "local burst"]

@@ -697,6 +697,8 @@ def build_batch_param_spec() -> list:
             "4. Events - Population baseline",
         "Population events - boundaries":
             "4. Events - Population boundaries",
+        "Population events - classes":
+            "4. Events - Population classes",
         "Population events - gaussian fit":
             "4. Events - Population Gaussian fit",
         # 5. Clustering / 6. Xcorr / 7. Pipeline-wide / 8. Output

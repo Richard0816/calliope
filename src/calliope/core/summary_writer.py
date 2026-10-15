@@ -323,6 +323,7 @@ def write_events_sheets(
     in_seconds: bool = True,
     filename: str = DEFAULT_FILENAME,
     extra_sheets: Optional[dict] = None,
+    event_classes: Optional[Sequence[str]] = None,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
 
@@ -372,6 +373,8 @@ def write_events_sheets(
             "end_s": e,
             "duration_s": e - s,
             "n_active_rois": active_count,
+            **({"class": event_classes[ev_id]} if event_classes is not None
+               and ev_id < len(event_classes) else {}),
         })
 
     # Wide per-ROI sheet: every onset for every ROI, NaN-padded to a

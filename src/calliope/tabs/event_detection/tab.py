@@ -258,11 +258,21 @@ class EventDetectionTab(ctk.CTkFrame):
          "group": "Population events - boundaries",
          "help": "force every window to peak +/- max_event_duration_s/2"},
         {"name": "merge_gap_s", "label": "Merge gap (s)",
-         "type": "float", "default": 0.0,
+         "type": "float", "default": 1.0,
          "group": "Population events - boundaries",
-         "help": "legacy overlap-merge gap; currently has NO effect (the "
-                 "merge path was disabled on 2026-05-01 in favour of "
-                 "watershed split) -- kept for compatibility"},
+         "help": "join back-to-back windows whose gap is <= this into one "
+                 "event (a seizure becomes one long event); 0 = off"},
+        {"name": "seizure_min_duration_s",
+         "label": "Seizure-like if >= (s)",
+         "type": "float", "default": 5.0,
+         "group": "Population events - classes",
+         "help": "events at least this long are classed 'seizure-like'"},
+        {"name": "population_fraction",
+         "label": "Population burst if ROI fraction >=",
+         "type": "float", "default": 0.5,
+         "group": "Population events - classes",
+         "help": "shorter events where at least this fraction of ROIs "
+                 "fire are 'population burst', else 'local burst'"},
         {"name": "use_gaussian_boundary",
          "label": "Use Gaussian-fit boundary",
          "type": "bool", "default": False,
@@ -815,7 +825,8 @@ class EventDetectionTab(ctk.CTkFrame):
             utils.plot_event_detection(diagnostics, ax=ax)
             ev = data["event_windows"]
             if ev is not None and len(ev) > 0:
-                utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
+                utils.shade_event_windows(ax, ev, color="C1", alpha=0.20,
+                                          classes=data.get("event_class"))
             # Force the time axis to span the full recording so the trace
             # doesn't look cut off when the auto-fit picks up only the
             # smoothed-density extent.
@@ -893,7 +904,7 @@ class EventDetectionTab(ctk.CTkFrame):
             return
         self._after_summary_write = publish if in_batch else None
         keys = ("fps", "T", "N_kept", "event_windows", "onsets_by_roi",
-                "event_monotonicity")
+                "event_monotonicity", "event_class")
         from ...core.offload import run_offloaded
         from ...core import event_detection_run as edr
         self._summary_job = run_offloaded(
@@ -973,6 +984,7 @@ class EventDetectionTab(ctk.CTkFrame):
             onsets_by_roi=data.get("onsets_by_roi") or [],
             fps=data.get("fps"),
             in_seconds=True,
+            event_classes=data.get("event_class"),
         )
         # Stamp the EventMonotonicity sheet from the per-event
         # Spearman scalars ``run_event_detection`` already computed

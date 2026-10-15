@@ -57,7 +57,7 @@ _EVENT_DETECTION_FIELDS = (
     "noise_mad_factor", "end_threshold_k",
     "max_walk_duration_s", "max_event_duration_s",
     "enable_watershed_split", "enforce_symmetric_clamp",
-    "merge_gap_s",
+    "merge_gap_s", "seizure_min_duration_s", "population_fraction",
     "use_gaussian_boundary", "gaussian_quantile",
     "gaussian_fit_pad_s", "gaussian_min_sigma_s",
 )
@@ -537,6 +537,7 @@ def run_event_detection(
         "event_counts": event_counts,
         "diagnostics": diagnostics,
         "event_windows": event_windows,
+        "event_class": (diagnostics or {}).get("event_class"),
         "A": A,
         "first_time": first_time,
         "onsets_by_roi": onsets_by_roi,
@@ -561,6 +562,7 @@ def run_event_detection(
             onsets_by_roi=onsets_by_roi,
             fps=fps,
             in_seconds=True,
+            event_classes=data["event_class"],
         )
         # One row per event; ``EventMonotonicity`` sheet stamps the
         # propagation-direction scalars next to the existing
@@ -616,7 +618,8 @@ def write_event_summary_offload(plane0_str: str, data: dict, *,
     return str(sw.write_events_sheets(
         plane0, event_windows=data.get("event_windows"),
         onsets_by_roi=data.get("onsets_by_roi") or [],
-        fps=data.get("fps"), in_seconds=True, extra_sheets=extra))
+        fps=data.get("fps"), in_seconds=True, extra_sheets=extra,
+        event_classes=data.get("event_class")))
 
 
 def export_event_figures_offload(plane0_str: str, params: dict,
@@ -709,7 +712,8 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
         core_utils.plot_event_detection(diagnostics, ax=ax)
         ev = data["event_windows"]
         if ev is not None and len(ev) > 0:
-            core_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
+            core_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20,
+                                           classes=data.get("event_class"))
         ax.set_xlim(0.0, duration_s)
         # Mirror the Tab 5 GUI fit: anchor ymin=0 and put ymax at the
         # tallest detected peak + 10% headroom. ``peak_height`` is the
