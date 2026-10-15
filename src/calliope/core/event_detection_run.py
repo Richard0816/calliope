@@ -510,6 +510,19 @@ def run_event_detection(
             return_diagnostics=True, **ed_kwargs,
         )
 
+    # Within-event timing (Tabs 7/8, monotonicity): half-max crossings on
+    # lightly filtered dF/F instead of the detection onsets (finding 4).
+    # A (who took part) still comes from the onsets.
+    dff_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    if (params.get("timing_method", "half-max") == "half-max"
+            and dff_path.exists() and A.size):
+        dff = np.memmap(str(dff_path), dtype="float32", mode="r",
+                        shape=(T, N_kept_full))
+        first_time = core_utils.half_max_first_times(
+            dff[:, pos_in_memmap], fps, event_windows, A,
+            cutoff_hz=float(params.get("timing_cutoff_hz", 5.0)))
+        del dff
+
     # ---- Per-event directional monotonicity --------------------------
     # For every detected population event, run the Spearman-rank
     # propagation-direction test (``core.spatial.

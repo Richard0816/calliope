@@ -262,6 +262,17 @@ class EventDetectionTab(ctk.CTkFrame):
          "group": "Population events - boundaries",
          "help": "join back-to-back windows whose gap is <= this into one "
                  "event (a seizure becomes one long event); 0 = off"},
+        {"name": "timing_method", "label": "Within-event timing",
+         "type": "choice", "choices": ["half-max", "first onset"],
+         "default": "half-max", "group": "Population events - timing",
+         "help": "per-ROI activation time inside each event (Tabs 7/8, "
+                 "monotonicity): half-max crossing on lightly filtered "
+                 "dF/F, or the detection onset (more jitter)"},
+        {"name": "timing_cutoff_hz", "label": "Timing filter cutoff (Hz)",
+         "type": "float", "default": 5.0,
+         "group": "Population events - timing",
+         "help": "zero-phase low-pass for the half-max timing; skipped "
+                 "when at or above ~Nyquist"},
         {"name": "seizure_min_duration_s",
          "label": "Seizure-like if >= (s)",
          "type": "float", "default": 5.0,

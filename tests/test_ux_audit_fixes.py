@@ -509,3 +509,19 @@ def test_back_to_back_windows_merge_and_classes():
     assert _merge_back_to_back(b, 0.0) is b          # 0 = off
     assert classify_events([6.0, 0.5, 0.5], [0.2, 0.7, 0.1]) == [
         "seizure-like", "population burst", "local burst"]
+
+
+def test_half_max_times_recover_subframe_delays():
+    """Finding 4: half-max timing recovers known per-cell delays."""
+    from calliope.core.utils import half_max_first_times
+    fps, T = 15.0, 300
+    t = np.arange(T) / fps
+    delays = np.array([0.0, 0.1, 0.25, 0.4])
+    onset = 10.0
+    # Sigmoid rises centred on the true time (half-max = the centre).
+    dff = np.stack([1 / (1 + np.exp(-(t - onset - d) / 0.08)) for d in delays], 1)
+    A = np.array([[True], [True], [True], [False]])
+    ft = half_max_first_times(dff, fps, [(onset - 0.2, onset + 1.5)], A,
+                              cutoff_hz=0)
+    np.testing.assert_allclose(ft[:3, 0], onset + delays[:3], atol=0.02)
+    assert np.isnan(ft[3, 0])
