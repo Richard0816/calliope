@@ -641,8 +641,39 @@ def _warn_dff_drift(plane0: Path, T: int, N: int, baseline_mode: str,
     return late
 
 
+def keep_rule_kwargs(params: dict) -> dict:
+    """Cell-filter keep rule from a param dict (Tab 3 'Cell filter' group)."""
+    return {"threshold": float(params.get("cellfilter_threshold", 0.5)),
+            "use_iscell": params.get("cellfilter_source") == "suite2p iscell"}
+
+
+def reapply_keep_rule(plane0: Path, *, threshold: float = 0.5,
+                      use_iscell: bool = False,
+                      size_outlier_z: float = SIZE_OUTLIER_Z) -> dict:
+    """Rewrite ``predicted_cell_mask.npy`` from the saved CNN scores (or
+    Suite2p's ``iscell``) without re-running the network. Overwrites any
+    hand-promoted mask. Returns kept / total / Suite2p-iscell counts."""
+    from .cellfilter.predict import keep_mask_from_scores
+    plane0 = Path(plane0)
+    probs = np.load(plane0 / "predicted_cell_prob.npy")
+    stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+    iscell_path = plane0 / "iscell.npy"
+    iscell = np.load(iscell_path) if iscell_path.exists() else None
+    if use_iscell and iscell is None:
+        raise FileNotFoundError(f"{iscell_path} not found")
+    mask, _ = keep_mask_from_scores(
+        probs, stat, threshold=threshold, size_outlier_z=size_outlier_z,
+        iscell=iscell if use_iscell else None)
+    np.save(plane0 / "predicted_cell_mask.npy", mask)
+    return {"kept": int(mask.sum()), "total": int(mask.size),
+            "iscell": int((iscell[:, 0] > 0).sum()) if iscell is not None
+            else None}
+
+
 def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
-                        size_outlier_z: float = SIZE_OUTLIER_Z) -> None:
+                        size_outlier_z: float = SIZE_OUTLIER_Z,
+                        threshold: float = 0.5,
+                        use_iscell: bool = False) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
@@ -655,7 +686,8 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
     model = load_model_from_checkpoint(Path(ckpt_path), device)
     try:
         predict_recording(rec_id, model, device, plane0=plane0,
-                          size_outlier_z=size_outlier_z)
+                          size_outlier_z=size_outlier_z,
+                          threshold=threshold, use_iscell=use_iscell)
     finally:
         # Drop model + checkpoint before flushing the allocator so the
         # weights actually return to the driver. Without this, every
@@ -947,7 +979,8 @@ def run_detection(
         predict_cell_filter(
             plane0, ckpt_path, rec_id or plane0.parent.name,
             size_outlier_z=float(params.get("size_outlier_z",
-                                            SIZE_OUTLIER_Z)))
+                                            SIZE_OUTLIER_Z)),
+            **keep_rule_kwargs(params))
 
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")

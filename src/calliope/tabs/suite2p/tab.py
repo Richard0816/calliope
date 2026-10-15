@@ -267,6 +267,14 @@ class Suite2pTab(ctk.CTkFrame):
          "type": "float", "default": SIZE_OUTLIER_Z, "group": "Cell filter",
          "help": "drop kept ROIs whose robust z of log(area) exceeds "
                  "this (sparsery blob artifacts); 0 disables"},
+        {"name": "cellfilter_source", "label": "Keep rule",
+         "type": "choice", "choices": ["cell filter", "suite2p iscell"],
+         "default": "cell filter", "group": "Cell filter",
+         "help": "'suite2p iscell' keeps Suite2p's own classifier picks "
+                 "(e.g. when the bundled filter doesn't suit your data)"},
+        {"name": "cellfilter_threshold", "label": "Keep if cell prob >=",
+         "type": "float", "default": 0.5, "group": "Cell filter",
+         "help": "cell-filter probability cutoff (used by 'cell filter')"},
         # Cellpose
         {"name": "cellpose_enabled", "label": "Run Cellpose pass",
          "type": "bool", "default": True, "group": "Cellpose",
@@ -552,6 +560,29 @@ class Suite2pTab(ctk.CTkFrame):
             _v.trace_add("write", lambda *_a: setattr(
                 self, "_acq_from_md", False))
 
+        # Keep rule (UX audit finding 8): the bundled filter can reject
+        # most cells on another lab's data; let the user lower the cutoff
+        # or fall back to Suite2p's iscell without curating/retraining.
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(row, text="Keep ROIs by:", width=110,
+                     anchor="w").pack(side="left")
+        self.keep_source_var = tk.StringVar(value="cell filter")
+        ctk.CTkOptionMenu(row, variable=self.keep_source_var,
+                          values=["cell filter", "suite2p iscell"],
+                          width=130).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row, text="prob >=").pack(side="left", padx=(0, 4))
+        self.keep_thr_var = tk.StringVar(value="0.5")
+        ctk.CTkEntry(row, textvariable=self.keep_thr_var, width=60).pack(
+            side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Apply to this recording", width=160,
+                      command=self._on_apply_keep_rule).pack(
+            side="left", padx=(0, 8))
+        self.keep_info_var = tk.StringVar(value="")
+        ctk.CTkLabel(row, textvariable=self.keep_info_var, text_color="gray",
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
+
         row = ctk.CTkFrame(header, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=2)
         self.csv_dff_var = tk.BooleanVar(value=False)
@@ -780,6 +811,15 @@ class Suite2pTab(ctk.CTkFrame):
             except ValueError:
                 return f"{label} must be a positive number (got {raw!r})."
             self._params[key] = val
+        raw = self.keep_thr_var.get().strip()
+        try:
+            thr = float(raw)
+            if not 0.0 <= thr <= 1.0:
+                raise ValueError
+        except ValueError:
+            return f"Cell prob threshold must be between 0 and 1 (got {raw!r})."
+        self._params["cellfilter_threshold"] = thr
+        self._params["cellfilter_source"] = self.keep_source_var.get()
         return None
 
     def _acq_fields_from_params(self) -> None:
@@ -789,6 +829,61 @@ class Suite2pTab(ctk.CTkFrame):
         um = float(self._params.get("um_per_pixel", 0) or 0)
         self._set_acq_fields(fps, um, "set by you" if fps or um else "")
         self._acq_from_md = not (fps or um)
+        self.keep_thr_var.set(
+            f"{float(self._params.get('cellfilter_threshold', 0.5)):g}")
+        self.keep_source_var.set(
+            self._params.get("cellfilter_source", "cell filter"))
+
+    def _update_keep_info(self, plane0: Path, keep: np.ndarray) -> None:
+        """'kept 46/138 (33%) · Suite2p iscell 113', with a warning when the
+        cell filter keeps far fewer than Suite2p's own classifier."""
+        kept, total = int(keep.sum()), int(keep.size)
+        text = f"kept {kept}/{total} ({100 * kept / max(total, 1):.0f}%)"
+        try:
+            n_is = int((np.load(plane0 / "iscell.npy")[:, 0] > 0).sum())
+        except Exception:
+            n_is = None
+        if n_is is not None:
+            text += f" · Suite2p iscell {n_is}"
+            if kept < 0.5 * n_is:
+                text += ("  - far fewer than Suite2p: try a lower prob "
+                         "or 'suite2p iscell'")
+                self._append_log(f"[GUI] Cell filter {text}")
+        self.keep_info_var.set(text)
+
+    def _on_apply_keep_rule(self) -> None:
+        """Re-apply the keep rule to the loaded recording (no CNN re-run)
+        and regenerate the filtered dF/F for Tabs 4-8."""
+        c = self._panel_cache
+        if c is None:
+            messagebox.showinfo("No recording", "Run or load detection first.")
+            return
+        plane0 = Path(c["plane0"])
+        err = self._acq_fields_to_params()
+        if err:
+            messagebox.showerror("Invalid setting", err)
+            return
+        if not messagebox.askyesno(
+                "Apply keep rule",
+                "This replaces the current kept-ROI set (including any "
+                "ROIs you promoted by hand) and regenerates the filtered "
+                "dF/F. Stages after Tab 3 need re-running. Continue?"):
+            return
+        from ...core import detection_run
+        try:
+            info = detection_run.reapply_keep_rule(
+                plane0, size_outlier_z=float(self._params.get(
+                    "size_outlier_z", SIZE_OUTLIER_Z)),
+                **detection_run.keep_rule_kwargs(self._params))
+        except Exception as e:
+            messagebox.showerror("Keep rule failed", str(e))
+            return
+        self._append_log(f"[GUI] keep rule applied: kept {info['kept']}/"
+                         f"{info['total']}")
+        self._on_iscell_flipped(-1, -1)  # redraw + regenerate filtered dF/F
+        c = self._panel_cache
+        if c is not None:
+            self._update_keep_info(plane0, c["keep"])
 
     def _on_advanced(self) -> None:
         self._acq_fields_to_params()  # a bad entry is reported on Run
@@ -1111,10 +1206,12 @@ class Suite2pTab(ctk.CTkFrame):
 
             if ckpt_path:
                 print("[GUI] running cell-filter prediction...")
+                from ...core.detection_run import keep_rule_kwargs
                 self._run_cellfilter(
                     final_plane0, ckpt_path, rec_id,
                     size_outlier_z=float(params.get(
-                        "size_outlier_z", SIZE_OUTLIER_Z)))
+                        "size_outlier_z", SIZE_OUTLIER_Z)),
+                    **keep_rule_kwargs(params))
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
@@ -1313,7 +1410,7 @@ class Suite2pTab(ctk.CTkFrame):
 
     def _run_cellfilter(
         self, plane0: Path, ckpt_path: str, rec_id: str,
-        size_outlier_z: float = SIZE_OUTLIER_Z,
+        size_outlier_z: float = SIZE_OUTLIER_Z, **keep_rule,
     ) -> None:
         """Score every ROI with the cell-filter CNN. Delegates to
         :func:`calliope.core.detection_run.predict_cell_filter` (shared
@@ -1325,7 +1422,8 @@ class Suite2pTab(ctk.CTkFrame):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  device: {device}   ckpt: {ckpt_path}")
         detection_run.predict_cell_filter(
-            plane0, ckpt_path, rec_id, size_outlier_z=size_outlier_z)
+            plane0, ckpt_path, rec_id, size_outlier_z=size_outlier_z,
+            **keep_rule)
 
     # -- Log queue + completion --------------------------------------------
 
@@ -1476,6 +1574,7 @@ class Suite2pTab(ctk.CTkFrame):
             plane0=plane0, bg_images=bg_images, stat=stat,
             n_total=n_total, keep=keep, probs=probs, ops_view=ops_view,
         )
+        self._update_keep_info(plane0, keep)
         pipe_n = self._pipeline_kept_n(plane0, n_total)
         if pipe_n is not None and pipe_n != int(keep.sum()):
             self._append_log(

@@ -471,3 +471,23 @@ def test_last_tab_remembered_and_first_launch_opens_tab1(tmp_path, monkeypatch):
     pg._save_last_tab(42)                     # out of range -> default
     assert pg._load_last_tab(9) == 1
 
+
+
+def test_keep_rule_threshold_and_iscell_fallback(tmp_path):
+    """Finding 8: lower the cell-prob cutoff or keep Suite2p's iscell,
+    without re-running the CNN."""
+    from calliope.core.detection_run import keep_rule_kwargs, reapply_keep_rule
+    probs = np.array([0.9, 0.4, 0.25, 0.1], dtype=np.float32)
+    iscell = np.array([[1, .9], [1, .8], [1, .7], [0, .1]])
+    stat = np.array([{"npix": 50, "lam": np.ones(50)} for _ in range(4)])
+    np.save(tmp_path / "predicted_cell_prob.npy", probs)
+    np.save(tmp_path / "iscell.npy", iscell)
+    np.save(tmp_path / "stat.npy", stat, allow_pickle=True)
+    run = lambda **p: reapply_keep_rule(tmp_path, size_outlier_z=0,
+                                        **keep_rule_kwargs(p))
+    assert run()["kept"] == 1
+    assert run(cellfilter_threshold=0.2)["kept"] == 3
+    info = run(cellfilter_source="suite2p iscell")
+    assert info == {"kept": 3, "total": 4, "iscell": 3}
+    assert np.load(tmp_path / "predicted_cell_mask.npy").tolist() == \
+        [True, True, True, False]
