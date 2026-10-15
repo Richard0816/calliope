@@ -36,6 +36,43 @@ GUI as shipped.
 | Spatial propagation | **Failed at defaults.** 0/8 bursts show significant propagation; per-cell timing error IQR 0.36 s against a 0.40 s wave (finding 4). |
 | 30 Hz recording in batch | **Wrong.** Ran at an assumed 15.08 Hz: every time and duration doubled, 2 spurious events (finding 3). |
 
+## Re-test on a workstation (2026-10-14/15)
+
+The cloud pass stubbed Cellpose and had no GPU. This pass re-ran what it
+couldn't, on Windows 11, Python 3.11, 32 GB RAM, RTX 3050 6 GB, real
+Cellpose 4.1.1, GUI driven by `tools/gui_driver.py`. Memory was shared
+with other jobs, so heavy runs were capped.
+
+| Check | Result |
+|---|---|
+| Real Cellpose on `rec_wave` (GPU, stock settings) | Cellpose 70 ROIs (70/70 true cells, 0 false); Sparsery 73 (70/70 + 3); merged 73; cell filter kept 71. Preprocess 16 s, detection 137 s incl. archive, peak RSS 3.8 GiB. |
+| Finding 1 OOM with a GPU | Not reproduced: the GPU clamp splits registration into 4 batches. The OOM is a CPU-path problem. The `[batch_size]` lines went to process stdout, not the Tab 3 console. |
+| Finding 12 on `rec_noise`, real Cellpose | Different from the cloud: Sparsery found 0 ROIs, but **Cellpose found 18 blobs** (median 3,454 px, max 8,218), so the run went on to extraction and the process tree grew past 15 GiB until it was stopped. A size cap on Cellpose ROIs now drops these (see below). |
+| Finding 3, `rec_split` in batch | After the fix: 30 Hz read from `finterval` with no input; 6/6 bursts; Batch Scan grouped the two parts. |
+| Finding 4, timing vs truth (Cellpose ROIs) | Detection onsets: bias -0.20 s, IQR 0.30 s, rho 0.14, wave significant 3/8. Half-max crossing on 5 Hz zero-phase dF/F: bias +0.00 s, IQR 0.05 s, rho 0.82, **8/8** (`rec_split`: rho 0.93, 6/6). |
+| Finding 5 cause (real PTZ, Tab 5 GUI defaults) | **Correction:** the fragmentation is not the 1.3 s cap. The 357-381 s seizure became 26 back-to-back windows, **none** at the cap; window gaps inside seizures are 0.05-0.2 s. Merging windows with gaps <= 1 s gives exactly the three seizures (357-381, 400-406, 414-429 s). |
+| Finding 8 (real PTZ) | Cell filter kept 46/138; Suite2p `iscell` 113. prob >= 0.3 keeps 113, >= 0.2 keeps 125. The `Fall.mat` `iscell[:,0]` is a human curation (classifier prob >= 0.5 keeps 90): against it the CNN's AUROC is 0.91, Suite2p's 0.88, and their mean 0.98. The CNN ranks well but is under-confident on foreign data. |
+| dF/F baseline (real PTZ) | With the first-2-min baseline the late median dF/F is -1.20. The drift warning now fires. |
+| Tab 5 freeze (real lab recording, 679 kept ROIs) | Detection already ran off-thread (30 s); the GUI froze ~23 s afterwards in three openpyxl load/save cycles of `calliope_summary.xlsx` on the Tk thread. |
+| Blob ROIs on a real lab recording | All 5 kept blobs (1.2-8.8 k px, cell-filter prob 0.87-1.0) came from the Cellpose pass, whose real cells were ~80 px; Sparsery ROIs are ~20 px. |
+| Manual subset from a Tab 6 cluster (52 ROIs) | Tab 4 titles ran off the figure. |
+
+## Status on branch `ux-audit-fixes`
+
+| Finding | Status |
+|---|---|
+| 1 OOM | Detection runs in a child process; RAM budget uses available RAM. CPU multiplier not yet recalibrated (needs a measured CPU run). |
+| 2 batch_size override | Fixed. |
+| 3 frame rate | Read from ImageJ / ScanImage / OME metadata, shown and editable in Tab 3, confirmation when unknown. Batch-table column not done. |
+| 4 timing | Half-max within-event timing (Advanced: "Within-event timing"). Tab 8 jitter warning not done. |
+| 5 seizures | Back-to-back windows merged (`merge_gap_s`, default 1 s); classes local burst / population burst / seizure-like. Real PTZ: 86 windows -> 35 events. |
+| 6, 7, 9-14, 16, 17 | Fixed (Cellpose prefetch progress bar and an "Open run" mismatch banner not done; the latter is unneeded since tabs are rebuilt). |
+| 8 cell filter | "Keep ROIs by" row in Tab 3 (prob cutoff or Suite2p iscell), kept/iscell readout with a low-keep hint, Apply without re-running the CNN. |
+| 15 archive | Interactive runs no longer archive; batch still does. |
+| 18 start tab | Opens on the last tab picked; Tab 1 on first launch. |
+| New | Tab 5 summary write off the GUI thread; Cellpose ROI size cap (`cellpose_max_area_factor`, default 4x a typical Cellpose cell); subset titles clipped with the full list in the status line. |
+| dF/F baseline | Kept as first-N minutes (decision), with the drift warning. |
+
 ## Findings, most severe first
 
 ### A. Wrong results or lost work
