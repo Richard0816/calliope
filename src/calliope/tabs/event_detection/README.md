@@ -79,6 +79,7 @@ When **enabled**:
 - The list is **intersected with the cell-filter keep mask** — ids outside the keep mask are skipped (logged via `format_roi_indices` for readability).
 - The heatmap, raster, and population event detection only see those ROIs.
 - The CSV export uses the same subset.
+- The heatmap and raster titles name the subset as a count plus a clipped id list (`n=37: 3-5,9,12,…`); the full list is in the wrapping status line.
 
 When **disabled** (default), all ROIs that survived the cell-filter keep mask are used, exactly as before.
 
@@ -225,12 +226,19 @@ After all `(start_s, end_s)` pairs are walked:
 - **Hard duration cap** (`max_event_duration_s = 1.3 s`): if `end_s − start_s > 1.3`, clamp it to centred-on-peak ±0.65 s.
 - **Symmetric clamp** (`enforce_symmetric_clamp=False` by default): if true, *every* window becomes peak ± `max_event_duration_s/2` (0.65 s at the default cap), not just the ones that exceed the cap. Useful for stereotyping but loses the natural boundaries.
 
-The `merge_gap_s` parameter is kept editable for compatibility but **currently has no effect**: the legacy overlap-merge block was disabled on 2026-05-01 (watershed split replaced it), so it is not applied even with `enable_watershed_split=False`.
+**Back-to-back merge (`merge_gap_s`, default `1.0` s; `0` = off).** After the duration cap, consecutive windows whose gap is `<= merge_gap_s` are joined into one event (`utils._merge_back_to_back`), so a seizure is one long event rather than many capped windows. Start/end span the group; per-event fields (peak height etc.) keep the tallest peak of each group. Overlapping or touching windows have gap `<= 0`, so this also re-joins watershed splits closer than `merge_gap_s`; lower it to keep close events apart. (The bare `EventDetectionParams` dataclass default is `0`; the Tab 5 GUI default is `1.0`.)
+
+**Event classes.** After merging, each event gets a class (`utils.classify_events`): **seizure-like** if its duration is `>= seizure_min_duration_s` (default `5` s); otherwise **population burst** if at least `population_fraction` (default `0.5`) of the ROIs are active in it; otherwise **local burst**. The class is the `class` column of the `EventWindows` sheet and colours the event shading on the density, heatmap and raster plots (one legend entry per class present).
 
 #### 3e — Activation matrix
 
 `A[i, e] = True` iff ROI `i` has at least one onset inside event `e`'s `[start_s, end_s]`.
-`first_time[i, e] = min(onsets_i ∩ [start_s, end_s])` or `NaN`.
+`first_time[i, e]` is the within-event activation time (`NaN` where `A` is False). Participation (`A`) always comes from the onsets; the *timing* depends on `timing_method`:
+
+- **`half-max`** (default): the first upward crossing of half the way from the pre-event baseline (median of the 1 s before the window) to the in-window peak, on dF/F zero-phase low-passed at `timing_cutoff_hz` (default `5` Hz, skipped near Nyquist) and interpolated between frames (`utils.half_max_first_times`, read from `r0p7_filtered_dff.memmap.float32`). The detection onsets come from a heavily low-passed, backtracked trace and jitter by about a propagation delay. On a synthetic travelling wave, half-max timing had bias 0.00 s and IQR 0.05 s against truth, recovered the wave direction with rho 0.82, and was significant in 8/8 events; the onset times gave bias -0.20 s, IQR 0.30 s, rho 0.14, and 3 of 8 events significant.
+- **`first onset`**: `min(onsets_i ∩ [start_s, end_s])`, the previous behaviour. Also the fallback when the filtered dF/F memmap is missing.
+
+This `first_time` is what Tabs 7 and 8 and the per-event monotonicity test consume.
 
 These are returned alongside `event_windows`.
 
@@ -249,7 +257,7 @@ The "Save Data…" buttons next to the heatmap and raster panels write **full-re
 
 Both prepend a `time_s` column = `frame_index / fps` and a header comment with `fps`, `frame_seconds`, `n_frames`, `n_rois_kept`.
 
-The summary export goes to `summary_writer.write_events_sheets`, which writes the `EventWindows`, `EventOnsets` and `RoiEventTimes` sheets to `<plane0>/calliope_summary.xlsx`; the tab's `_write_summary` then adds the `EventMonotonicity` sheet (§2).
+In the interactive tab the summary workbook is written in a **background process** (`event_detection_run.write_event_summary_offload`, one open of the file for the Recording, event and EventMonotonicity sheets), so the GUI no longer freezes for the ~23 s the write took on a 679-ROI recording after Render. In a batch, the event results are published to Tabs 7/8 only after the write finishes. Workbook writes (`summary_writer.write_sheets`) are serialized by a cross-process file lock (`calliope_summary.xlsx.lock`) so overlapping writers cannot drop each other's sheets. The export goes to `summary_writer.write_events_sheets`, which writes the `EventWindows`, `EventOnsets` and `RoiEventTimes` sheets to `<plane0>/calliope_summary.xlsx`; the tab's `_write_summary` then adds the `EventMonotonicity` sheet (§2).
 
 ---
 
@@ -259,7 +267,7 @@ In-memory only (no new on-disk arrays beyond the summary sheets and optional CSV
 
 `<plane0>/calliope_summary.xlsx` gets:
 - **EventWindows** sheet (`summary_writer.write_events_sheets`): one row per
-  event — `event_id, start_s, end_s, duration_s, n_active_rois`.
+  event — `event_id, start_s, end_s, duration_s, n_active_rois`, plus `class` (local burst / population burst / seizure-like).
 - **EventOnsets** sheet (same writer): long format — one row per in-event
   onset, `event_id, roi, onset_s, t_relative_s`.
 - **RoiEventTimes** sheet (same writer): wide table, one `roi_<i>` column per
@@ -534,9 +542,8 @@ Walking each peak outward to a window, then splitting/clamping
     minimum-density valley between their peaks (watershed block in `_boundaries_from_peaks`), so close events
     stay separate.
   - *What it means to you:* keep on for distinct back-to-back epileptiform
-    events. Turning it off leaves overlapping windows as walked -- the old
-    merge-overlapping path was disabled on 2026-05-01, so `merge_gap_s` does
-    not kick in either.
+    events. Turning it off leaves overlapping windows as walked. Either way,
+    windows closer than `merge_gap_s` are joined afterwards (below).
 - **Force symmetric clamp (`enforce_symmetric_clamp`) — default `False`.**
   - *What it does:* when on, **every** window is forced to peak ±
     `max_event_duration_s/2`, not just the ones exceeding the cap
@@ -544,13 +551,34 @@ Walking each peak outward to a window, then splitting/clamping
   - *What it means to you:* turn on to stereotype all events to a fixed width
     (handy for averaging/alignment) at the cost of each event's natural
     boundaries. Leave off to keep walked widths up to the cap.
-- **Merge gap (`merge_gap_s`) — default `0.0`.**
-  - *What it does:* legacy overlap-merge gap (seconds). **Currently has no
-    effect**: the merge block in `_boundaries_from_peaks` was disabled on
-    2026-05-01 when watershed split replaced it, so the value is ignored
-    whether or not `enable_watershed_split` is on.
-  - *What it means to you:* nothing today -- kept editable (and saved in
-    manifests / batch rows) for compatibility only.
+- **Merge gap (`merge_gap_s`) — default `1.0`.**
+  - *What it does:* after the duration cap, joins consecutive windows whose
+    gap (seconds) is at most this into one event (`_merge_back_to_back`). `0`
+    turns merging off.
+  - *What it means to you:* a seizure shows up as one long event instead of
+    dozens of capped windows. Lower it (or set `0`) if distinct short events
+    less than a second apart should stay separate.
+- **Seizure-like if >= (s) (`seizure_min_duration_s`) — default `5.0`** (group
+  *Population events - classes*).
+  - *What it does:* events at least this long are classed `seizure-like`.
+  - *What it means to you:* sets where bursts end and seizure-like events
+    begin; only affects the `class` label and shading colour.
+- **Population burst if ROI fraction >= (`population_fraction`) — default `0.5`.**
+  - *What it does:* shorter events in which at least this fraction of ROIs are
+    active are `population burst`; the rest are `local burst`.
+  - *What it means to you:* raise it to call only near-global events
+    population bursts.
+- **Within-event timing (`timing_method`) — default `half-max`** (group
+  *Population events - timing*; choices `half-max`, `first onset`).
+  - *What it does:* how `first_time` is computed for Tabs 7/8 and the
+    monotonicity test (see §3e): half-max crossing on lightly filtered dF/F, or
+    the detection onset.
+  - *What it means to you:* `half-max` is far less jittery; choose `first onset`
+    to reproduce older results.
+- **Timing filter cutoff (Hz) (`timing_cutoff_hz`) — default `5.0`.**
+  - *What it does:* zero-phase low-pass applied to dF/F before the half-max
+    crossing; skipped when at or above ~0.45 x fps.
+  - *What it means to you:* lower = smoother but blurs fast rises.
 
 ### Population events — gaussian fit
 
@@ -595,7 +623,7 @@ is recorded in the diagnostics dict.
 The Gaussian-fit group is inactive in the default short-event configuration
 but stays editable so you can revert to the older boundary heuristics (set
 `use_gaussian_boundary` on and/or `enable_watershed_split` off) without leaving
-the GUI. `merge_gap_s` is also still editable but currently inert (see above).
+the GUI. `merge_gap_s` and the class/timing knobs act after the boundaries are set (see above).
 
 **Manual subset (UI-only, not in `PARAM_SPEC`).** A header checkbox
 (`manual_subset_var`) + text entry (`manual_roi_var`, format `0,3,5-9`) restrict
@@ -621,7 +649,8 @@ in the *Advanced…* dialog.
 5. **Walk** outward from each peak until the trace falls below `end_threshold` *or* you hit `max_walk_duration_s`.
 6. **Watershed split** overlapping windows at the bin of minimum smoothed density between consecutive peaks.
 7. **Hard cap** any final window > `max_event_duration_s` to peak ± `max_event_duration_s/2`.
-8. **Activation matrix:** for each event, mark every ROI that has at least one onset inside `[start_s, end_s]`; record the earliest such onset.
+7b. **Merge:** join consecutive windows with gap `<= merge_gap_s` (span start to max end, keep the tallest peak's fields). **Classify:** `seizure-like` if duration `>= seizure_min_duration_s`, else `population burst` if active-ROI fraction `>= population_fraction`, else `local burst`.
+8. **Activation matrix:** for each event, mark every ROI that has at least one onset inside `[start_s, end_s]`. Timing: with `timing_method='half-max'`, the first upward crossing of baseline + 0.5 x (peak - baseline) on `sosfiltfilt` dF/F at `timing_cutoff_hz`, interpolated; otherwise the earliest onset in the window.
 9. The display heatmap is per-ROI 1st/99.5th-percentile-normalised `lp_ds` with rows sorted by event count (descending). The raster is binary onsets at downsampled bin resolution.
 
 The full annotated reference is in `core/utils.py` (`mad_z`,

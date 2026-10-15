@@ -41,6 +41,8 @@ The "Trace source" radio + entry chooses what to compute the FFT and live previe
 - **Best-scoring ROI**: ROI with the largest `predicted_cell_prob`.
 - **Manual ROI(s)**: user-supplied ROI ids/ranges (e.g. `0,3,5-9`) using `gui_common.parse_manual_roi_spec`. If multiple are given, aggregated by `mean` or `median` (combobox).
 
+A manual subset is shown in the plot titles as the count plus a clipped id list (`n=37: 3-5,9,12,…`) so the title stays inside the figure; the full list is in the wrapping status line.
+
 Manual ids are **always** Suite2p indices into the full `(T, N_total)` `r0p7_dff.memmap.float32`, irrespective of whether they survive the cell-filter mask. Mean/median/best aggregations operate on the kept-only `(T, N_kept)` memmap.
 
 ### Step 2 — FFT power spectrum
