@@ -73,7 +73,6 @@ def size_outlier_mask(stat, keep, z_thresh: float) -> np.ndarray:
     return out
 
 
-@torch.no_grad()                                                  # See model.py
 def keep_mask_from_scores(probs, stat, *, threshold: float = C.THRESHOLD,
                           iscell=None,
                           size_outlier_z: float = C.SIZE_OUTLIER_Z):
@@ -86,6 +85,7 @@ def keep_mask_from_scores(probs, stat, *, threshold: float = C.THRESHOLD,
     return mask & ~big, big
 
 
+@torch.no_grad()                                                  # See model.py
 def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
                       plane0: Path | None = None,
                       size_outlier_z: float = C.SIZE_OUTLIER_Z,
