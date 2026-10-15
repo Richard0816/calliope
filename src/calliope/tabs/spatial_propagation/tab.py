@@ -349,7 +349,8 @@ class SpatialPropagationTab(ctk.CTkFrame):
             return
         plane0 = Path(plane0)
         save_folder = core_utils.save_folder_for_plane0(plane0)
-        figures_root = save_folder / "calliope_figures"
+        from ...core.output_layout import figures_root as _fr
+        figures_root = _fr(save_folder)
         sp_dir = figures_root / "spatial_propagation"
         self.status_var.set("Exporting spatial-propagation figures ...")
         self.update_idletasks()

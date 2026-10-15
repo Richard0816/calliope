@@ -47,7 +47,8 @@ STAGES = ("preprocess", "detection", "lowpass", "event_detection",
 
 
 def _figures_dir_for(save_folder: Path, stage: str) -> Path:
-    return Path(save_folder) / "calliope_figures" / stage
+    from .output_layout import figures_root
+    return figures_root(save_folder) / stage
 
 
 # ROI-survival / kept-count resolution is shared with the GUI batch
@@ -189,7 +190,7 @@ def run_recording(
         # the figures that did get written.
         try:
             manifest_path = write_export_manifest(
-                save_folder / "calliope_figures",
+                _figures_dir_for(save_folder, "x").parent,
                 rec_id=rec_id, params=params,
                 plane0=Path(plane0), ckpt_path=ckpt_path,
             )

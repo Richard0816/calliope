@@ -49,7 +49,11 @@ def test_plane0_for_is_fixed_depth(tmp_path):
 def test_manifest_path_for(tmp_path):
     run = tmp_path / "rec"
     assert run_loader.manifest_path_for(run) == (
-        run / "calliope_figures" / "manifest.json")
+        run / "output" / "figures" / "manifest.json")
+    old = run / "calliope_figures" / "manifest.json"   # a pre-output/ run
+    old.parent.mkdir(parents=True)
+    old.write_text("{}")
+    assert run_loader.manifest_path_for(run) == old
 
 
 # --------------------------------------------------------------------------

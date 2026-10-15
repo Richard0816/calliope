@@ -834,7 +834,8 @@ class LowpassTab(ctk.CTkFrame):
             return
         from ...core.utils import save_folder_for_plane0
         save_folder = save_folder_for_plane0(plane0)
-        figures_root = save_folder / "calliope_figures"
+        from ...core.output_layout import figures_root as _fr
+        figures_root = _fr(save_folder)
         lowpass_dir = figures_root / "lowpass"
         try:
             from ...core.lowpass_run import render_lowpass_figures

@@ -6,10 +6,10 @@ folder (``detection/…/plane0``, memmaps, caches) is CalLIOPE's own::
     <recording>/output/
         calliope_summary.xlsx
         README.txt            (lists every file and the tab that wrote it)
-        manifest.json
         <recording>.nwb       (if exported)
-        figures/<n_tab>/...   (PNG + SVG)
-        data/<n_tab>/...      (CSV, or .npy for big traces in compact mode)
+        figures/manifest.json (parameters + versions of the run)
+        figures/<stage>/...   (PNG + SVG)
+        data/<stage>/...      (CSV, or .npy for big traces in compact mode)
 
 ``EXPORTS`` is the catalogue of optional items; which are on is a
 per-user setting in ``~/.calliope/exports.json`` (see docs/
@@ -27,9 +27,10 @@ import numpy as np
 OUTPUT_DIRNAME = "output"
 SETTINGS_FILE = Path.home() / ".calliope" / "exports.json"
 
-TAB_DIRS = {1: "1_preprocess", 3: "3_detection", 4: "4_lowpass",
-            5: "5_events", 6: "6_clustering", 7: "7_xcorr",
-            8: "8_propagation", 0: "nwb"}
+# Same stage names the figure renderers have always used.
+TAB_DIRS = {1: "preprocess", 3: "detection", 4: "lowpass",
+            5: "event_detection", 6: "clustering", 7: "crosscorrelation",
+            8: "spatial_propagation", 0: "nwb"}
 
 # key -> (tab, label, kind, default). kind: "img" | "data" | "big" (T x N).
 EXPORTS: dict[str, tuple[int, str, str, bool]] = {
@@ -94,8 +95,13 @@ def output_dir(save_folder) -> Path:
     return Path(save_folder) / OUTPUT_DIRNAME
 
 
+def figures_root(save_folder) -> Path:
+    """Parent of the per-stage figure folders; ``manifest.json`` sits here."""
+    return output_dir(save_folder) / "figures"
+
+
 def figures_dir(save_folder, tab: int) -> Path:
-    return output_dir(save_folder) / "figures" / TAB_DIRS[tab]
+    return figures_root(save_folder) / TAB_DIRS[tab]
 
 
 def data_dir(save_folder, tab: int) -> Path:
@@ -164,17 +170,13 @@ def write_readme(save_folder) -> Path:
 
 def migrate_run(save_folder, plane0: Optional[Path] = None, log=print) -> list:
     """Move an old run's user files into ``output/`` once:
-    ``plane0/calliope_summary.xlsx`` -> ``output/``, and
-    ``calliope_figures/<stage>/`` -> ``output/figures/<n_stage>/`` (its
-    ``manifest.json`` -> ``output/``). Nothing is overwritten. Returns
-    the moves made."""
+    ``plane0/calliope_summary.xlsx`` -> ``output/``, and everything in
+    ``calliope_figures/`` -> ``output/figures/``. Nothing is overwritten.
+    Returns the moves made."""
     save_folder = Path(save_folder)
     plane0 = Path(plane0) if plane0 else (
         save_folder / "detection" / "final" / "suite2p" / "plane0")
     out = output_dir(save_folder)
-    stage_dirs = {"preprocess": 1, "detection": 3, "lowpass": 4,
-                  "event_detection": 5, "clustering": 6,
-                  "crosscorrelation": 7, "spatial_propagation": 8}
     moves = []
     old_xlsx = plane0 / "calliope_summary.xlsx"
     if old_xlsx.exists() and not (out / old_xlsx.name).exists():
@@ -182,12 +184,7 @@ def migrate_run(save_folder, plane0: Optional[Path] = None, log=print) -> list:
     figs = save_folder / "calliope_figures"
     if figs.is_dir():
         for p in figs.iterdir():
-            if p.is_dir() and p.name in stage_dirs:
-                dest = figures_dir(save_folder, stage_dirs[p.name])
-            elif p.name == "manifest.json":
-                dest = out / p.name
-            else:
-                dest = out / "figures" / p.name
+            dest = figures_root(save_folder) / p.name
             if not dest.exists():
                 moves.append((p, dest))
     for src, dest in moves:

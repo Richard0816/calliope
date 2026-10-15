@@ -923,7 +923,8 @@ class EventDetectionTab(ctk.CTkFrame):
         from ...core.export_manifest import write_export_manifest
         from ...core.utils import safe_recording_id, save_folder_for_plane0
         save_folder = save_folder_for_plane0(plane0)
-        figures_root = save_folder / "calliope_figures"
+        from ...core.output_layout import figures_root as _fr
+        figures_root = _fr(save_folder)
         rec_id = safe_recording_id(plane0)
         write_export_manifest(
             figures_root, rec_id=rec_id, params=dict(self._params),
@@ -998,7 +999,8 @@ class EventDetectionTab(ctk.CTkFrame):
         from ...core.utils import save_folder_for_plane0
         from ...core import event_detection_run as edr
         save_folder = save_folder_for_plane0(plane0)
-        figures_root = save_folder / "calliope_figures"
+        from ...core.output_layout import figures_root as _fr
+        figures_root = _fr(save_folder)
         params = dict(self._params)
         self.status_var.set("Exporting event figures ...")
 

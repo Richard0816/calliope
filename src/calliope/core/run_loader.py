@@ -28,7 +28,10 @@ def plane0_for(run_folder: Path) -> Path:
 
 def manifest_path_for(run_folder: Path) -> Path:
     """Where the per-run ``manifest.json`` lives (may not exist)."""
-    return Path(run_folder) / "calliope_figures" / "manifest.json"
+    from .output_layout import figures_root
+    new = figures_root(run_folder) / "manifest.json"
+    old = Path(run_folder) / "calliope_figures" / "manifest.json"
+    return old if (not new.exists() and old.exists()) else new
 
 
 def read_manifest(run_folder: Path) -> Optional[dict]:
