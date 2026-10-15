@@ -406,7 +406,7 @@ class EventDetectionTab(ctk.CTkFrame):
             value="Compute lowpass + derivative on tab 4 first.")
         ctk.CTkLabel(row, textvariable=self.status_var,
                      font=ctk.CTkFont(size=11, slant="italic"),
-                     wraplength=700, justify="left").pack(
+                     wraplength=380, justify="left").pack(
             side="left")
         ctk.CTkButton(row, text="Advanced...", width=100,
                       command=self._on_advanced).pack(side="right",

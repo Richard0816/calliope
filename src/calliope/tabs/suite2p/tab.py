@@ -849,12 +849,14 @@ class Suite2pTab(ctk.CTkFrame):
         except Exception:
             n_is = None
         if n_is is not None:
-            text += f" · Suite2p iscell {n_is}"
+            text += f" · iscell {n_is}"
             if kept < 0.5 * n_is:
-                text += ("  - far fewer than Suite2p: try a lower prob "
-                         "or 'suite2p iscell'")
-                self._append_log(f"[GUI] Cell filter {text}")
-        self.keep_info_var.set(text)
+                text += " - low: try a lower prob or 'suite2p iscell'"
+                self._append_log(
+                    f"[GUI] Cell filter kept {kept} ROIs, under half of "
+                    f"Suite2p's iscell ({n_is}); try a lower prob or "
+                    f"the 'suite2p iscell' keep rule.")
+        self.keep_info_var.set(text + " ")  # Tk clips the last italic glyph
 
     def _on_apply_keep_rule(self) -> None:
         """Re-apply the keep rule to the loaded recording (no CNN re-run)
@@ -1584,6 +1586,12 @@ class Suite2pTab(ctk.CTkFrame):
             n_total=n_total, keep=keep, probs=probs, ops_view=ops_view,
         )
         self._update_keep_info(plane0, keep)
+        if self._acq_from_md or not self.fps_var.get().strip():
+            # A loaded run: show the rate / pixel size it was run with
+            # (blank fields read as "unknown" on the next Run).
+            self._set_acq_fields(core_utils.ops_fs(plane0),
+                                 core_utils.load_pix_to_um(plane0),
+                                 "from this run")
         pipe_n = self._pipeline_kept_n(plane0, n_total)
         if pipe_n is not None and pipe_n != int(keep.sum()):
             self._append_log(

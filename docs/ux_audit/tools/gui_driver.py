@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
 
     def _log_popup(kind, title, msg):
-        with open(POPUPS, "a") as f:
+        with open(POPUPS, "a", encoding="utf-8") as f:
             f.write(f"[{time.time() - T0:7.1f}s] {kind}: {title!r}\n    "
                     + str(msg).replace("\n", "\n    ") + "\n")
 
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     def _hook(exc, val, tb):
         s = "".join(traceback.format_exception(exc, val, tb))
         TK_ERRORS.append(s)
-        with open(POPUPS, "a") as f:
+        with open(POPUPS, "a", encoding="utf-8") as f:
             f.write(f"[{time.time() - T0:7.1f}s] TK CALLBACK EXCEPTION\n{s}\n")
 
 
