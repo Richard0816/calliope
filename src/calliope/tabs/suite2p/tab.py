@@ -543,6 +543,8 @@ class Suite2pTab(ctk.CTkFrame):
             row, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_btn.pack(side="left", padx=(6, 0))
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(row, 3, side="left", padx=(6, 0))
         self.nwb_btn = ctk.CTkButton(
             row, text="Export NWB", width=110,
             command=self._on_export_nwb, state="disabled")

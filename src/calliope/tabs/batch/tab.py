@@ -586,6 +586,8 @@ class BatchTab(ctk.CTkFrame):
             text="Save figures during batch (PNG + SVG per stage + manifest)",
             variable=self.save_figures_var,
         ).pack(side="left")
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(row, [3, 4, 5, 6, 7], side="left", padx=(12, 0))
 
         # --- Output: what to save ------------------------------------
         # Lets the user shrink each recording's output folder by dropping
@@ -2118,6 +2120,9 @@ class BatchTab(ctk.CTkFrame):
                 pass
             self._append_log(
                 "  [clustering] cluster ROI lists exported")
+            if getattr(cl, "_plane0", None) is not None:
+                from ...gui_common import export_stage_in_background
+                export_stage_in_background(cl, "clustering", cl._plane0)
             self.after(0, lambda: self._on_stage_done(
                 "clustering", plane0))
 

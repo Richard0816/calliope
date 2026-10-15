@@ -297,3 +297,10 @@ def export_stage_offload(stage: str, plane0_str: str, *, progress_q=None) -> lis
     """Picklable :mod:`calliope.core.offload` target: ``write_stage_exports``
     in a child process (a 700-ROI dF/F CSV is ~175 MB of text)."""
     return [str(p) for p in write_stage_exports(stage, plane0_str)]
+
+
+# Items write_stage_exports actually produces today; the menus list only
+# these so no checkbox is a no-op. The rest of EXPORTS (images, plot data,
+# Tab 8, NWB) is the planned catalogue -- see docs/output_redesign_plan.md.
+WIRED = frozenset(set(_SHEET_EXPORTS) | set(_TRACE_EXPORTS)
+                  | {"zdrift", "xcorr_pairs"})

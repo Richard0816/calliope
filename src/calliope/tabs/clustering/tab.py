@@ -447,6 +447,8 @@ class ClusteringTab(ctk.CTkFrame):
             ctl, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_figs_btn.pack(side="right", padx=(0, 6))
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(ctl, 6, side="right", padx=(0, 6))
         self.summary_btn = ctk.CTkButton(
             ctl, text="Save summary", width=120,
             command=self._on_save_summary, state="disabled")

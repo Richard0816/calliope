@@ -1377,3 +1377,53 @@ def export_stage_in_background(widget, stage: str, plane0) -> None:
                                                      f"export failed: {e}")})
     run_offloaded(widget, q, output_layout.export_stage_offload,
                   args=(stage, str(plane0)))
+
+
+_EXPORT_VARS: dict = {}
+
+
+def export_vars(master) -> dict:
+    """One shared ``BooleanVar`` per data-to-save item (plus the compact
+    switch), loaded from and saved to ``~/.calliope/exports.json``. Every
+    tab's menu and Tab 0's menu bind to these, so they never disagree."""
+    from .core import output_layout as ol
+    if not _EXPORT_VARS:
+        saved = ol.load_settings()
+
+        def persist(*_):
+            ol.save_settings({k: v.get() for k, v in _EXPORT_VARS.items()})
+
+        for k, v in saved.items():
+            var = tk.BooleanVar(master=master.winfo_toplevel(), value=v)
+            var.trace_add("write", persist)
+            _EXPORT_VARS[k] = var
+    return _EXPORT_VARS
+
+
+def add_data_to_save_button(parent, tabs, **pack):
+    """'Data to save' button: a checkbox menu of the items ``tabs`` (one
+    tab number, or several for Tab 0) write into <recording>/output/
+    when their stage finishes. ``pack`` options go to the button."""
+    from .core import output_layout as ol
+    tabs = [tabs] if isinstance(tabs, int) else list(tabs)
+    menu = tk.Menu(parent, tearoff=0)
+    v = export_vars(parent)
+    for t in tabs:
+        if len(tabs) > 1:
+            menu.add_separator() if menu.index("end") is not None else None
+            menu.add_command(label=f"Tab {t}" if t else "Other",
+                             state="disabled")
+        for key, (tab, label, kind, _d) in ol.EXPORTS.items():
+            if tab == t and key in ol.WIRED:
+                tag = {"img": " (PNG+SVG)", "big": " (large: time x ROI)"}.get(kind, "")
+                menu.add_checkbutton(label=label + tag, variable=v[key])
+    if any(ol.EXPORTS[k][2] == "big" and ol.EXPORTS[k][0] in tabs
+           for k in ol.WIRED):
+        menu.add_separator()
+        menu.add_checkbutton(label="Compact format (.npy for large traces)",
+                             variable=v[ol.COMPACT_KEY])
+    btn = ctk.CTkButton(parent, text="Data to save ▾", width=120)
+    btn.configure(command=lambda: menu.tk_popup(
+        btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height()))
+    btn.pack(**pack)
+    return btn

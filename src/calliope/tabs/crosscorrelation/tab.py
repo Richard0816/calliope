@@ -828,6 +828,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
             run_inner, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_figs_btn.pack(side="left", padx=(8, 0))
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(run_inner, 7, side="left", padx=(8, 0))
 
         # Abort button: only enabled while a worker is alive.
         self.abort_btn = ctk.CTkButton(

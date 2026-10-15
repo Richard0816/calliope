@@ -223,6 +223,8 @@ class LowpassTab(ctk.CTkFrame):
             row, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_btn.pack(side="left", padx=(6, 0))
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(row, 4, side="left", padx=(6, 0))
         self.compute_progress = ctk.CTkProgressBar(
             row, mode="indeterminate", width=160)
         self.compute_progress.pack(side="left", padx=12)

@@ -397,6 +397,8 @@ class EventDetectionTab(ctk.CTkFrame):
             row, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
         self.export_btn.pack(side="right", padx=(0, 6))
+        from ...gui_common import add_data_to_save_button
+        add_data_to_save_button(row, 5, side="right", padx=(0, 6))
         ctk.CTkButton(row, text="Reload from folder...", width=160,
                       command=self._reload_from_folder).pack(side="right")
 
