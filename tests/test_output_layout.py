@@ -46,3 +46,18 @@ def test_migrate_old_run_moves_once_and_writes_readme(tmp_path):
     assert not (tmp_path / "calliope_figures").exists()
     assert "figures/5_events/raster.png" in (out / "README.txt").read_text()
     assert ol.migrate_run(tmp_path, log=lambda *_: None) == []  # idempotent
+
+
+def test_summary_workbook_goes_to_output_and_adopts_old_copy(tmp_path):
+    from calliope.core import summary_writer as sw
+    p0 = tmp_path / "rec" / "detection" / "final" / "suite2p" / "plane0"
+    p0.mkdir(parents=True)
+    sw.write_sheets(p0.parent, {"Old": {"a": [1]}})       # bare folder: in place
+    assert (p0.parent / "calliope_summary.xlsx").exists()
+    old = p0 / "calliope_summary.xlsx"
+    (p0.parent / "calliope_summary.xlsx").rename(old)        # a pre-output/ run
+    assert sw.existing_summary_path(p0) == old
+    path = sw.write_sheet(p0, "New", {"b": [2]})
+    assert path == tmp_path / "rec" / "output" / "calliope_summary.xlsx"
+    assert not old.exists()
+    assert {"Old", "New"} <= set(pd.read_excel(path, sheet_name=None))

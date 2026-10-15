@@ -84,7 +84,8 @@ def _build_image_mask(s: dict, Ly: int, Lx: int) -> np.ndarray:
 def _read_event_windows(plane0: Path) -> Optional[np.ndarray]:
     """Return an (n_events, 2) array of [start_s, end_s] from the summary
     workbook, or None if no event sheet is present/readable."""
-    xlsx = plane0 / "calliope_summary.xlsx"
+    from .summary_writer import existing_summary_path
+    xlsx = existing_summary_path(plane0)
     if not xlsx.exists():
         return None
     try:

@@ -76,9 +76,38 @@ DEFAULT_FILENAME = "calliope_summary.xlsx"
 # ---------------------------------------------------------------------------
 
 
+_PLANE0_TAIL = ("detection", "final", "suite2p", "plane0")
+
+
 def summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
-    """Resolve the workbook path for a given plane0 directory."""
-    return Path(plane0) / filename
+    """Where the workbook is written: ``<recording>/output/`` for the
+    standard ``<recording>/detection/final/suite2p/plane0`` layout, else
+    next to ``plane0`` (bare folders, tests)."""
+    plane0 = Path(plane0)
+    if plane0.parts[-4:] == _PLANE0_TAIL:
+        from .output_layout import output_dir
+        return output_dir(plane0.parents[3]) / filename
+    return plane0 / filename
+
+
+def _writable_summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
+    """``summary_path``, first moving a pre-``output/`` run's workbook
+    there so its sheets aren't split across two files."""
+    new = summary_path(plane0, filename)
+    old = Path(plane0) / filename
+    if not new.exists() and old.exists() and old != new:
+        import shutil
+        new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old), str(new))
+    return new
+
+
+def existing_summary_path(plane0, filename: str = DEFAULT_FILENAME) -> Path:
+    """For readers: the workbook in ``output/``, or a pre-``output/`` run's
+    ``plane0/`` copy when only that exists."""
+    new = summary_path(plane0, filename)
+    old = Path(plane0) / filename
+    return old if (not new.exists() and old.exists()) else new
 
 
 def _to_dataframe(data) -> pd.DataFrame:
@@ -124,7 +153,7 @@ def write_sheet(
     swallowing it -- silent failure here would corrupt the
     accumulated state of the workbook.
     """
-    path = summary_path(plane0, filename)
+    path = _writable_summary_path(plane0, filename)
     df = _to_dataframe(data)
 
     if path.exists():
@@ -145,7 +174,7 @@ def write_sheet(
 def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path:
     """Write multiple sheets in a single workbook open. ``sheets`` maps
     sheet_name -> DataFrame/dict/records."""
-    path = summary_path(plane0, filename)
+    path = _writable_summary_path(plane0, filename)
     if path.exists():
         with pd.ExcelWriter(
             path, engine="openpyxl", mode="a", if_sheet_exists="replace"

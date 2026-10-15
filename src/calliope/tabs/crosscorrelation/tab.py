@@ -585,7 +585,10 @@ def _read_event_windows_from_summary(plane0: Path):
         import openpyxl  # noqa
     except Exception:
         return []
-    candidates = sorted(plane0.glob("*summary*.xlsx"))
+    from ...core.summary_writer import existing_summary_path
+    first = existing_summary_path(plane0)
+    candidates = ([first] if first.exists() else []) + [
+        p for p in sorted(plane0.glob("*summary*.xlsx")) if p != first]
     for path in candidates:
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
