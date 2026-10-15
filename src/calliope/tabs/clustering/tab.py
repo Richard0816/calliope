@@ -1477,6 +1477,9 @@ class ClusteringTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] cluster summary write failed: {e}")
         self.status_var.set(f"Exported clusters to {out_dir}")
+        if self._plane0 is not None:
+            from ...gui_common import export_stage_in_background
+            export_stage_in_background(self, "clustering", self._plane0)
 
     # -- Summary export ----------------------------------------------------
 

@@ -899,6 +899,8 @@ class EventDetectionTab(ctk.CTkFrame):
             self._write_summary(plane0, data)
         except Exception as e:
             print(f"[GUI] event summary write failed: {e}")
+        from ...gui_common import export_stage_in_background
+        export_stage_in_background(self, "events", plane0)
 
         # Persist the params used so a future "Open run folder…" reload
         # can restore them instead of recomputing with GUI defaults.

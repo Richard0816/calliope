@@ -1256,6 +1256,8 @@ class Suite2pTab(ctk.CTkFrame):
         self.progress.stop()
         self.run_btn.configure(state="normal")
         self.status_var.set(f"Done -> {plane0}")
+        from ...gui_common import export_stage_in_background
+        export_stage_in_background(self, "detection", plane0)
         try:
             self.state.set_plane0(plane0)
         except Exception as e:

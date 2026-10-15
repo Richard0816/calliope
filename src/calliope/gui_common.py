@@ -1357,3 +1357,23 @@ class QueueWriter(io.TextIOBase):
         if self._buf:
             self.q.put(("log", self._buf))
             self._buf = ""
+
+
+def export_stage_in_background(widget, stage: str, plane0) -> None:
+    """Write the user's ticked data items for a finished stage into
+    ``<recording>/output/`` without blocking the GUI (see
+    :func:`calliope.core.output_layout.write_stage_exports`)."""
+    from .core import output_layout
+    from .core.offload import run_offloaded
+    q: "queue.Queue" = queue.Queue()
+
+    def done(paths):
+        if paths:
+            print(f"[output] {stage}: {len(paths)} file(s) -> "
+                  f"{Path(paths[0]).parents[2]}")
+
+    drain_queue(widget, q, {"done": done,
+                            "error": lambda e: print(f"[output] {stage} "
+                                                     f"export failed: {e}")})
+    run_offloaded(widget, q, output_layout.export_stage_offload,
+                  args=(stage, str(plane0)))

@@ -804,6 +804,8 @@ class LowpassTab(ctk.CTkFrame):
             f"r0p7_filtered_dff_dt.memmap.float32 "
             f"@ {cutoff_hz:.3f} Hz")
         if self._plane0 is not None:
+            from ...gui_common import export_stage_in_background
+            export_stage_in_background(self, "lowpass", self._plane0)
             try:
                 self.state.set_lowpass_ready(self._plane0)
             except Exception as e:

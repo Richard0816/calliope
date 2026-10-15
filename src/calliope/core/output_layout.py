@@ -291,3 +291,9 @@ def write_stage_exports(stage: str, plane0, settings: Optional[dict] = None,
         log(f"[output] {stage}: wrote {len(written)} file(s) to "
             f"{output_dir(save_folder)}")
     return written
+
+
+def export_stage_offload(stage: str, plane0_str: str, *, progress_q=None) -> list:
+    """Picklable :mod:`calliope.core.offload` target: ``write_stage_exports``
+    in a child process (a 700-ROI dF/F CSV is ~175 MB of text)."""
+    return [str(p) for p in write_stage_exports(stage, plane0_str)]

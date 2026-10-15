@@ -1415,6 +1415,9 @@ class CrossCorrelationTab(ctk.CTkFrame):
         (progress pin, ``set_xcorr_ready`` publish, button re-enable) is
         unchanged.
         """
+        if not payload.get("aborted") and self._plane0 is not None:
+            from ...gui_common import export_stage_in_background
+            export_stage_in_background(self, "xcorr", self._plane0)
         if payload.get("aborted"):
             self._on_xc_aborted(payload.get("mode", ""))
         elif payload.get("mode") == "full":
