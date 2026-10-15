@@ -56,6 +56,7 @@ with other jobs, so heavy runs were capped.
 | Tab 5 freeze (real lab recording, 679 kept ROIs) | Detection already ran off-thread (30 s); the GUI froze ~23 s afterwards in three openpyxl load/save cycles of `calliope_summary.xlsx` on the Tk thread. |
 | Blob ROIs on a real lab recording | All 5 kept blobs (1.2-8.8 k px, cell-filter prob 0.87-1.0) came from the Cellpose pass, whose real cells were ~80 px; Sparsery ROIs are ~20 px. |
 | Manual subset from a Tab 6 cluster (52 ROIs) | Tab 4 titles ran off the figure. |
+| Zenodo 5931656 zebrafish PTZ, recording 019 (256x256, 300 frames, 2 Hz, float32, no metadata), batch with a 2 Hz row override, 6 GB job cap | Preprocess fine (2.9 s). GPU registration crashed twice (0xC0000005) with all 300 frames in one batch; the batch's conservative retry (3 batches) registered in 3 s. **Sparsery did not converge: 8,500+ ROIs and still climbing (~200/s)** in a ~550 um field when the run was stopped because system commit reached 93%. Needs a capped re-run (`max_ROIs`, spatial_scale) before Tabs 4-8 can be judged on this data. |
 
 ## Status on branch `ux-audit-fixes`
 
