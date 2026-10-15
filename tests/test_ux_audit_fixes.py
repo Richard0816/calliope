@@ -451,3 +451,12 @@ def test_call_in_child_survives_killed_child():
     from calliope.core.offload import call_in_child
     with pytest.raises(RuntimeError, match=r"exit code 137.*out of memory"):
         call_in_child(_child_killed, died_hint="ran out of memory")
+
+
+def test_short_roi_label_clips_long_subsets():
+    from calliope.gui_common import short_roi_label
+    ids = list(range(0, 400, 3))  # no runs, so the plain list is very long
+    s = short_roi_label(ids)
+    assert s.startswith(f"n={len(ids)}: 0,3,") and s.endswith(",…")
+    assert len(s) < 60
+    assert short_roi_label([4, 1, 2, 3]) == "n=4: 1-4"

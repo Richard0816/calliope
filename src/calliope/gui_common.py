@@ -1196,6 +1196,16 @@ def parse_manual_roi_spec(text: str, n_total: int) -> list[int]:
     return out
 
 
+def short_roi_label(indices, max_chars: int = 40) -> str:
+    """``'n=37: 3-5,9,12,…'`` -- count first, id list clipped so a plot
+    title stays inside its figure (cluster subsets ran off the edge).
+    Show the full list with :func:`format_roi_indices` somewhere that wraps."""
+    s = format_roi_indices(sorted(int(i) for i in indices))
+    if len(s) > max_chars:
+        s = s[:max_chars].rsplit(",", 1)[0] + ",…"
+    return f"n={len(indices)}: {s}"
+
+
 def format_roi_indices(indices: list[int]) -> str:
     """Render a sorted list of ints as compact 'a-b' runs joined by commas
     (e.g. [1,2,3,7,10,11,12] -> '1-3,7,10-12').

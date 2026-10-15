@@ -71,8 +71,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from .logic import summary_writer
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, report_stage_error,
-    open_advanced, spec_defaults,
+    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, format_roi_indices,
+    report_stage_error, open_advanced, short_roi_label, spec_defaults,
 )
 
 
@@ -384,7 +384,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self.status_var = tk.StringVar(
             value="Compute lowpass + derivative on tab 4 first.")
         ctk.CTkLabel(row, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+                     font=ctk.CTkFont(size=11, slant="italic"),
+                     wraplength=700, justify="left").pack(
             side="left")
         ctk.CTkButton(row, text="Advanced...", width=100,
                       command=self._on_advanced).pack(side="right",
@@ -846,9 +847,19 @@ class EventDetectionTab(ctk.CTkFrame):
 
         n_events = (len(data["event_windows"])
                     if data["event_windows"] is not None else 0)
+        subset = (self._params.get("manual_subset_enabled")
+                  and data.get("kept_idx") is not None)
         self.status_var.set(
             f"Rendered  N_kept={N}  T={T}  fps={fps:.2f}  "
-            f"duration={duration_s:.1f}s  events={n_events}")
+            f"duration={duration_s:.1f}s  events={n_events}"
+            + (f"\nSubset ROIs:{format_roi_indices(sorted(int(i) for i in data['kept_idx']))}"
+               if subset else ""))
+        if subset:
+            for a, c in ((self.hm_ax, self.hm_canvas),
+                         (self.er_ax, self.er_canvas)):
+                a.set_title(f"Subset {short_roi_label(data['kept_idx'])}",
+                            fontsize=8)
+                c.draw_idle()
 
         # Drop the display-only arrays from the cached payload now that
         # they live on the matplotlib figures. ``heatmap`` and ``raster``

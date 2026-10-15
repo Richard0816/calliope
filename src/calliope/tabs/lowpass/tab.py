@@ -90,7 +90,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from ...gui_common import (
     AppState, attach_fig_toolbar, drain_queue, format_roi_indices, report_stage_error,
-    open_advanced, parse_manual_roi_spec, spec_defaults,
+    open_advanced, parse_manual_roi_spec, short_roi_label, spec_defaults,
 )
 
 
@@ -134,6 +134,9 @@ class LowpassTab(ctk.CTkFrame):
         self._fps_src: str = "default"
         self._mean_dff: Optional[np.ndarray] = None
         self._trace_label: str = "mean"
+        # Full manual-subset id list for the (wrapping) status line; the
+        # plot titles carry only a clipped version.
+        self._trace_ids: str = ""
         self._fft_xf: Optional[np.ndarray] = None
         self._fft_power: Optional[np.ndarray] = None
         self._cutoff_line = None
@@ -302,7 +305,8 @@ class LowpassTab(ctk.CTkFrame):
         self.status_var = tk.StringVar(
             value="Run detection first (or reload from a finished folder).")
         ctk.CTkLabel(self, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+                     font=ctk.CTkFont(size=11, slant="italic"),
+                     wraplength=900, justify="left").pack(
             anchor="w", padx=10, pady=(0, 6))
 
         # Persistent recording header so the user can always tell
@@ -438,6 +442,7 @@ class LowpassTab(ctk.CTkFrame):
 
     def _load_data(self, plane0: Path) -> None:
         from . import logic as utils
+        self._trace_ids = ""  # set again below only for a multi-ROI subset
         F = np.load(plane0 / "F.npy", mmap_mode="r")
         N_total, T = F.shape
         self._T = int(T)
@@ -540,8 +545,8 @@ class LowpassTab(ctk.CTkFrame):
                                     if n_excl else "")
                         self._trace_label = (
                             f"{agg} of ROIs "
-                            f"{format_roi_indices(roi_indices)} "
-                            f"(n={len(roi_indices)}){excl_str}")
+                            f"{short_roi_label(roi_indices)}{excl_str}")
+                        self._trace_ids = format_roi_indices(roi_indices)
 
         if source == "best":
             probs_full = np.load(prob_path).astype(np.float32)
@@ -720,7 +725,8 @@ class LowpassTab(ctk.CTkFrame):
         self.status_var.set(
             f"Source: {self._trace_label}  "
             f"T={self._mean_dff.size}  fps={self._fps:.2f} ({self._fps_src})  "
-            f"cutoff={self.cutoff_var.get():.3f} Hz")
+            f"cutoff={self.cutoff_var.get():.3f} Hz"
+            + (f"\nROIs: {self._trace_ids}" if self._trace_ids else ""))
 
     def _on_manual_entry(self, _event=None) -> None:
         # Snap source to manual and reload. Also fired on FocusOut so clicking
