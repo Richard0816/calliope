@@ -595,6 +595,30 @@ def run_event_detection_offload(plane0_str: str, params: dict, *,
     )
 
 
+def write_event_summary_offload(plane0_str: str, data: dict, *,
+                                progress_q=None) -> str:
+    """Picklable :mod:`calliope.core.offload` target: Tab 5's summary
+    workbook write (Recording, event and EventMonotonicity sheets).
+
+    openpyxl re-reads and re-saves the whole workbook, which took ~23 s
+    across three calls on a 679-ROI recording and froze the GUI when it
+    ran on the Tk thread. Here it runs in a child process, in one open.
+    """
+    from . import summary_writer as sw
+    plane0 = Path(plane0_str)
+    extra = {"Recording": sw.update_recording_meta(
+        plane0, fps=data.get("fps"), T=data.get("T"), N=data.get("N_kept"),
+        write=False)}
+    em = data.get("event_monotonicity")
+    if em:
+        extra["EventMonotonicity"] = sw.write_event_monotonicity_sheet(
+            plane0, em, write=False)
+    return str(sw.write_events_sheets(
+        plane0, event_windows=data.get("event_windows"),
+        onsets_by_roi=data.get("onsets_by_roi") or [],
+        fps=data.get("fps"), in_seconds=True, extra_sheets=extra))
+
+
 def export_event_figures_offload(plane0_str: str, params: dict,
                                  figures_root_str: str, *,
                                  progress_q=None) -> dict:

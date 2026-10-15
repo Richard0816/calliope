@@ -289,6 +289,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self.state = state
         self._plane0: Optional[Path] = None
         self._render_queue: queue.Queue = queue.Queue()
+        self._summary_job = None
+        self._after_summary_write = None
         # Heavy detection runs in a child process (see core.offload) so
         # the pure-Python per-ROI hysteresis loop can't hold the GIL and
         # freeze the GUI. ``None`` until the first render.
@@ -318,6 +320,8 @@ class EventDetectionTab(ctk.CTkFrame):
                      "error": self._on_render_error,
                      "status": self._on_render_status,
                      "export_done": self._on_export_done,
+                     "summary_done": self._on_summary_written,
+                     "summary_error": self._on_summary_failed,
                      "export_error": self._on_export_error},
                     poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
@@ -863,10 +867,33 @@ class EventDetectionTab(ctk.CTkFrame):
         if job is None or not job.running():
             self.export_btn.configure(state="normal")
 
-        # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
-        # propagation) can render the same events without re-detecting.
-        # This MUST run before the deferred disk writes below so the
-        # batch runner advances even if the summary write later fails.
+        # The summary workbook write runs in a child process: openpyxl
+        # took ~23 s on a 679-ROI recording and froze the GUI when it ran
+        # here. In a batch, publish only once it has finished, so the next
+        # stage (and the finalize move) never races the write; otherwise
+        # publish now so Tab 8 can render straight away.
+        publish = lambda d=data: self._publish_event_results(d)
+        in_batch = bool(getattr(self.state, "batch_active", False))
+        if not in_batch:
+            publish()
+        if self._plane0 is None:
+            if in_batch:
+                publish()
+            return
+        self._after_summary_write = publish if in_batch else None
+        keys = ("fps", "T", "N_kept", "event_windows", "onsets_by_roi",
+                "event_monotonicity")
+        from ...core.offload import run_offloaded
+        from ...core import event_detection_run as edr
+        self._summary_job = run_offloaded(
+            self, self._render_queue, edr.write_event_summary_offload,
+            args=(str(self._plane0), {k: data.get(k) for k in keys}),
+            done_kind="summary_done", error_kind="summary_error",
+            poll_ms=self.POLL_MS)
+
+    def _publish_event_results(self, data: dict) -> None:
+        """Publish to AppState so downstream tabs (e.g. Tab 8 spatial
+        propagation) render the same events, and the batch runner advances."""
         try:
             self.state.set_event_results({
                 "plane0": self._plane0,
@@ -886,39 +913,25 @@ class EventDetectionTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
 
-        # Defer the slow disk work (openpyxl summary workbook + manifest
-        # merge) to a follow-up tick. Writing the workbook can take a
-        # second or two; running it inline here would freeze the GUI
-        # right after the figures appear. The figures + AppState publish
-        # above have already happened, so the user sees results
-        # immediately and the writes finish in the background.
-        if self._plane0 is not None:
-            self.after(1, lambda p=self._plane0, d=data:
-                       self._finish_render_writes(p, d))
+    def _on_summary_failed(self, payload) -> None:
+        print(f"[GUI] event summary write failed:\n{payload}")
+        self._on_summary_written(None)
 
-    def _finish_render_writes(self, plane0: Path, data: dict) -> None:
-        """Deferred summary-workbook + manifest writes (off the hot path).
-
-        Split out of :meth:`_on_render_done` so the openpyxl / disk work
-        runs on a later ``after`` tick instead of blocking the event
-        loop the moment a render completes.
-        """
-        try:
-            self._write_summary(plane0, data)
-        except Exception as e:
-            print(f"[GUI] event summary write failed: {e}")
-
+    def _on_summary_written(self, payload) -> None:
         # Persist the params used so a future "Open run folder…" reload
         # can restore them instead of recomputing with GUI defaults.
         # Suppressed during a reload's own recompute (writing back the
         # just-loaded params is pointless, and writing defaults when none
         # were found would silently record them as the run's settings).
-        if not self._suppress_manifest_write:
+        if not self._suppress_manifest_write and self._plane0 is not None:
             try:
-                self._write_event_manifest(plane0)
+                self._write_event_manifest(self._plane0)
             except Exception as e:
                 print(f"[GUI] event manifest update failed: {e}")
         self._suppress_manifest_write = False
+        then, self._after_summary_write = self._after_summary_write, None
+        if then is not None:
+            then()
 
     def _write_event_manifest(self, plane0: Path) -> None:
         """Merge the current event-detection params into the run manifest.
