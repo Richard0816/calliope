@@ -61,3 +61,32 @@ def test_summary_workbook_goes_to_output_and_adopts_old_copy(tmp_path):
     assert path == tmp_path / "rec" / "output" / "calliope_summary.xlsx"
     assert not old.exists()
     assert {"Old", "New"} <= set(pd.read_excel(path, sheet_name=None))
+
+
+def test_write_stage_exports_tables_and_traces(tmp_path):
+    from calliope.core import summary_writer as sw
+    p0 = tmp_path / "rec" / "detection" / "final" / "suite2p" / "plane0"
+    p0.mkdir(parents=True)
+    T, N = 8, 3
+    F = np.arange(N * T, dtype=np.float32).reshape(N, T)
+    np.save(p0 / "F.npy", F)
+    np.save(p0 / "ops.npy", {"fs": 4.0}, allow_pickle=True)
+    keep = np.array([True, False, True])
+    np.save(p0 / "r0p7_cell_mask_bool.npy", keep)
+    mm = np.memmap(p0 / "r0p7_filtered_dff.memmap.float32", dtype="float32",
+                   mode="w+", shape=(T, 2))
+    mm[:] = F[keep].T; mm.flush(); del mm
+    sw.write_sheet(p0, "ROIs", {"roi": [0, 1, 2]})
+    s = ol.default_settings() | {"trace_dff": True, "trace_f": True}
+    out = ol.write_stage_exports("detection", p0, s, log=lambda *_: None)
+    names = sorted(p.name for p in out)
+    assert names == ["F.csv", "dff.csv", "rois.csv"]
+    dff = pd.read_csv(tmp_path / "rec" / "output" / "data" / "detection" / "dff.csv")
+    assert list(dff.columns) == ["time_s", "roi_0", "roi_2"]
+    assert dff["time_s"].iloc[1] == 0.25 and dff["roi_2"].iloc[0] == F[2, 0]
+    f = pd.read_csv(tmp_path / "rec" / "output" / "data" / "detection" / "F.csv")
+    assert f["roi_2"].tolist() == F[2].tolist()
+    # Off by default: nothing big written.
+    out2 = ol.write_stage_exports("detection", p0, ol.default_settings(),
+                                  log=lambda *_: None)
+    assert [p.name for p in out2] == ["rois.csv"]

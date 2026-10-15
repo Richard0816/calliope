@@ -196,3 +196,98 @@ def migrate_run(save_folder, plane0: Optional[Path] = None, log=print) -> list:
     if moves:
         write_readme(save_folder)
     return moves
+
+
+# -- per-stage exports ------------------------------------------------------
+
+# Small tables are CSV copies of workbook sheets: key -> (tab, sheet, file).
+_SHEET_EXPORTS = {
+    "rois_table": (3, "ROIs", "rois"),
+    "event_windows": (5, "EventWindows", "event_windows"),
+    "event_onsets": (5, "EventOnsets", "event_onsets"),
+    "event_monotonicity": (5, "EventMonotonicity", "event_monotonicity"),
+    "cluster_membership": (6, "Clusters", "cluster_membership"),
+}
+# Big traces read from plane0: key -> (tab, file, output name, is_memmap).
+_TRACE_EXPORTS = {
+    "trace_f": (3, "F.npy", "F", False),
+    "trace_fneu": (3, "Fneu.npy", "Fneu", False),
+    "trace_spks": (3, "spks.npy", "spks", False),
+    "trace_dff": (3, "r0p7_filtered_dff.memmap.float32", "dff", True),
+    "trace_lowpass": (4, "r0p7_filtered_dff_lowpass.memmap.float32",
+                      "dff_lowpass", True),
+    "trace_dt": (4, "r0p7_filtered_dff_dt.memmap.float32", "dff_dt", True),
+}
+STAGE_TAB = {"detection": 3, "lowpass": 4, "events": 5, "clustering": 6,
+             "xcorr": 7}
+
+
+def write_stage_exports(stage: str, plane0, settings: Optional[dict] = None,
+                        log=print) -> list:
+    """Write the ticked data items of one finished stage into
+    ``output/data/<stage>/`` (and refresh README.txt). Reads only what
+    the stage left on disk, so the GUI and batch call it the same way;
+    a missing input skips that item with a log line. Returns the paths
+    written."""
+    from . import utils
+    from .summary_writer import existing_summary_path
+    plane0 = Path(plane0)
+    save_folder = utils.save_folder_for_plane0(plane0)
+    s = settings if settings is not None else load_settings()
+    tab = STAGE_TAB[stage]
+    written: list = []
+
+    def on(key):
+        return s.get(key) and EXPORTS[key][0] == tab
+
+    xlsx = existing_summary_path(plane0)
+    for key, (_t, sheet, name) in _SHEET_EXPORTS.items():
+        if on(key):
+            try:
+                import pandas as pd
+                written.append(write_table(save_folder, tab, name,
+                                           pd.read_excel(xlsx, sheet_name=sheet)))
+            except Exception as e:
+                log(f"[output] {key} skipped: {e}")
+
+    mask_path = plane0 / "r0p7_cell_mask_bool.npy"
+    keep = np.load(mask_path) if mask_path.exists() else None
+    fps = utils.ops_fs(plane0) or utils.get_fps_from_notes(str(plane0))
+    for key, (_t, fname, name, is_mm) in _TRACE_EXPORTS.items():
+        f = plane0 / fname
+        if not on(key):
+            continue
+        if keep is None or not f.exists():
+            log(f"[output] {key} skipped: {f.name} or the keep mask is missing")
+            continue
+        ids = np.flatnonzero(keep)
+        if is_mm:
+            T = np.load(plane0 / "F.npy", mmap_mode="r").shape[1]
+            tr = np.memmap(str(f), dtype="float32", mode="r",
+                           shape=(T, ids.size))
+        else:  # suite2p (N_total, T): kept rows, transposed to time-down
+            tr = np.load(f, mmap_mode="r")[keep].T
+        written.append(write_trace(save_folder, tab, name, tr, fps, ids,
+                                   compact=bool(s.get(COMPACT_KEY))))
+        del tr
+
+    if stage == "detection" and s.get("zdrift"):
+        for src, dest in ((plane0 / "zdrift_pc1.csv", data_dir(save_folder, 3)),
+                          (plane0 / "zdrift_qc.png", figures_dir(save_folder, 3))):
+            if src.exists():
+                dest.mkdir(parents=True, exist_ok=True)
+                written.append(Path(shutil.copy2(src, dest / src.name)))
+
+    if stage == "xcorr" and s.get("xcorr_pairs"):
+        for csv in plane0.glob("*cluster_results/cross_correlation_*/**/*_summary.csv"):
+            rel = csv.relative_to(next(p for p in csv.parents
+                                       if p.name.startswith("cross_correlation_")).parent)
+            dest = data_dir(save_folder, 7) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            written.append(Path(shutil.copy2(csv, dest)))
+
+    if written:
+        write_readme(save_folder)
+        log(f"[output] {stage}: wrote {len(written)} file(s) to "
+            f"{output_dir(save_folder)}")
+    return written
