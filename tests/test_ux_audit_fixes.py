@@ -460,3 +460,14 @@ def test_short_roi_label_clips_long_subsets():
     assert s.startswith(f"n={len(ids)}: 0,3,") and s.endswith(",…")
     assert len(s) < 60
     assert short_roi_label([4, 1, 2, 3]) == "n=4: 1-4"
+
+
+def test_last_tab_remembered_and_first_launch_opens_tab1(tmp_path, monkeypatch):
+    import calliope.pipeline_gui as pg
+    monkeypatch.setattr(pg, "LAST_TAB_FILE", tmp_path / "x" / "last_tab")
+    assert pg._load_last_tab(9) == 1          # first launch
+    pg._save_last_tab(6)
+    assert pg._load_last_tab(9) == 6
+    pg._save_last_tab(42)                     # out of range -> default
+    assert pg._load_last_tab(9) == 1
+

@@ -306,6 +306,25 @@ class _Sidebar(ctk.CTkFrame):
 # Main app
 # ---------------------------------------------------------------------------
 
+LAST_TAB_FILE = Path.home() / ".calliope" / "last_tab"
+
+
+def _load_last_tab(n_tabs: int, default: int = 1) -> int:
+    try:
+        idx = int(LAST_TAB_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return default
+    return idx if 0 <= idx < n_tabs else default
+
+
+def _save_last_tab(idx: int) -> None:
+    try:
+        LAST_TAB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_TAB_FILE.write_text(str(int(idx)))
+    except OSError:
+        pass  # a read-only home just means no memory of the last tab
+
+
 class PipelineApp(ctk.CTk):
     """The root window.
 
@@ -408,7 +427,7 @@ class PipelineApp(ctk.CTk):
             "8. Spatial propagation",
         ]
         self._sidebar = _Sidebar(self, labels=tab_labels,
-                                 on_select=self._show_tab,
+                                 on_select=self._on_sidebar_select,
                                  on_open_run=self._on_open_run,
                                  on_import_suite2p=self._on_import_suite2p)
         self._sidebar.grid(row=0, column=0, sticky="nsw")
@@ -451,10 +470,10 @@ class PipelineApp(ctk.CTk):
          self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
             self._tabs_in_order
 
-        # ``-1`` is the "no tab is shown yet" sentinel; the first
-        # ``_show_tab(0)`` call below promotes Tab 0.
+        # ``-1`` is the "no tab is shown yet" sentinel. Open on the tab the
+        # user last picked, Tab 1 on first launch (UX audit finding 18).
         self._current_tab_index = -1
-        self._show_tab(0)
+        self._show_tab(_load_last_tab(len(self._tab_containers)))
 
         # Single mouse-wheel router for the whole app. The fallback
         # canvas is resolved dynamically per event to the currently
@@ -474,6 +493,12 @@ class PipelineApp(ctk.CTk):
         if 0 <= idx < len(self._tab_containers):
             return self._tab_containers[idx]._parent_canvas
         return None
+
+    def _on_sidebar_select(self, idx: int) -> None:
+        """Sidebar click: show the tab and remember it for next launch.
+        Programmatic switches (batch runner, Open run folder) aren't saved."""
+        self._show_tab(idx)
+        _save_last_tab(idx)
 
     def _show_tab(self, idx_or_widget) -> None:
         """Activate the tab at ``idx_or_widget`` (int index OR tab
