@@ -546,6 +546,17 @@ class PipelineApp(ctk.CTk):
                 f"detection/final/suite2p/plane0 outputs found.")
             return
 
+        # Runs made before output/ existed: move their workbook and figures
+        # into <run>/output/ once, so every user file is in one place.
+        try:
+            from .core.output_layout import migrate_run
+            moved = migrate_run(run_folder)
+            if moved:
+                print(f"[GUI] moved {len(moved)} item(s) of this older run "
+                      f"into {run_folder / 'output'}")
+        except Exception as e:
+            print(f"[GUI] output/ migration skipped: {e}")
+
         # Start from a clean bus so a stage missing from this run can't
         # inherit the previous run's value.
         self.state_obj.reset()
