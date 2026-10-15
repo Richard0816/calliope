@@ -941,6 +941,8 @@ def run_detection(
             "cellpose_model_type": "cpsam",
             "cellpose_channel_input": "Vcorr",
             "cellpose_diameter": params.get("cellpose_diameter", 0),
+            "cellpose_max_area_factor":
+                float(params.get("cellpose_max_area_factor", 4.0)),
             "cellpose_flow_threshold": float(
                 params.get("sam_flow_threshold", 0.8)),
             "cellpose_cellprob_threshold": float(

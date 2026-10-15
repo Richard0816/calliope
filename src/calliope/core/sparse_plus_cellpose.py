@@ -131,6 +131,8 @@ SPARSERY_OPS = {
 CELLPOSE_CFG = {
     'cellpose_model_type':         'cyto2',
     'cellpose_diameter':           0,      # 0 = auto
+    # Drop ROIs > this x a typical Cellpose cell (blobs); 0 = off.
+    'cellpose_max_area_factor':    4.0,
     'cellpose_flow_threshold':     0.8,
     'cellpose_cellprob_threshold': -1.0,
     'cellpose_channel_input':      'meanImg',

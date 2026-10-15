@@ -1445,6 +1445,36 @@ def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
     return stat
 
 
+# Cellpose 4's unified model works at a nominal 30 px cell diameter; used
+# as the size reference when no diameter was requested or estimated.
+CELLPOSE_NOMINAL_DIAMETER = 30.0
+
+
+def drop_oversized_cellpose(stat: list, factor: float,
+                            diameter=None, verbose: bool = True) -> list:
+    """Drop Cellpose ROIs larger than ``factor`` x a typical cell's area.
+
+    The typical area is the smaller of this pass's median ROI area and a
+    disk of the Cellpose diameter (requested, else estimated, else
+    :data:`CELLPOSE_NOMINAL_DIAMETER`). On flat or noisy regions Cellpose
+    returns large blobs (1-9k px on a real recording where cells were
+    ~80 px; ~3.5k px on pure noise); the relative cut adapts to each
+    recording's cell size, so no per-recording threshold is needed.
+    ``factor <= 0`` disables it.
+    """
+    if not factor or factor <= 0 or not stat:
+        return stat
+    area = np.array([len(s["ypix"]) for s in stat], dtype=float)
+    d = float(diameter) if diameter else CELLPOSE_NOMINAL_DIAMETER
+    cap = factor * min(float(np.median(area)), np.pi * (d / 2.0) ** 2)
+    keep = area <= cap
+    if verbose and not keep.all():
+        print(f"  > cellpose size cap: dropped {int((~keep).sum())} ROIs "
+              f"> {cap:.0f} px ({factor:g} x typical cell); largest "
+              f"{int(area.max())} px")
+    return [s for s, k in zip(stat, keep) if k]
+
+
 def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
                       verbose: bool = True):
     """Run Cellpose on the mean image from the shared registration.
@@ -1612,6 +1642,10 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
               f"(est. diameter={diams})")
 
     stat = _cellpose_masks_to_stat(np.asarray(masks))
+    stat = drop_oversized_cellpose(
+        stat, float(cfg.get("cellpose_max_area_factor", 4.0)),
+        diameter or (float(diams) if diams is not None else None),
+        verbose=verbose)
 
     # Persist outputs in a suite2p-like layout so the rest of the
     # pipeline + any downstream audit tools can find them.

@@ -525,3 +525,18 @@ def test_half_max_times_recover_subframe_delays():
                               cutoff_hz=0)
     np.testing.assert_allclose(ft[:3, 0], onset + delays[:3], atol=0.02)
     assert np.isnan(ft[3, 0])
+
+
+def test_cellpose_size_cap_drops_blobs_only():
+    """Cellpose blobs (1-9k px where cells are ~80 px) are dropped by a cap
+    relative to the pass's own typical cell, so no per-recording tuning."""
+    from calliope.core.suite2p_pipeline import drop_oversized_cellpose
+    sizes = [60, 70, 78, 80, 85, 90, 120, 300, 1224, 3402, 8769]
+    stat = [{"ypix": np.zeros(n, int), "xpix": np.zeros(n, int)} for n in sizes]
+    kept = [len(s["ypix"]) for s in drop_oversized_cellpose(stat, 4.0)]
+    assert kept == [60, 70, 78, 80, 85, 90, 120, 300]   # cap = 4 x 85 px
+    assert drop_oversized_cellpose(stat, 0) is stat     # 0 = off
+    # All blobs (pure noise): the 30 px nominal disk (707 px) caps at 2.8k.
+    noise = [{"ypix": np.zeros(n, int), "xpix": np.zeros(n, int)}
+             for n in (3000, 3400, 3500, 8000)]
+    assert drop_oversized_cellpose(noise, 4.0, verbose=False) == []

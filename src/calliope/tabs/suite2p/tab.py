@@ -289,6 +289,11 @@ class Suite2pTab(ctk.CTkFrame):
          "default": "cyto2", "group": "Cellpose"},
         {"name": "cellpose_diameter", "label": "diameter (0=auto)",
          "type": "int", "default": 0, "group": "Cellpose"},
+        {"name": "cellpose_max_area_factor",
+         "label": "Max ROI size (x typical cell, 0=off)",
+         "type": "float", "default": 4.0, "group": "Cellpose",
+         "help": "drop Cellpose ROIs bigger than this many times a "
+                 "typical Cellpose cell (blobs on flat/noisy regions)"},
         {"name": "cellpose_flow_threshold", "label": "flow_threshold",
          "type": "float", "default": 0.8, "group": "Cellpose"},
         {"name": "cellpose_cellprob_threshold", "label": "cellprob_threshold",
@@ -1123,6 +1128,8 @@ class Suite2pTab(ctk.CTkFrame):
                 params.get("cellpose_model_type", "cyto2"),
             "cellpose_diameter":
                 params.get("cellpose_diameter", 0),
+            "cellpose_max_area_factor":
+                float(params.get("cellpose_max_area_factor", 4.0)),
             "cellpose_flow_threshold":
                 params.get("cellpose_flow_threshold", 0.8),
             "cellpose_cellprob_threshold":
@@ -1153,6 +1160,8 @@ class Suite2pTab(ctk.CTkFrame):
                 "cellpose_model_type": "cpsam",
                 "cellpose_channel_input": "Vcorr",
                 "cellpose_diameter": params.get("cellpose_diameter", 0),
+                "cellpose_max_area_factor":
+                    float(params.get("cellpose_max_area_factor", 4.0)),
                 "cellpose_flow_threshold": float(
                     params.get("sam_flow_threshold", 0.8)),
                 "cellpose_cellprob_threshold": float(
