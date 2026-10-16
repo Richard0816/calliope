@@ -261,9 +261,12 @@ In-memory only (no new on-disk arrays beyond the summary sheets and optional CSV
 - **EventWindows** sheet (`summary_writer.write_events_sheets`): one row per
   event — `event_id, start_s, end_s, duration_s, n_active_rois`.
 - **EventOnsets** sheet (same writer): long format — one row per in-event
-  onset, `event_id, roi, onset_s, t_relative_s`.
-- **RoiEventTimes** sheet (same writer): wide table, one `roi_<i>` column per
-  ROI listing every onset time (NaN-padded), in or out of an event.
+  onset, `event_id, roi, onset_s, t_relative_s`. `roi` is the **Suite2p ROI
+  id** (the tab passes `kept_idx` as `roi_ids`), the same id as the ROIs and
+  Clusters sheets and every other tab — not the position in Tab 5's kept list.
+- **RoiEventTimes** sheet (same writer): wide table, one `roi_<suite2p id>`
+  column per kept ROI listing every onset time (NaN-padded), in or out of an
+  event.
 - **EventMonotonicity** sheet (`summary_writer.write_event_monotonicity_sheet`):
   one row per event with the directional-monotonicity scalars (§2).
 

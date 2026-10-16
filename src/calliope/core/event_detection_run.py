@@ -561,6 +561,7 @@ def run_event_detection(
             onsets_by_roi=onsets_by_roi,
             fps=fps,
             in_seconds=True,
+            roi_ids=kept_idx,
         )
         # One row per event; ``EventMonotonicity`` sheet stamps the
         # propagation-direction scalars next to the existing

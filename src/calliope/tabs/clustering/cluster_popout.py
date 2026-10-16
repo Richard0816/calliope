@@ -3,15 +3,15 @@
 What it shows
 -------------
 When the user clicks an ROI on Tab 6's spatial cluster map, this
-Toplevel opens with two stacked panels for that ROI's cluster:
+Toplevel opens with three stacked panels for that ROI's cluster:
 
-    [ Filtered lowpass dF/F heatmap, one row per ROI ]
+    [ Filtered dF/F heatmap, one row per ROI ]
+    [ Median dF/F across the cluster's ROIs, 25-75% band shaded ]
     [ Event raster, same row order, one dot per onset ]
 
-Plus a status row that names the cluster and lists its members as
-*filtered-list positions* (columns of Tab 6's dF/F, not Suite2p ROI
-ids -- Tab 6's "ROIs in picked clusters" box shows Suite2p ids). The
-row of the clicked ROI is highlighted with a yellow tick on the y-axis.
+Plus a status row that names the cluster (C1, C2, ... as on Tab 6) and
+lists its members by Suite2p ROI id, the id every tab and the summary
+workbook use. The row of the clicked ROI is highlighted in yellow.
 
 Data sources
 ------------
@@ -126,7 +126,7 @@ class ClusterPopout(ctk.CTkToplevel):
     def __init__(self, master, plane0: Path) -> None:
         super().__init__(master)
         self.title("Cluster heatmap + raster")
-        self.geometry("1300x720")
+        self.geometry("1300x820")
         self.wm_minsize(900, 500)
 
         self._plane0 = Path(plane0)
@@ -140,11 +140,14 @@ class ClusterPopout(ctk.CTkToplevel):
         self._cluster_color: str = "#cccccc"
         self._fps: float = 1.0
         self._event_results: Optional[dict] = None
+        self._roi_ids: Optional[np.ndarray] = None         # Suite2p ids
+        self._cluster_name: str = ""
 
-        self._fig = plt.Figure(figsize=(13, 6.6), tight_layout=True)
-        gs = self._fig.add_gridspec(2, 1, height_ratios=[3, 2])
+        self._fig = plt.Figure(figsize=(13, 7.6), tight_layout=True)
+        gs = self._fig.add_gridspec(3, 1, height_ratios=[3, 1.6, 2])
         self._ax_hm = self._fig.add_subplot(gs[0, 0])
-        self._ax_rs = self._fig.add_subplot(gs[1, 0], sharex=self._ax_hm)
+        self._ax_md = self._fig.add_subplot(gs[1, 0], sharex=self._ax_hm)
+        self._ax_rs = self._fig.add_subplot(gs[2, 0], sharex=self._ax_hm)
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(side="top", fill="both",
                                           expand=True)
@@ -169,7 +172,8 @@ class ClusterPopout(ctk.CTkToplevel):
                      dff: np.ndarray, labels: np.ndarray, stat,
                      cluster_color: str = "#cccccc",
                      fps: float = 1.0,
-                     event_results: Optional[dict] = None) -> None:
+                     event_results: Optional[dict] = None,
+                     roi_ids=None, cluster_name: str = "") -> None:
         """Repaint the popout for the cluster containing ``clicked_idx``.
 
         Parameters
@@ -197,6 +201,12 @@ class ClusterPopout(ctk.CTkToplevel):
             carried a ``"raster"`` aligned with ``dff``; today it never
             does (see ``_slice_state_raster``), so the
             derivative-threshold fallback is shown.
+        roi_ids : sequence of int, optional
+            Suite2p ROI id of each ``dff`` column. Labels, the title and
+            the member list use these; without them they fall back to
+            column positions (marked "pos").
+        cluster_name : str
+            The cluster as Tab 6 names it ("C2"); default: the raw label.
         """
         self._dff = np.asarray(dff)
         self._labels = np.asarray(labels)
@@ -206,6 +216,10 @@ class ClusterPopout(ctk.CTkToplevel):
         self._cluster_color = str(cluster_color or "#cccccc")
         self._fps = float(fps) if fps and fps > 0 else 1.0
         self._event_results = event_results
+        self._roi_ids = (np.asarray(roi_ids, dtype=int)
+                         if roi_ids is not None
+                         and len(roi_ids) == self._dff.shape[1] else None)
+        self._cluster_name = cluster_name or f"Cluster {self._cluster_label}"
         self._render()
         self.deiconify()
         self.lift()
@@ -223,7 +237,12 @@ class ClusterPopout(ctk.CTkToplevel):
         T = int(self._dff.shape[0])
 
         self._ax_hm.clear()
+        self._ax_md.clear()
         self._ax_rs.clear()
+
+        def sid(i):  # column position -> the id users see everywhere
+            return (int(self._roi_ids[i]) if self._roi_ids is not None
+                    else f"pos {int(i)}")
 
         if n_in == 0:
             self._ax_hm.text(0.5, 0.5,
@@ -248,12 +267,34 @@ class ClusterPopout(ctk.CTkToplevel):
                     float(time_axis[-1]) if T else 1.0,
                     n_in - 0.5, -0.5),
             cmap="magma")
-        self._ax_hm.set_ylabel("ROI (within cluster)")
+        # Label rows with Suite2p ids (every row up to 40, else ~40 evenly
+        # spaced rows) so the axis never shows bare row numbers.
+        rows = np.arange(0, n_in, max(1, int(np.ceil(n_in / 40))))
+        for ax in (self._ax_hm, self._ax_rs):
+            ax.set_ylabel("Suite2p ROI" if self._roi_ids is not None
+                          else "ROI (column position)")
+            ax.set_yticks(rows)
+            ax.set_yticklabels([str(sid(cluster_idxs[r])) for r in rows],
+                               fontsize=6)
         title_rgba = to_rgba(self._cluster_color, alpha=0.25)
         self._ax_hm.set_title(
-            f"Cluster {self._cluster_label}    n = {n_in}    "
-            f"clicked ROI position {self._highlight_idx}",
+            f"{self._cluster_name}    n = {n_in}    "
+            f"clicked ROI {sid(self._highlight_idx)}",
             backgroundcolor=title_rgba)
+        self._ax_hm.tick_params(labelbottom=False)
+
+        # -- Median dF/F across the cluster -----------------------------
+        q25, med, q75 = np.percentile(cluster_dff, [25, 50, 75], axis=0)
+        self._ax_md.fill_between(time_axis, q25, q75,
+                                 color=self._cluster_color, alpha=0.3,
+                                 linewidth=0, label="25-75%")
+        self._ax_md.plot(time_axis, med, color="black", linewidth=0.8,
+                         label="median")
+        self._ax_md.set_ylabel("dF/F")
+        self._ax_md.set_title(f"Median dF/F across {n_in} ROIs",
+                              fontsize=9)
+        self._ax_md.legend(loc="upper right", fontsize=7, frameon=False)
+        self._ax_md.tick_params(labelbottom=False)
         # Yellow tick + row outline for the clicked ROI.
         if self._highlight_idx is not None:
             try:
@@ -290,7 +331,6 @@ class ClusterPopout(ctk.CTkToplevel):
             except (IndexError, ValueError):
                 pass
         self._ax_rs.set_xlabel("Time (s)" if self._fps != 1.0 else "Frame")
-        self._ax_rs.set_ylabel("ROI (within cluster)")
         self._ax_rs.set_title(f"Event raster ({raster_src})")
 
         self._fig.tight_layout()
@@ -298,13 +338,13 @@ class ClusterPopout(ctk.CTkToplevel):
 
         # Status: cluster summary + the cluster's filtered-position
         # roster, capped so a giant cluster doesn't blow up the label.
-        roster = ", ".join(str(int(i)) for i in cluster_idxs[:30])
+        roster = ", ".join(str(sid(i)) for i in cluster_idxs[:30])
         if cluster_idxs.size > 30:
             roster += f", ... (+{cluster_idxs.size - 30})"
         self._status_var.set(
-            f"Cluster {self._cluster_label}  n={n_in}  "
-            f"clicked={self._highlight_idx}  "
-            f"raster={raster_src}    members: {roster}")
+            f"{self._cluster_name}  n={n_in}  "
+            f"clicked ROI {sid(self._highlight_idx)}  "
+            f"raster={raster_src}    Suite2p ROIs: {roster}")
 
     # -- Close --------------------------------------------------------------
 

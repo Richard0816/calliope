@@ -5,7 +5,7 @@
 - `max_corr` — Pearson r at that lag.
 - `zero_lag_corr` — Pearson r at lag 0.
 
-Two modes: **full recording** and **per event** (cropped to each window from Tab 5). Plus a **violin plot** summarising every pair's distribution and a **single-pair preview** for inspecting individual cell pairs.
+Two modes: **full recording** and **per event** (cropped to each window from Tab 5). Plus a **violin plot** summarising every pair's distribution and a **single-pair preview** for inspecting individual cell pairs. The preview's ROI A / ROI B boxes take **Suite2p ROI ids** (as shown everywhere else); an id the cell filter rejected is refused with a message.
 
 ---
 

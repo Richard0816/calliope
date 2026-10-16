@@ -302,8 +302,14 @@ def write_events_sheets(
     fps: Optional[float] = None,
     in_seconds: bool = True,
     filename: str = DEFAULT_FILENAME,
+    roi_ids: Optional[Sequence[int]] = None,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
+
+    ``roi_ids[i]`` is the Suite2p ROI id of ``onsets_by_roi[i]`` (Tab 5's
+    ``kept_idx``). Every ``roi`` value written is that Suite2p id, so the
+    sheets line up with the ROIs / Clusters sheets and every other tab;
+    omitting it falls back to list positions (bare callers, tests).
 
     EventWindows:  event_id, start_s, end_s, duration_s, n_active_rois
     EventOnsets:   event_id, roi, onset_s, t_relative_s  (only onsets that
@@ -326,6 +332,12 @@ def write_events_sheets(
         event_windows = [(float(s), float(e)) for s, e in event_windows]
 
     onsets_by_roi = [np.asarray(x, dtype=float) for x in onsets_by_roi]
+    if roi_ids is None:
+        roi_ids = range(len(onsets_by_roi))
+    roi_ids = [int(r) for r in roi_ids]
+    if len(roi_ids) != len(onsets_by_roi):
+        raise ValueError(f"roi_ids has {len(roi_ids)} entries for "
+                         f"{len(onsets_by_roi)} ROIs")
 
     win_rows = []
     onset_rows = []
@@ -341,7 +353,7 @@ def write_events_sheets(
             for t in onsets[mask]:
                 onset_rows.append({
                     "event_id": ev_id,
-                    "roi": roi,
+                    "roi": roi_ids[roi],
                     "onset_s": float(t),
                     "t_relative_s": float(t) - s,
                 })
@@ -362,7 +374,7 @@ def write_events_sheets(
         padded = np.full(max_len, np.nan, dtype=float)
         if arr.size:
             padded[:arr.size] = arr
-        roi_event_times[f"roi_{roi}"] = padded
+        roi_event_times[f"roi_{roi_ids[roi]}"] = padded
     roi_event_times_df = pd.DataFrame(roi_event_times)
 
     return write_sheets(

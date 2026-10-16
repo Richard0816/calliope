@@ -266,11 +266,12 @@ Tab 6 has **no PARAM_SPEC / Advanced dialog** — every tunable is an inline Tk-
 Module: `tabs/clustering/cluster_popout.py`. Single-instance per plane0 — clicking a different ROI swaps focus on the existing window.
 
 Stacked panels:
-1. **Heatmap** of filtered lowpass dF/F restricted to that ROI's cluster (`(n_in_cluster, T)`, per-row min-max normalised, `magma` colormap). The cluster's colour from the spatial map tints the title background so the popout reads at a glance.
-2. **Event raster** for the same rows. In the GUI this is the `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout: the live `AppState.event_results` payload published by Tab 5 does **not** carry a precomputed `'raster'` (only the headless event-detection runner emits one), so the `event_results['raster']` branch is forward-compatible scaffolding that activates only if a future payload supplies a column-matched raster (and its row-alignment to the filtered stat list is established). Whether to build a real onset raster from `event_results['onsets_by_roi']` is an open owner decision.
-3. **Status row** lists the cluster's members as *filtered-list positions* (dF/F columns), not Suite2p ids — use the tab's "ROIs in picked clusters (Suite2p ids)" box for ids.
+1. **Heatmap** of filtered lowpass dF/F restricted to that ROI's cluster (`(n_in_cluster, T)`, per-row min-max normalised, `magma` colormap). Rows are labelled with Suite2p ROI ids (every row up to 40, else ~40 evenly spaced). The title names the cluster as Tab 6 does (C1, C2, ...) and the clicked ROI by Suite2p id; the cluster's colour tints the title background.
+2. **Median dF/F** across the cluster's ROIs (not normalised), with the 25-75% range shaded in the cluster colour.
+3. **Event raster** for the same rows. In the GUI this is the `|d/dt| ≥ k·MAD` derivative-threshold raster computed in-popout: the live `AppState.event_results` payload published by Tab 5 does **not** carry a precomputed `'raster'` (only the headless event-detection runner emits one), so the `event_results['raster']` branch is forward-compatible scaffolding that activates only if a future payload supplies a column-matched raster (and its row-alignment to the filtered stat list is established). Whether to build a real onset raster from `event_results['onsets_by_roi']` is an open owner decision.
+4. **Status row** lists the cluster's members by **Suite2p ROI id** (capped at 30 + overflow count). Ids come from the ids the linkage was built on (`_linkage_ids_current`); if the kept ROIs changed since clustering ran, labels fall back to column positions marked `pos`.
 
-Both panels share the time axis (seconds, using the resolved frame rate — Tab 3's FPS override, else the default fallback) and draw a yellow row marker for the clicked ROI's position within the cluster. The status bar lists the cluster's filtered-position roster (capped at 30 + overflow count).
+All panels share the time axis (seconds, using the resolved frame rate — Tab 3's FPS override, else the default fallback); the heatmap and raster draw a yellow row marker for the clicked ROI.
 
 The popout reuses Tab 6's already-loaded `_dff` and `_stat`, so no extra disk reads happen on click.
 
@@ -324,5 +325,5 @@ Tab 6 inherits the global customtkinter dark theme from `pipeline_gui`.
 - **Popouts.**
   - **Per-cluster colors** (`CustomColorDialog`) — opens from "Per-cluster colors..." in the bottom controls; non-resizable color-picker dialog with one swatch button per cluster.
   - **Recluster (new window)** (`ReclusterWindow`) — opens from the recluster row; resizable Toplevel hosting a sub-dendrogram + sub-spatial map plus its own slider. Read-only.
-  - **Cluster heatmap + raster** (`ClusterPopout`) — opens on click of an ROI in the spatial map; resizable Toplevel showing the heatmap + raster for that ROI's cluster.
+  - **Cluster heatmap + raster** (`ClusterPopout`) — opens on click of an ROI in the spatial map; resizable Toplevel showing the heatmap, the cluster's median dF/F and the raster for that ROI's cluster, labelled by Suite2p ROI id.
 - All matplotlib toolbars route through `gui_common.attach_fig_toolbar` and pick up the dark restyle automatically.

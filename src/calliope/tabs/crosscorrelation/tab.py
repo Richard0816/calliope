@@ -877,11 +877,11 @@ class CrossCorrelationTab(ctk.CTkFrame):
 
         ctrl = ctk.CTkFrame(sp_frame, fg_color="transparent")
         ctrl.pack(fill="x", padx=6, pady=(0, 4))
-        ctk.CTkLabel(ctrl, text="ROI A:").pack(side="left")
+        ctk.CTkLabel(ctrl, text="ROI A (Suite2p id):").pack(side="left")
         self.sp_roiA_var = tk.StringVar(value="0")
         ctk.CTkEntry(ctrl, textvariable=self.sp_roiA_var, width=70).pack(
             side="left", padx=(2, 8))
-        ctk.CTkLabel(ctrl, text="ROI B:").pack(side="left")
+        ctk.CTkLabel(ctrl, text="ROI B (Suite2p id):").pack(side="left")
         self.sp_roiB_var = tk.StringVar(value="1")
         ctk.CTkEntry(ctrl, textvariable=self.sp_roiB_var, width=70).pack(
             side="left", padx=(2, 8))
@@ -946,18 +946,35 @@ class CrossCorrelationTab(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("dF/F unavailable", str(e))
             return
-        # Parse ROI indices
+        # The boxes take Suite2p ROI ids (as every other tab shows them);
+        # translate to columns of the filtered dF/F.
         try:
-            iA = int(self.sp_roiA_var.get())
-            iB = int(self.sp_roiB_var.get())
+            sA = int(self.sp_roiA_var.get())
+            sB = int(self.sp_roiB_var.get())
         except ValueError:
             messagebox.showerror(
-                "Bad ROI index", "ROI A and ROI B must be integers.")
+                "Bad ROI id", "ROI A and ROI B must be Suite2p ROI ids.")
             return
-        if not (0 <= iA < N and 0 <= iB < N):
+        try:
+            from ...core.utils import resolve_filtered_mask
+            n_total = int(np.load(self._plane0 / "F.npy", mmap_mode="r").shape[0])
+            if N == n_total:  # an unfiltered prefix: column == Suite2p id
+                col_of = {i: i for i in range(N)}
+            else:
+                mask, _n = resolve_filtered_mask(self._plane0, n_total)
+                col_of = {int(s): c
+                          for c, s in enumerate(np.flatnonzero(mask))}
+        except Exception as e:
+            messagebox.showerror("ROI ids unavailable", str(e))
+            return
+        missing = [s for s in (sA, sB) if s not in col_of]
+        if missing:
             messagebox.showerror(
-                "Out of range", f"ROI indices must be in [0, {N - 1}].")
+                "ROI not kept",
+                f"Suite2p ROI {', '.join(map(str, missing))} is not in the "
+                f"filtered dF/F (rejected by the cell filter, or out of range).")
             return
+        iA, iB = col_of[sA], col_of[sB]
         try:
             max_lag = float(self.sp_lag_var.get())
         except ValueError:
@@ -1011,7 +1028,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         if not np.any(np.isfinite(r)) or np.allclose(r, 0.0):
             messagebox.showinfo(
                 "Flat trace",
-                f"ROI {iA} or ROI {iB} is constant over this window; "
+                f"ROI {sA} or ROI {sB} is constant over this window; "
                 "cross-correlation is undefined.")
             self._sp_placeholder(
                 "Cross-correlation undefined (a selected ROI is "
@@ -1048,7 +1065,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         ax.set_ylabel("Pearson r on filtered dF/F\n"
                       "(indicator kinetics blur peak; lag resolution\n"
                       "is indicator- not frame-rate-limited)")
-        ax.set_title(f"ROI {iA}  vs  ROI {iB}  -  {ev_title}",
+        ax.set_title(f"ROI {sA}  vs  ROI {sB}  -  {ev_title}",
                      fontsize=10)
         ax.legend(fontsize=8, loc="best", frameon=True)
         ax.grid(True, alpha=0.3)

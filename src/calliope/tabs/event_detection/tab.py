@@ -941,6 +941,7 @@ class EventDetectionTab(ctk.CTkFrame):
             onsets_by_roi=data.get("onsets_by_roi") or [],
             fps=data.get("fps"),
             in_seconds=True,
+            roi_ids=data.get("kept_idx"),
         )
         # Stamp the EventMonotonicity sheet from the per-event
         # Spearman scalars ``run_event_detection`` already computed

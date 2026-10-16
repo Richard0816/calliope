@@ -970,12 +970,16 @@ class ClusteringTab(ctk.CTkFrame):
                 messagebox.showerror("Cluster popout failed", str(e))
                 return
             self._cluster_popout = popout
+        vid = next((v for v, lbl in self._visual_to_label.items()
+                    if int(lbl) == cluster_label), None)
         popout.show_cluster(
             clicked_idx=clicked_idx,
             cluster_label=cluster_label,
             dff=self._dff, labels=labels, stat=self._stat,
             cluster_color=cluster_color, fps=fps,
             event_results=event_results,
+            roi_ids=self._linkage_ids_current(),
+            cluster_name=f"C{vid}" if vid is not None else "",
         )
 
     def _on_custom_colors(self) -> None:
