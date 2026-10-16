@@ -66,7 +66,8 @@ from ...core.detection_run import archive_recording_post_detection
 from .logic import (
     BATCH_JSON_NAME, BATCH_REPORT_NAME,
     SINGLE_DRIVE_FINALIZE_RATE_BYTES_PER_SEC, TIFF_GLOBS,
-    build_batch_param_spec, is_scratch_owned, mark_scratch_owned,
+    build_batch_param_spec, group_multipart_tiffs, is_scratch_owned,
+    mark_scratch_owned,
     measure_tree, mirror_sync_pass, prune_scratch_tree,
     scratch_root_problem, synchronous_final_sweep,
 )
@@ -535,6 +536,11 @@ class BatchTab(ctk.CTkFrame):
                     textvariable=self.depth_var).pack(side="left")
         ctk.CTkButton(row, text="Scan", width=80,
                       command=self._on_scan).pack(side="left", padx=(8, 0))
+        # Untick (and re-scan) to get one row per file again.
+        self.group_parts_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(row, text="Group multi-part files",
+                        variable=self.group_parts_var).pack(
+            side="left", padx=(8, 0))
 
         row = ctk.CTkFrame(top, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=2)
@@ -877,13 +883,13 @@ class BatchTab(ctk.CTkFrame):
 
     def _on_scan(self) -> None:
         """Walk the working directory up to ``depth`` levels and add
-        one row per TIFF file.
+        one row per recording.
 
-        Each ``.tif`` / ``.tiff`` becomes its own queue row keyed by
-        the file's stem (filename without extension). When a folder
-        holds multiple TIFFs, each one gets its own row -- the user
-        can still combine them into a grouped recording afterwards
-        via "Merge selected" if they're actually a multi-file series.
+        With "Group multi-part files" ticked, unambiguous multi-part
+        names (see :func:`logic.group_multipart_tiffs`) become one
+        grouped row; every other ``.tif`` / ``.tiff`` gets its own row
+        keyed by its stem. Other multi-file series can still be combined
+        via "Merge selected".
 
         Identifier collisions (two TIFFs with the same stem under
         different folders) are disambiguated by appending the
@@ -922,23 +928,31 @@ class BatchTab(ctk.CTkFrame):
                 f"at depth {depth}.")
             return
 
-        # Build identifiers from each file's stem, disambiguating
-        # collisions with a parent-folder suffix. Sort by resolved
+        # One row per recording: multi-part files (ScanImage
+        # "<acq>_NNNNN_NNNNN", "<name>_partNNN") grouped when the box is
+        # ticked (UX audit finding 13), else one row per file. Identifiers
+        # that collide across folders get a parent-folder suffix so two
+        # rows never write into the same <output>/<ident>/. Sorted by
         # path so the queue order is reproducible.
         tiff_paths.sort()
-        stem_counts: dict[str, int] = {}
-        for t in tiff_paths:
-            stem_counts[t.stem] = stem_counts.get(t.stem, 0) + 1
-        for t in tiff_paths:
-            stem = t.stem
-            if stem_counts[stem] > 1:
-                ident = f"{stem}__{t.parent.name}"
-            else:
-                ident = stem
-            self.add_row(identifier=ident, tiffs=[str(t)])
+        if self.group_parts_var.get():
+            recs = group_multipart_tiffs(tiff_paths)
+        else:
+            recs = [(t.stem, [t]) for t in tiff_paths]
+        id_counts: dict[str, int] = {}
+        for ident, _parts in recs:
+            id_counts[ident] = id_counts.get(ident, 0) + 1
+        for ident, parts in recs:
+            if id_counts[ident] > 1:
+                ident = f"{ident}__{parts[0].parent.name}"
+            self.add_row(identifier=ident, tiffs=[str(t) for t in parts])
+        n_grouped = sum(1 for _i, parts in recs if len(parts) > 1)
         self._log(
-            f"Scan: added {len(tiff_paths)} rows "
-            f"(one per TIFF) from {root_path}")
+            f"Scan: added {len(recs)} rows from {len(tiff_paths)} TIFFs "
+            f"under {root_path}"
+            + (f" ({n_grouped} multi-part recording(s) grouped; untick "
+               f"'Group multi-part files' and re-scan to split)"
+               if n_grouped else ""))
 
     @staticmethod
     def _walk_to_depth(root: Path, depth: int):
@@ -2349,7 +2363,9 @@ class BatchTab(ctk.CTkFrame):
                 f"  [detection] ROI-count check failed ({e}); "
                 f"continuing to lowpass."))
 
-    def _skip_row_no_rois(self) -> None:
+    def _skip_row_no_rois(
+            self, reason: str = "0 ROIs survive the cell filter -- "
+                                "recording is noise") -> None:
         """Finish the current row when detection found no ROIs (the
         recording is noise): mark every stage after detection as skipped
         and hand off to ``_on_row_done``.
@@ -2360,8 +2376,8 @@ class BatchTab(ctk.CTkFrame):
         ``"no_rois"`` status set here survives into the batch report.
         """
         self._append_log(
-            "  [detection] 0 ROIs survive the cell filter -- recording is "
-            "noise. Skipping lowpass + downstream analysis.")
+            f"  [detection] {reason}. Skipping lowpass + downstream "
+            f"analysis.")
         try:
             start = self.STAGES.index("detection") + 1
         except ValueError:
@@ -2570,6 +2586,17 @@ class BatchTab(ctk.CTkFrame):
         t.start()
 
     def _fail_stage(self, stage: str, exc: BaseException) -> None:
+        # Neither detector found an ROI: the recording is noise, which is
+        # a result (no_rois), not a failure (UX audit finding 12).
+        if stage == "detection" and "NoRoisDetected" in str(exc):
+            self._row_results["stages"][stage] = {
+                "status": "no_rois",
+                "duration_s": time.time() - self._stage_t0,
+                "error": None,
+            }
+            self._skip_row_no_rois(
+                "Sparsery and Cellpose found no ROIs -- recording is noise")
+            return
         # RAM out-of-memory auto-retry: re-run the whole recording with
         # conservative resources before giving up (RAM only -- disk-full
         # isn't fixable by smaller batches, so it falls through to failure).
@@ -2700,9 +2727,11 @@ class BatchTab(ctk.CTkFrame):
             self._current_row.set_status(f"{status} (transferring)")
         else:
             self._current_row.set_status(status)
+        why = self._row_results.get("error") if status != "ok" else None
         self._append_log(
             f"--- '{self._current_row.identifier}' "
-            f"{status} in {elapsed:.1f}s ---")
+            f"{status} in {elapsed:.1f}s"
+            + (f": {why}" if why else "") + " ---")
         self.after(0, self._batch_next_row)
 
     def _start_mirror_for_row(self, ident: str,

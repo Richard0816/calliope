@@ -149,5 +149,7 @@ To reproduce Tab 1 from scratch you need:
 Tab 1 inherits the global customtkinter dark theme from `pipeline_gui`.
 
 - **Resizable panels (drag grips).** Panel 2 (TIFF files listbox) and Panel 5 (Log) each carry a draggable handle below them. Drag down to extend that panel — the scrollable tab body absorbs the extra height. Panels 1 (Working directory), 3 (Output root), and 4 (Run) stay at natural height.
+- **Typed or pasted working dir.** Pressing Enter or leaving the working-directory entry adopts it like Browse (`_use_dir`): fills the TIFF list and the default output root; an unchanged path keeps the current selection. The default output root is `<parent>/data`, except when the TIFFs already sit under a folder named `data`, where it is that folder (no `data/data`).
+- **Status and log.** After a run the log reports the frame rate read from the TIFF metadata (`Frame rate: X Hz (<source>); edit it in Tab 3 if wrong`) or warns that none was found. The status reads "Done - N frames." or "Loaded existing outputs." when reloading without a frame count.
 - **Scroll on hover.** Spinning the wheel anywhere over the TIFF list scrolls the listbox; elsewhere on the tab it scrolls the tab body when content overflows.
 - **No popouts.** TIFF picking is inline in the listbox; the Advanced parameters open in a modal `AdvancedDialog` (resizable; live PARAM_SPEC form).

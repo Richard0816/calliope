@@ -16,6 +16,7 @@ This is the heaviest tab — it kicks off Suite2p, Cellpose, the dF/F computatio
 - `result.shifted_tiff` (and its sibling shifted TIFFs in the same folder) from Tab 1.
 - The in-source **base settings** dict from `calliope.core.calliope_settings` (suite2p registration / detection / extraction overrides on top of suite2p's defaults; the pixel scale is not here — it comes from Tab 3's Pixel-scale params and `core.scale.FOV_UM_REFERENCE`). The user's Advanced parameters and the "Edit suite2p settings..." popout override individual fields at runtime.
 - A **cell-filter checkpoint** (`.pt`) for the trained `CellFilter` model. Ships bundled at `<calliope/data>/cellfilter_best.pt` and is loaded by default. Users can point the Browse... field at their own retrained checkpoint (a successful **Retrain cell filter** in the curation popout selects its new `best.pt` automatically); if the file is missing or unreadable, the third panel falls back to Suite2p's `iscell.npy`.
+- **Frame rate (Hz)** and **µm/px** header fields (mirror `fps_override` / `um_per_pixel`). When a recording loads, they are filled from the raw TIFF metadata (`core/acquisition.py::recording_metadata`, read from the original raw TIFF via the raw-paths sidecar, else any TIFF in the folder) and a source note is shown beside them. Sources: ImageJ `finterval` (s/frame) or `fps` (pixel size from the X-resolution tag when `unit` is microns); ScanImage `SI.hRoiManager.scanVolumeRate` (falling back to `scanFrameRate`) divided by `SI.hScan2D.logAverageFactor`; OME-TIFF `Pixels@TimeIncrement` / `PhysicalSizeX`. A value you type (non-zero) always wins. On Run, `acquisition.fill_from_metadata` fills any remaining 0 and logs `[fps] … from <source>` / `[scale] … µm/px`; with no rate found anywhere (and not in a batch) a confirmation prompt asks whether to run with the 15.08 Hz fallback. Blank or non-positive entries are rejected. When an existing run is opened (Load existing panels, Open run folder), the fields show that run's own frame rate (`ops.npy` `fs`) and µm/px, labelled "from this run".
 - The **per-recording GCaMP variant**, picked from the dropdown in the Tab 3 header. Resolves to the Suite2p deconvolution `tau` (seconds). Default is jGCaMP8m (`tau = 0.25 s`). A **custom τ (s)** entry field sits next to the dropdown: enter a positive number to override the variant τ (for an indicator not in the preset list, or a rig-calibrated value); leave it blank to use the dropdown. The actual τ used is recorded in `ops.npy` and surfaced in the export `manifest.json`.
 
 ---
@@ -102,6 +103,10 @@ never reads — disabling them removes a large transient allocation (which
 could fail on memory-/commit-constrained Windows boxes) without changing
 registration or detection output. Re-enable via the "Edit suite2p
 settings…" popout if you want the regDX/regPC numbers.
+
+**Child process.** Tab 3's heavy pass (registration + Sparsery + Cellpose + extraction, `sparse_plus_cellpose.run`) runs in a spawned child process (`core/offload.py::call_in_child` → `sparse_plus_cellpose.run_offload`), not in the GUI's worker thread. Everything the run prints is streamed back line by line to the console. If the OS kills the child for running out of memory, the GUI survives and raises "Worker process exited unexpectedly (exit code …)" with the hint to lower `batch_size` (and `nbins`) in "Edit suite2p settings…". Live children are terminated at interpreter exit.
+
+**`batch_size` budget.** Auto-pick (`utils.pick_batch_size`) sizes one suite2p working set against `_ram_budget_bytes(fraction, headroom_gib)` = `min(fraction × total − headroom_gib, fraction × available)` (default fraction 0.8, headroom 4 GiB), so RAM already in use by other programs or a previous recording counts. A `batch_size` the user set explicitly (legacy ops file, or "Edit suite2p settings…") always wins; the auto-pick is skipped and the console logs `[batch_size] using user-set batch_size=…`. Three harmless PyTorch UserWarnings (sparse-tensor beta notices, read-only memmap view) are filtered so they don't bury real warnings in the console.
 
 ### Step 1 — `sparse_plus_cellpose.run` (ROI detection)
 
@@ -190,6 +195,10 @@ Vectorises the per-ROI loop on GPU and writes the same `r0p7_dff` memmap. The ro
 
 `gpu_roi_chunk` lets the user split into smaller VRAM chunks if a recording overflows.
 
+**dF/F drift warning.** After the dF/F memmap is written, `detection_run._warn_dff_drift` takes the median over time of each ROI's dF/F in the last 10% of frames, then the median across ROIs; if its absolute value exceeds `DFF_DRIFT_WARN = 0.05` it logs a warning that the baseline isn't following slow drift (photobleaching?) and suggests the rolling-percentile baseline. Warning only; nothing is changed.
+
+**No ROIs.** If the Sparsery + Cellpose merge yields 0 ROIs, `sparse_plus_cellpose` raises `NoRoisDetected` (a `RuntimeError` subclass). Tab 0 treats it as a `no_rois` status rather than a failure (see the batch README). The recording label above the panels reads `Recording: <folder name>` (suffixed "not detected yet" until detection or a reload).
+
 ### Step 3 — Cell-filter CNN (overview)
 
 Suite2p's built-in `iscell.npy` classifier is noisy across recordings — it tends to keep blood vessels, dendritic clutter, and bright-pixel artefacts. The cell filter is an in-house, hand-trained replacement.
@@ -212,6 +221,8 @@ The two embeddings are concatenated (128-d) and passed through a small MLP head 
 If the checkpoint is missing, the tab logs a warning and the third panel falls back to Suite2p's `iscell.npy[:, 0] > 0`.
 
 → See [`core/cellfilter/README.md`](../../core/cellfilter/README.md) for the full architecture, dataset construction, training procedure, and inference details.
+
+**Keep rule ("Keep ROIs by" row in the header).** Which ROIs count as cells is chosen by a *keep rule*: **cell filter** (`prob >= threshold`, default `0.5`) or **Suite2p iscell** (Suite2p's own classifier picks; the size gate still applies). Both are also in Advanced (Cell filter group: `cellfilter_source`, `cellfilter_threshold`) and are batch-row params of the same names. **Apply to this recording** re-applies the rule to the loaded run without re-running the CNN (`detection_run.reapply_keep_rule` rewrites `predicted_cell_mask.npy` from the saved `predicted_cell_prob.npy`, or from `iscell.npy`) and regenerates the filtered dF/F for Tabs 4-8. It **replaces the current kept set, including ROIs promoted by hand** (a confirmation dialog says so), and the stages after Tab 3 need re-running. The readout beside the button reads `kept X/N (P%) · iscell M`; when the cell filter keeps fewer than half of Suite2p's iscell count the readout appends a hint (try a lower prob or the iscell rule) and the log notes it. Useful when the bundled filter rejects most cells on another lab's data.
 
 ### Step 4 — Filtered dF/F
 
@@ -249,6 +260,8 @@ Immediately after the prune, `core.detection_run.archive_recording_post_detectio
 4. **Optionally delete the user's external raw originals** (off by default; opt-in via `delete_external_raw_after_archive`).
 
 If compression fails on any raw, the archive step aborts **before** any deletions so the recording stays in a re-runnable state.
+
+**Batch only.** Only batch runs archive. An interactive Run from Tab 3 forces `archive_post_detection=False`: the raw TIFF, the shifted TIFF and `data.bin` are left in place (the status line reads "tidying up intermediates" instead of "archiving raw data"). The batch sets the key itself on every stage, so a value left behind by a batch cannot leak into a later interactive run.
 
 **Runs in a child process (not the detection thread).** The prune + Zstd-19 compression is slow (minutes on multi-GB raws) and, run on the detection worker *thread*, froze the GUI ("Not Responding") at the end of every run. It now runs in a child process via `core.offload.run_offloaded` calling `core.detection_run.archive_offload` (safe to offload — unlike detection, this step uses no suite2p multiprocessing). The tab draws the panels as soon as detection finishes, then archives in the background with compression progress streamed to the console. **`set_plane0` — the signal Tab 0's batch runner waits on to advance — is published only when the archive completes** (`_on_archive_done`), preserving the previous ordering where a batch row finished only after archiving. Archive failure is logged and still publishes `plane0` (best-effort; it never blocks the pipeline).
 
@@ -382,15 +395,22 @@ that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults in
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
+| `cellpose_enabled` ("Run Cellpose pass") | `True` | Off = Sparsery ROIs only; the Cellpose pass is skipped (`cp_stat = []`) and the console notes it. | Untick on an offline rig with no Cellpose model. |
+| `cellpose_model_path` ("Cellpose model file") | `''` | Local model file passed as `pretrained_model`; blank = cellpose's cached `cpsam`, downloaded (~1.2 GB) from huggingface.co on first use. | Set when the machine can't reach huggingface.co. |
+| `cellpose_max_area_factor` ("Max ROI size (x typical cell, 0=off)") | `4.0` | Cellpose-pass blob cap. Drops Cellpose ROIs larger than this factor times a typical cell area: the smaller of the pass's median ROI area and a disk of the Cellpose diameter (requested, else estimated, else a nominal 30 px when auto) (`suite2p_pipeline.drop_oversized_cellpose`; the console logs how many were dropped). `0` = off. | Cellpose returns large blobs on flat or noisy regions (1-9k px where real cells were ~80 px). The cap is relative, so it adapts to each recording's cell size. Lower = stricter. The size-outlier z gate (§5.2b) still applies after the cell filter. |
 | `cellpose_model_type` | `cyto2` | Selects the Cellpose model (`cyto` / `cyto2` / `nuclei`). | `cyto2` is the right generalist cytoplasm model for somatic GCaMP. **Note:** on Cellpose 4.x the model axis is ignored (only the unified `cpsam` model exists), so this becomes an audit label rather than a live switch. Use `nuclei` only for nuclear-localised indicators. |
 | `cellpose_diameter` | `0` (auto) | Expected cell diameter in pixels; 0 lets Cellpose auto-estimate per-image. | Leave at 0 unless auto-estimation drifts. **Set explicitly** (in px) if you know your soma size and Cellpose is over/under-segmenting — pinning the diameter is the single most effective Cellpose fix. |
 | `cellpose_flow_threshold` | `0.8` | Max allowed flow-field error for a mask to be kept; higher = more permissive. | **Raise toward 1.0** to keep more (possibly malformed) masks; **lower** to reject ragged segmentations. 0.8 is already slightly permissive. |
 | `cellpose_cellprob_threshold` | `-1.0` | Pixel cell-probability cutoff for inclusion in a mask; lower = more inclusive (default Cellpose is 0). | At −1.0 this is deliberately more inclusive than stock Cellpose, so dim cells get masks. **Raise toward 0 or above** if Cellpose is producing bloated/merged blobs; **lower** to grab even fainter cells (the merge step and CNN filter both backstop the extra junk). |
 
-### 5.2b Cell filter (size gate)
+**Model preflight.** Before Run, `suite2p_pipeline.cellpose_model_problem(cfg)` checks the model (skipped when `cellpose_enabled` is off): a set `cellpose_model_path` that doesn't exist is a hard error (cellpose would otherwise silently swap in `cpsam`); an un-downloaded default `cpsam` asks "Download it during this run?" (No cancels). A model-load failure mid-run raises a message explaining the offline/proxy options (copy a `cpsam` file into the model dir, set the model file, or untick the Cellpose pass).
+
+### 5.2b Cell filter (keep rule and size gate)
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
+| `cellfilter_source` ("Keep rule") | `cell filter` | `cell filter` keeps ROIs with CNN prob >= `cellfilter_threshold`; `suite2p iscell` keeps Suite2p's own picks. See the Keep rule paragraph after Step 3. Also a batch-row param. | Switch to `suite2p iscell` when the bundled filter does not suit your data. |
+| `cellfilter_threshold` ("Keep if cell prob >=") | `0.5` | CNN probability cutoff, 0-1 (used by `cell filter` only). Also a batch-row param. | Lower it if the cell filter keeps far fewer ROIs than Suite2p's iscell. |
 | `size_outlier_z` | `4.0` | After the CNN, drop kept ROIs whose robust z of `log(npix)` (median/MAD over kept ROIs) exceeds this. One-sided: only too-big ROIs. Skipped with < 10 kept ROIs. `0` disables. Also in Tab 0 under "2. Detection - Cell filter". | Catches huge sparsery blobs the CNN lets through. At 4.0 an ROI must be roughly 5-6x the median area (depends on spread) to be cut. **Lower (3)** = more aggressive; **0** = opt out. The root fix for blobs is still `spatial_scale` (§5.1); this is the backstop. |
 
 ### 5.3 Merge (Cellpose → Sparsery overlap drop)
@@ -421,7 +441,7 @@ first-N-minutes value are separate Tk vars (§2 Step 2); the knobs here are the
 
 | Setting (`key`) | Default | What it does | What it means to you |
 |---|---|---|---|
-| `fps_override` | `0.0` | Frame rate. **0 = use the 15.08 Hz fallback** (with a one-time warning); a non-zero value sets fps for the dF/F math **and** is passed to `sparse_plus_cellpose.run(fps_override=...)`, so suite2p's `fs` (deconvolution timing) and `ops.npy['fs']`, which Tabs 4-8 read, use it too. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, and (via `ops.npy['fs']`) Tab 4's low-pass cutoff and SG derivative `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
+| `fps_override` | `0.0` | Frame rate. **0 = read it from the TIFF metadata** (ImageJ / ScanImage / OME; see §1), and only if none is found use the 15.08 Hz fallback (with a warning and, outside batch, a confirmation prompt); a non-zero value sets fps for the dF/F math **and** is passed to `sparse_plus_cellpose.run(fps_override=...)`, so suite2p's `fs` (deconvolution timing) and `ops.npy['fs']`, which Tabs 4-8 read, use it too. | **Always set this to your true frame rate.** It scales every time-domain quantity downstream: the rolling-window length (`win_sec × fps`), the first-N-min frame count, and (via `ops.npy['fs']`) Tab 4's low-pass cutoff and SG derivative `delta=1/fps`. A wrong fps silently mis-scales every later tab. |
 | `neuropil_coef` | `0.7` | The `r` in `F_corr = F − r·Fneu`; fraction of the neuropil trace subtracted (Chen et al. 2013). | 0.7 removes ~70% of out-of-focus contamination, the field standard. **Raise** if traces still show obvious neuropil bleed-through (shared slow waves across all cells); **lower** if subtraction is over-correcting bright cells into negative dF/F. Note the on-disk `r0p7_` filename prefix is hardcoded by downstream tools and does **not** change when you change `r` — only the math does. |
 | `perc` | `10` | Baseline percentile of the sliding `percentile_filter` in **rolling** mode. **Ignored in first-N mode** — `first_n_min_df_over_f_1d` always uses the *mean* of the baseline window and accepts `perc` only for call-site symmetry. | The "what counts as baseline" knob for rolling mode. **Lower (e.g. 5)** chases the trough of the trace (good if cells are active most of the time and the 10th pct is still riding events); **raise** for very quiet cells where a low percentile sits in noise. Switch to first-N mode if you want a plain mean baseline instead. |
 | `win_sec` | `45.0` | Rolling-mode only: width (s) of the sliding percentile window for `F0[t]` (`utils.robust_df_over_f_1d`). | **Ignored in first-N mode.** Window must be wider than your longest real event or it will track the event and flatten it. **Shorten** to follow faster baseline drift (bleaching, swelling); **lengthen** if long events are being eaten by the baseline. |

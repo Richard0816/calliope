@@ -61,7 +61,10 @@ Public surface
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import os
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -124,40 +127,54 @@ def write_sheet(
     swallowing it -- silent failure here would corrupt the
     accumulated state of the workbook.
     """
-    path = summary_path(plane0, filename)
-    df = _to_dataframe(data)
-
-    if path.exists():
-        # Append-mode writer keeps the existing workbook contents
-        # and only touches the named sheet.
-        with pd.ExcelWriter(
-            path, engine="openpyxl", mode="a", if_sheet_exists="replace"
-        ) as w:
-            df.to_excel(w, sheet_name=sheet_name, index=False)
-    else:
-        # Fresh workbook -- create parents and write in mode="w".
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
-            df.to_excel(w, sheet_name=sheet_name, index=False)
-    return path
+    return write_sheets(plane0, {sheet_name: data}, filename=filename)
 
 
 def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path:
     """Write multiple sheets in a single workbook open. ``sheets`` maps
     sheet_name -> DataFrame/dict/records."""
     path = summary_path(plane0, filename)
-    if path.exists():
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Tab 5 writes from a background process, so two writers can overlap;
+    # each rewrites the whole file, and the loser's sheets would vanish.
+    with _workbook_lock(path):
+        exists = path.exists()
         with pd.ExcelWriter(
-            path, engine="openpyxl", mode="a", if_sheet_exists="replace"
+            path, engine="openpyxl", mode="a" if exists else "w",
+            **({"if_sheet_exists": "replace"} if exists else {}),
         ) as w:
             for name, data in sheets.items():
                 _to_dataframe(data).to_excel(w, sheet_name=name, index=False)
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
-            for name, data in sheets.items():
-                _to_dataframe(data).to_excel(w, sheet_name=name, index=False)
     return path
+
+
+@contextlib.contextmanager
+def _workbook_lock(path: Path, timeout_s: float = 300.0):
+    """Cross-process exclusive lock on ``<workbook>.lock`` (OS-released if
+    the holder dies, so no stale locks)."""
+    with open(str(path) + ".lock", "a+b") as fh:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} is locked by another writer")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            # flock is released when the file closes.
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +192,7 @@ def update_recording_meta(
     N: Optional[int] = None,
     extra: Optional[dict] = None,
     filename: str = DEFAULT_FILENAME,
+    write: bool = True,
 ) -> Path:
     """Write/update the "Recording" sheet (key/value pairs).
 
@@ -211,6 +229,8 @@ def update_recording_meta(
         for k, v in extra.items():
             rows.append((str(k), v))
     df = pd.DataFrame(rows, columns=["key", "value"])
+    if not write:
+        return df
     return write_sheet(plane0, "Recording", df, filename=filename)
 
 
@@ -303,6 +323,8 @@ def write_events_sheets(
     in_seconds: bool = True,
     filename: str = DEFAULT_FILENAME,
     roi_ids: Optional[Sequence[int]] = None,
+    extra_sheets: Optional[dict] = None,
+    event_classes: Optional[Sequence[str]] = None,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
 
@@ -363,6 +385,8 @@ def write_events_sheets(
             "end_s": e,
             "duration_s": e - s,
             "n_active_rois": active_count,
+            **({"class": event_classes[ev_id]} if event_classes is not None
+               and ev_id < len(event_classes) else {}),
         })
 
     # Wide per-ROI sheet: every onset for every ROI, NaN-padded to a
@@ -383,6 +407,7 @@ def write_events_sheets(
             "EventWindows": win_rows,
             "EventOnsets": onset_rows,
             "RoiEventTimes": roi_event_times_df,
+            **(extra_sheets or {}),
         },
         filename=filename,
     )
@@ -393,6 +418,7 @@ def write_event_monotonicity_sheet(
     monotonicity_rows: Sequence[dict],
     *,
     filename: str = DEFAULT_FILENAME,
+    write: bool = True,
 ) -> Path:
     """Write the "EventMonotonicity" sheet.
 
@@ -435,6 +461,8 @@ def write_event_monotonicity_sheet(
             "u_x": (float(r["u_x"]) if r.get("u_x") is not None else ""),
             "u_y": (float(r["u_y"]) if r.get("u_y") is not None else ""),
         })
+    if not write:
+        return rows
     return write_sheet(plane0, "EventMonotonicity", rows, filename=filename)
 
 

@@ -868,6 +868,10 @@ def load_base_settings(config: Suite2pPipelineConfig):
     db['nchannels'] = 1
     db['nplanes'] = 1
 
+    # batch_size the user set explicitly (legacy ops file or popout edit);
+    # None means auto-pick it from RAM below.
+    user_bs = None
+
     # --- Step 1: optional legacy override file (back-compat) ---
     # Applied BEFORE the popout edits so an explicit per-session edit
     # always wins over a saved file.
@@ -883,14 +887,17 @@ def load_base_settings(config: Suite2pPipelineConfig):
         #       updated_settings.npy) -- deep-merge directly.
         if _looks_like_nested_settings(loaded):
             _deep_merge(settings, loaded)
+            user_bs = get_setting(loaded, 'batch_size')
         else:
             apply_db_overrides(db, loaded)
             apply_settings_overrides(settings, loaded)
+            user_bs = loaded.get('batch_size')
 
     # --- Step 2: optional Tab 3 popout overrides (per-session edits) ---
     settings_override = getattr(config, 'settings_override', None)
     if settings_override:
         _deep_merge(settings, settings_override)
+        user_bs = get_setting(settings_override, 'batch_size', user_bs)
 
     # --- Pipeline-required settings, applied unconditionally.
     # NOTE: preclassify is intentionally NOT forced here -- it is a
@@ -929,9 +936,15 @@ def load_base_settings(config: Suite2pPipelineConfig):
     # Recordings 2..N: scaled by the previous run's observed peak RAM
     # so we converge on ``utils.RAM_TARGET_FRACTION``. Single-shot Tab 3
     # calls just get the initial estimate every time (no feedback loop
-    # because there's no recording 2 to apply it to).
-    set_setting(settings, 'batch_size',
-                utils.get_adaptive_sizer().pick(config.tiff_folder))
+    # because there's no recording 2 to apply it to). A batch_size the user
+    # set explicitly always wins.
+    if user_bs:
+        set_setting(settings, 'batch_size', int(user_bs))
+        print(f"[batch_size] using user-set batch_size={int(user_bs)} "
+              f"(auto-pick skipped)")
+    else:
+        set_setting(settings, 'batch_size',
+                    utils.get_adaptive_sizer().pick(config.tiff_folder))
 
     # --- nbins (legacy nbinned) capped to RAM budget ---
     safe_nbinned = utils.change_nbinned_according_to_free_ram(config.tiff_folder)
@@ -1364,6 +1377,28 @@ def cellpose_sam_available() -> bool:
     return not hasattr(_cp_models, "Cellpose")
 
 
+def cellpose_model_problem(cfg: dict) -> Optional[str]:
+    """Why the Cellpose pass can't start straight away, or ``None``.
+
+    Checked before Run (Tab 3) so a missing model is known up front
+    instead of after registration + Sparsery (UX audit finding 9):
+    a user-set model file that doesn't exist (cellpose would otherwise
+    silently swap in cpsam), or the default cpsam model not downloaded
+    yet (it will download ~1.2 GB from huggingface.co mid-run).
+    """
+    if not cfg.get("cellpose_enabled", True) or not cellpose_sam_available():
+        return None
+    model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
+    if model_path:
+        return (None if Path(model_path).is_file() else
+                f"Cellpose model file not found: {model_path}")
+    if not (Path(_cp_models.MODEL_DIR) / "cpsam").is_file():
+        return (f"The Cellpose model (cpsam, ~1.2 GB) is not downloaded yet; "
+                f"detection will fetch it from huggingface.co into "
+                f"{_cp_models.MODEL_DIR}.")
+    return None
+
+
 def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
     """Convert a cellpose integer label mask into suite2p-style stat dicts.
 
@@ -1408,6 +1443,36 @@ def _cellpose_masks_to_stat(masks: np.ndarray) -> list[dict]:
             'radius': float(np.sqrt(npix / np.pi)),
         })
     return stat
+
+
+# Cellpose 4's unified model works at a nominal 30 px cell diameter; used
+# as the size reference when no diameter was requested or estimated.
+CELLPOSE_NOMINAL_DIAMETER = 30.0
+
+
+def drop_oversized_cellpose(stat: list, factor: float,
+                            diameter=None, verbose: bool = True) -> list:
+    """Drop Cellpose ROIs larger than ``factor`` x a typical cell's area.
+
+    The typical area is the smaller of this pass's median ROI area and a
+    disk of the Cellpose diameter (requested, else estimated, else
+    :data:`CELLPOSE_NOMINAL_DIAMETER`). On flat or noisy regions Cellpose
+    returns large blobs (1-9k px on a real recording where cells were
+    ~80 px; ~3.5k px on pure noise); the relative cut adapts to each
+    recording's cell size, so no per-recording threshold is needed.
+    ``factor <= 0`` disables it.
+    """
+    if not factor or factor <= 0 or not stat:
+        return stat
+    area = np.array([len(s["ypix"]) for s in stat], dtype=float)
+    d = float(diameter) if diameter else CELLPOSE_NOMINAL_DIAMETER
+    cap = factor * min(float(np.median(area)), np.pi * (d / 2.0) ** 2)
+    keep = area <= cap
+    if verbose and not keep.all():
+        print(f"  > cellpose size cap: dropped {int((~keep).sum())} ROIs "
+              f"> {cap:.0f} px ({factor:g} x typical cell); largest "
+              f"{int(area.max())} px")
+    return [s for s, k in zip(stat, keep) if k]
 
 
 def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
@@ -1546,7 +1611,22 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
         # which is how the downstream ``_source`` tag tells the
         # cyto2-on-meanImg pass apart from the sam-on-Vcorr pass even
         # though they share an underlying weight checkpoint.
-        model = _cp_models.CellposeModel(gpu=True)
+        problem = cellpose_model_problem(cfg)
+        if problem and "not found" in problem:
+            raise RuntimeError(problem)
+        model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
+        try:
+            model = (_cp_models.CellposeModel(gpu=True,
+                                              pretrained_model=model_path)
+                     if model_path else _cp_models.CellposeModel(gpu=True))
+        except Exception as e:
+            raise RuntimeError(
+                f"Couldn't load the Cellpose model ({e}). On first use it "
+                f"downloads (~1.2 GB) from huggingface.co into "
+                f"{_cp_models.MODEL_DIR}. If this machine is offline or "
+                f"behind a proxy/firewall, copy a 'cpsam' model file there "
+                f"or set 'Cellpose model file' in Tab 3's Advanced, or "
+                f"untick 'Run Cellpose pass' to use Sparsery only.") from e
         eval_kwargs = dict(
             diameter=diameter,
             flow_threshold=flow_threshold,
@@ -1562,6 +1642,10 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
               f"(est. diameter={diams})")
 
     stat = _cellpose_masks_to_stat(np.asarray(masks))
+    stat = drop_oversized_cellpose(
+        stat, float(cfg.get("cellpose_max_area_factor", 4.0)),
+        diameter or (float(diams) if diams is not None else None),
+        verbose=verbose)
 
     # Persist outputs in a suite2p-like layout so the rest of the
     # pipeline + any downstream audit tools can find them.

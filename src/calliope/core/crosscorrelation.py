@@ -815,11 +815,34 @@ def _save_corr_heatmaps(pair_dir, cA, cB, roisA, roisB,
     return out_png
 
 
+# Clusters smaller than this are left out of pair statistics: a 1-ROI
+# cluster has no within-cluster pairs, and its cross-cluster "pairs" all
+# reuse the same cell (pseudo-replication; UX audit finding 6).
+MIN_XCORR_CLUSTER_SIZE = 2
+
+
+def _xcorr_cluster_names(cluster_rois_s2p: dict) -> list:
+    """Sorted cluster names with at least MIN_XCORR_CLUSTER_SIZE ROIs;
+    logs the ones skipped."""
+    names = sorted(cluster_rois_s2p)
+    small = [n for n in names
+             if len(cluster_rois_s2p[n]) < MIN_XCORR_CLUSTER_SIZE]
+    if small:
+        print(f"[xcorr] skipping cluster(s) with < {MIN_XCORR_CLUSTER_SIZE} "
+              f"ROIs: " + ", ".join(f"{n} ({len(cluster_rois_s2p[n])})"
+                                    for n in small))
+    return [n for n in names if n not in small]
+
+
 def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
                             zero_lag_corr=None, p_value=None,
                             p_value_fdr=None, partial_corr=None,
-                            extra_cols=None):
+                            extra_cols=None, same_cluster=False):
     """Write a CAxCB summary CSV from batched (nA, nB) result matrices.
+
+    same_cluster: the matrices are one cluster against itself, so only
+    the i < j pairs are written -- no self-pairs (r = 1, lag 0) and no
+    mirrored duplicates (UX audit finding 6).
 
     p_value / p_value_fdr (optional): per-pair p-values from
     ``circular_shift_null_pvalues`` and the BH-FDR-corrected version.
@@ -858,6 +881,9 @@ def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
             arr = np.broadcast_to(np.asarray(val), (nA * nB,))
             cols.append(np.asarray(arr))
             header.append(name)
+    if same_cluster:
+        keep = np.triu(np.ones((nA, nB), dtype=bool), k=1).reshape(-1)
+        cols = [c[keep] for c in cols]
 
     fmts = ["%d", "%d", "%.6g", "%.6g"]
     if zero_lag_corr is not None:
@@ -947,7 +973,7 @@ def run_cluster_xcorr_full_fast(
 
     gpu_ok = bool(use_gpu and cp is not None)
 
-    cluster_names = sorted(clusters.keys())
+    cluster_names = _xcorr_cluster_names(cluster_rois_s2p)
 
     # Pre-build per-cluster (T, n_in_cluster) matrices and z-score once.
     cluster_X = {}
@@ -1033,6 +1059,12 @@ def run_cluster_xcorr_full_fast(
                     ZA_pre=cluster_Z[cA], ZB_pre=cluster_Z[cB],
                     n_shuffles=int(n_shuffles), seed=pair_seed,
                 )
+                if cA == cB:
+                    # FDR over the distinct i < j pairs only -- self-pairs
+                    # and mirrored duplicates aren't tests.
+                    iu = np.triu_indices(len(roisA), k=1)
+                    p_val_fdr = np.full_like(p_val, np.nan)
+                    p_val_fdr[iu] = _bh_fdr(p_val[iu])
 
             # Slice the population-wide partial-correlation matrix down
             # to this cluster pair. Map Suite2p ROI ids -> filtered
@@ -1070,7 +1102,7 @@ def run_cluster_xcorr_full_fast(
                 summary_path, roisA, roisB, best_lag, max_c,
                 zero_lag_corr=z0 if (zero_lag or compute_partial) else None,
                 p_value=p_val, p_value_fdr=p_val_fdr,
-                partial_corr=partial_block,
+                partial_corr=partial_block, same_cluster=(cA == cB),
             )
 
             # When partial correlation is requested, also drop a side-by-side
@@ -1155,7 +1187,7 @@ def run_cluster_xcorr_per_event_fast(
     out_root.mkdir(parents=True, exist_ok=True)
 
     gpu_ok = bool(use_gpu and cp is not None)
-    cluster_names = sorted(clusters.keys())
+    cluster_names = _xcorr_cluster_names(cluster_rois_s2p)
 
     total = len(event_windows)
     for ev_idx, (s_sec, e_sec) in enumerate(event_windows):
@@ -1213,6 +1245,7 @@ def run_cluster_xcorr_per_event_fast(
                         ("event_end_sec", float(e_sec)),
                         ("n_frames", int(f1 - f0)),
                     ],
+                    same_cluster=(cA == cB),
                 )
 
         if gpu_ok:
@@ -1294,6 +1327,7 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
     import matplotlib.pyplot as plt
     from ..tabs.crosscorrelation.tab import (
         _get_metric_arrays, _plot_violin, _plot_lag_violin,
+        _roi_level_lag_pvalue,
     )
 
     corr_labels, corr_arrays = _get_metric_arrays(pair_data, "zero_lag_corr")
@@ -1317,6 +1351,8 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
             ax_lag, lag_labels, lag_arrays,
             "Lag at peak correlation (s)",
             f"Per-pair best-lag distribution  ({title_suffix})",
+            pvals=[_roi_level_lag_pvalue(lb, pair_data[lb])
+                   for lb in lag_labels],
         )
     else:
         ax_lag.set_axis_off()

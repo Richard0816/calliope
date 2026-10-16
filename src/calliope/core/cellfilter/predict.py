@@ -73,10 +73,24 @@ def size_outlier_mask(stat, keep, z_thresh: float) -> np.ndarray:
     return out
 
 
+def keep_mask_from_scores(probs, stat, *, threshold: float = C.THRESHOLD,
+                          iscell=None,
+                          size_outlier_z: float = C.SIZE_OUTLIER_Z):
+    """Keep rule: ``probs >= threshold``, or Suite2p's own classifier when
+    ``iscell`` (the ``iscell.npy`` array) is given; the size-outlier gate
+    applies either way. Returns ``(mask, size_outliers)``."""
+    mask = (np.asarray(iscell)[:, 0] > 0 if iscell is not None
+            else np.asarray(probs) >= float(threshold))
+    big = size_outlier_mask(stat, mask, size_outlier_z)
+    return mask & ~big, big
+
+
 @torch.no_grad()                                                  # See model.py
 def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
                       plane0: Path | None = None,
-                      size_outlier_z: float = C.SIZE_OUTLIER_Z) -> Path:
+                      size_outlier_z: float = C.SIZE_OUTLIER_Z,
+                      threshold: float = C.THRESHOLD,
+                      use_iscell: bool = False) -> Path:
     """Score every ROI in one recording and write the keep-mask.
 
     Parameters
@@ -143,9 +157,11 @@ def predict_recording(rec_id: str, model: CellFilter, device: torch.device,
     # Boolean mask: NumPy treats ``probs >= C.THRESHOLD`` as a
     # vectorised comparison returning a bool array of the same
     # shape.
-    mask = probs >= C.THRESHOLD
-    big = size_outlier_mask(rec.stat, mask, size_outlier_z)
-    mask &= ~big
+    iscell_path = rec.plane0 / "iscell.npy"
+    mask, big = keep_mask_from_scores(
+        probs, rec.stat, threshold=threshold, size_outlier_z=size_outlier_z,
+        iscell=(np.load(iscell_path)
+                if use_iscell and iscell_path.exists() else None))
     np.save(out_mask, mask)
     print(f"{rec_id}: {mask.sum()}/{N} kept "
           f"({int(big.sum())} dropped as size outliers, z>{size_outlier_z})"

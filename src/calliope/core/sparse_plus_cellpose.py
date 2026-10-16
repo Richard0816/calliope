@@ -54,6 +54,8 @@ Standalone use (edit ``TIFF_FOLDER`` / ``SAVE_FOLDER`` below first)::
 from __future__ import annotations
 
 # ``time`` is used for ad-hoc timing prints during long-running steps.
+import contextlib
+import io
 import time
 from pathlib import Path
 
@@ -129,9 +131,16 @@ SPARSERY_OPS = {
 CELLPOSE_CFG = {
     'cellpose_model_type':         'cyto2',
     'cellpose_diameter':           0,      # 0 = auto
+    # Drop ROIs > this x a typical Cellpose cell (blobs); 0 = off.
+    'cellpose_max_area_factor':    4.0,
     'cellpose_flow_threshold':     0.8,
     'cellpose_cellprob_threshold': -1.0,
     'cellpose_channel_input':      'meanImg',
+    # False = Sparsery only (e.g. offline rig with no Cellpose model).
+    'cellpose_enabled':            True,
+    # Local model file; '' = cellpose's cached cpsam (downloaded on
+    # first use from huggingface.co into ~/.cellpose/models).
+    'cellpose_model_path':         '',
 }
 
 # Default ``hard_cap`` for :func:`run`. Not enforced with suite2p 1.0 (see
@@ -141,6 +150,12 @@ HARD_CAP = 60000
 # A cellpose ROI is dropped if this fraction of its pixels is already
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
+
+
+class NoRoisDetected(RuntimeError):
+    """Neither detector found any ROI -- the recording is noise. Batch
+    runners finish the row as ``no_rois`` instead of ``failed`` (matched
+    by class name when the error crosses a process boundary as text)."""
 
 
 # ============================================================================
@@ -441,7 +456,8 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
               f"{len(combined_raw)} total ROIs")
 
     if not combined_raw:
-        raise RuntimeError('merge produced 0 ROIs — nothing to extract')
+        raise NoRoisDetected('Sparsery and Cellpose found no ROIs '
+                             '(merge produced 0 ROIs) -- nothing to extract')
 
     # Build the flat ops dict that suite2p's extract.create_masks_and_extract
     # still consumes. Start from the shared-registration's view and overlay
@@ -785,9 +801,15 @@ def run(
         print(f'[s+cp] cellpose pass (meanImg)')
     cp_dir = save_root / 'cellpose_pass'
     t_cp = time.time()
-    cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
-        cp_dir, shared_plane0, cp_cfg, verbose=verbose,
-    )
+    if cp_cfg.get('cellpose_enabled', True):
+        cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
+            cp_dir, shared_plane0, cp_cfg, verbose=verbose,
+        )
+    else:
+        cp_stat = []
+        if verbose:
+            print('[s+cp] cellpose pass skipped (cellpose_enabled=False); '
+                  'Sparsery ROIs only')
     if verbose:
         print(f'[s+cp] cellpose: {len(cp_stat)} ROIs '
               f'({time.time() - t_cp:.1f}s)')
@@ -889,6 +911,41 @@ def run(
         print(f'  stat.npy:  {len(stat_arr)} ROIs')
         print(f'  F/Fneu/spks/iscell saved')
     return final_plane0
+
+
+class _LineCallbackWriter(io.TextIOBase):
+    """stdout/stderr stand-in that hands each complete line to ``cb``."""
+
+    def __init__(self, cb) -> None:
+        self._cb, self._buf = cb, ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            self._cb(line)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._cb(self._buf)
+            self._buf = ""
+
+
+def run_offload(progress_q=None, **kwargs) -> str:
+    """Picklable :func:`calliope.core.offload.call_in_child` target for
+    Tab 3: runs :func:`run` in a child process so an out-of-memory kill
+    takes down the worker, not the GUI. Everything the run prints is
+    streamed back line by line as progress; returns the plane0 path.
+    """
+    from .offload import make_progress_cb
+    cb = make_progress_cb(progress_q) or (lambda _line: None)
+    writer = _LineCallbackWriter(cb)
+    with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+        try:
+            return str(run(**kwargs))
+        finally:
+            writer.flush()
 
 
 # ============================================================================

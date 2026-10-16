@@ -267,12 +267,33 @@ class Suite2pTab(ctk.CTkFrame):
          "type": "float", "default": SIZE_OUTLIER_Z, "group": "Cell filter",
          "help": "drop kept ROIs whose robust z of log(area) exceeds "
                  "this (sparsery blob artifacts); 0 disables"},
+        {"name": "cellfilter_source", "label": "Keep rule",
+         "type": "choice", "choices": ["cell filter", "suite2p iscell"],
+         "default": "cell filter", "group": "Cell filter",
+         "help": "'suite2p iscell' keeps Suite2p's own classifier picks "
+                 "(e.g. when the bundled filter doesn't suit your data)"},
+        {"name": "cellfilter_threshold", "label": "Keep if cell prob >=",
+         "type": "float", "default": 0.5, "group": "Cell filter",
+         "help": "cell-filter probability cutoff (used by 'cell filter')"},
         # Cellpose
+        {"name": "cellpose_enabled", "label": "Run Cellpose pass",
+         "type": "bool", "default": True, "group": "Cellpose",
+         "help": "off = Sparsery ROIs only (e.g. no Cellpose model on an "
+                 "offline rig)"},
+        {"name": "cellpose_model_path", "label": "Cellpose model file",
+         "type": "str", "default": "", "group": "Cellpose",
+         "help": "local model file; blank = cellpose's cpsam, downloaded "
+                 "on first use from huggingface.co"},
         {"name": "cellpose_model_type", "label": "model_type",
          "type": "choice", "choices": ["cyto", "cyto2", "nuclei"],
          "default": "cyto2", "group": "Cellpose"},
         {"name": "cellpose_diameter", "label": "diameter (0=auto)",
          "type": "int", "default": 0, "group": "Cellpose"},
+        {"name": "cellpose_max_area_factor",
+         "label": "Max ROI size (x typical cell, 0=off)",
+         "type": "float", "default": 4.0, "group": "Cellpose",
+         "help": "drop Cellpose ROIs bigger than this many times a "
+                 "typical Cellpose cell (blobs on flat/noisy regions)"},
         {"name": "cellpose_flow_threshold", "label": "flow_threshold",
          "type": "float", "default": 0.8, "group": "Cellpose"},
         {"name": "cellpose_cellprob_threshold", "label": "cellprob_threshold",
@@ -437,6 +458,8 @@ class Suite2pTab(ctk.CTkFrame):
         except (TypeError, ValueError):
             _ct = 0.0
         self.custom_tau_var.set(f"{_ct:g}" if _ct > 0 else "")
+        # Row's frame rate / µm-per-px (0 = read from TIFF metadata).
+        self._acq_fields_from_params()
 
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self)
@@ -514,6 +537,56 @@ class Suite2pTab(ctk.CTkFrame):
                   "the suite2p tau. A custom τ overrides the dropdown."),
             text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
         ).pack(side="left")
+
+        # ---- Acquisition: frame rate + pixel size (UX audit finding 3) ----
+        # Mirrors the fps_override / um_per_pixel params. Filled from the
+        # raw TIFF metadata when a recording loads unless the user typed a
+        # value; blank = unknown (Run then asks before using the fallback).
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(row, text="Frame rate (Hz):", width=110,
+                     anchor="w").pack(side="left")
+        self.fps_var = tk.StringVar(value="")
+        ctk.CTkEntry(row, textvariable=self.fps_var, width=80).pack(
+            side="left", padx=(0, 12))
+        ctk.CTkLabel(row, text="µm/px:", anchor="w").pack(
+            side="left", padx=(0, 4))
+        self.umpx_var = tk.StringVar(value="")
+        ctk.CTkEntry(row, textvariable=self.umpx_var, width=80).pack(
+            side="left", padx=(0, 8))
+        self.acq_src_var = tk.StringVar(value="")
+        ctk.CTkLabel(row, textvariable=self.acq_src_var, text_color="gray",
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
+        # True while the field values came from metadata (not typed), so
+        # the next recording's metadata may replace them.
+        self._acq_from_md = True
+        for _v in (self.fps_var, self.umpx_var):
+            _v.trace_add("write", lambda *_a: setattr(
+                self, "_acq_from_md", False))
+
+        # Keep rule (UX audit finding 8): the bundled filter can reject
+        # most cells on another lab's data; let the user lower the cutoff
+        # or fall back to Suite2p's iscell without curating/retraining.
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(row, text="Keep ROIs by:", width=110,
+                     anchor="w").pack(side="left")
+        self.keep_source_var = tk.StringVar(value="cell filter")
+        ctk.CTkOptionMenu(row, variable=self.keep_source_var,
+                          values=["cell filter", "suite2p iscell"],
+                          width=130).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row, text="prob >=").pack(side="left", padx=(0, 4))
+        self.keep_thr_var = tk.StringVar(value="0.5")
+        ctk.CTkEntry(row, textvariable=self.keep_thr_var, width=60).pack(
+            side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Apply to this recording", width=160,
+                      command=self._on_apply_keep_rule).pack(
+            side="left", padx=(0, 8))
+        self.keep_info_var = tk.StringVar(value="")
+        ctk.CTkLabel(row, textvariable=self.keep_info_var, text_color="gray",
+                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+            side="left")
 
         row = ctk.CTkFrame(header, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=2)
@@ -668,7 +741,23 @@ class Suite2pTab(ctk.CTkFrame):
         if path:
             self.ckpt_var.set(path)
 
+    def _set_acq_fields(self, fps, um_px, source: str) -> None:
+        """Programmatic fill of the frame-rate / µm-per-px fields."""
+        self.fps_var.set(f"{float(fps):g}" if fps else "")
+        self.umpx_var.set(f"{float(um_px):g}" if um_px else "")
+        self.acq_src_var.set(source)
+        self._acq_from_md = True
+
     def _on_preprocess_result(self, result: PreprocessResult) -> None:
+        if self._acq_from_md or not self.fps_var.get().strip():
+            from ...core import acquisition
+            md = acquisition.recording_metadata(result.out_dir)
+            self._set_acq_fields(
+                md.get("fps"), md.get("um_per_px"),
+                f"from {md['source']}" if md.get("fps") else
+                "frame rate not in the TIFF metadata - enter it")
+        self.recording_var.set(
+            f"Recording: {result.out_dir.name} (not detected yet)")
         self.run_btn.configure(state="normal")
         existing = candidate_plane0(result)
         if existing is not None and plane0_has_outputs(existing):
@@ -714,9 +803,100 @@ class Suite2pTab(ctk.CTkFrame):
         except Exception as e:
             self._append_log(f"[GUI] plane0 publish error: {e}")
 
+    def _acq_fields_to_params(self) -> Optional[str]:
+        """Copy the frame-rate / µm-per-px fields into ``_params`` (blank
+        -> 0 = unset). Returns an error message for a bad entry."""
+        for var, key, label in ((self.fps_var, "fps_override", "Frame rate"),
+                                (self.umpx_var, "um_per_pixel", "µm/px")):
+            raw = var.get().strip()
+            try:
+                val = float(raw) if raw else 0.0
+                if val < 0:
+                    raise ValueError
+            except ValueError:
+                return f"{label} must be a positive number (got {raw!r})."
+            self._params[key] = val
+        raw = self.keep_thr_var.get().strip()
+        try:
+            thr = float(raw)
+            if not 0.0 <= thr <= 1.0:
+                raise ValueError
+        except ValueError:
+            return f"Cell prob threshold must be between 0 and 1 (got {raw!r})."
+        self._params["cellfilter_threshold"] = thr
+        self._params["cellfilter_source"] = self.keep_source_var.get()
+        return None
+
+    def _acq_fields_from_params(self) -> None:
+        """Show ``_params``' frame rate / µm-per-px in the fields; a set
+        (non-zero) value counts as typed, so metadata won't replace it."""
+        fps = float(self._params.get("fps_override", 0) or 0)
+        um = float(self._params.get("um_per_pixel", 0) or 0)
+        self._set_acq_fields(fps, um, "set by you" if fps or um else "")
+        self._acq_from_md = not (fps or um)
+        self.keep_thr_var.set(
+            f"{float(self._params.get('cellfilter_threshold', 0.5)):g}")
+        self.keep_source_var.set(
+            self._params.get("cellfilter_source", "cell filter"))
+
+    def _update_keep_info(self, plane0: Path, keep: np.ndarray) -> None:
+        """'kept 46/138 (33%) · Suite2p iscell 113', with a warning when the
+        cell filter keeps far fewer than Suite2p's own classifier."""
+        kept, total = int(keep.sum()), int(keep.size)
+        text = f"kept {kept}/{total} ({100 * kept / max(total, 1):.0f}%)"
+        try:
+            n_is = int((np.load(plane0 / "iscell.npy")[:, 0] > 0).sum())
+        except Exception:
+            n_is = None
+        if n_is is not None:
+            text += f" · iscell {n_is}"
+            if kept < 0.5 * n_is:
+                text += " - low: try a lower prob or 'suite2p iscell'"
+                self._append_log(
+                    f"[GUI] Cell filter kept {kept} ROIs, under half of "
+                    f"Suite2p's iscell ({n_is}); try a lower prob or "
+                    f"the 'suite2p iscell' keep rule.")
+        self.keep_info_var.set(text + " ")  # Tk clips the last italic glyph
+
+    def _on_apply_keep_rule(self) -> None:
+        """Re-apply the keep rule to the loaded recording (no CNN re-run)
+        and regenerate the filtered dF/F for Tabs 4-8."""
+        c = self._panel_cache
+        if c is None:
+            messagebox.showinfo("No recording", "Run or load detection first.")
+            return
+        plane0 = Path(c["plane0"])
+        err = self._acq_fields_to_params()
+        if err:
+            messagebox.showerror("Invalid setting", err)
+            return
+        if not messagebox.askyesno(
+                "Apply keep rule",
+                "This replaces the current kept-ROI set (including any "
+                "ROIs you promoted by hand) and regenerates the filtered "
+                "dF/F. Stages after Tab 3 need re-running. Continue?"):
+            return
+        from ...core import detection_run
+        try:
+            info = detection_run.reapply_keep_rule(
+                plane0, size_outlier_z=float(self._params.get(
+                    "size_outlier_z", SIZE_OUTLIER_Z)),
+                **detection_run.keep_rule_kwargs(self._params))
+        except Exception as e:
+            messagebox.showerror("Keep rule failed", str(e))
+            return
+        self._append_log(f"[GUI] keep rule applied: kept {info['kept']}/"
+                         f"{info['total']}")
+        self._on_iscell_flipped(-1, -1)  # redraw + regenerate filtered dF/F
+        c = self._panel_cache
+        if c is not None:
+            self._update_keep_info(plane0, c["keep"])
+
     def _on_advanced(self) -> None:
+        self._acq_fields_to_params()  # a bad entry is reported on Run
         if open_advanced(self, "Suite2p Detection - Advanced parameters",
                          self.PARAM_SPEC, self._params):
+            self._acq_fields_from_params()
             self._append_log(
                 "[GUI] Advanced parameters updated. Re-run detection "
                 "to apply.")
@@ -774,6 +954,46 @@ class Suite2pTab(ctk.CTkFrame):
             self._append_log(
                 f"[GUI] No cell-filter checkpoint at {ckpt_path}; "
                 "the third panel will fall back to suite2p's iscell.")
+
+        err = self._acq_fields_to_params()
+        if err:
+            messagebox.showerror("Invalid acquisition setting", err)
+            return
+        in_batch = getattr(getattr(self.winfo_toplevel(), "batch_tab", None),
+                           "_batch_active", False)
+        if not in_batch:
+            # A one-off run keeps the raw/shifted TIFFs and data.bin; only
+            # batch archives (UX audit finding 15). The batch sets this
+            # key itself on every stage, so a value it left behind must
+            # not leak into an interactive run.
+            self._params["archive_post_detection"] = False
+        if not self._params.get("fps_override") and not in_batch:
+            from ...core import acquisition
+            from ...core.calliope_settings import DEFAULT_FPS
+            if not acquisition.recording_metadata(
+                    result.out_dir).get("fps") and not messagebox.askyesno(
+                    "Frame rate unknown",
+                    f"No frame rate was found in the TIFF metadata and none "
+                    f"is set.\n\nRun assuming {DEFAULT_FPS:g} Hz? Every event "
+                    f"time and duration will be wrong if your acquisition "
+                    f"rate differs.\n\nChoose No to enter it in 'Frame rate "
+                    f"(Hz)' first."):
+                return
+
+        # Cellpose model preflight (UX audit finding 9): know about a
+        # missing model now, not after registration + Sparsery.
+        from ...core.suite2p_pipeline import cellpose_model_problem
+        problem = cellpose_model_problem(
+            {**spec_defaults(self.PARAM_SPEC), **self._params})
+        if problem and "not found" in problem:
+            messagebox.showerror("Cellpose model", problem)
+            return
+        if problem and not in_batch and not messagebox.askyesno(
+                "Cellpose model download",
+                f"{problem}\n\nDownload it during this run? Choose No to "
+                f"cancel; to run without it, untick 'Run Cellpose pass' "
+                f"in Advanced (Sparsery only)."):
+            return
 
         baseline_mode = self.baseline_var.get()
         baseline_min = 2.0
@@ -890,6 +1110,12 @@ class Suite2pTab(ctk.CTkFrame):
         # PARAM_SPEC defaults fill any key missing from _params, so the
         # spec stays the single source of the GUI's defaults.
         params = {**spec_defaults(Suite2pTab.PARAM_SPEC), **self._params}
+        # Frame rate / pixel size from the raw TIFF metadata when left at 0
+        # (UX audit finding 3); drives suite2p fs, dF/F, z-drift and scale.
+        from ...core import acquisition
+        params = acquisition.fill_from_metadata(
+            params, tiff_folder,
+            log=lambda m: self._log_queue.put(("log", m)))
         sparsery_ops = {
             "high_pass":         params["high_pass"],
             "preclassify":       params["preclassify"],
@@ -904,11 +1130,16 @@ class Suite2pTab(ctk.CTkFrame):
                 params.get("cellpose_model_type", "cyto2"),
             "cellpose_diameter":
                 params.get("cellpose_diameter", 0),
+            "cellpose_max_area_factor":
+                float(params.get("cellpose_max_area_factor", 4.0)),
             "cellpose_flow_threshold":
                 params.get("cellpose_flow_threshold", 0.8),
             "cellpose_cellprob_threshold":
                 params.get("cellpose_cellprob_threshold", -1.0),
             "cellpose_channel_input": "meanImg",
+            "cellpose_enabled": bool(params.get("cellpose_enabled", True)),
+            "cellpose_model_path": str(params.get("cellpose_model_path", "")
+                                       or ""),
         }
         hard_cap = int(params.get("hard_cap", 60000))
         max_overlap = float(params.get("max_overlap", 0.3))
@@ -931,6 +1162,8 @@ class Suite2pTab(ctk.CTkFrame):
                 "cellpose_model_type": "cpsam",
                 "cellpose_channel_input": "Vcorr",
                 "cellpose_diameter": params.get("cellpose_diameter", 0),
+                "cellpose_max_area_factor":
+                    float(params.get("cellpose_max_area_factor", 4.0)),
                 "cellpose_flow_threshold": float(
                     params.get("sam_flow_threshold", 0.8)),
                 "cellpose_cellprob_threshold": float(
@@ -939,9 +1172,13 @@ class Suite2pTab(ctk.CTkFrame):
 
         with contextlib.redirect_stdout(writer), \
                 contextlib.redirect_stderr(writer):
-            print("[GUI] running sparse_plus_cellpose...")
+            print("[GUI] running sparse_plus_cellpose in a child process...")
             from ...core import sparse_plus_cellpose as spc
-            final_plane0 = spc.run(
+            from ...core.offload import call_in_child
+            # Child process, not this thread: registration + detection can
+            # exhaust RAM, and an OS out-of-memory kill must take down the
+            # worker rather than the whole GUI (UX audit finding 1).
+            final_plane0 = Path(call_in_child(spc.run_offload, dict(
                 tiff_folder=str(tiff_folder),
                 save_folder=str(save_folder),
                 # path_to_ops omitted: in-source defaults from
@@ -960,7 +1197,9 @@ class Suite2pTab(ctk.CTkFrame):
                 enable_sam_vcorr_pass=enable_sam,
                 sam_vcorr_cfg=sam_cfg,
                 verbose=True,
-            )
+            ), on_progress=print, died_hint=(
+                "Detection most likely ran out of memory. Lower batch_size "
+                "(and nbins) in 'Edit suite2p settings...' and re-run.")))
             print(f"[GUI] suite2p plane0 -> {final_plane0}")
             self._log_queue.put(("plane0", final_plane0))
 
@@ -978,10 +1217,12 @@ class Suite2pTab(ctk.CTkFrame):
 
             if ckpt_path:
                 print("[GUI] running cell-filter prediction...")
+                from ...core.detection_run import keep_rule_kwargs
                 self._run_cellfilter(
                     final_plane0, ckpt_path, rec_id,
                     size_outlier_z=float(params.get(
-                        "size_outlier_z", SIZE_OUTLIER_Z)))
+                        "size_outlier_z", SIZE_OUTLIER_Z)),
+                    **keep_rule_kwargs(params))
                 print("[GUI] predicted_cell_mask.npy written")
 
             self._run_filtered_dff(final_plane0)
@@ -1180,7 +1421,7 @@ class Suite2pTab(ctk.CTkFrame):
 
     def _run_cellfilter(
         self, plane0: Path, ckpt_path: str, rec_id: str,
-        size_outlier_z: float = SIZE_OUTLIER_Z,
+        size_outlier_z: float = SIZE_OUTLIER_Z, **keep_rule,
     ) -> None:
         """Score every ROI with the cell-filter CNN. Delegates to
         :func:`calliope.core.detection_run.predict_cell_filter` (shared
@@ -1192,7 +1433,8 @@ class Suite2pTab(ctk.CTkFrame):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  device: {device}   ckpt: {ckpt_path}")
         detection_run.predict_cell_filter(
-            plane0, ckpt_path, rec_id, size_outlier_z=size_outlier_z)
+            plane0, ckpt_path, rec_id, size_outlier_z=size_outlier_z,
+            **keep_rule)
 
     # -- Log queue + completion --------------------------------------------
 
@@ -1234,10 +1476,14 @@ class Suite2pTab(ctk.CTkFrame):
             self._finish_detection(plane0)
             return
 
-        self.status_var.set("Detection complete -- archiving raw data "
-                            "(compressing) in the background...")
-        self._append_log("[GUI] archiving raw data in a background "
-                         "process (GUI stays responsive)...")
+        if ctx["params"].get("archive_post_detection", True):
+            self.status_var.set("Detection complete -- archiving raw data "
+                                "(compressing) in the background...")
+            self._append_log("[GUI] archiving raw data in a background "
+                             "process (GUI stays responsive)...")
+        else:
+            self.status_var.set("Detection complete -- tidying up "
+                                "intermediates...")
         from ...core.offload import run_offloaded
         from ...core import detection_run as _dr
         self._archive_job = run_offloaded(
@@ -1339,6 +1585,13 @@ class Suite2pTab(ctk.CTkFrame):
             plane0=plane0, bg_images=bg_images, stat=stat,
             n_total=n_total, keep=keep, probs=probs, ops_view=ops_view,
         )
+        self._update_keep_info(plane0, keep)
+        if self._acq_from_md or not self.fps_var.get().strip():
+            # A loaded run: show the rate / pixel size it was run with
+            # (blank fields read as "unknown" on the next Run).
+            self._set_acq_fields(core_utils.ops_fs(plane0),
+                                 core_utils.load_pix_to_um(plane0),
+                                 "from this run")
         pipe_n = self._pipeline_kept_n(plane0, n_total)
         if pipe_n is not None and pipe_n != int(keep.sum()):
             self._append_log(

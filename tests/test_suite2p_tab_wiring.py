@@ -39,8 +39,12 @@ def _run_pipeline_capture_spc_kwargs(monkeypatch, tmp_path, fps_override):
         raise _StopAfterSpcRun
 
     fake_spc = types.ModuleType("calliope.core.sparse_plus_cellpose")
-    fake_spc.run = fake_run
+    fake_spc.run = fake_spc.run_offload = fake_run
     import calliope.core as core_pkg
+    from calliope.core import offload
+    # Run the detection "child" inline so the stub sees the kwargs.
+    monkeypatch.setattr(offload, "call_in_child",
+                        lambda fn, kwargs, *a, **k: fn(**kwargs))
     monkeypatch.setitem(sys.modules, "calliope.core.sparse_plus_cellpose",
                         fake_spc)
     monkeypatch.setattr(core_pkg, "sparse_plus_cellpose", fake_spc,

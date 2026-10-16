@@ -71,8 +71,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from .logic import summary_writer
 
 from ...gui_common import (
-    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, report_stage_error,
-    open_advanced, spec_defaults,
+    AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, format_roi_indices,
+    report_stage_error, open_advanced, short_roi_label, spec_defaults,
 )
 
 
@@ -258,11 +258,32 @@ class EventDetectionTab(ctk.CTkFrame):
          "group": "Population events - boundaries",
          "help": "force every window to peak +/- max_event_duration_s/2"},
         {"name": "merge_gap_s", "label": "Merge gap (s)",
-         "type": "float", "default": 0.0,
+         "type": "float", "default": 1.0,
          "group": "Population events - boundaries",
-         "help": "legacy overlap-merge gap; currently has NO effect (the "
-                 "merge path was disabled on 2026-05-01 in favour of "
-                 "watershed split) -- kept for compatibility"},
+         "help": "join back-to-back windows whose gap is <= this into one "
+                 "event (a seizure becomes one long event); 0 = off"},
+        {"name": "timing_method", "label": "Within-event timing",
+         "type": "choice", "choices": ["half-max", "first onset"],
+         "default": "half-max", "group": "Population events - timing",
+         "help": "per-ROI activation time inside each event (Tabs 7/8, "
+                 "monotonicity): half-max crossing on lightly filtered "
+                 "dF/F, or the detection onset (more jitter)"},
+        {"name": "timing_cutoff_hz", "label": "Timing filter cutoff (Hz)",
+         "type": "float", "default": 5.0,
+         "group": "Population events - timing",
+         "help": "zero-phase low-pass for the half-max timing; skipped "
+                 "when at or above ~Nyquist"},
+        {"name": "seizure_min_duration_s",
+         "label": "Seizure-like if >= (s)",
+         "type": "float", "default": 5.0,
+         "group": "Population events - classes",
+         "help": "events at least this long are classed 'seizure-like'"},
+        {"name": "population_fraction",
+         "label": "Population burst if ROI fraction >=",
+         "type": "float", "default": 0.5,
+         "group": "Population events - classes",
+         "help": "shorter events where at least this fraction of ROIs "
+                 "fire are 'population burst', else 'local burst'"},
         {"name": "use_gaussian_boundary",
          "label": "Use Gaussian-fit boundary",
          "type": "bool", "default": False,
@@ -289,6 +310,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self.state = state
         self._plane0: Optional[Path] = None
         self._render_queue: queue.Queue = queue.Queue()
+        self._summary_job = None
+        self._after_summary_write = None
         # Heavy detection runs in a child process (see core.offload) so
         # the pure-Python per-ROI hysteresis loop can't hold the GIL and
         # freeze the GUI. ``None`` until the first render.
@@ -318,6 +341,8 @@ class EventDetectionTab(ctk.CTkFrame):
                      "error": self._on_render_error,
                      "status": self._on_render_status,
                      "export_done": self._on_export_done,
+                     "summary_done": self._on_summary_written,
+                     "summary_error": self._on_summary_failed,
                      "export_error": self._on_export_error},
                     poll_ms=self.POLL_MS)
         state.subscribe_plane0(self._on_plane0)
@@ -380,7 +405,8 @@ class EventDetectionTab(ctk.CTkFrame):
         self.status_var = tk.StringVar(
             value="Compute lowpass + derivative on tab 4 first.")
         ctk.CTkLabel(row, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+                     font=ctk.CTkFont(size=11, slant="italic"),
+                     wraplength=380, justify="left").pack(
             side="left")
         ctk.CTkButton(row, text="Advanced...", width=100,
                       command=self._on_advanced).pack(side="right",
@@ -776,10 +802,17 @@ class EventDetectionTab(ctk.CTkFrame):
         N = data["N_kept"]; T = data["T"]
         ds = data["downsample"]; fps = data["fps"]
 
+        # x in seconds, not downsampled bins whose width changes per
+        # recording (UX audit papercut).
+        def _extent(m):
+            return (0.0, m.shape[1] * ds / fps if fps > 0 else m.shape[1],
+                    m.shape[0], 0)
+
         ax = self.hm_ax
         ax.clear(); ax.set_axis_on()
-        ax.imshow(hm, aspect="auto", interpolation="nearest")
-        ax.set_xlabel(f"Time (downsampled bins ~{ds * 1000.0 / fps:.0f} ms)",
+        ax.imshow(hm, aspect="auto", interpolation="nearest",
+                  extent=_extent(hm))
+        ax.set_xlabel(f"Time (s)  [{ds * 1000.0 / fps:.0f} ms bins]",
                       fontsize=8)
         ax.set_ylabel("ROIs (most active at top)", fontsize=8)
         ax.tick_params(labelsize=7)
@@ -787,8 +820,9 @@ class EventDetectionTab(ctk.CTkFrame):
 
         ax = self.er_ax
         ax.clear(); ax.set_axis_on()
-        ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys")
-        ax.set_xlabel(f"Time (downsampled bins ~{ds * 1000.0 / fps:.0f} ms)",
+        ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys",
+                  extent=_extent(rs))
+        ax.set_xlabel(f"Time (s)  [{ds * 1000.0 / fps:.0f} ms bins]",
                       fontsize=8)
         ax.set_ylabel("ROIs (most active at top)", fontsize=8)
         ax.tick_params(labelsize=7)
@@ -802,7 +836,8 @@ class EventDetectionTab(ctk.CTkFrame):
             utils.plot_event_detection(diagnostics, ax=ax)
             ev = data["event_windows"]
             if ev is not None and len(ev) > 0:
-                utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
+                utils.shade_event_windows(ax, ev, color="C1", alpha=0.20,
+                                          classes=data.get("event_class"))
             # Force the time axis to span the full recording so the trace
             # doesn't look cut off when the auto-fit picks up only the
             # smoothed-density extent.
@@ -834,9 +869,19 @@ class EventDetectionTab(ctk.CTkFrame):
 
         n_events = (len(data["event_windows"])
                     if data["event_windows"] is not None else 0)
+        subset = (self._params.get("manual_subset_enabled")
+                  and data.get("kept_idx") is not None)
         self.status_var.set(
             f"Rendered  N_kept={N}  T={T}  fps={fps:.2f}  "
-            f"duration={duration_s:.1f}s  events={n_events}")
+            f"duration={duration_s:.1f}s  events={n_events}"
+            + (f"\nSubset ROIs:{format_roi_indices(sorted(int(i) for i in data['kept_idx']))}"
+               if subset else ""))
+        if subset:
+            for a, c in ((self.hm_ax, self.hm_canvas),
+                         (self.er_ax, self.er_canvas)):
+                a.set_title(f"Subset {short_roi_label(data['kept_idx'])}",
+                            fontsize=8)
+                c.draw_idle()
 
         # Drop the display-only arrays from the cached payload now that
         # they live on the matplotlib figures. ``heatmap`` and ``raster``
@@ -855,10 +900,33 @@ class EventDetectionTab(ctk.CTkFrame):
         if job is None or not job.running():
             self.export_btn.configure(state="normal")
 
-        # Publish to AppState so downstream tabs (e.g. Tab 8 spatial
-        # propagation) can render the same events without re-detecting.
-        # This MUST run before the deferred disk writes below so the
-        # batch runner advances even if the summary write later fails.
+        # The summary workbook write runs in a child process: openpyxl
+        # took ~23 s on a 679-ROI recording and froze the GUI when it ran
+        # here. In a batch, publish only once it has finished, so the next
+        # stage (and the finalize move) never races the write; otherwise
+        # publish now so Tab 8 can render straight away.
+        publish = lambda d=data: self._publish_event_results(d)
+        in_batch = bool(getattr(self.state, "batch_active", False))
+        if not in_batch:
+            publish()
+        if self._plane0 is None:
+            if in_batch:
+                publish()
+            return
+        self._after_summary_write = publish if in_batch else None
+        keys = ("fps", "T", "N_kept", "event_windows", "onsets_by_roi",
+                "event_monotonicity", "event_class", "kept_idx")
+        from ...core.offload import run_offloaded
+        from ...core import event_detection_run as edr
+        self._summary_job = run_offloaded(
+            self, self._render_queue, edr.write_event_summary_offload,
+            args=(str(self._plane0), {k: data.get(k) for k in keys}),
+            done_kind="summary_done", error_kind="summary_error",
+            poll_ms=self.POLL_MS)
+
+    def _publish_event_results(self, data: dict) -> None:
+        """Publish to AppState so downstream tabs (e.g. Tab 8 spatial
+        propagation) render the same events, and the batch runner advances."""
         try:
             self.state.set_event_results({
                 "plane0": self._plane0,
@@ -878,39 +946,25 @@ class EventDetectionTab(ctk.CTkFrame):
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")
 
-        # Defer the slow disk work (openpyxl summary workbook + manifest
-        # merge) to a follow-up tick. Writing the workbook can take a
-        # second or two; running it inline here would freeze the GUI
-        # right after the figures appear. The figures + AppState publish
-        # above have already happened, so the user sees results
-        # immediately and the writes finish in the background.
-        if self._plane0 is not None:
-            self.after(1, lambda p=self._plane0, d=data:
-                       self._finish_render_writes(p, d))
+    def _on_summary_failed(self, payload) -> None:
+        print(f"[GUI] event summary write failed:\n{payload}")
+        self._on_summary_written(None)
 
-    def _finish_render_writes(self, plane0: Path, data: dict) -> None:
-        """Deferred summary-workbook + manifest writes (off the hot path).
-
-        Split out of :meth:`_on_render_done` so the openpyxl / disk work
-        runs on a later ``after`` tick instead of blocking the event
-        loop the moment a render completes.
-        """
-        try:
-            self._write_summary(plane0, data)
-        except Exception as e:
-            print(f"[GUI] event summary write failed: {e}")
-
+    def _on_summary_written(self, payload) -> None:
         # Persist the params used so a future "Open run folder…" reload
         # can restore them instead of recomputing with GUI defaults.
         # Suppressed during a reload's own recompute (writing back the
         # just-loaded params is pointless, and writing defaults when none
         # were found would silently record them as the run's settings).
-        if not self._suppress_manifest_write:
+        if not self._suppress_manifest_write and self._plane0 is not None:
             try:
-                self._write_event_manifest(plane0)
+                self._write_event_manifest(self._plane0)
             except Exception as e:
                 print(f"[GUI] event manifest update failed: {e}")
         self._suppress_manifest_write = False
+        then, self._after_summary_write = self._after_summary_write, None
+        if then is not None:
+            then()
 
     def _write_event_manifest(self, plane0: Path) -> None:
         """Merge the current event-detection params into the run manifest.
@@ -942,6 +996,7 @@ class EventDetectionTab(ctk.CTkFrame):
             fps=data.get("fps"),
             in_seconds=True,
             roi_ids=data.get("kept_idx"),
+            event_classes=data.get("event_class"),
         )
         # Stamp the EventMonotonicity sheet from the per-event
         # Spearman scalars ``run_event_detection`` already computed

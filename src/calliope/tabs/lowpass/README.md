@@ -41,6 +41,8 @@ The "Trace source" radio + entry chooses what to compute the FFT and live previe
 - **Best-scoring ROI**: ROI with the largest `predicted_cell_prob`.
 - **Manual ROI(s)**: user-supplied ROI ids/ranges (e.g. `0,3,5-9`) using `gui_common.parse_manual_roi_spec`. If multiple are given, aggregated by `mean` or `median` (combobox).
 
+A manual subset is shown in the plot titles as the count plus a clipped id list (`n=37: 3-5,9,12,…`) so the title stays inside the figure; the full list is in the wrapping status line.
+
 Manual ids are **always** Suite2p indices into the full `(T, N_total)` `r0p7_dff.memmap.float32`, irrespective of whether they survive the cell-filter mask. Mean/median/best aggregations operate on the kept-only `(T, N_kept)` memmap.
 
 ### Step 2 — FFT power spectrum
@@ -79,7 +81,7 @@ y, zf  = sosfilt(sos, x, zi=zi)                     # one-direction (causal) fil
 Two important choices:
 
 1. **Causal**, not zero-phase. We do **not** use `filtfilt` here because the downstream derivative + onset detection treats the smoothed signal as causal. The deeper reason this is *safe for cross-correlation*: applying the *same* LTI filter to every ROI trace preserves the location of the inter-ROI cross-correlation peak. The filtered-CCG equals the raw-CCG convolved with the autocorrelation of the filter's impulse response, and that autocorrelation is **even (symmetric)** regardless of whether the filter itself is causal. So relative timing between any two ROIs survives identical filtering — only the **absolute** onset time of each ROI is shifted, by roughly half the impulse-response duration (≈ 0.16 s for the default order-2 Butterworth at 1 Hz cutoff and 15 fps). Subtract this constant offset if aligning to external events (stimulus, behavior, etc.).
-   The visualisation overlay uses `utils.lowpass_zero_phase_1d` (`sosfiltfilt`) instead — appropriate only because that path is comparing a single trace against its raw version, not computing CCGs.
+   The visualisation overlay (panel 3, titled "Low-pass preview (zero-phase)" and labelled as such, with a note that Compute writes the causal filter) uses `utils.lowpass_zero_phase_1d` (`sosfiltfilt`) instead — appropriate only because that path is comparing a single trace against its raw version, not computing CCGs.
    **Future upgrade (planned, not yet wired):** for sharp GCaMP8 transients the IIR's frequency-dependent group delay starts to matter (the constant-group-delay intuition only holds asymptotically for a Butterworth). A linear-phase FIR replacement would make the constant-group-delay assumption exact across all frequencies.
 2. **State initialisation to the first sample.** A zero-initial state would inject a startup transient as the filter "ramped up" from 0 to the dF/F mean. Setting `zi` to repeated copies of `x[0]` makes the filter start at steady state.
 

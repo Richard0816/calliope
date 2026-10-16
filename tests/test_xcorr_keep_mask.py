@@ -65,31 +65,35 @@ def test_load_keep_mask_prefers_frozen_mask(tmp_path):
     assert xc._load_keep_mask(plane0, "r0p7_") is None
 
 
+def _row(df, a, b):
+    return df[(df["roiA"] == a) & (df["roiB"] == b)].iloc[0]
+
+
 def test_full_run_reads_frozen_columns_after_live_mask_drift(tmp_path):
-    plane0 = _drifted_plane0(tmp_path, {"C1": [1], "C2": [3]})
+    plane0 = _drifted_plane0(tmp_path, {"C1": [1, 2], "C2": [3, 4]})
     out = xc.run_cluster_xcorr_full_fast(
         plane0, PREFIX, 15.0, "", max_lag_seconds=0.5, use_gpu=False,
         n_shuffles=0)
     df = pd.read_csv(out / "C1xC2" / "C1xC2_summary.csv")
-    assert list(df["roiA"]) == [1] and list(df["roiB"]) == [3]
+    assert len(df) == 4
     # ROI 1 and ROI 3 carry the same trace in the frozen layout; the live
     # mask would have paired two independent noise columns instead.
-    assert df["zero_lag_corr"].iloc[0] == pytest.approx(1.0, abs=1e-4)
+    assert _row(df, 1, 3)["zero_lag_corr"] == pytest.approx(1.0, abs=1e-4)
 
 
 def test_per_event_run_reads_frozen_columns(tmp_path):
-    plane0 = _drifted_plane0(tmp_path, {"C1": [1], "C2": [3]})
+    plane0 = _drifted_plane0(tmp_path, {"C1": [1, 2], "C2": [3, 4]})
     out = xc.run_cluster_xcorr_per_event_fast(
         plane0, PREFIX, 15.0, "", [(1.0, 20.0)], max_lag_seconds=0.5,
         use_gpu=False)
     csvs = list(out.glob("event*/C1xC2/C1xC2_summary.csv"))
     assert len(csvs) == 1
     df = pd.read_csv(csvs[0])
-    assert df["zero_lag_corr"].iloc[0] == pytest.approx(1.0, abs=1e-4)
+    assert _row(df, 1, 3)["zero_lag_corr"] == pytest.approx(1.0, abs=1e-4)
 
 
 def test_out_of_range_roi_raises_clear_error(tmp_path):
-    plane0 = _drifted_plane0(tmp_path, {"C1": [1], "C2": [9]})
+    plane0 = _drifted_plane0(tmp_path, {"C1": [1, 2], "C2": [3, 9]})
     with pytest.raises(ValueError, match="out of range"):
         xc.run_cluster_xcorr_full_fast(
             plane0, PREFIX, 15.0, "", use_gpu=False, n_shuffles=0)

@@ -572,6 +572,7 @@ def compute_dff_memmaps(
             baseline_min=baseline_min, fps=fps,
             r=r, F=F, Fneu=Fneu,
             progress_cb=progress_cb):
+        _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
@@ -609,11 +610,70 @@ def compute_dff_memmaps(
                 f"dF/F batch {i0}-{i1 - 1}/{N - 1} "
                 f"({time.time() - t0:.1f}s)")
     del dff_mm
+    _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 
+# |median dF/F| over the last 10% of the recording above which the
+# baseline is flagged as not tracking slow drift (e.g. photobleaching).
+DFF_DRIFT_WARN = 0.05
+
+
+def _warn_dff_drift(plane0: Path, T: int, N: int, baseline_mode: str,
+                    progress_cb) -> Optional[float]:
+    """Warn when dF/F has drifted away from 0 by the end of the recording
+    -- the first-N-minutes baseline doesn't follow photobleaching, so
+    late dF/F sinks below 0 (UX audit papercut). Returns the late median
+    (or None if it couldn't be read). Never raises."""
+    try:
+        mm = np.memmap(str(plane0 / "r0p7_dff.memmap.float32"),
+                       dtype="float32", mode="r", shape=(T, N))
+        late = float(np.nanmedian(np.median(mm[int(T * 0.9):], axis=0)))
+        del mm
+    except Exception:
+        return None
+    if abs(late) > DFF_DRIFT_WARN:
+        msg = (f"[dF/F] WARNING: median dF/F over the last 10% of the "
+               f"recording is {late:+.3f}, not ~0 -- the {baseline_mode} "
+               f"baseline isn't following slow drift (photobleaching?). "
+               f"Consider the rolling-percentile baseline.")
+        (progress_cb or print)(msg)
+    return late
+
+
+def keep_rule_kwargs(params: dict) -> dict:
+    """Cell-filter keep rule from a param dict (Tab 3 'Cell filter' group)."""
+    return {"threshold": float(params.get("cellfilter_threshold", 0.5)),
+            "use_iscell": params.get("cellfilter_source") == "suite2p iscell"}
+
+
+def reapply_keep_rule(plane0: Path, *, threshold: float = 0.5,
+                      use_iscell: bool = False,
+                      size_outlier_z: float = SIZE_OUTLIER_Z) -> dict:
+    """Rewrite ``predicted_cell_mask.npy`` from the saved CNN scores (or
+    Suite2p's ``iscell``) without re-running the network. Overwrites any
+    hand-promoted mask. Returns kept / total / Suite2p-iscell counts."""
+    from .cellfilter.predict import keep_mask_from_scores
+    plane0 = Path(plane0)
+    probs = np.load(plane0 / "predicted_cell_prob.npy")
+    stat = np.load(plane0 / "stat.npy", allow_pickle=True)
+    iscell_path = plane0 / "iscell.npy"
+    iscell = np.load(iscell_path) if iscell_path.exists() else None
+    if use_iscell and iscell is None:
+        raise FileNotFoundError(f"{iscell_path} not found")
+    mask, _ = keep_mask_from_scores(
+        probs, stat, threshold=threshold, size_outlier_z=size_outlier_z,
+        iscell=iscell if use_iscell else None)
+    np.save(plane0 / "predicted_cell_mask.npy", mask)
+    return {"kept": int(mask.sum()), "total": int(mask.size),
+            "iscell": int((iscell[:, 0] > 0).sum()) if iscell is not None
+            else None}
+
+
 def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
-                        size_outlier_z: float = SIZE_OUTLIER_Z) -> None:
+                        size_outlier_z: float = SIZE_OUTLIER_Z,
+                        threshold: float = 0.5,
+                        use_iscell: bool = False) -> None:
     """Run the cell-filter CNN. Writes ``predicted_cell_mask.npy`` and
     ``predicted_cell_prob.npy`` into ``plane0``.
     """
@@ -626,7 +686,8 @@ def predict_cell_filter(plane0: Path, ckpt_path: str, rec_id: str,
     model = load_model_from_checkpoint(Path(ckpt_path), device)
     try:
         predict_recording(rec_id, model, device, plane0=plane0,
-                          size_outlier_z=size_outlier_z)
+                          size_outlier_z=size_outlier_z,
+                          threshold=threshold, use_iscell=use_iscell)
     finally:
         # Drop model + checkpoint before flushing the allocator so the
         # weights actually return to the driver. Without this, every
@@ -853,6 +914,11 @@ def run_detection(
     Returns ``{plane0: Path, fps: float, T: int, N: int,
     pix_to_um: float|None, figures: list[str]}``.
     """
+    # Frame rate / pixel size from the raw TIFF metadata when the caller
+    # left them at 0 (UX audit finding 3).
+    from . import acquisition
+    params = acquisition.fill_from_metadata(params, tiff_folder,
+                                            log=progress_cb or print)
     if progress_cb is not None:
         progress_cb("[detection] running sparse_plus_cellpose...")
     sparsery_ops = _build_sparsery_ops(params)
@@ -875,6 +941,8 @@ def run_detection(
             "cellpose_model_type": "cpsam",
             "cellpose_channel_input": "Vcorr",
             "cellpose_diameter": params.get("cellpose_diameter", 0),
+            "cellpose_max_area_factor":
+                float(params.get("cellpose_max_area_factor", 4.0)),
             "cellpose_flow_threshold": float(
                 params.get("sam_flow_threshold", 0.8)),
             "cellpose_cellprob_threshold": float(
@@ -913,7 +981,8 @@ def run_detection(
         predict_cell_filter(
             plane0, ckpt_path, rec_id or plane0.parent.name,
             size_outlier_z=float(params.get("size_outlier_z",
-                                            SIZE_OUTLIER_Z)))
+                                            SIZE_OUTLIER_Z)),
+            **keep_rule_kwargs(params))
 
     if progress_cb is not None:
         progress_cb("[detection] writing filtered dF/F...")

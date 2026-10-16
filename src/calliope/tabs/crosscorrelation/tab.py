@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import queue
 import re
+import time
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -197,6 +198,22 @@ def _sign_flip_pvalue(values: np.ndarray, n_perm: int = 10000,
     return hits / n_perm
 
 
+def _roi_level_lag_pvalue(pair: str, df: pd.DataFrame) -> float:
+    """Sign-flip p-value for "cluster A leads/lags cluster B", with one
+    value per ROI of A (its mean best lag over B's ROIs) rather than one
+    per pair -- pairs reuse the same cells, so testing them directly is
+    pseudo-replication (UX audit finding 6). Within-cluster pairs (CnxCn)
+    have no lead/lag direction (each i < j pair's sign is arbitrary), so
+    they get no test (NaN)."""
+    nums = re.findall(r"\d+", pair)
+    if len(nums) >= 2 and nums[0] == nums[1]:
+        return float("nan")
+    if "roiA" not in df.columns or "best_lag_sec" not in df.columns:
+        return float("nan")
+    per_roi = df.groupby("roiA")["best_lag_sec"].mean().dropna().to_numpy()
+    return _sign_flip_pvalue(per_roi) if per_roi.size >= 2 else float("nan")
+
+
 def _significance_marker(p: float) -> str:
     if p < 0.001:
         return "***"
@@ -241,7 +258,8 @@ def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str,
     """Lead/Lag-styled violin plot for per-pair best-lag distributions.
 
     Each violin is coloured by the sign of its mean and the sign-flip
-    permutation p-value:
+    permutation p-value (callers pass ROI-level p-values from
+    :func:`_roi_level_lag_pvalue`; NaN = not tested):
       * blue  - mean > 0 and p < 0.05 (Lead)
       * red   - mean < 0 and p < 0.05 (Lag)
       * gray  - not significant
@@ -534,7 +552,9 @@ class ViolinWindow(ctk.CTkToplevel):
             ax.clear()
             ax.set_axis_on()
 
-        title_suffix = self._recording_label
+        mode = ("per-event windows" if "per_event" in self._xcorr_root.name
+                else "full recording")
+        title_suffix = f"{self._recording_label}, {mode}"
         if corr_arrays:
             _plot_violin(
                 self.ax_corr, corr_labels, corr_arrays,
@@ -556,7 +576,7 @@ class ViolinWindow(ctk.CTkToplevel):
             for label, arr in zip(lag_labels, lag_arrays):
                 p = self._pval_cache.get(label)
                 if p is None:
-                    p = _sign_flip_pvalue(arr)
+                    p = _roi_level_lag_pvalue(label, pair_data[label])
                     self._pval_cache[label] = p
                 lag_pvals.append(p)
             _plot_lag_violin(
@@ -658,6 +678,10 @@ class CrossCorrelationTab(ctk.CTkFrame):
             try:
                 state.subscribe_plane0(self._on_plane0_broadcast)
                 state.subscribe_lowpass_ready(self._on_plane0_broadcast)
+                # Tab 6 publishes this after analysis and after Export
+                # writes the *_rois.npy files, so Run enables without a
+                # manual reload (UX audit finding 10).
+                state.subscribe_clusters_ready(self._on_plane0_broadcast)
                 state.subscribe_event_results(
                     self._on_event_results_broadcast)
                 state.subscribe_release_memmaps(self._release_dff_cache)
@@ -1445,6 +1469,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         params = self._gather_params()
         plane0 = self._plane0
         self._disable_run()
+        self._xc_t0 = time.time()
         self.progress.set(0)
         self.status_var.set("Running full-recording cross-correlation...")
         self._log(f"\n[full] plane0={plane0}")
@@ -1500,6 +1525,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
         plane0 = self._plane0
         evts = list(self._event_windows)
         self._disable_run()
+        self._xc_t0 = time.time()
         self._set_progress(0, len(evts))
         self.status_var.set(
             f"Running per-event cross-correlation ({len(evts)} events)...")
@@ -1529,7 +1555,12 @@ class CrossCorrelationTab(ctk.CTkFrame):
     def _on_xc_progress(self, payload) -> None:
         done, total, label = payload
         self._set_progress(done, total)
-        self.status_var.set(f"{label} ({done}/{total})")
+        # Elapsed / ETA from the per-item rate so far (UX audit papercut:
+        # a 6-minute full run gave no sense of how long was left).
+        elapsed = time.time() - getattr(self, "_xc_t0", time.time())
+        eta = elapsed / done * (total - done) if done else 0.0
+        self.status_var.set(f"{label} ({done}/{total})  elapsed "
+                            f"{elapsed:.0f}s, ~{eta:.0f}s left")
 
     def _on_xc_done_full(self, payload: str) -> None:
         self._set_progress(1, 1)

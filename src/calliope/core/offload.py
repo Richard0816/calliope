@@ -463,6 +463,71 @@ _POOL = _WarmPool()
 atexit.register(_POOL.shutdown)
 
 
+# Live :func:`call_in_child` processes, terminated at interpreter exit so a
+# closed GUI doesn't wait on (non-daemonic) detection children.
+_LIVE_CHILDREN: set = set()
+
+
+@atexit.register
+def _kill_live_children() -> None:
+    for p in list(_LIVE_CHILDREN):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def call_in_child(fn: Callable, kwargs: Optional[dict] = None,
+                  on_progress: Optional[Callable[[Any], None]] = None,
+                  *, died_hint: str = "") -> Any:
+    """Run ``fn(**kwargs)`` in a fresh spawned process and block until done.
+
+    For use from a worker *thread* that already owns its own GUI plumbing:
+    progress payloads are handed to ``on_progress`` as they arrive, the
+    result is returned, a child exception is re-raised as ``RuntimeError``
+    carrying the child traceback, and a child that dies without reporting
+    (e.g. killed by the OS for running out of memory) raises
+    ``RuntimeError`` with its exit code plus ``died_hint`` -- the GUI
+    process survives either way.
+
+    The child is non-daemonic so ``fn`` may start its own processes
+    (cellpose / suite2p pools); it is terminated at interpreter exit.
+    """
+    q = _CTX.Queue()
+    p = _CTX.Process(target=_run_child,
+                     args=(q, fn, (), {**(kwargs or {}), "progress_q": q}))
+    p.start()
+    _LIVE_CHILDREN.add(p)
+    try:
+        dead_polls = 0
+        while True:
+            try:
+                tag, payload = q.get(timeout=0.5)
+            except _queue.Empty:
+                if p.is_alive():
+                    continue
+                dead_polls += 1
+                if dead_polls < _DEAD_GRACE_POLLS:
+                    continue
+                p.join(timeout=1)
+                raise RuntimeError(
+                    f"Worker process exited unexpectedly (exit code "
+                    f"{p.exitcode}) without a result. {died_hint}".strip())
+            if tag == _PROGRESS:
+                if on_progress is not None:
+                    on_progress(payload)
+            elif tag == _DONE:
+                return payload
+            else:
+                # Exception line first: callers (batch log, report) keep
+                # only the message's first line.
+                lines = str(payload).strip().splitlines() or ["(no detail)"]
+                raise RuntimeError(f"{lines[-1]}\n{payload}")
+    finally:
+        _LIVE_CHILDREN.discard(p)
+        p.join(timeout=5)
+
+
 def run_offloaded(widget, out_queue, fn: Callable, args: Sequence = (),
                   kwargs: Optional[dict] = None, *,
                   done_kind: str = "done", error_kind: str = "error",

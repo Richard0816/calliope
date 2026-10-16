@@ -90,7 +90,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from ...gui_common import (
     AppState, attach_fig_toolbar, drain_queue, format_roi_indices, report_stage_error,
-    open_advanced, parse_manual_roi_spec, spec_defaults,
+    open_advanced, parse_manual_roi_spec, short_roi_label, spec_defaults,
 )
 
 
@@ -134,6 +134,9 @@ class LowpassTab(ctk.CTkFrame):
         self._fps_src: str = "default"
         self._mean_dff: Optional[np.ndarray] = None
         self._trace_label: str = "mean"
+        # Full manual-subset id list for the (wrapping) status line; the
+        # plot titles carry only a clipped version.
+        self._trace_ids: str = ""
         self._fft_xf: Optional[np.ndarray] = None
         self._fft_power: Optional[np.ndarray] = None
         self._cutoff_line = None
@@ -302,7 +305,8 @@ class LowpassTab(ctk.CTkFrame):
         self.status_var = tk.StringVar(
             value="Run detection first (or reload from a finished folder).")
         ctk.CTkLabel(self, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=11, slant="italic")).pack(
+                     font=ctk.CTkFont(size=11, slant="italic"),
+                     wraplength=900, justify="left").pack(
             anchor="w", padx=10, pady=(0, 6))
 
         # Persistent recording header so the user can always tell
@@ -367,7 +371,9 @@ class LowpassTab(ctk.CTkFrame):
 
         f3 = ctk.CTkFrame(body)
         f3.grid(row=2, column=0, sticky="nsew")
-        ctk.CTkLabel(f3, text="3. Low-pass dF/F",
+        ctk.CTkLabel(f3, text="3. Low-pass dF/F  (preview: zero-phase, "
+                              "aligned with panel 2; Compute writes the "
+                              "causal filter)",
                      font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(6, 0))
         self.lp_fig = plt.Figure(figsize=(8, 2.4), tight_layout=True)
@@ -436,6 +442,7 @@ class LowpassTab(ctk.CTkFrame):
 
     def _load_data(self, plane0: Path) -> None:
         from . import logic as utils
+        self._trace_ids = ""  # set again below only for a multi-ROI subset
         F = np.load(plane0 / "F.npy", mmap_mode="r")
         N_total, T = F.shape
         self._T = int(T)
@@ -538,8 +545,8 @@ class LowpassTab(ctk.CTkFrame):
                                     if n_excl else "")
                         self._trace_label = (
                             f"{agg} of ROIs "
-                            f"{format_roi_indices(roi_indices)} "
-                            f"(n={len(roi_indices)}){excl_str}")
+                            f"{short_roi_label(roi_indices)}{excl_str}")
+                        self._trace_ids = format_roi_indices(roi_indices)
 
         if source == "best":
             probs_full = np.load(prob_path).astype(np.float32)
@@ -700,7 +707,8 @@ class LowpassTab(ctk.CTkFrame):
         ax.plot(t, y, lw=0.7, color="tab:blue")
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_ylabel(f"{ylabel} low-pass @ {cutoff:.2f} Hz", fontsize=8)
-        ax.set_title(f"Low-pass - {self._trace_label}", fontsize=9)
+        ax.set_title(f"Low-pass preview (zero-phase) - {self._trace_label}",
+                     fontsize=9)
         ax.tick_params(labelsize=7)
         ax.set_xlim(0, t[-1] if t.size else 1.0)
         self.lp_canvas.draw_idle()
@@ -717,7 +725,8 @@ class LowpassTab(ctk.CTkFrame):
         self.status_var.set(
             f"Source: {self._trace_label}  "
             f"T={self._mean_dff.size}  fps={self._fps:.2f} ({self._fps_src})  "
-            f"cutoff={self.cutoff_var.get():.3f} Hz")
+            f"cutoff={self.cutoff_var.get():.3f} Hz"
+            + (f"\nROIs: {self._trace_ids}" if self._trace_ids else ""))
 
     def _on_manual_entry(self, _event=None) -> None:
         # Snap source to manual and reload. Also fired on FocusOut so clicking

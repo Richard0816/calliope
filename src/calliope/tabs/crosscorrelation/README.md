@@ -115,9 +115,9 @@ A single `cp.asarray` move at the top, all matmuls on GPU, one `cp.asnumpy` at t
 ### Step 3 — Full-recording mode (`run_cluster_xcorr_full_fast`)
 
 ```python
-cluster_names = sorted(clusters)          # e.g. "C1", "C2", ...
+cluster_names = _xcorr_cluster_names(clusters)   # sorted; drops clusters with < MIN_XCORR_CLUSTER_SIZE (2) ROIs, logging them
 for iA, cA in enumerate(cluster_names):
-    for cB in cluster_names[iA:]:         # upper triangle only (incl. self-pairs)
+    for cB in cluster_names[iA:]:         # upper triangle only (incl. CnxCn blocks)
         X_A = dff[:, clusters[cA]]
         X_B = dff[:, clusters[cB]]
         best_lag, best_corr, zero_corr = batch_xcorr_clusters(
@@ -127,7 +127,14 @@ for iA, cA in enumerate(cluster_names):
 ```
 
 Only the upper triangle (`cluster_names[iA:]`) is written, so a pair appears
-once as `CAxCB` (never the mirror `CBxCA`); self-pairs `CAxCA` are included.
+once as `CAxCB` (never the mirror `CBxCA`); within-cluster blocks `CAxCA` are included
+but hold only the distinct `i < j` ROI pairs (`same_cluster=True`): no self-pairs
+(r = 1, lag 0) and no mirrored duplicates. Clusters with fewer than
+`MIN_XCORR_CLUSTER_SIZE = 2` ROIs are skipped entirely (a 1-ROI cluster has no
+within-cluster pairs and its cross-cluster pairs all reuse one cell) and the skip is
+logged as `[xcorr] skipping cluster(s) with < 2 ROIs: ...`. For `CAxCA` the
+`p_value_fdr` Benjamini-Hochberg correction runs over the `i < j` p-values only
+(self-pairs and mirrored entries are not tests).
 
 The output layout is:
 
@@ -218,7 +225,7 @@ Plotted with the peak marked in red and the zero-lag value marked in green. The 
 
 #### Sign-flip permutation test (`_sign_flip_pvalue`)
 
-For each pair's lag distribution `values` of length `n`:
+The test is **ROI-level** (`_roi_level_lag_pvalue`): for a cross-cluster pair `CAxCB`, `values` holds one number per ROI of A, namely that ROI's mean `best_lag_sec` over B's ROIs (`groupby("roiA")`). Pairs reuse the same cells, so testing every pair directly would be pseudo-replication. Fewer than 2 ROIs gives NaN. Within-cluster blocks (`CnxCn`) get **no test** (NaN): each `i < j` pair's lag sign is arbitrary, so there is no lead/lag direction. The violin titles state the mode, "full recording" or "per-event windows". For the `values` array of length `n`:
 
 ```python
 observed = abs(values.mean())
@@ -311,7 +318,7 @@ For the violin permutation test (not user-exposed; fixed in code): `n_perm=10000
 
 ## 5. UI flow
 
-1. Set plane0 (auto-broadcast from Tab 5 or browse).
+1. Set plane0 (auto-broadcast from Tab 5 or browse). Tab 7 also refreshes when Tab 6 exports (`clusters_ready`), so Run enables without a manual reload.
 2. Set prefix / cluster_folder / fps / max_lag.
 3. **Run full-recording cross-correlation** — runs until done (or abort).
 4. **Reload event windows** if you've edited the xlsx by hand (Tab 5 reruns auto-push via `event_results`).
@@ -328,7 +335,7 @@ For the violin permutation test (not user-exposed; fixed in code): `n_perm=10000
 3. **GPU path** identical to (2) but with `cupy` arrays; a single `asarray` in and `asnumpy` out.
 4. **Cluster file format:** `C{i}_rois.npy` containing Suite2p ROI indices, plus a `_indices_are_suite2p` marker file. Honour both layouts on load.
 5. **Per-event windowing:** prefer Tab 5's in-memory `event_results` for the current plane0; fall back to the EventWindows sheet of `<rec>_summary.xlsx`. Convert seconds to `(f0, f1)` frame indices and clamp `max_lag` to the window length so zero-pad doesn't dominate.
-6. **Sign-flip permutation:** random ±1 signs over the values array, recompute mean, count `|permuted| ≥ |observed|`. Chunk the random-sign matrix to bound memory.
+6. **Sign-flip permutation:** on per-roiA mean best lags (not per pair), skipping within-cluster blocks; random ±1 signs over the values array, recompute mean, count `|permuted| ≥ |observed|`. Chunk the random-sign matrix to bound memory.
 7. **Single-pair full curve:** same z-scoring, but use `numpy.lib.stride_tricks.sliding_window_view` and one `(2L+1, T) · (T,)` matmul to get all lags in one shot.
 8. **Output schema:** one per-pair `C{i}xC{j}_summary.csv` (via `np.savetxt`) holding `roiA, roiB, best_lag_sec, max_corr [, zero_lag_corr, …]` so downstream analyses can read the summaries. No dense `.npy` matrices are written.
 

@@ -47,3 +47,14 @@ def test_cluster_popout_suite2p_ids_and_median_trace(tmp_path):
         pop._on_close()
     finally:
         root.destroy()
+
+
+def test_background_event_summary_uses_suite2p_ids(tmp_path):
+    from calliope.core.event_detection_run import write_event_summary_offload
+    path = write_event_summary_offload(str(tmp_path), {
+        "fps": 10.0, "T": 100, "N_kept": 2, "kept_idx": [8, 41],
+        "event_windows": [(1.0, 2.0)],
+        "onsets_by_roi": [np.array([]), np.array([1.4])]})
+    sheets = pd.read_excel(path, sheet_name=None)
+    assert sheets["EventOnsets"]["roi"].tolist() == [41]
+    assert list(sheets["RoiEventTimes"].columns) == ["roi_8", "roi_41"]

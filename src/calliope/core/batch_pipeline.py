@@ -197,14 +197,24 @@ def run_recording(
         except Exception as e:
             _emit(f"manifest: skipped ({e})")
     except Exception as e:
+        # Neither detector found an ROI: a noise recording is a result
+        # (no_rois), not a failure (UX audit finding 12).
+        from .sparse_plus_cellpose import NoRoisDetected
+        no_rois = isinstance(e, NoRoisDetected)
         stages["detection"].update(
-            status="failed", duration_s=time.time() - t0,
-            error=f"{e}\n{traceback.format_exc()}")
-        _emit(f"detection: FAILED -- {e}")
+            status="no_rois" if no_rois else "failed",
+            duration_s=time.time() - t0,
+            error=None if no_rois else f"{e}\n{traceback.format_exc()}")
+        _emit(f"detection: {'no ROIs' if no_rois else 'FAILED'} -- {e}")
+        if no_rois:
+            for s in STAGES[STAGES.index("lowpass"):]:
+                stages[s].update(
+                    status="skipped",
+                    error="no ROIs detected (recording is noise)")
         return {
             "recording_id": rec_id,
             "save_folder": str(save_folder),
-            "status": "failed",
+            "status": "no_rois" if no_rois else "failed",
             "plane0": None,
             "stages": stages,
             "figures": figures,

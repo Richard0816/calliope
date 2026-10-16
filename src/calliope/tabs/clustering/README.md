@@ -219,6 +219,10 @@ The export translates leaf positions to Suite2p ids with the ordered ids recorde
 
 Stale `C*_rois.npy` files are deleted before writing, so re-export with fewer clusters doesn't leave ghost files behind.
 
+After writing, Export publishes `state.set_clusters_ready(plane0)`; Tab 7 subscribes, so its Run enables without a manual reload.
+
+The status line and the spatial-map title list the ROI count per cluster in visual order, e.g. `4 clusters (29/26/15/1)`.
+
 ---
 
 ## 3. Outputs (on disk)
@@ -281,19 +285,17 @@ The popout reuses Tab 6's already-loaded `_dff` and `_stat`, so no extra disk re
 
 ```python
 grid = arange(start=0.90, stop=0.05 - 1e-9, step=-0.01)   # descending cut fractions of zmax
-# count_clusters (fcluster) is monotone non-decreasing down the grid, so:
-i   = bisect grid for the first index whose count_clusters(Z, grid[i]) >= min(target_counts)
-# then a short forward scan from i lands the first count actually in target_counts
-for f in grid[i:]:
-    n = count_clusters(Z, f)                # == unique(fcluster(Z, t=f*zmax, 'distance')).size
+# Linear scan (not bisect): the count of sized clusters is not monotone down the grid,
+# since a split can turn one big cluster into two small ones.
+for f in grid:
+    labels = fcluster(Z, t=f*zmax, criterion='distance')
+    n = sum(bincount(labels) >= min_cluster_size)   # only clusters with >= min_cluster_size (3) ROIs count
     if n in target_counts:
         return f
-    if n > max(target_counts):
-        break
 return start                                  # nothing hit the band → fall back to 0.90
 ```
 
-(See `auto_choose_threshold` in `core/clustering.py` for the exact implementation.) Defaults `target_counts=(4, 5)` aim for **4–5 clusters**, which is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
+(See `auto_choose_threshold` in `core/clustering.py` for the exact implementation.) Defaults `target_counts=(4, 5)`, `min_cluster_size=3` aim for **4–5 clusters of at least 3 ROIs each** (smaller clusters still exist in the cut but do not count toward the target, so the cut no longer stops on e.g. 29/26/15/1). That is a good visual starting point for ~100–500 cells. Override via the slider for any other count.
 
 ---
 
@@ -312,7 +314,7 @@ return start                                  # nothing hit the band → fall ba
    - One `C{i}_rois.npy` per cluster, indices = Suite2p ROI indices.
    - `linkage.npy` (full `Z`), `linkage_roi_ids.npy` (ordered Suite2p ids of the leaves), `threshold_used.npy` (single-element float).
    - Marker file `_indices_are_suite2p` to disambiguate from the legacy filtered-position layout.
-8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5)) -> float`.
+8. **AVAILABLE_PALETTES, resolve_palette, auto_choose_threshold** — all in `core/clustering.py`. Reproduce signatures `resolve_palette(name, n_colors) -> list[str]` and `auto_choose_threshold(Z, target_counts=(4,5), min_cluster_size=3) -> float`.
 9. **Picked-cluster ROI list:** translate the picked visual ids → raw fcluster labels via `_visual_to_label`, mask the leaf array with `np.isin`, translate leaf positions to Suite2p ROI ids with the ids the linkage was built on (empty if the current kept ids differ), sort, format with `format_roi_indices` (compact `a-b` runs), and expose a Copy button that calls `clipboard_clear/append + update()` so the text survives Tk shutdown on Windows.
 10. **Reload existing clusters:** `np.load` the saved `linkage.npy` + `threshold_used.npy`, validate `Z.shape[0]+1 == N_kept` and that `linkage_roi_ids.npy` equals the current kept ids, reload dF/F + stat + ops, snap manual mode + slider to the saved threshold, render. Skips the `ward_linkage` call entirely.
 

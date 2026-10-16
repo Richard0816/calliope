@@ -53,6 +53,22 @@ acceleration, reinstall the CUDA build afterwards:
 pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
+**Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's
+`torch` is a CUDA build, and `requirements.txt` also pins its ~2.7 GB of
+`nvidia-*` libraries, about 5.5 GB in all. To skip them, install the CPU
+torch first, then let pip resolve the rest from `pyproject.toml` instead
+of the lockfile:
+
+```bash
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+pip install -e .                          # resolves the remaining deps
+```
+
+**Linux: tkinter.** The GUI needs Tk, which many distributions package
+separately from Python. If `calliope` reports that tkinter is missing,
+install it (Debian/Ubuntu: `sudo apt install python3.12-tk`, matching
+your Python version; Fedora: `sudo dnf install python3-tkinter`).
+
 > **venv folder name.** The pip path above (and the README) uses `venv`;
 > `uv sync` creates `.venv`. Either works. Just use the same name when
 > activating, deleting or rebuilding it.

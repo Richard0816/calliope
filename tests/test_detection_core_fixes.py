@@ -273,7 +273,8 @@ def test_removed_tab3_lowpass_keys_are_gone_and_load_harmlessly():
     stub = types.SimpleNamespace(
         PARAM_SPEC=Suite2pTab.PARAM_SPEC,
         _params=spec_defaults(Suite2pTab.PARAM_SPEC),
-        custom_tau_var=types.SimpleNamespace(set=lambda v: None))
+        custom_tau_var=types.SimpleNamespace(set=lambda v: None),
+        _acq_fields_from_params=lambda: None)
     Suite2pTab.apply_batch_row(stub, {**_OLD_TAB3_KEYS, "perc": 20})
     assert stub._params["perc"] == 20
     assert not removed & set(stub._params)

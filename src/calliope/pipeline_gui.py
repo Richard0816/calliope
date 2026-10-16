@@ -29,13 +29,25 @@ live in ``calliope.gui_common``. Each tab is wrapped by
 # stay cheap even when the file imports a lot of heavy modules.
 from __future__ import annotations
 
-# ``sys`` is only used for ``sys.platform`` -- we sniff it to apply a
-# Windows-only taskbar workaround below.
+# ``sys`` is used for ``sys.platform`` (a Windows-only taskbar
+# workaround below) and the missing-tkinter exit message.
 import sys
 
 # ``Path`` is used by the "Open run folder…" handler to derive a run's
 # on-disk layout.
 from pathlib import Path
+
+# Tk ships separately from Python on many Linux distros; pip can't
+# install it, so say how instead of dying with a bare ModuleNotFoundError
+# (UX audit finding 16).
+try:
+    import tkinter  # noqa: F401
+except ModuleNotFoundError:
+    sys.exit("CalLIOPE needs tkinter, which this Python was installed "
+             "without.\nInstall it with your system package manager, e.g. "
+             f"'sudo apt install python{sys.version_info[0]}."
+             f"{sys.version_info[1]}-tk' (Debian/Ubuntu) or 'sudo dnf "
+             "install python3-tkinter' (Fedora), then run calliope again.")
 
 # customtkinter is a third-party re-skin of Tk. ``ctk.CTk`` is its
 # themed root window; we subclass it for ``PipelineApp`` so the whole
@@ -208,7 +220,7 @@ class _Sidebar(ctk.CTkFrame):
     """
 
     def __init__(self, master, labels, on_select, on_open_run=None,
-                 width=210):
+                 on_import_suite2p=None, width=210):
         # ``super()`` reaches the parent class (``ctk.CTkFrame``);
         # forwarding the relevant kwargs lets it set up its own widget
         # state before we add ours.
@@ -240,6 +252,11 @@ class _Sidebar(ctk.CTkFrame):
             ctk.CTkButton(
                 self, text="\U0001F4C2  Open run folder…",
                 height=30, corner_radius=6, command=on_open_run,
+            ).pack(fill="x", padx=8, pady=(0, 4))
+        if on_import_suite2p is not None:
+            ctk.CTkButton(
+                self, text="\U0001F4E5  Import Suite2p output…",
+                height=30, corner_radius=6, command=on_import_suite2p,
             ).pack(fill="x", padx=8, pady=(0, 4))
 
         # "Now viewing" indicator -- set by ``set_run_label`` after a run
@@ -288,6 +305,25 @@ class _Sidebar(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
+
+LAST_TAB_FILE = Path.home() / ".calliope" / "last_tab"
+
+
+def _load_last_tab(n_tabs: int, default: int = 1) -> int:
+    try:
+        idx = int(LAST_TAB_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return default
+    return idx if 0 <= idx < n_tabs else default
+
+
+def _save_last_tab(idx: int) -> None:
+    try:
+        LAST_TAB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_TAB_FILE.write_text(str(int(idx)))
+    except OSError:
+        pass  # a read-only home just means no memory of the last tab
+
 
 class PipelineApp(ctk.CTk):
     """The root window.
@@ -391,8 +427,9 @@ class PipelineApp(ctk.CTk):
             "8. Spatial propagation",
         ]
         self._sidebar = _Sidebar(self, labels=tab_labels,
-                                 on_select=self._show_tab,
-                                 on_open_run=self._on_open_run)
+                                 on_select=self._on_sidebar_select,
+                                 on_open_run=self._on_open_run,
+                                 on_import_suite2p=self._on_import_suite2p)
         self._sidebar.grid(row=0, column=0, sticky="nsw")
 
         # Content host: every tab body is grided into row 0 / col 0 of
@@ -433,10 +470,10 @@ class PipelineApp(ctk.CTk):
          self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
             self._tabs_in_order
 
-        # ``-1`` is the "no tab is shown yet" sentinel; the first
-        # ``_show_tab(0)`` call below promotes Tab 0.
+        # ``-1`` is the "no tab is shown yet" sentinel. Open on the tab the
+        # user last picked, Tab 1 on first launch (UX audit finding 18).
         self._current_tab_index = -1
-        self._show_tab(0)
+        self._show_tab(_load_last_tab(len(self._tab_containers)))
 
         # Single mouse-wheel router for the whole app. The fallback
         # canvas is resolved dynamically per event to the currently
@@ -456,6 +493,12 @@ class PipelineApp(ctk.CTk):
         if 0 <= idx < len(self._tab_containers):
             return self._tab_containers[idx]._parent_canvas
         return None
+
+    def _on_sidebar_select(self, idx: int) -> None:
+        """Sidebar click: show the tab and remember it for next launch.
+        Programmatic switches (batch runner, Open run folder) aren't saved."""
+        self._show_tab(idx)
+        _save_last_tab(idx)
 
     def _show_tab(self, idx_or_widget) -> None:
         """Activate the tab at ``idx_or_widget`` (int index OR tab
@@ -517,7 +560,77 @@ class PipelineApp(ctk.CTk):
 
     # -- Open a finished run -------------------------------------------------
 
-    def _on_open_run(self) -> None:
+    def _rebuild_analysis_tabs(self) -> None:
+        """Destroy and recreate Tabs 1-8 so nothing drawn for the previous
+        recording survives into the next (UX audit finding 11): a stage the
+        new run lacks then shows an empty tab, not the old recording.
+        Tab 0 (batch queue) is kept; it only subscribes during a run."""
+        self.state_obj.release_memmaps()
+        self.state_obj.clear_listeners()
+        if self._current_tab_index > 0:
+            self._current_tab_index = -1  # outgoing container is destroyed
+        for i in range(1, len(self._tabs_in_order)):
+            cls = type(self._tabs_in_order[i])
+            self._tab_containers[i].destroy()
+            container, tab = _make_scrollable_tab(
+                self._content, cls, self.state_obj)
+            self._tabs_in_order[i] = tab
+            self._tab_containers[i] = container
+        (self.batch_tab, self.preprocess_tab, self.qc_tab,
+         self.detection_tab, self.lowpass_tab, self.event_tab,
+         self.clustering_tab, self.xcorr_tab, self.spatial_tab) = \
+            self._tabs_in_order
+
+    def _on_import_suite2p(self) -> None:
+        """Build a CalLIOPE run from an existing Suite2p result (a plane0
+        folder, picked via its ops.npy, or a Fall.mat), then open it like
+        "Open run folder" (UX audit finding 14). The conversion + dF/F +
+        cell filter run in a child process."""
+        import queue
+        from tkinter import filedialog, messagebox
+        from .core import suite2p_import
+        from .core.offload import run_offloaded
+        from .gui_common import drain_queue
+
+        src = filedialog.askopenfilename(
+            title="Pick a Suite2p Fall.mat, or ops.npy inside a plane0 folder",
+            filetypes=[("Suite2p output", "Fall.mat ops.npy *.mat"),
+                       ("All files", "*.*")])
+        if not src:
+            return
+        src_p = Path(src)
+        if src_p.name.lower() == "ops.npy":
+            src_p = src_p.parent
+            name = (src_p.parent.parent.name if src_p.name == "plane0"
+                    else src_p.name)
+        else:
+            name = src_p.parent.name
+        dest = filedialog.askdirectory(
+            title="Where should the CalLIOPE run folder be created?")
+        if not dest:
+            return
+        run = Path(dest) / f"{name or 'suite2p'}_calliope"
+        if run.exists() and any(run.iterdir()):
+            messagebox.showerror(
+                "Folder exists", f"{run} already exists and is not empty.")
+            return
+        self._sidebar.set_run_label(f"Importing {src_p.name}…")
+        q: queue.Queue = queue.Queue()
+
+        def _failed(msg):
+            self._sidebar.set_run_label("")
+            messagebox.showerror("Import failed", str(msg).split("\n")[0])
+
+        drain_queue(self, q, {
+            "done": lambda p: self._on_open_run(Path(p)),
+            "error": _failed,
+            "progress": lambda m: print(m)}, poll_ms=200)
+        run_offloaded(self, q, suite2p_import.import_suite2p,
+                      args=(str(src_p), str(run)),
+                      kwargs={"ckpt_path": str(
+                          self.detection_tab.DEFAULT_CKPT_PATH)})
+
+    def _on_open_run(self, folder=None) -> None:
         """Point the whole app at one finished recording folder and
         repopulate every tab in dependency order, without rerunning the
         pipeline.
@@ -532,8 +645,9 @@ class PipelineApp(ctk.CTk):
         from tkinter import filedialog, messagebox
         from .core import run_loader
 
-        folder = filedialog.askdirectory(
-            title="Select a CalLIOPE run (recording) folder")
+        if folder is None:
+            folder = filedialog.askdirectory(
+                title="Select a CalLIOPE run (recording) folder")
         if not folder:
             return
         run_folder = Path(folder)
@@ -545,10 +659,17 @@ class PipelineApp(ctk.CTk):
                 f"qc.gif / mean.npy and no "
                 f"detection/final/suite2p/plane0 outputs found.")
             return
+        if getattr(self.batch_tab, "_batch_active", False):
+            messagebox.showinfo(
+                "Batch running",
+                "A batch is running. Wait for it to finish (or abort it) "
+                "before opening another run folder.")
+            return
 
-        # Start from a clean bus so a stage missing from this run can't
-        # inherit the previous run's value.
+        # Start from a clean bus and fresh tabs so a stage missing from
+        # this run can't inherit the previous run's value or drawing.
         self.state_obj.reset()
+        self._rebuild_analysis_tabs()
         params = run_loader.manifest_params(run_folder)
         loaded: list[str] = []
         skipped: list[str] = []
@@ -623,9 +744,10 @@ class PipelineApp(ctk.CTk):
             except Exception as e:
                 skipped.append(f"cross-correlation ({e})")
 
-        # Trust signals: a persistent "now viewing" label, land on QC.
+        # Trust signals: a persistent "now viewing" label, land on the
+        # first stage that actually loaded (QC, else detection).
         self._sidebar.set_run_label(f"▶ {run_folder.name}")
-        self._show_tab(2)
+        self._show_tab(2 if inv.has_preprocess else 3)
         self._report_open_run(run_folder, inv, params, loaded, skipped)
 
     def _rehydrate_events(self, params: dict) -> bool:

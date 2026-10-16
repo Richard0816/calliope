@@ -57,7 +57,7 @@ _EVENT_DETECTION_FIELDS = (
     "noise_mad_factor", "end_threshold_k",
     "max_walk_duration_s", "max_event_duration_s",
     "enable_watershed_split", "enforce_symmetric_clamp",
-    "merge_gap_s",
+    "merge_gap_s", "seizure_min_duration_s", "population_fraction",
     "use_gaussian_boundary", "gaussian_quantile",
     "gaussian_fit_pad_s", "gaussian_min_sigma_s",
 )
@@ -510,6 +510,19 @@ def run_event_detection(
             return_diagnostics=True, **ed_kwargs,
         )
 
+    # Within-event timing (Tabs 7/8, monotonicity): half-max crossings on
+    # lightly filtered dF/F instead of the detection onsets (finding 4).
+    # A (who took part) still comes from the onsets.
+    dff_path = plane0 / "r0p7_filtered_dff.memmap.float32"
+    if (params.get("timing_method", "half-max") == "half-max"
+            and dff_path.exists() and A.size):
+        dff = np.memmap(str(dff_path), dtype="float32", mode="r",
+                        shape=(T, N_kept_full))
+        first_time = core_utils.half_max_first_times(
+            dff[:, pos_in_memmap], fps, event_windows, A,
+            cutoff_hz=float(params.get("timing_cutoff_hz", 5.0)))
+        del dff
+
     # ---- Per-event directional monotonicity --------------------------
     # For every detected population event, run the Spearman-rank
     # propagation-direction test (``core.spatial.
@@ -537,6 +550,7 @@ def run_event_detection(
         "event_counts": event_counts,
         "diagnostics": diagnostics,
         "event_windows": event_windows,
+        "event_class": (diagnostics or {}).get("event_class"),
         "A": A,
         "first_time": first_time,
         "onsets_by_roi": onsets_by_roi,
@@ -562,6 +576,7 @@ def run_event_detection(
             fps=fps,
             in_seconds=True,
             roi_ids=kept_idx,
+            event_classes=data["event_class"],
         )
         # One row per event; ``EventMonotonicity`` sheet stamps the
         # propagation-direction scalars next to the existing
@@ -594,6 +609,32 @@ def run_event_detection_offload(plane0_str: str, params: dict, *,
         write_summary=False,
         progress_cb=make_progress_cb(progress_q),
     )
+
+
+def write_event_summary_offload(plane0_str: str, data: dict, *,
+                                progress_q=None) -> str:
+    """Picklable :mod:`calliope.core.offload` target: Tab 5's summary
+    workbook write (Recording, event and EventMonotonicity sheets).
+
+    openpyxl re-reads and re-saves the whole workbook, which took ~23 s
+    across three calls on a 679-ROI recording and froze the GUI when it
+    ran on the Tk thread. Here it runs in a child process, in one open.
+    """
+    from . import summary_writer as sw
+    plane0 = Path(plane0_str)
+    extra = {"Recording": sw.update_recording_meta(
+        plane0, fps=data.get("fps"), T=data.get("T"), N=data.get("N_kept"),
+        write=False)}
+    em = data.get("event_monotonicity")
+    if em:
+        extra["EventMonotonicity"] = sw.write_event_monotonicity_sheet(
+            plane0, em, write=False)
+    return str(sw.write_events_sheets(
+        plane0, event_windows=data.get("event_windows"),
+        onsets_by_roi=data.get("onsets_by_roi") or [],
+        fps=data.get("fps"), in_seconds=True, extra_sheets=extra,
+        event_classes=data.get("event_class"),
+        roi_ids=data.get("kept_idx")))
 
 
 def export_event_figures_offload(plane0_str: str, params: dict,
@@ -649,10 +690,14 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
     fps = data["fps"]; T = data["T"]; ds = data["downsample"]
     bin_ms = ds * 1000.0 / fps if fps > 0 else 0.0
 
+    def _extent(m):  # x axis in seconds rather than display bins
+        return (0.0, m.shape[1] * ds / fps if fps > 0 else m.shape[1],
+                m.shape[0], 0)
+
     fig = plt.Figure(figsize=(9, 4), tight_layout=True)
     ax = fig.add_subplot(111)
-    ax.imshow(hm, aspect="auto", interpolation="nearest")
-    ax.set_xlabel(f"Time (downsampled bins ~{bin_ms:.0f} ms)")
+    ax.imshow(hm, aspect="auto", interpolation="nearest", extent=_extent(hm))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
     ax.set_ylabel("ROIs (most active at top)")
     ax.set_title("Low-pass dF/F heatmap")
     p = figures_dir / "heatmap.png"
@@ -663,8 +708,9 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
 
     fig = plt.Figure(figsize=(9, 4), tight_layout=True)
     ax = fig.add_subplot(111)
-    ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys")
-    ax.set_xlabel(f"Time (downsampled bins ~{bin_ms:.0f} ms)")
+    ax.imshow(rs, aspect="auto", interpolation="nearest", cmap="Greys",
+              extent=_extent(rs))
+    ax.set_xlabel(f"Time (s)  [{bin_ms:.0f} ms bins]")
     ax.set_ylabel("ROIs (most active at top)")
     ax.set_title("Onset raster")
     p = figures_dir / "raster.png"
@@ -681,7 +727,8 @@ def _render_event_figures(data: dict, *, figures_dir: Path) -> list[str]:
         core_utils.plot_event_detection(diagnostics, ax=ax)
         ev = data["event_windows"]
         if ev is not None and len(ev) > 0:
-            core_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20)
+            core_utils.shade_event_windows(ax, ev, color="C1", alpha=0.20,
+                                           classes=data.get("event_class"))
         ax.set_xlim(0.0, duration_s)
         # Mirror the Tab 5 GUI fit: anchor ymin=0 and put ymax at the
         # tallest detected peak + 10% headroom. ``peak_height`` is the

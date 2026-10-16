@@ -384,6 +384,11 @@ def drain_queue(widget, q: "queue.Queue", handlers: dict,
 
     def _tick() -> None:
         try:
+            if not widget.winfo_exists():
+                return  # tab destroyed (e.g. rebuilt by "Open run folder")
+        except Exception:
+            return
+        try:
             while True:
                 kind, payload = q.get_nowait()
                 handler = handlers.get(kind)
@@ -733,6 +738,14 @@ class AppState:
             except Exception as e:
                 print(f"release_memmaps listener error: {e}")
 
+    def clear_listeners(self) -> None:
+        """Drop every subscriber. Used when the analysis tabs are rebuilt
+        (each new tab re-subscribes in its constructor), so the destroyed
+        tabs' callbacks never fire again."""
+        for name, val in vars(self).items():
+            if name.endswith("_listeners") and isinstance(val, list):
+                val.clear()
+
     # ---- bulk reset (used before loading a different run) ----
 
     def reset(self) -> None:
@@ -742,9 +755,10 @@ class AppState:
         a prior run can't be mistaken for the new one. This resets only
         the shared *values* -- it does not notify subscribers or force a
         tab to wipe what it has already drawn, so the caller is expected
-        to republish the new run's channels immediately afterwards. A
-        stage absent from the new run will leave the prior tab's view in
-        place; that's a known limitation of the additive reload.
+        to republish the new run's channels immediately afterwards.
+        "Open run folder" also rebuilds the analysis tabs
+        (``PipelineApp._rebuild_analysis_tabs``) so a stage absent from the
+        new run shows an empty tab rather than the prior run's view.
         """
         self.working_dir = None
         self.data_root = None
@@ -1180,6 +1194,16 @@ def parse_manual_roi_spec(text: str, n_total: int) -> list[int]:
             f"out of range [0, {n_total}): {bad[:5]}"
             + ("..." if len(bad) > 5 else ""))
     return out
+
+
+def short_roi_label(indices, max_chars: int = 40) -> str:
+    """``'n=37: 3-5,9,12,…'`` -- count first, id list clipped so a plot
+    title stays inside its figure (cluster subsets ran off the edge).
+    Show the full list with :func:`format_roi_indices` somewhere that wraps."""
+    s = format_roi_indices(sorted(int(i) for i in indices))
+    if len(s) > max_chars:
+        s = s[:max_chars].rsplit(",", 1)[0] + ",…"
+    return f"n={len(indices)}: {s}"
 
 
 def format_roi_indices(indices: list[int]) -> str:

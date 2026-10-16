@@ -24,6 +24,14 @@ the user having to click each tab one recording at a time.
   gets suffixed (`<stem>__<parent>`) so the rows don't collide on
   `<output>/<ident>/`. If the TIFFs are actually a multi-file recording,
   select the relevant rows and click **Merge selected** afterwards.
+  With the **Group multi-part files** checkbox ticked (default), Scan
+  groups unambiguous multi-part names into one row (`logic.group_multipart_tiffs`):
+  ScanImage `<acq>_NNNNN_NNNNN` (last index = file chunk of one acquisition)
+  and `<name>_partNNN`, same folder, at least 2 parts, ordered by part index;
+  the identifier is the shared base name. A single trailing index
+  (`rec_00018`) is NOT grouped (usually a separate acquisition). Untick and
+  re-scan for one row per file. The Scan log line reports rows, TIFFs and
+  how many recordings were grouped.
 - **Rows** — a scrollable list. Each row is one recording: identifier, the
   TIFF list, a Tab 1-style **Browse...** picker, an **Edit params...** button
   (per-row override), a status label, and an **x** button to remove.
@@ -94,6 +102,15 @@ normally — so the detection folder + figures that *were* produced are
 kept. The separate headless orchestrator
 `core.batch_pipeline.run_recording` (not used by Tab 0) applies the same
 guard (`_no_rois_survive`) and returns `status="no_rois"`.
+
+The zero-ROI case can also arise earlier: when neither Sparsery nor Cellpose
+finds any ROI, detection raises `NoRoisDetected` (merge produced 0 ROIs). The GUI
+batch recognises it by class name in the error text (the error crosses a
+process boundary as text), records the detection stage as `no_rois`, skips
+lowpass onward and finishes the row as `no_rois` rather than `failed`; the headless
+`batch_pipeline.run_recording` does the same (`status="no_rois"`, later stages
+`skipped`, no traceback). The row's closing log line now includes the error
+text when the row did not finish `ok`.
 
 ### Abort behavior
 
