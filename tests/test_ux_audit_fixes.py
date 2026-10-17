@@ -280,6 +280,7 @@ def test_rebuild_analysis_tabs_replaces_tabs_and_listeners():
         counts = {k: len(v) for k, v in vars(st).items()
                   if k.endswith("_listeners")}
         old_tabs = list(app._tabs_in_order)
+        old_children = set(app._content.winfo_children())
         app.qc_tab.status_marker = "previous recording"
         app._rebuild_analysis_tabs()
         app._show_tab(2)
@@ -290,6 +291,12 @@ def test_rebuild_analysis_tabs_replaces_tabs_and_listeners():
                    zip(app._tabs_in_order[1:], old_tabs[1:]))
         assert not hasattr(app.qc_tab, "status_marker")
         assert not old_tabs[8].winfo_exists()
+        # The old tabs' outer scroll frames (and their canvases, whose
+        # <Configure> callbacks touched the destroyed inner frame) are gone:
+        # only Tab 0's and the 8 new tabs' frames remain.
+        survivors = [w for w in old_children if w.winfo_exists()]
+        assert len(survivors) == 1, survivors
+        assert len(app._content.winfo_children()) == len(app._tab_containers)
         # Fresh tabs re-subscribed exactly once; no stale callbacks remain.
         assert {k: len(v) for k, v in vars(st).items()
                 if k.endswith("_listeners")} == counts

@@ -191,6 +191,8 @@ def _make_scrollable_tab(parent, tab_class, *args, **kwargs):
         # grows to absorb the new requested height. Without the second
         # binding the canvas keeps its old fixed height and the new
         # child just crushes its siblings.
+        if not container.winfo_exists():  # tab replaced mid-event
+            return
         canvas_h = canvas.winfo_height()
         natural_h = container.winfo_reqheight()
         canvas.itemconfigure(window_id, height=max(natural_h, canvas_h))
@@ -571,7 +573,12 @@ class PipelineApp(ctk.CTk):
             self._current_tab_index = -1  # outgoing container is destroyed
         for i in range(1, len(self._tabs_in_order)):
             cls = type(self._tabs_in_order[i])
-            self._tab_containers[i].destroy()
+            old = self._tab_containers[i]
+            # CTkScrollableFrame.destroy() removes only the inner frame; its
+            # outer frame and canvas (with <Configure> callbacks that touch
+            # the inner frame) would survive, raising TclErrors and keeping
+            # the old tab alive. Destroying the outer frame takes all three.
+            getattr(old, "_parent_frame", old).destroy()
             container, tab = _make_scrollable_tab(
                 self._content, cls, self.state_obj)
             self._tabs_in_order[i] = tab
