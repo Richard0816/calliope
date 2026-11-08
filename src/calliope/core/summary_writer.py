@@ -144,8 +144,23 @@ def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path
             **({"if_sheet_exists": "replace"} if exists else {}),
         ) as w:
             for name, data in sheets.items():
-                _to_dataframe(data).to_excel(w, sheet_name=name, index=False)
+                df = _to_dataframe(data)
+                if len(df) >= _XLSX_MAX_ROWS or df.shape[1] > _XLSX_MAX_COLS:
+                    # Over Excel's sheet limit (e.g. EventOnsets on a dense
+                    # in vivo recording): full table goes to a CSV beside
+                    # the workbook, the sheet just points at it.
+                    csv = path.with_name(f"{path.stem}_{name}.csv")
+                    df.to_csv(csv, index=False)
+                    df = pd.DataFrame({"note": [
+                        f"{len(df)} rows x {df.shape[1]} columns exceed Excel's "
+                        f"sheet limit; full table in {csv.name}"]})
+                df.to_excel(w, sheet_name=name, index=False)
     return path
+
+
+# Excel's hard limits (1,048,576 rows incl. the header row; 16,384 columns).
+_XLSX_MAX_ROWS = 1_048_576
+_XLSX_MAX_COLS = 16_384
 
 
 @contextlib.contextmanager

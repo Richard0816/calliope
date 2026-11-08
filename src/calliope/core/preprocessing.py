@@ -63,12 +63,25 @@ import shutil
 from typing import Callable, Optional, Sequence
 
 import numpy as np
+import psutil
 # ``tifffile`` is the de-facto Python library for scientific TIFFs
 # (multi-page, big, OME-XML, etc). ``imread`` returns an ndarray;
 # ``TiffWriter`` lets us stream one page at a time.
 import tifffile
 # Pillow gives us GIF encoding via ``Image.save(..., save_all=True)``.
 from PIL import Image
+
+
+def _check_fits_in_ram(path: Path, copies: float) -> None:
+    """Raise ``MemoryError`` up front when ``copies`` x the file size won't
+    fit in available RAM. On Windows an oversized in-RAM read does not raise
+    MemoryError promptly -- it spills into the page file and stalls the
+    machine -- so callers check first and take their streaming path."""
+    need = Path(path).stat().st_size * copies
+    avail = psutil.virtual_memory().available
+    if need > 0.8 * avail:
+        raise MemoryError(f"{Path(path).name}: in-RAM path needs ~{need / 1e9:.1f} GB, "
+                          f"{avail / 1e9:.1f} GB available")
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +180,8 @@ def shift_tiff_to_uint16(
         # Fast path: read the whole stack into RAM as int32 (so we
         # can hold negative values), shift so min becomes 0, then
         # cast down to uint16 (Suite2p's expected dtype).
+        # raw + int32 copy (2x an int16 raw) + uint16 output
+        _check_fits_in_ram(src_tiff, copies=4)
         _log(f"[shift] reading {src_tiff.name} (in-RAM)")
         data = tifffile.imread(str(src_tiff)).astype(np.int32)
         gmin = int(data.min()); gmax = int(data.max())
@@ -201,14 +216,14 @@ def shift_tiff_to_uint16(
             mean=mean, qc_frames=qc_frames,
             n_frames=int(data.shape[0]),
         )
-    except MemoryError:
+    except MemoryError as e:
         # Slow path: very large recordings (10+ GB raw) won't fit in
         # RAM. Drop down to a two-pass streaming version that scans
         # for the global min in pass 1 and writes the shifted output
         # one TIFF page at a time in pass 2. Mean + QC samples are
         # accumulated during pass 2 so we don't re-read the output.
-        _log("[shift] MemoryError on in-RAM path; "
-             "retrying with streaming shift")
+        _log(f"[shift] in-RAM path won't fit ({e}); "
+             "using streaming shift")
         mean, qc_frames, n_pages = _shift_tiff_streaming(
             src_tiff, dst_tiff,
             progress_cb=_log,
@@ -399,6 +414,7 @@ def compress_raw_tiff(
     try:
         _log(f"[compress] reading {src.name} (in-RAM)")
         try:
+            _check_fits_in_ram(src, copies=2.5)  # data + verify read-back
             data = tifffile.imread(str(src))
         except MemoryError:
             _log("[compress] MemoryError on in-RAM read; falling back to streaming")

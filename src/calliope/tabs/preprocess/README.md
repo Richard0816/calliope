@@ -49,7 +49,7 @@ data = data.astype(np.uint16)
 tifffile.imwrite(dst, data)
 ```
 
-**Streaming fallback** (`_shift_tiff_streaming`) — triggered when the in-RAM read raises `MemoryError`. Two passes:
+**Streaming fallback** (`_shift_tiff_streaming`) — triggered when the in-RAM read raises `MemoryError`, or up front when ~4× the file size won't fit in 80% of available RAM (`_check_fits_in_ram`; Windows otherwise spills a too-big read into the page file instead of raising, which stalled a 23 GB in vivo stack on a 34 GB machine). `compress_raw_tiff` runs the same check (~2.5×) before its in-RAM read. Two passes:
 
 1. **Scan**: open `tifffile.TiffFile(src)`, iterate over `tf.pages`, track per-page `min` and `max`, accumulate global `gmin`, `gmax`. No frame held in RAM beyond the current one.
 2. **Write**: open the source again and a `TiffWriter(dst, bigtiff=True)` (BigTIFF avoids the 4 GB single-file cap), shift each page by `−gmin`, cast to `uint16`, write.
@@ -139,7 +139,7 @@ To reproduce Tab 1 from scratch you need:
 1. `tifffile` to read multi-page TIFFs page-by-page (`TiffFile.pages`, `TiffWriter`, `bigtiff=True`).
 2. `numpy` for the shift arithmetic and mean accumulation.
 3. `Pillow` (`PIL.Image`) for GIF encoding.
-4. The decision tree: try in-RAM shift, on `MemoryError` fall back to two-pass streaming.
+4. The decision tree: in-RAM shift if the file fits (RAM pre-check), else / on `MemoryError` two-pass streaming.
 5. The group invariant: one shared shift constant across all files, computed before any writes begin.
 6. The output filename conventions (`shifted_<orig>.tif` or `NNN_shifted_<orig>.tif`) — Suite2p's `natsort` depends on the leading numeric prefix to read multi-file groups in order.
 
