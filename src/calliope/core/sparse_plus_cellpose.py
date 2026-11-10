@@ -151,6 +151,68 @@ HARD_CAP = 60000
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
+# Rough peak of Suite2p detection relative to its binned movie (the float32
+# movie plus the normalised / downsampled copies Sparsery makes). An estimate,
+# calibrated on one 1024x1024 x 10,923-frame in vivo recording: ~11 GB binned,
+# ~20-25 GB at the failure.
+DETECTION_MEM_FACTOR = 2.0
+
+
+def available_commit_bytes() -> int | None:
+    """Memory that can still be committed (RAM + page file), in bytes.
+
+    This is what an allocation actually runs into on Windows: once the commit
+    limit is reached, a process fails to start (0xC0000142) or the system
+    stalls, even if free-RAM figures look fine.
+    """
+    try:
+        import ctypes
+
+        class _Perf(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong)] + [(n, ctypes.c_size_t) for n in (
+                "CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable",
+                "SystemCache", "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [
+                (n, ctypes.c_ulong) for n in ("HandleCount", "ProcessCount", "ThreadCount")]
+        p = _Perf(); p.cb = ctypes.sizeof(p)
+        if ctypes.windll.psapi.GetPerformanceInfo(ctypes.byref(p), p.cb):
+            return int((p.CommitLimit - p.CommitTotal) * p.PageSize)
+    except (AttributeError, OSError):          # not Windows
+        pass
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available + psutil.swap_memory().free)
+    except Exception:
+        return None
+
+
+def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
+                           verbose: bool = True) -> int:
+    """Estimate Suite2p detection's peak memory and stop before it can't fit.
+
+    Uses Suite2p's own binning rule (``bin_size = max(1, nframes // nbins,
+    round(tau * fs))`` unless ``detection.bin_size`` is set). Raises
+    ``MemoryError`` if the estimate exceeds the memory that can still be
+    committed, and warns above 80% of it. Returns the estimate in bytes.
+    """
+    det = settings.get("detection", {}) or {}
+    bin_size = det.get("bin_size") or max(
+        1, nframes // max(1, int(det.get("nbins") or 5000)),
+        int(round(float(settings.get("tau", 1.0)) * float(settings.get("fs", 10.0)))))
+    need = int(DETECTION_MEM_FACTOR * (nframes // int(bin_size)) * Ly * Lx * 4)
+    avail = available_commit_bytes()
+    if avail is None:
+        return need
+    gb = lambda b: b / 2**30
+    msg = (f"Suite2p detection needs about {gb(need):.1f} GB ({nframes} frames of {Ly}x{Lx}, "
+           f"bin size {bin_size}) but only {gb(avail):.1f} GB can still be committed "
+           f"(RAM + page file).")
+    if need > avail:
+        raise MemoryError(msg + " Close other programs, enlarge the page file on an NTFS drive, "
+                                "or crop/split the recording, then run detection again.")
+    if verbose and need > 0.8 * avail:
+        print(f"[s+cp] WARNING: {msg} Detection may fail if other programs use more memory.")
+    return need
+
 
 class NoRoisDetected(RuntimeError):
     """Neither detector found any ROI -- the recording is noise. Batch
@@ -792,6 +854,11 @@ def run(
     }
     apply_settings_overrides(sp_settings, sp_ops)
     apply_settings_overrides(sp_settings, {'roidetect': True})
+    _rv = utils.load_plane_view(shared_plane0)
+    _Ly, _Lx = int(_rv['Ly']), int(_rv['Lx'])
+    _bin = Path(shared_plane0) / 'data.bin'
+    _nf = int(_rv.get('nframes') or 0) or (_bin.stat().st_size // (_Ly * _Lx * 2) if _bin.exists() else 0)
+    check_detection_memory(_Ly, _Lx, _nf, sp_settings, verbose=verbose)
     if verbose:
         for _note in inert_sparsery_op_notes(sp_ops, base_settings):
             print(f'[s+cp] {_note}')
