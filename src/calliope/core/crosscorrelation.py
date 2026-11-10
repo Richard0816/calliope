@@ -322,8 +322,10 @@ def batch_xcorr_clusters(X_A, X_B, fps, max_lag_seconds, *,
         Zs = ZA_pad[L:L + T]
         zero_lag_corr = (Zs.T @ ZB) * inv_T
 
-    # Convert the integer lag indices back to seconds.
-    best_lag_sec = ((best_lag_idx.astype(ZA.dtype) - dtype(L))
+    # Convert the integer lag indices back to seconds. Index j pairs
+    # A(t + j - L) with B(t), so A leading B by d frames peaks at
+    # j - L = -d; negate so positive => A leads B (the documented sign).
+    best_lag_sec = ((dtype(L) - best_lag_idx.astype(ZA.dtype))
                     / dtype(float(fps)))
 
     # If we ran on GPU, copy the result matrices back to host RAM
@@ -528,7 +530,9 @@ def single_pair_xcorr_curve(sigA, sigB, fps, max_lag_seconds):
     Za_pad = np.concatenate([pad, Za, pad])
     from numpy.lib.stride_tricks import sliding_window_view
     windows = sliding_window_view(Za_pad, T)  # (2L+1, T)
-    r = (windows @ Zb) / float(T)
+    # Row j pairs A(t + j - L) with B(t); reverse so r[i] sits at lag
+    # i - L with positive => A leads B (same sign as batch_xcorr_clusters).
+    r = ((windows @ Zb) / float(T))[::-1]
 
     lags = np.arange(-L, L + 1, dtype=np.int64)
     lags_sec = lags.astype(np.float32) / float(fps)

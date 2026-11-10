@@ -260,7 +260,7 @@ The spatial map then asks the obvious follow-up: *do these functional clusters c
 
 **What it does.** For each pair of clusters (Cᵢ, Cⱼ), and for each pair of cells (one from Cᵢ, one from Cⱼ), it computes the **time-lagged Pearson correlation**: shift cell-A's trace by `k` frames, ask "how correlated is shifted-A with B?", repeat for `k ∈ [−L, +L]`, and report:
 
-- `best_lag_sec`: the lag at which correlation is highest (in seconds; positive ⇒ A leads B by that many seconds).
+- `best_lag_sec`: the lag at which correlation is highest (in seconds; positive ⇒ A leads B by that many seconds). Runs made before 2026-11-09 stored the opposite sign; negate it when reading those CSVs.
 - `max_corr`: the correlation value at that lag.
 - `zero_lag_corr`: correlation at `lag = 0` (instantaneous co-firing).
 

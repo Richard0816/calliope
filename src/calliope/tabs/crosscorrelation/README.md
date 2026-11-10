@@ -2,6 +2,8 @@
 
 **Goal.** For each pair of clusters (Cᵢ × Cⱼ) and each pair of cells inside them, compute the time-lagged Pearson correlation. Report:
 - `best_lag_sec` — lag at which correlation peaks (positive = ROI A leads).
+  Runs written before 2026-11-09 stored this with the opposite sign (fixed in
+  `core/crosscorrelation.py`); negate it when reading older CSVs.
 - `max_corr` — Pearson r at that lag.
 - `zero_lag_corr` — Pearson r at lag 0.
 
