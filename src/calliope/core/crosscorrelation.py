@@ -1331,7 +1331,7 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
     import matplotlib.pyplot as plt
     from ..tabs.crosscorrelation.tab import (
         _get_metric_arrays, _plot_violin, _plot_lag_violin,
-        _roi_level_lag_pvalue,
+        _lag_pvalues_fdr,
     )
 
     corr_labels, corr_arrays = _get_metric_arrays(pair_data, "zero_lag_corr")
@@ -1351,12 +1351,12 @@ def _save_violin_pair(pair_data, *, save_path: Path, title_suffix: str):
                      transform=ax_corr.transAxes)
 
     if lag_arrays:
+        lag_p = _lag_pvalues_fdr(pair_data)        # BH-FDR over the run's tested pairs
         _plot_lag_violin(
             ax_lag, lag_labels, lag_arrays,
             "Lag at peak correlation (s)",
             f"Per-pair best-lag distribution  ({title_suffix})",
-            pvals=[_roi_level_lag_pvalue(lb, pair_data[lb])
-                   for lb in lag_labels],
+            pvals=[lag_p[lb][1] for lb in lag_labels],
         )
     else:
         ax_lag.set_axis_off()

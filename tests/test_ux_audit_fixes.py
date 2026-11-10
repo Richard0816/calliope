@@ -547,3 +547,20 @@ def test_cellpose_size_cap_drops_blobs_only():
     noise = [{"ypix": np.zeros(n, int), "xpix": np.zeros(n, int)}
              for n in (3000, 3400, 3500, 8000)]
     assert drop_oversized_cellpose(noise, 4.0, verbose=False) == []
+
+
+def test_lag_violin_pvalues_are_bh_fdr_corrected():
+    import pandas as pd
+    from calliope.core.crosscorrelation import _bh_fdr
+    from calliope.tabs.crosscorrelation.tab import _lag_pvalues_fdr
+    rng = np.random.default_rng(0)
+    def pair(mu):
+        return pd.DataFrame({"roiA": np.repeat(range(12), 3), "roiB": np.tile(range(3), 12),
+                             "best_lag_sec": rng.normal(mu, 1.0, 36)})
+    data = {"C1xC1": pair(0.5), "C1xC2": pair(1.5), "C1xC3": pair(0.3), "C2xC3": pair(0.0)}
+    out = _lag_pvalues_fdr(data)
+    assert np.isnan(out["C1xC1"][0]) and np.isnan(out["C1xC1"][1])     # within-cluster: untested, not in the family
+    tested = ["C1xC2", "C1xC3", "C2xC3"]
+    raw = [out[k][0] for k in tested]
+    assert np.allclose([out[k][1] for k in tested], _bh_fdr(raw))
+    assert all(out[k][1] >= out[k][0] for k in tested)

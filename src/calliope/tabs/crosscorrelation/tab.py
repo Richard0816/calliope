@@ -214,6 +214,21 @@ def _roi_level_lag_pvalue(pair: str, df: pd.DataFrame) -> float:
     return _sign_flip_pvalue(per_roi) if per_roi.size >= 2 else float("nan")
 
 
+def _lag_pvalues_fdr(pair_data: dict) -> dict[str, tuple[float, float]]:
+    """``{pair: (raw p, BH-FDR p)}`` for every pair in ``pair_data``.
+
+    The family is every tested (between-cluster) pair of the run; untested
+    within-cluster pairs stay NaN and are left out of the correction. Callers
+    pass the run's full pair set, so hiding clusters in the viewer does not
+    change which violins are significant.
+    """
+    from ...core.crosscorrelation import _bh_fdr
+    raw = {lb: _roi_level_lag_pvalue(lb, df) for lb, df in pair_data.items()}
+    tested = [lb for lb, p in raw.items() if np.isfinite(p)]
+    fdr = dict(zip(tested, _bh_fdr([raw[lb] for lb in tested])))
+    return {lb: (p, float(fdr.get(lb, np.nan))) for lb, p in raw.items()}
+
+
 def _significance_marker(p: float) -> str:
     if p < 0.001:
         return "***"
@@ -258,8 +273,8 @@ def _plot_lag_violin(ax, labels, arrays, ylabel: str, title: str,
     """Lead/Lag-styled violin plot for per-pair best-lag distributions.
 
     Each violin is coloured by the sign of its mean and the sign-flip
-    permutation p-value (callers pass ROI-level p-values from
-    :func:`_roi_level_lag_pvalue`; NaN = not tested):
+    permutation p-value (callers pass the BH-FDR-corrected ROI-level p-values
+    from :func:`_lag_pvalues_fdr`; NaN = not tested):
       * blue  - mean > 0 and p < 0.05 (Lead)
       * red   - mean < 0 and p < 0.05 (Lag)
       * gray  - not significant
@@ -354,11 +369,11 @@ class ViolinWindow(ctk.CTkToplevel):
         self.wm_minsize(720, 540)
 
         self._xcorr_root = xcorr_root
-        # Per-pair-label cache of sign-flip permutation p-values. Each pair's
-        # best-lag array (and thus its p-value) is identical across cluster
-        # re-renders, so this avoids re-running the 10k-permutation test for
-        # every still-included pair on every Apply click.
-        self._pval_cache: dict[str, float] = {}
+        # {pair: (raw p, BH-FDR p)} for the lead/lag violins, computed once over
+        # the run's full pair set on first render: the FDR family must not
+        # change when clusters are hidden, and it spares re-running the
+        # 10k-permutation test on every Apply click.
+        self._lag_p: Optional[dict[str, tuple[float, float]]] = None
         # Recording label = human-readable name shown in the title
         # bar. ``xcorr_root`` lives at
         # ``<plane0>/<prefix>cluster_results/<cluster_folder>/cross_correlation_full``
@@ -570,15 +585,9 @@ class ViolinWindow(ctk.CTkToplevel):
                               transform=self.ax_corr.transAxes)
 
         if lag_arrays:
-            # Reuse cached per-pair p-values across cluster-filter renders;
-            # only newly-seen pairs pay the permutation test.
-            lag_pvals = []
-            for label, arr in zip(lag_labels, lag_arrays):
-                p = self._pval_cache.get(label)
-                if p is None:
-                    p = _roi_level_lag_pvalue(label, pair_data[label])
-                    self._pval_cache[label] = p
-                lag_pvals.append(p)
+            if self._lag_p is None:
+                self._lag_p = _lag_pvalues_fdr(self._pair_data)
+            lag_pvals = [self._lag_p[label][1] for label in lag_labels]
             _plot_lag_violin(
                 self.ax_lag, lag_labels, lag_arrays,
                 "Lag at peak correlation (s)",

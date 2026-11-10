@@ -246,7 +246,9 @@ Implemented in **chunks of 256 permutations** to keep memory at `O(chunk · n)` 
 
 This tests `H0: lag distribution is symmetric around 0` (no consistent lead/lag direction). Rejecting `H0` means the cluster pair has a directional relationship.
 
-Significance markers: `***` (`p < 0.001`), `**` (`p < 0.01`), `*` (`p < 0.05`).
+**Multiple-comparison correction (since 2026-11-09).** The colours and markers use **Benjamini–Hochberg FDR-corrected** p-values (`_lag_pvalues_fdr`, reusing `core.crosscorrelation._bh_fdr`). The family is every tested between-cluster pair of the run. Untested within-cluster pairs (NaN) are left out. Hiding clusters in the viewer does not change the family, so a violin's significance never depends on which other clusters are shown. Before this date the violins used uncorrected p-values. These p-values are not written to any CSV. The per-cell-pair `p_value` / `p_value_fdr` columns in the summary CSVs are a different test (the circular-shift null).
+
+Significance markers (on the FDR-corrected p): `***` (`p < 0.001`), `**` (`p < 0.01`), `*` (`p < 0.05`).
 
 ### Step 7 — Aborting
 
