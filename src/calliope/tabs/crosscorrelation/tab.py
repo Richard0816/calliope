@@ -1301,11 +1301,16 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 full_pair, save_path=xc_dir / "full.png",
                 title_suffix="full recording")
             n_files += 2  # png + svg
-            if per_event_dir.is_dir():
-                pe_pair = _load_pair_data(per_event_dir)
+            # Pair CSVs nest one level deeper per event, so plot one
+            # representative event (same choice as the headless runner).
+            from ...core.crosscorrelation import _pick_representative_event_dir
+            ev_dir = (_pick_representative_event_dir(per_event_dir)
+                      if per_event_dir.is_dir() else None)
+            if ev_dir is not None:
                 _save_violin_pair(
-                    pe_pair, save_path=xc_dir / "per_event.png",
-                    title_suffix="per event")
+                    _load_pair_data(ev_dir),
+                    save_path=xc_dir / "per_event.png",
+                    title_suffix=f"per event: {ev_dir.name}")
                 n_files += 2
             manifest_path = write_export_manifest(
                 figures_root,

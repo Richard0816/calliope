@@ -33,6 +33,8 @@ From `plane0/`:
 > `per_event.png` shows one **representative** event window (the one with
 > the most cluster-pair data); per-window CSVs for every event are written
 > under the cluster-results tree.
+> Tab 7's own figure export (also what the GUI Tab 0 batch calls) picks
+> the same representative event.
 > Tab 0's headless batch path uses this; Tab 7 runs the same runners in
 > a child process (`run_cluster_xcorr_offload` via `core.offload`) and
 > adds its interactive filters. The GUI batch drives Tab 7 through
