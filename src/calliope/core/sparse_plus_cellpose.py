@@ -152,9 +152,10 @@ HARD_CAP = 60000
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
 # Rough peak of Suite2p detection relative to its binned movie (the float32
-# movie plus the normalised / downsampled copies Sparsery makes). An estimate,
-# calibrated on one 1024x1024 x 10,923-frame in vivo recording: ~11 GB binned,
-# ~20-25 GB at the failure.
+# movie plus the normalised / downsampled copies Sparsery makes). UNCALIBRATED:
+# the only evidence is one 1024x1024 x 10,923-frame in vivo run (10.7 GiB binned)
+# that died with roughly 15 GiB committable, so the true factor is >= ~1.4 and its
+# upper bound is unknown. That is why check_detection_memory only warns.
 DETECTION_MEM_FACTOR = 2.0
 
 
@@ -187,12 +188,13 @@ def available_commit_bytes() -> int | None:
 
 def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
                            verbose: bool = True) -> int:
-    """Estimate Suite2p detection's peak memory and stop before it can't fit.
+    """Estimate Suite2p detection's peak memory and warn if it may not fit.
 
     Uses Suite2p's own binning rule (``bin_size = max(1, nframes // nbins,
-    round(tau * fs))`` unless ``detection.bin_size`` is set). Raises
-    ``MemoryError`` if the estimate exceeds the memory that can still be
-    committed, and warns above 80% of it. Returns the estimate in bytes.
+    round(tau * fs))`` unless ``detection.bin_size`` is set) and
+    ``DETECTION_MEM_FACTOR``. Warns above 80% of the memory that can still be
+    committed, and always warns (even when not verbose) above 100%. It never
+    stops the run: the factor is uncalibrated. Returns the estimate in bytes.
     """
     det = settings.get("detection", {}) or {}
     bin_size = det.get("bin_size") or max(
@@ -207,9 +209,10 @@ def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
            f"bin size {bin_size}) but only {gb(avail):.1f} GB can still be committed "
            f"(RAM + page file).")
     if need > avail:
-        raise MemoryError(msg + " Close other programs, enlarge the page file on an NTFS drive, "
-                                "or crop/split the recording, then run detection again.")
-    if verbose and need > 0.8 * avail:
+        print(f"[s+cp] WARNING: {msg} The {DETECTION_MEM_FACTOR:g}x estimate is uncalibrated, but "
+              "this run may fail in detection. To be safe, close other programs, enlarge the page "
+              "file on an NTFS drive, or crop/split the recording.", flush=True)
+    elif verbose and need > 0.8 * avail:
         print(f"[s+cp] WARNING: {msg} Detection may fail if other programs use more memory.")
     return need
 
