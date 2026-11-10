@@ -550,19 +550,33 @@ def refine_onsets(onsets, lp, fps, min_rise_dff=0.0, backtrack_s=0.8):
         # never produces one, but the function shouldn't assume it).
         c = min(max(int(c), 0), n - 1)
         lo = max(0, c - win)
-        # Foot = the trough the rise climbs out of. Walk back from the crossing
-        # only while the trace stays *below* the crossing level, then take the
-        # argmin of that span. The two halves matter:
-        #  - argmin (not the first local min) reaches the real foot, so a second
-        #    crossing part-way up one event isn't left stranded ("late").
-        #  - stopping at the most recent sample already >= the crossing level
-        #    keeps it from backtracking across a *separate, earlier* bump into
-        #    that bump's trough ("too far back"). ``backtrack_s`` still caps it.
+        # Foot = the trough the rise climbs out of. The search span runs back
+        # from the crossing only while the trace stays *below* the crossing
+        # level, so it never crosses a *separate, earlier* bump ("too far
+        # back"); ``backtrack_s`` still caps it. Within the span, walk down the
+        # rise to the nearest trough -- NOT the span's argmin, which on a flat
+        # noisy baseline lands wherever the noise dips lowest, up to a whole
+        # window early. Only if that trough is still more than halfway up the
+        # rise to the upcoming peak (a shoulder, e.g. a second crossing part-way
+        # up one event) do we step back over the bump to the next trough
+        # ("late" guard). Halfway is measured against the peak, not the
+        # crossing: a crossing right at the foot leaves noise wiggles that are
+        # large next to (crossing - floor) but tiny next to the transient.
         cv = lp[c]
+        s0 = c
+        while s0 > lo and lp[s0 - 1] < cv:
+            s0 -= 1
+        floor = float(lp[s0:c + 1].min())
+        pk = float(lp[c:min(n, c + win + 1)].max())
         b = c
-        while b > lo and lp[b - 1] < cv:
-            b -= 1
-        foot = b + int(np.argmin(lp[b:c + 1]))
+        while True:
+            while b > s0 and lp[b - 1] < lp[b]:
+                b -= 1
+            if b == s0 or lp[b] - floor <= 0.5 * (pk - floor):
+                break
+            while b > s0 and lp[b - 1] >= lp[b]:
+                b -= 1
+        foot = b
         if min_rise_dff > 0.0:
             hi = min(n, c + win + 1)
             peak = c + int(np.argmax(lp[c:hi]))
@@ -3249,6 +3263,17 @@ def save_pix_to_um(plane0: Union[str, Path], value: float) -> None:
     np.save(cal_path, payload, allow_pickle=True)
 
 
+def _dff_denominator(baseline, F):
+    """dF/F denominator: ``baseline``, floored at 10% of the trace's own scale.
+
+    Neuropil subtraction can push a real ROI's baseline to or below zero.
+    Without a scale-aware floor the denominator collapses to 1e-9 and dF/F
+    reaches ~1e12, which then dominates z-scores and event detection.
+    """
+    scale = max(abs(float(np.median(F))), float(np.std(F)))
+    return max(float(baseline), 0.1 * scale, 1e-9)
+
+
 def robust_df_over_f_1d(F, win_sec=45, perc=10, fps=30.0):
     """Rolling-percentile baseline dF/F for one trace.
 
@@ -3295,10 +3320,10 @@ def robust_df_over_f_1d(F, win_sec=45, perc=10, fps=30.0):
     # ``eps`` (epsilon) is what we divide by. We use the 1st
     # percentile of the baseline -- not the baseline itself -- so a
     # bright ROI ends up normalised to a *cell-relative* scale, not
-    # a per-frame moving target. ``eps = max(eps, 1e-9)`` guards
-    # against literal zeros.
+    # a per-frame moving target. ``_dff_denominator`` guards against a
+    # baseline at or below zero.
     eps = np.nanpercentile(F0, 1) if np.isfinite(F0).any() else 1.0
-    eps = max(eps, 1e-9)
+    eps = _dff_denominator(eps, F)
     dff = (F - F0) / eps
     return dff
 
@@ -3336,7 +3361,7 @@ def first_n_min_df_over_f_1d(F, baseline_min=2.0, perc=10, fps=30.0):
     # downward and inflate dF/F. (``perc`` is accepted for call-site
     # symmetry with ``robust_df_over_f_1d`` but is not used here.)
     F0_scalar = float(np.nanmean(F[:n_baseline]))
-    eps = max(F0_scalar, 1e-9)
+    eps = _dff_denominator(F0_scalar, F)
     return ((F - F0_scalar) / eps).astype(np.float32)
 
 

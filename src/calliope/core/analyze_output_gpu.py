@@ -88,12 +88,16 @@ def _gpu_process_all(
             F_corr = cp.asarray(Fc_host, dtype=cp.float32)
         # match CPU first_n_min_df_over_f_1d: mean of the first-N-min window
         F0 = cp.mean(F_corr[:n_baseline, :], axis=0, keepdims=True)
-        F0_safe = cp.maximum(F0, cp.full_like(F0, 1e-9))
+        # same floor as utils._dff_denominator
+        scale = cp.maximum(cp.abs(cp.median(F_corr, axis=0, keepdims=True)),
+                           cp.std(F_corr, axis=0, keepdims=True))
+        F0_safe = cp.maximum(cp.maximum(F0, 0.1 * scale),
+                             cp.full_like(F0, 1e-9))
         dff = (F_corr - F0) / F0_safe
 
         dff_out[:, start:end] = cp.asnumpy(dff)
 
-        del Fc, Fn, F_corr, F0, F0_safe, dff
+        del Fc, Fn, F_corr, F0, scale, F0_safe, dff
         cp.get_default_memory_pool().free_all_blocks()
 
     # End-of-function cleanup: sync the stream so the per-chunk pool

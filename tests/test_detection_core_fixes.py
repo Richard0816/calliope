@@ -230,6 +230,7 @@ def _numpy_cupy():
         asarray=lambda x, dtype=None: np.asarray(x, dtype=dtype),
         asnumpy=np.asarray, float32=np.float32, isfinite=np.isfinite,
         mean=np.mean, maximum=np.maximum, full_like=np.full_like,
+        median=np.median, std=np.std, abs=np.abs,
         get_default_memory_pool=lambda: pool,
         get_default_pinned_memory_pool=lambda: pool,
         cuda=types.SimpleNamespace(Stream=types.SimpleNamespace(
@@ -289,3 +290,24 @@ def test_s2p_open_dff_memmap_needs_only_the_dff_file(tmp_path):
     dff, t, n = utils.s2p_open_dff_memmap(tmp_path, prefix="r0p7_")
     assert (t, n) == (T, N)
     np.testing.assert_array_equal(np.asarray(dff), data)
+
+
+def test_gpu_matches_cpu_when_baseline_is_negative(tmp_path, monkeypatch):
+    from calliope.core import analyze_output_gpu as gpu
+    monkeypatch.setattr(gpu, "cp", _numpy_cupy(), raising=False)
+    monkeypatch.setattr(gpu, "_CUPY_OK", True, raising=False)
+    rng = np.random.default_rng(2)
+    F = (300 + 20 * rng.standard_normal((2, 400))).astype(np.float32)
+    F[0, :60] = -5 + rng.standard_normal(60)    # ROI 0: negative first-N mean
+    out = {}
+    for name, use_gpu in (("gpu", True), ("cpu", False)):
+        d = tmp_path / name
+        d.mkdir()
+        np.save(d / "F.npy", F)
+        np.save(d / "Fneu.npy", np.zeros_like(F))
+        dr.compute_dff_memmaps(d, {"fps_override": 10.0, "use_gpu_dff": use_gpu},
+                               baseline_mode="first_n", baseline_min=0.1)
+        out[name] = np.memmap(d / "r0p7_dff.memmap.float32", dtype="float32",
+                              mode="r", shape=(400, 2))
+    np.testing.assert_allclose(out["gpu"], out["cpu"], rtol=1e-4, atol=1e-4)
+    assert np.abs(out["gpu"]).max() < 100

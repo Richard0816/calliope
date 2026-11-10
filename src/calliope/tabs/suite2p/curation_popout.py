@@ -195,6 +195,38 @@ def _upsert_label(csv_path: Path, plane0_path: Path,
         writer.writerows(rows)
 
 
+def _norm_path(p) -> str:
+    import os
+    return os.path.normcase(os.path.abspath(str(p)))
+
+
+def _apply_label_overrides(plane0: Path, labels) -> int:
+    """Re-impose ``plane0``'s human labels (labels-CSV rows) on
+    ``predicted_cell_mask.npy`` so a re-predict never undoes manual
+    curation. Returns the number of labels applied (0 = file untouched).
+    """
+    from ...core.cellfilter import config as _cfg
+    sub = labels[labels["plane0_path"].map(_norm_path) == _norm_path(plane0)]
+    path = Path(plane0) / _cfg.PREDICTED_MASK_NAME
+    if sub.empty or not path.exists():
+        return 0
+    mask = np.load(path).astype(bool)
+    rois = sub["ROI_number"].to_numpy()
+    ok = (rois >= 0) & (rois < mask.size)
+    mask[rois[ok]] = sub["user_defined_cell"].to_numpy()[ok] == 1
+    np.save(path, mask)
+    return int(ok.sum())
+
+
+def _find_plane0s(root: Path, exclude: Path) -> list[Path]:
+    """Every finished plane0 under ``root`` (has ``stat.npy`` + the
+    all-ROI dF/F memmap the cell filter scores), minus ``exclude``."""
+    ex = _norm_path(exclude)
+    return sorted({f.parent for f in Path(root).rglob("r0p7_dff.memmap.float32")
+                   if (f.parent / "stat.npy").exists()
+                   and _norm_path(f.parent) != ex})
+
+
 class CurationPopout(ctk.CTkToplevel):
     """Toplevel curation window for one Suite2p ROI.
 
@@ -774,12 +806,6 @@ class CurationPopout(ctk.CTkToplevel):
         # not touch Tk variables.
         warm_start = self._warm_start_ckpt()
         size_z = self._size_outlier_z()
-        if warm_start is not None:
-            init_line = (f"Fine-tunes the selected checkpoint\n"
-                         f"{warm_start}\n(lr {_cfg.WARM_START_LR:g}).")
-        else:
-            init_line = (f"Trains from random init (lr {_cfg.LR:g}); no "
-                         f"selected checkpoint to warm-start from.")
         # Tab 3 (the only parent that supplies the checkpoint hook)
         # also rewrites the filtered dF/F memmap on the (-1, -1)
         # sentinel and selects the new best.pt.
@@ -787,32 +813,108 @@ class CurationPopout(ctk.CTkToplevel):
             " Tab 3 then rewrites the filtered dF/F memmap to the new "
             "cell set and selects the new best.pt as its checkpoint."
             if self._on_checkpoint_trained is not None else "")
-        if not messagebox.askyesno(
-                "Retrain cell filter",
-                f"Retrain the cell filter now?\n\n"
-                f"Reads {self._csv_path}\n"
+        info = (f"Reads {self._csv_path}\n"
                 f"and writes best.pt / last.pt to\n"
-                f"{_cfg.CHECKPOINT_DIR}.\n{init_line}\n\n"
+                f"{_cfg.CHECKPOINT_DIR}.\n\n"
                 f"Training runs in the background and may take a while. "
                 f"Flip buttons stay enabled, but the trainer reads the "
                 f"labels CSV when it starts, so flips made during "
                 f"training go into the next round.\n\n"
-                f"When it finishes, this recording is re-predicted "
+                f"When it finishes, this recording (and any recordings "
+                f"under the re-apply folder) is re-predicted "
                 f"(size_outlier_z={size_z:g}) and "
-                f"{_cfg.PREDICTED_MASK_NAME} is overwritten."
-                f"{parent_line}"):
+                f"{_cfg.PREDICTED_MASK_NAME} is overwritten; ROIs you "
+                f"labelled by hand keep your label.{parent_line}")
+        opts = self._ask_retrain_options(info, warm_start)
+        if opts is None:
             return
+        if opts["mode"] != "finetune":
+            warm_start = None
+        reapply = (opts.get("reapply_root") or "").strip() or None
         self._retrain_btn.configure(state="disabled")
         self._train_status_var.set("Training... see console for epoch log")
         self._train_thread = threading.Thread(
-            target=self._train_worker, args=(warm_start, size_z),
+            target=self._train_worker,
+            args=(warm_start, size_z, bool(opts.get("implicit")), reapply),
             daemon=True)
         self._train_thread.start()
         # Poll the worker so the status label flips back when done.
         self._poll_train_state()
 
+    def _ask_retrain_options(self, info: str,
+                             warm_start: Optional[Path]) -> Optional[dict]:
+        """Modal Retrain dialog. Returns ``{"mode": "finetune"|"scratch",
+        "implicit": bool, "reapply_root": str}`` or ``None`` on cancel.
+        Fine-tune is only offered when a checkpoint is selected."""
+        from tkinter import filedialog
+        from ...core.cellfilter import config as _cfg
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Retrain cell filter")
+        dlg.transient(self)
+        result: dict = {}
+        mode = tk.StringVar(value="finetune" if warm_start else "scratch")
+        implicit = tk.BooleanVar(value=False)
+        root = tk.StringVar(value="")
+
+        ctk.CTkLabel(dlg, text="Starting point", anchor="w",
+                     font=ctk.CTkFont(weight="bold")
+                     ).pack(fill="x", padx=12, pady=(12, 2))
+        ft_text = (f"Fine-tune the selected checkpoint (lr "
+                   f"{_cfg.WARM_START_LR:g})\n{warm_start}" if warm_start
+                   else "Fine-tune (no checkpoint selected in Tab 3)")
+        ctk.CTkRadioButton(dlg, text=ft_text, variable=mode,
+                           value="finetune",
+                           state="normal" if warm_start else "disabled"
+                           ).pack(anchor="w", padx=20, pady=2)
+        ctk.CTkRadioButton(dlg, text=(f"Train from scratch (random init, "
+                                      f"lr {_cfg.LR:g})"),
+                           variable=mode, value="scratch"
+                           ).pack(anchor="w", padx=20, pady=2)
+
+        ctk.CTkCheckBox(
+            dlg, variable=implicit,
+            text=("Count the kept ROIs I didn't flip on labelled recordings "
+                  "as cells\n(use when you only rejected the bad ones; any "
+                  "bad ROI you missed is learned as a cell)")
+        ).pack(anchor="w", padx=12, pady=(12, 2))
+
+        ctk.CTkLabel(dlg, anchor="w",
+                     text=("Then re-apply the new model to every recording "
+                           "under (optional):")
+                     ).pack(fill="x", padx=12, pady=(12, 2))
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(fill="x", padx=12)
+        ctk.CTkEntry(row, textvariable=root, width=420
+                     ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            row, text="Browse...", width=90,
+            command=lambda: root.set(
+                filedialog.askdirectory(parent=dlg) or root.get())
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(dlg, text=info, anchor="w", justify="left",
+                     wraplength=560).pack(fill="x", padx=12, pady=12)
+
+        def _ok():
+            result.update(mode=mode.get(), implicit=bool(implicit.get()),
+                          reapply_root=root.get())
+            dlg.destroy()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(btns, text="Cancel", width=100,
+                      command=dlg.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Train", width=100,
+                      command=_ok).pack(side="right", padx=(0, 6))
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+        self.wait_window(dlg)
+        return result or None
+
     def _train_worker(self, warm_start: Optional[Path] = None,
-                      size_outlier_z: Optional[float] = None) -> None:
+                      size_outlier_z: Optional[float] = None,
+                      implicit_positives: bool = False,
+                      reapply_root: Optional[str] = None) -> None:
         """Run training, then immediately re-score the current
         recording's ROIs with the fresh checkpoint so Tab 3's panels
         + the popout's status bar reflect the new predictions
@@ -830,6 +932,9 @@ class CurationPopout(ctk.CTkToplevel):
              when Retrain was clicked) so
              ``predicted_cell_prob.npy`` / ``predicted_cell_mask.npy``
              reflect the new model.
+          2b. Re-impose this recording's hand labels on the new mask,
+             then repeat 2 + 2b for every other finished plane0 under
+             ``reapply_root`` and rewrite its filtered dF/F memmap.
           3. Stash ``("ok", ...)`` for the poller. The poller flips
              the status label, reloads ``self._probs``, and fires
              ``on_iscell_changed(-1, -1)``.
@@ -846,11 +951,13 @@ class CurationPopout(ctk.CTkToplevel):
             size_outlier_z = float(_cfg.SIZE_OUTLIER_Z)
         try:
             from ...core.cellfilter import train as _train
+            kw = ({"implicit_positives": True}
+                  if implicit_positives else {})
             if warm_start is not None:
                 best_auc = _train.main(warm_start=warm_start,
-                                       lr=_cfg.WARM_START_LR)
+                                       lr=_cfg.WARM_START_LR, **kw)
             else:
-                best_auc = _train.main()
+                best_auc = _train.main(**kw)
         except Exception as e:
             self._train_result = ("err", f"Training failed: {e}")
             return
@@ -879,10 +986,13 @@ class CurationPopout(ctk.CTkToplevel):
             import torch
             device = torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu")
+            from ...core.cellfilter.dataset import load_labels
             model = load_model_from_checkpoint(ckpt_path, device)
+            labels = load_labels(self._csv_path)
             predict_recording(self._rec_id, model, device,
                               plane0=self._plane0,
                               size_outlier_z=size_outlier_z)
+            _apply_label_overrides(self._plane0, labels)
             self._train_result = (
                 "ok",
                 "Training complete. predicted_cell_mask.npy refreshed.")
@@ -890,6 +1000,45 @@ class CurationPopout(ctk.CTkToplevel):
             self._train_result = (
                 "warn",
                 f"Training complete but re-predict failed: {e}")
+            return
+        if reapply_root:
+            self._reapply(reapply_root, model, device, labels,
+                          size_outlier_z)
+
+    def _reapply(self, root, model, device, labels,
+                 size_outlier_z: float) -> None:
+        """Re-predict every other finished plane0 under ``root`` with the
+        new model, keep its hand labels, and rewrite its filtered dF/F
+        memmap so downstream tabs see the new cell set. Worker thread;
+        amends ``self._train_result``."""
+        from ...core import utils as _u
+        from ...core.cellfilter.predict import predict_recording
+        from ...core.detection_run import compute_filtered_dff
+        kind, msg = self._train_result
+        try:
+            targets = _find_plane0s(Path(root), self._plane0)
+        except Exception as e:
+            self._train_result = ("warn", f"{msg} Re-apply: could not "
+                                          f"scan {root}: {e}")
+            return
+        failed = []
+        for p0 in targets:
+            try:
+                predict_recording(_u.infer_recording_id(p0), model, device,
+                                  plane0=p0, size_outlier_z=size_outlier_z)
+                _apply_label_overrides(p0, labels)
+                if (p0 / "r0p7_filtered_dff.memmap.float32").exists():
+                    compute_filtered_dff(p0)
+            except Exception as e:
+                failed.append(f"{p0}: {e}")
+                print(f"[curation] re-apply failed for {p0}: {e}")
+        msg = (f"{msg} Re-applied to {len(targets) - len(failed)}/"
+               f"{len(targets)} other recording(s) under {root}; re-run "
+               f"their events / clusters to use the new cell set.")
+        if failed:
+            kind = "warn"
+            msg += " Failed:\n" + "\n".join(failed)
+        self._train_result = (kind, msg)
 
     def _poll_train_state(self) -> None:
         if self._train_thread is None:

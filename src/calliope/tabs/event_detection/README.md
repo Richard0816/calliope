@@ -135,9 +135,14 @@ Then merge onsets closer than `min_sep_s · fps` frames into the earliest of the
 
 The Schmitt trigger fires partway *up* the rise (where the derivative robust-z
 crosses `z_enter`), not at its foot. `refine_onsets` (`core/utils.py`, called per ROI
-in `run_event_detection`) walks each crossing back along the low-pass dF/F
-to the local minimum that starts the rise, so the reported frame lands at event
-**onset**. Two crossings on one rise collapse to a single foot.
+in `run_event_detection`) walks each crossing back down the low-pass dF/F
+to the nearest trough the rise climbs out of, so the reported frame lands at
+event **onset**. If that trough is still more than halfway up the rise to the
+upcoming peak (a shoulder), the walk steps back over it to the next trough. The
+foot is deliberately *not* the lowest point in the look-back window: on a flat
+noisy baseline that lands wherever the noise dips lowest, up to a whole window
+(~1 s) early, which dragged population event windows early too (fixed
+2026-10-31). Two crossings on one rise collapse to a single foot.
 
 If `min_rise_dff > 0` it additionally drops onsets whose foot→peak rise on the
 low-pass dF/F is below `min_rise_dff` **absolute dF/F**. The floor is absolute
@@ -350,9 +355,9 @@ raw dF/F scale.
 - **Onset backtrack (`onset_backtrack_s`) — default `0.0` (auto).**
   - *What it does:* cap (seconds) on how far `refine_onsets` walks an onset back
     to the foot of its rise (and forward to the peak for the rise gate). The
-    foot is the `argmin` over the look-back, but the walk never crosses a sample
-    already as high as the onset itself, so it can't reach back into a separate
-    earlier bump. `0` = **auto**: `max(tau, 0.8/cutoff_hz)` per recording,
+    foot is the nearest trough below the rise (stepping over a shoulder more
+    than halfway up), and the walk never crosses a sample already as high as
+    the onset itself, so it can't reach back into a separate earlier bump. `0` = **auto**: `max(tau, 0.8/cutoff_hz)` per recording,
     where `cutoff_hz` is the batch row's value, else the cutoff Tab 4 stamped
     into `meta.json` `lowpass_filtered` when it wrote the memmaps, else 1 Hz
     (`_resolve_cutoff_hz`).

@@ -284,7 +284,7 @@ def run_recording(
             status="ok", duration_s=time.time() - t0)
         figures["event_detection"] = event_data.get("figures", [])
         _emit(f"event_detection: done "
-              f"(events={len(event_data.get('event_windows') or [])})")
+              f"(events={len(event_data.get('event_windows', []))})")
     except Exception as e:
         stages["event_detection"].update(
             status="failed", duration_s=time.time() - t0,

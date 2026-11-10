@@ -453,10 +453,17 @@ After every flip the popout auto-advances to the next sorted ROI — `1`/`0` is 
 
 ### 7.3 Retrain loop (auto re-predict)
 
-The Tab 3 popout's **Retrain cell filter** button (greyed until ≥1 flip in the current session) asks for confirmation (the dialog lists every side effect below), then in a worker thread does:
+The Tab 3 popout's **Retrain cell filter** button (greyed until ≥1 flip in the current session) opens a Retrain dialog (it lists every side effect below) with three choices:
 
-1. `cellfilter.train.main(warm_start=<Tab 3's selected checkpoint>, lr=config.WARM_START_LR)` — reads the labels CSV, writes new `best.pt` + `last.pt` to `CHECKPOINT_DIR`. The selected checkpoint is the bundled `cellfilter_best.pt` unless the user browsed to another one; if the field is empty or the file is missing, it trains from random init at `config.LR`. Flip buttons stay enabled; flips made during training go into the next round.
-2. `predict_recording(rec_id, model, device, plane0=self._plane0, size_outlier_z=<Tab 3's live value>)` — scores every ROI in the *current* recording against the fresh checkpoint with the same size gate the detection run uses (`0` = off is honoured).
+- **Starting point** — *Fine-tune the selected checkpoint* (default; the bundled `cellfilter_best.pt` unless the user browsed to another one, at `config.WARM_START_LR`) or *Train from scratch* (random init at `config.LR`). Fine-tune is greyed out when Tab 3's checkpoint field is empty or the file is missing. Both modes train on the whole labels CSV, so earlier labels keep the fine-tuned model from forgetting what it already learned.
+- **Count the kept ROIs I didn't flip on labelled recordings as cells** (off by default) — `train.main(implicit_positives=True)` / CLI `--implicit-positives`. For every recording with at least one label, each ROI that is still kept (`utils.resolve_live_mask`) and has no label row is added as a positive for this run only (never written to the CSV). Use it when you only rejected the obvious junk: without positives the validation split lacks a class, AUROC is undefined and no `best.pt` is written. Cost: any bad ROI you missed is learned as a cell.
+- **Re-apply the new model to every recording under** a folder (optional) — after training, every other finished plane0 below it (has `stat.npy` + `r0p7_dff.memmap.float32`) is re-predicted too.
+
+Then, in a worker thread:
+
+1. `cellfilter.train.main(...)` with the chosen mode — reads the labels CSV, writes new `best.pt` + `last.pt` to `CHECKPOINT_DIR`. Flip buttons stay enabled; flips made during training go into the next round.
+2. `predict_recording(rec_id, model, device, plane0=self._plane0, size_outlier_z=<Tab 3's live value>)` — scores every ROI in the *current* recording against the fresh checkpoint with the same size gate the detection run uses (`0` = off is honoured). The recording's hand labels from the CSV are then re-imposed on `predicted_cell_mask.npy`, so a re-predict never undoes manual curation.
+   - With a re-apply folder, the same predict + hand-label overlay runs on every other plane0 under it, and its filtered dF/F memmap is rewritten (`detection_run.compute_filtered_dff`) when one exists. The status line reports how many succeeded; failures turn the result into a warning. Events / clusters / cross-correlation for those recordings still need a re-run (Batch tab).
 3. Back on the Tk thread: switches Tab 3's checkpoint field to the new `best.pt` (so later **Run detection** passes use it), refreshes the popout's own `_probs` cache, and fires `on_iscell_changed(-1, -1)` — the same sentinel as **Promote to filter mask**. Tab 3 then reloads the keep mask, repaints panels 2 + 3, and rewrites the filtered dF/F memmap to the new cell set (`_regenerate_after_promote`: releases downstream memmap handles first). Already-computed downstream results (events, clusters, cross-correlation) still need a re-run.
 
 Result states:

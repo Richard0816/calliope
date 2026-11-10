@@ -44,6 +44,7 @@ def _bare_popout(tmp_path, **hooks):
     pop._train_status_var = _Var()
     pop._retrain_btn = _Btn()
     pop._train_state_after_id = None
+    pop._csv_path = tmp_path / "labels.csv"
     return pop
 
 
@@ -219,15 +220,14 @@ def test_split_labels_rejects_unknown_split():
 def test_retrain_dialog_describes_threaded_training(tmp_path, monkeypatch):
     seen = {}
 
-    def _ask(title, text):
-        seen["text"] = text
-        return False                      # cancel: nothing is started
+    def _ask(info, warm_start):
+        seen["text"] = info
+        return None                       # cancel: nothing is started
 
-    monkeypatch.setattr(CP.messagebox, "askyesno", _ask)
     pop = _bare_popout(tmp_path, get_size_outlier_z=lambda: 0,
                        on_checkpoint_trained=lambda p: None)
+    pop._ask_retrain_options = _ask
     pop._train_thread = None
-    pop._csv_path = tmp_path / "labels.csv"
     pop._on_retrain()
     text = seen["text"]
     assert "synchronous" not in text and "block" not in text
@@ -235,3 +235,82 @@ def test_retrain_dialog_describes_threaded_training(tmp_path, monkeypatch):
     assert "size_outlier_z=0" in text
     assert "filtered dF/F memmap" in text
     assert pop._train_thread is None
+
+
+def test_retrain_scratch_choice_drops_warm_start(tmp_path, monkeypatch):
+    ckpt = tmp_path / "sel.pt"
+    ckpt.write_bytes(b"x")
+    pop = _bare_popout(tmp_path, get_ckpt_path=lambda: str(ckpt))
+    pop._ask_retrain_options = lambda info, warm: {
+        "mode": "scratch", "implicit": True, "reapply_root": " "}
+    pop._train_thread = None
+    started = {}
+
+    class _Thread:
+        def __init__(self, target, args, daemon):
+            started["args"] = args
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(CP.threading, "Thread", _Thread)
+    pop._poll_train_state = lambda: None
+    pop._on_retrain()
+    assert started["args"] == (None, C.SIZE_OUTLIER_Z, True, None)
+
+
+def _plane0(root, name, keep):
+    p0 = root / name / "suite2p" / "plane0"
+    p0.mkdir(parents=True)
+    np.save(p0 / "stat.npy", np.array([{"npix": 1}] * len(keep)),
+            allow_pickle=True)
+    np.save(p0 / C.PREDICTED_MASK_NAME, np.array(keep, bool))
+    (p0 / "r0p7_dff.memmap.float32").write_bytes(b"")
+    return p0
+
+
+def test_implicit_positives_add_only_unlabelled_kept_rois(tmp_path):
+    p0 = _plane0(tmp_path, "a", [True, True, False, True])
+    df = pd.DataFrame({"plane0_path": [str(p0)], "recording_ID": ["a"],
+                       "ROI_number": [0], "user_defined_cell": [0],
+                       "timestamp_iso": [""]})
+    out = T._add_implicit_positives(df)
+    added = out[out.timestamp_iso == "implicit"]
+    assert sorted(added.ROI_number) == [1, 3]
+    assert (added.user_defined_cell == 1).all()
+    assert out[out.ROI_number == 0].user_defined_cell.tolist() == [0]
+
+
+def test_label_overrides_win_over_prediction(tmp_path):
+    p0 = _plane0(tmp_path, "a", [True, False, True])
+    labels = pd.DataFrame({"plane0_path": [str(p0), str(p0), "elsewhere"],
+                           "ROI_number": [0, 1, 2],
+                           "user_defined_cell": [0, 1, 0]})
+    assert CP._apply_label_overrides(p0, labels) == 2
+    assert np.load(p0 / C.PREDICTED_MASK_NAME).tolist() == [False, True, True]
+
+
+def test_reapply_repredicts_other_recordings_and_keeps_labels(
+        tmp_path, fake_train, monkeypatch):
+    from calliope.core import detection_run
+    cur = _plane0(tmp_path, "cur", [True])
+    other = _plane0(tmp_path, "other", [True, True])
+    (other / "r0p7_filtered_dff.memmap.float32").write_bytes(b"")
+    nofilt = _plane0(tmp_path, "nofilt", [True])
+    rewritten = []
+    monkeypatch.setattr(detection_run, "compute_filtered_dff",
+                        rewritten.append)
+    predicted = []
+    monkeypatch.setattr(
+        P, "predict_recording",
+        lambda rec_id, model, device, plane0=None, size_outlier_z=None:
+            predicted.append(plane0))
+    labels = pd.DataFrame({"plane0_path": [str(other)], "ROI_number": [1],
+                           "user_defined_cell": [0]})
+    pop = _bare_popout(cur)
+    pop._train_result = ("ok", "done.")
+    pop._reapply(tmp_path, "model", "cpu", labels, 4.0)
+    assert sorted(predicted) == sorted([other, nofilt])
+    assert rewritten == [other]
+    assert np.load(other / C.PREDICTED_MASK_NAME).tolist() == [True, False]
+    assert pop._train_result[0] == "ok" and "2/2" in pop._train_result[1]

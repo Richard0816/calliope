@@ -37,6 +37,7 @@ Usage
 -----
     python -m calliope.core.cellfilter.train [--warm-start CKPT] [--lr LR]
         [--ckpt-dir DIR] [--split {roi,recording}] [--keep-missing]
+        [--implicit-positives]
 
 Outputs
 -------
@@ -209,6 +210,49 @@ def _drop_missing_recordings(df):
     return df
 
 
+def _add_implicit_positives(df):
+    """Label every still-kept, unlabelled ROI on a curated recording as
+    a cell (``user_defined_cell=1``).
+
+    "Curated" = the recording has at least one row in ``df``. "Kept"
+    = :func:`utils.resolve_live_mask` (predicted_cell_mask -> iscell).
+    Explicit labels always win: only ROIs with no row are added, and the
+    rows are never written back to the CSV. Lets a curator who only
+    rejected the obvious junk still give the trainer positives -- at the
+    cost that any bad ROI they missed is learned as a cell.
+    """
+    import pandas as pd
+    from ..utils import resolve_live_mask
+    extra = []
+    for p0, sub in df.groupby("plane0_path"):
+        stat_path = Path(p0) / "stat.npy"
+        if not stat_path.exists():
+            continue
+        n = len(np.load(stat_path, allow_pickle=True))
+        keep = resolve_live_mask(p0, n)
+        if keep.shape[0] != n:
+            print(f"WARNING: keep mask / stat.npy size mismatch in {p0}; "
+                  f"no implicit positives from it")
+            continue
+        labelled = sub["ROI_number"].to_numpy()
+        keep[labelled[(labelled >= 0) & (labelled < n)]] = False
+        rois = np.flatnonzero(keep)
+        if rois.size:
+            extra.append(pd.DataFrame({
+                "plane0_path": p0,
+                "recording_ID": sub["recording_ID"].iloc[0],
+                "ROI_number": rois.astype(int),
+                "user_defined_cell": 1,
+                "timestamp_iso": "implicit",
+            }))
+    if not extra:
+        return df
+    added = sum(len(e) for e in extra)
+    print(f"implicit positives: +{added} kept, unflipped ROI(s) "
+          f"labelled as cells")
+    return pd.concat([df, *extra], ignore_index=True)
+
+
 SPLITS = ("roi", "recording")
 
 
@@ -239,7 +283,8 @@ def main(warm_start: "Path | str | None" = None,
          lr: "float | None" = None,
          ckpt_dir: "Path | None" = None,
          skip_missing: bool = True,
-         split: str = "roi"):
+         split: str = "roi",
+         implicit_positives: bool = False):
     """Top-level training driver.
 
     Parameters
@@ -266,6 +311,9 @@ def main(warm_start: "Path | str | None" = None,
         ``split_by_roi``; ``"recording"`` = whole-recording holdout via
         ``split_by_recording`` (leak-free; needs >= ~5 labelled
         recordings and raises ``ValueError`` if a side lacks a class).
+    implicit_positives : bool
+        Also treat every kept, unlabelled ROI on each labelled recording
+        as a cell (see :func:`_add_implicit_positives`). Off by default.
 
     Steps:
         1. Seed RNGs + select GPU/CPU device.
@@ -296,6 +344,8 @@ def main(warm_start: "Path | str | None" = None,
     df = load_labels(C.LABELS_CSV)
     if skip_missing:
         df = _drop_missing_recordings(df)
+    if implicit_positives:
+        df = _add_implicit_positives(df)
     if len(df) == 0:
         raise RuntimeError(
             "No labelled ROIs with recordings present on disk -- nothing "
@@ -455,6 +505,10 @@ if __name__ == "__main__":
                     help="validation split: 'roi' (stratified per-ROI, "
                          "default) or 'recording' (whole-recording "
                          "holdout; needs >= ~5 labelled recordings)")
+    ap.add_argument("--implicit-positives", action="store_true",
+                    help="also label every kept, unlabelled ROI on each "
+                         "labelled recording as a cell")
     args = ap.parse_args()
     main(warm_start=args.warm_start, lr=args.lr, ckpt_dir=args.ckpt_dir,
-         skip_missing=not args.keep_missing, split=args.split)
+         skip_missing=not args.keep_missing, split=args.split,
+         implicit_positives=args.implicit_positives)
