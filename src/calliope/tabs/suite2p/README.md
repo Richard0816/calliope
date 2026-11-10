@@ -129,12 +129,12 @@ are documented in [§5.2](#52-cellpose-generalist-segmenter-primary-pass-on-mean
 
 1. Reads (or stream-computes via `core/correlation_image.py::compute_vcorr`) the recording's correlation image `Vcorr` — per-pixel Pearson r with the 4-neighbour mean. Suite2p 1.0 produces this during detection (lives in `detect_outputs.npy`); the runner picks it up from the sparsery pass output and persists it next to the shared registration as `Vcorr.npy` so `run_cellpose_pass`'s filesystem fallback can find it.
 2. Runs Cellpose-SAM (`model_type='cpsam'`, cellpose ≥ 4.0) on `Vcorr` with the user-tunable `sam_flow_threshold` / `sam_cellprob_threshold`.
-3. Filters the result against the Sparsery mask *independently* (i.e. not against the cyto2 pass — intentional, so SAM can recover silent cells the primary cellpose pass also flagged).
+3. Filters the result against every ROI already kept (Sparsery plus the primary Cellpose pass), so a cell both Cellpose passes find stays a single ROI. Before 2026-11-09 this pass was checked against Sparsery only, so such a cell could become two ROIs.
 4. Tags every ROI in the final `stat.npy` with `_source ∈ {sparsery, cellpose_cyto2, cellpose_sam}` for provenance.
 
 Silently skips with a console warning when cellpose 3.x is installed (SAM is 4.x-only). The SAM checkpoint is ~1 GB; cellpose downloads it on first invocation. Reference: Pachitariu et al., Cellpose-SAM bioRxiv 2025 ([doi:10.1101/2025.04.28.651001](https://doi.org/10.1101/2025.04.28.651001)).
 
-**Merge.** Each Cellpose pass (primary + optional SAM) is independently filtered against Sparsery: a Cellpose ROI is dropped if more than `max_overlap` ([§5.3](#53-merge-cellpose--sparsery-overlap-drop), default `0.3`) of the Cellpose ROI's pixels are covered by a Sparsery ROI. The surviving ROIs from every pass are appended to Sparsery's output to form the final `stat.npy`, with the `_source` field preserving provenance.
+**Merge.** The primary Cellpose pass is filtered against Sparsery: a Cellpose ROI is dropped if more than `max_overlap` ([§5.3](#53-merge-cellpose--sparsery-overlap-drop), default `0.3`) of its pixels are covered by a Sparsery ROI. The optional SAM pass is filtered the same way against Sparsery **plus the kept primary-pass ROIs** (`filter_extra_cellpose_passes`); when two ROIs overlap, the earlier one stays. The surviving ROIs from every pass are appended to Sparsery's output to form the final `stat.npy`, with the `_source` field preserving provenance.
 
 **dF/F per Suite2p convention** is computed downstream (Step 2). Suite2p also produces:
 - `F.npy` — `(N_total, T)` per-ROI raw fluorescence (sum over `xpix/ypix` weighted by `lam`).
@@ -424,7 +424,7 @@ that never fired enough for Sparsery to catch (`run_cellpose_pass`, defaults in
 Off by default. When enabled, after the Sparsery + cyto2 passes the runner runs
 Cellpose-SAM (`model_type='cpsam'`, **requires cellpose ≥ 4.0**) on the
 correlation image `Vcorr` to recover *silent* cells, then filters that pass
-against Sparsery independently and tags survivors `_source='cellpose_sam'`
+against Sparsery and the kept primary-pass ROIs and tags survivors `_source='cellpose_sam'`
 (the SAM block in `sparse_plus_cellpose.run`). See §2 Step 1 for the full mechanism.
 
 | Setting (`key`) | Default | What it does | What it means to you |

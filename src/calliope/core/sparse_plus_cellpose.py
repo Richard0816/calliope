@@ -221,8 +221,25 @@ def filter_non_overlapping_cellpose(sparsery_stat, cellpose_stat,
             dropped += 1
     if verbose:
         print(f"    cellpose merge: kept {len(kept)} / {len(cellpose_stat)} "
-              f"ROIs (dropped {dropped} overlapping sparsery)")
+              f"ROIs (dropped {dropped} overlapping already-kept ROIs)")
     return kept
+
+
+def filter_extra_cellpose_passes(sparsery_stat, cellpose_kept, extra_passes,
+                                 Ly: int, Lx: int, max_overlap: float,
+                                 verbose: bool = True):
+    """Filter each extra pass (``[(tag, stat), ...]``) against every ROI
+    already kept -- Sparsery, the mean-image Cellpose pass, then earlier
+    extra passes -- so a cell found twice keeps only its earlier ROI.
+    Returns ``[(tag, kept_stat), ...]``."""
+    already = list(sparsery_stat) + list(cellpose_kept)
+    out = []
+    for tag, stat_list in extra_passes:
+        kept = filter_non_overlapping_cellpose(already, stat_list, Ly, Lx,
+                                               max_overlap=max_overlap, verbose=verbose)
+        out.append((str(tag), kept))
+        already += kept
+    return out
 
 
 def _detection_meta(detection_settings, detect_view, fallback_view) -> dict:
@@ -398,22 +415,16 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
         max_overlap=max_overlap, verbose=verbose,
     )
 
-    # Filter each extra cellpose pass independently against the same
-    # Sparsery mask. Doing it independently (instead of chaining each
-    # against the previous cumulative mask) is deliberate: the audit
-    # plan for Tier 2 #13 explicitly says "Filter each Cellpose output
-    # against Sparsery independently (not against each other)" so the
-    # SAM pass can recover silent cells the cyto2 pass also flagged.
-    # The follow-up de-dup happens implicitly via Suite2p's
-    # extract/classify pipeline downstream.
-    extra_kept: list[tuple[str, list]] = []
-    if extra_cellpose_passes:
-        for tag, stat_list in extra_cellpose_passes:
-            kept = filter_non_overlapping_cellpose(
-                sparsery_stat, stat_list, Ly, Lx,
-                max_overlap=max_overlap, verbose=verbose,
-            )
-            extra_kept.append((str(tag), kept))
+    # Each extra cellpose pass is filtered against everything already kept
+    # (Sparsery + the mean-image pass + earlier extra passes), keeping the
+    # earlier ROI. Nothing downstream de-duplicates (Suite2p extraction just
+    # extracts every ROI it's given), so filtering only against Sparsery let a
+    # cell found by both Cellpose passes become two ROIs. The old Tier 2 #13
+    # reason for filtering independently (SAM recovering cells the cyto2 pass
+    # also found) no longer applies: both passes are Cellpose-SAM now.
+    extra_kept = filter_extra_cellpose_passes(
+        sparsery_stat, cellpose_kept, extra_cellpose_passes or [], Ly, Lx,
+        max_overlap=max_overlap, verbose=verbose)
 
     combined_raw = []
     for s in sparsery_stat:
