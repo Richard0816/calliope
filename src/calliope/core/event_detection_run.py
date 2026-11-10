@@ -622,6 +622,18 @@ def write_event_summary_offload(plane0_str: str, data: dict, *,
     """
     from . import summary_writer as sw
     plane0 = Path(plane0_str)
+    # Diagnostic: a batch run once handed this writer 1,339,949 in-window
+    # onset rows that no replay of the same run reproduces (11,853).
+    # Batch passes numpy arrays here, so no `x or []` (ambiguous truth value).
+    wins = data.get("event_windows")
+    wins = [] if wins is None else wins
+    ons = data.get("onsets_by_roi")
+    ons = [np.asarray(o, dtype=float) for o in ([] if ons is None else ons)]
+    n_rows = sum(int(((o >= s) & (o <= e)).sum()) for s, e in wins for o in ons)
+    print(f"[event-summary] {plane0}: N={data.get('N_kept')} T={data.get('T')} "
+          f"fps={data.get('fps')} windows={len(wins)} "
+          f"onsets={sum(o.size for o in ons)} EventOnsets rows={n_rows}",
+          flush=True)
     extra = {"Recording": sw.update_recording_meta(
         plane0, fps=data.get("fps"), T=data.get("T"), N=data.get("N_kept"),
         write=False)}
@@ -631,7 +643,7 @@ def write_event_summary_offload(plane0_str: str, data: dict, *,
             plane0, em, write=False)
     return str(sw.write_events_sheets(
         plane0, event_windows=data.get("event_windows"),
-        onsets_by_roi=data.get("onsets_by_roi") or [],
+        onsets_by_roi=ons,
         fps=data.get("fps"), in_seconds=True, extra_sheets=extra,
         event_classes=data.get("event_class"),
         roi_ids=data.get("kept_idx")))
