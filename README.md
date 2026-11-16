@@ -32,6 +32,15 @@ The first line must use Python 3.11 or 3.12 — on Windows,
 `py -3.12 -m venv venv` picks it explicitly. Check with
 `python --version` after activating.
 
+**Cellpose version.** `requirements.txt` pins cellpose 4.1.1, the version
+CalLIOPE 1.0 and its manuscript were validated on; it segments with the
+`cpsam` model. Installs that resolve from `pyproject.toml` alone
+(`pip install -e .`, uv, conda) can get cellpose 4.2 or later, which
+segments with `cpsam_v2` instead. CalLIOPE runs with either, but
+`cpsam_v2` masks have not been compared with `cpsam` ones. To reproduce
+the paper exactly, `pip install cellpose==4.1.1`. Each run records the
+cellpose version and model in `ops.npy` under `cellpose_config`.
+
 **Linux:** install Tk first (`sudo apt install python3.12-tk`, matching
 your Python), since pip can't. The steps above pull a ~5.5 GB CUDA build
 of PyTorch on Linux; for a small CPU-only install see

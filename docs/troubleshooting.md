@@ -84,8 +84,13 @@ version). It is saved to `~/.cellpose/models/<name>`
 `/Users/<you>/.cellpose/models/<name>` on macOS), or to the folder in the
 `CELLPOSE_LOCAL_MODELS_PATH` environment variable if that is set. Tab 3
 checks for that file before every run and only asks "Download it during
-this run?" when it is missing. CalLIOPE 1.0 was validated with cellpose
-4.1 (`cpsam`).
+this run?" when it is missing.
+
+CalLIOPE 1.0 and its manuscript were validated on cellpose 4.1.1
+(`cpsam`); `cpsam_v2` masks from cellpose 4.2+ have not been compared
+with them. For exact reproduction of the paper, `pip install
+cellpose==4.1.1` (`requirements.txt` already pins it). Each run records
+`cellpose_version` and `model_name` in `ops.npy` → `cellpose_config`.
 
 **Asked to download the Cellpose model on every run.** The download is
 not ending up in that file. Check whether it exists and is ~1.2 GB after

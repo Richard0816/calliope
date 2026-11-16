@@ -425,6 +425,34 @@ def test_cellpose_load_failure_explains_itself(tmp_path, monkeypatch):
         sp.run_cellpose_pass(tmp_path / "cp", plane0, {}, verbose=False)
 
 
+
+def test_cellpose_pass_records_version_and_model(tmp_path, monkeypatch):
+    # cpsam (cellpose 4.1) and cpsam_v2 (4.2+) are different weights, so
+    # the run record must say which one segmented.
+    plane0 = tmp_path / "shared"
+    plane0.mkdir()
+    np.save(plane0 / "ops.npy", {"meanImg": np.random.rand(32, 32),
+                                 "Ly": 32, "Lx": 32}, allow_pickle=True)
+
+    class FakeModel:
+        def __init__(self, gpu=False, pretrained_model="cpsam_v2"):
+            self.pretrained_model = str(tmp_path / "models" / "cpsam_v2")
+
+        def eval(self, img, **kw):
+            m = np.zeros(img.shape[:2], int)
+            m[4:9, 4:9] = 1
+            return m, None, None
+
+    monkeypatch.setattr(sp._cp_models, "CellposeModel", FakeModel)
+    monkeypatch.setattr(sp, "cellpose_model_problem", lambda cfg: None)
+    monkeypatch.setattr(sp, "cellpose_version", lambda: "4.2.1.1")
+    _, ops, out = sp.run_cellpose_pass(tmp_path / "cp", plane0, {},
+                                       verbose=False)
+    for o in (ops, np.load(out / "ops.npy", allow_pickle=True).item()):
+        cc = o["cellpose_config"]
+        assert cc["cellpose_version"] == "4.2.1.1"
+        assert cc["model_name"] == "cpsam_v2"
+
 # --- papercuts ---
 
 def test_dff_drift_warning(tmp_path):

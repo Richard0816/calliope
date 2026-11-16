@@ -1390,6 +1390,15 @@ def cellpose_default_model() -> str:
     return d if isinstance(d, str) and d else "cpsam"
 
 
+def cellpose_version() -> Optional[str]:
+    """Installed cellpose version, for the run record."""
+    try:
+        from importlib.metadata import version
+        return version("cellpose")
+    except Exception:
+        return None
+
+
 def cellpose_model_problem(cfg: dict) -> Optional[str]:
     """Why the Cellpose pass can't start straight away, or ``None``.
 
@@ -1673,6 +1682,11 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
     ops_out["Lx"] = int(img.shape[1])
     ops_out["cellpose_config"] = {
         "api_version": api_version,
+        # What actually segmented: cpsam (cellpose 4.1) and cpsam_v2
+        # (4.2+) are different weights.
+        "cellpose_version": cellpose_version(),
+        "model_name": Path(str(getattr(model, "pretrained_model", "")
+                               or model_type)).name,
         "model_type": model_type,
         "diameter_requested": cfg.get("cellpose_diameter", 0),
         "diameter_estimated": float(diams) if diams is not None else None,
