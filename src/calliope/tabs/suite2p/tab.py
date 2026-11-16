@@ -91,6 +91,7 @@ from ...core.utils import DEFAULT_FPS
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
     drain_queue, open_advanced, report_stage_error, spec_defaults,
+    wrap_to_width,
 )
 
 
@@ -505,9 +506,15 @@ class Suite2pTab(ctk.CTkFrame):
                      width=60).pack(side="left", padx=(0, 2))
         ctk.CTkLabel(row, text="min").pack(side="left", padx=(0, 12))
         ctk.CTkRadioButton(
-            row, text="Rolling percentile (window / pct in Advanced)",
+            row, text="Rolling percentile",
             value="rolling", variable=self.baseline_var,
         ).pack(side="left")
+        hint = ctk.CTkLabel(
+            row, text="(Rolling window (s) and Baseline percentile in "
+                      "Advanced...)",
+            text_color="gray", anchor="w", justify="left")
+        hint.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        wrap_to_width(hint)
 
         # ---- GCaMP variant picker (drives Suite2p's tau) ----
         row = ctk.CTkFrame(header, fg_color="transparent")
