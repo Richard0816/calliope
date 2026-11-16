@@ -383,6 +383,33 @@ def test_cellpose_model_problem(tmp_path, monkeypatch):
         {"cellpose_model_path": str(tmp_path / "cpsam")}) is None
 
 
+
+@pytest.mark.parametrize("default, cache_fn", [
+    ("cpsam", "cache_CPSAM_model_path"),    # cellpose <= 4.1
+    ("cpsam_v2", "cache_model_path"),       # cellpose >= 4.2
+])
+def test_cellpose_cache_check_follows_installed_default(
+        tmp_path, monkeypatch, default, cache_fn):
+    # 4.2 renamed the default model; checking for 'cpsam' then asked to
+    # download on every run although cpsam_v2 was cached.
+    import types
+
+    class CellposeModel:
+        def __init__(self, gpu=False, pretrained_model=default):
+            pass
+
+    def must_not_download(*a):
+        raise AssertionError("the check must not download")
+
+    fake = types.SimpleNamespace(MODEL_DIR=tmp_path,
+                                 CellposeModel=CellposeModel,
+                                 **{cache_fn: must_not_download})
+    monkeypatch.setattr(sp, "_cp_models", fake)
+    monkeypatch.setattr(sp, "_CELLPOSE_AVAILABLE", True)
+    assert default in sp.cellpose_model_problem({})
+    (tmp_path / default).write_bytes(b"x")
+    assert sp.cellpose_model_problem({}) is None
+
 def test_cellpose_load_failure_explains_itself(tmp_path, monkeypatch):
     plane0 = tmp_path / "shared"
     plane0.mkdir()

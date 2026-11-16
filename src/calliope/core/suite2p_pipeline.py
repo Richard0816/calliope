@@ -46,6 +46,7 @@ One monkey-patch is installed:
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 import shutil
 import time
@@ -1377,6 +1378,18 @@ def cellpose_sam_available() -> bool:
     return not hasattr(_cp_models, "Cellpose")
 
 
+def cellpose_default_model() -> str:
+    """Name of the model ``CellposeModel()`` loads by default: ``cpsam``
+    up to cellpose 4.1, ``cpsam_v2`` from 4.2. Read from the signature so
+    the cache check follows whatever cellpose is installed."""
+    try:
+        d = inspect.signature(_cp_models.CellposeModel.__init__).parameters[
+            "pretrained_model"].default
+    except (AttributeError, KeyError, TypeError, ValueError):
+        d = None
+    return d if isinstance(d, str) and d else "cpsam"
+
+
 def cellpose_model_problem(cfg: dict) -> Optional[str]:
     """Why the Cellpose pass can't start straight away, or ``None``.
 
@@ -1392,8 +1405,10 @@ def cellpose_model_problem(cfg: dict) -> Optional[str]:
     if model_path:
         return (None if Path(model_path).is_file() else
                 f"Cellpose model file not found: {model_path}")
-    if not (Path(_cp_models.MODEL_DIR) / "cpsam").is_file():
-        return (f"The Cellpose model (cpsam, ~1.2 GB) is not downloaded yet; "
+    # Only check the file: cellpose's cache_*model_path helpers download.
+    name = cellpose_default_model()
+    if not (Path(_cp_models.MODEL_DIR) / name).is_file():
+        return (f"The Cellpose model ({name}, ~1.2 GB) is not downloaded yet; "
                 f"detection will fetch it once from huggingface.co into "
                 f"{_cp_models.MODEL_DIR} and reuse it on later runs. If "
                 f"this message comes back every run, the download is not "
@@ -1627,7 +1642,8 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
                 f"Couldn't load the Cellpose model ({e}). On first use it "
                 f"downloads (~1.2 GB) from huggingface.co into "
                 f"{_cp_models.MODEL_DIR}. If this machine is offline or "
-                f"behind a proxy/firewall, copy a 'cpsam' model file there "
+                f"behind a proxy/firewall, copy the "
+                f"'{cellpose_default_model()}' model file there "
                 f"or set 'Cellpose model file' in Tab 3's Advanced, or "
                 f"untick 'Run Cellpose pass' to use Sparsery only.") from e
         eval_kwargs = dict(

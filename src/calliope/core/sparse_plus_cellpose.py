@@ -138,7 +138,7 @@ CELLPOSE_CFG = {
     'cellpose_channel_input':      'meanImg',
     # False = Sparsery only (e.g. offline rig with no Cellpose model).
     'cellpose_enabled':            True,
-    # Local model file; '' = cellpose's cached cpsam (downloaded on
+    # Local model file; '' = cellpose's cached default (downloaded on
     # first use from huggingface.co into ~/.cellpose/models).
     'cellpose_model_path':         '',
 }

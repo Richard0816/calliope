@@ -283,7 +283,8 @@ class Suite2pTab(ctk.CTkFrame):
                  "offline rig)"},
         {"name": "cellpose_model_path", "label": "Cellpose model file",
          "type": "str", "default": "", "group": "Cellpose",
-         "help": "local model file; blank = cellpose's cpsam, downloaded "
+         "help": "local model file; blank = cellpose's default model "
+                 "(cpsam, or cpsam_v2 from cellpose 4.2), downloaded "
                  "on first use from huggingface.co"},
         {"name": "cellpose_model_type", "label": "model_type",
          "type": "choice", "choices": ["cyto", "cyto2", "nuclei"],

@@ -73,16 +73,19 @@ raw TIFFs and output folder to a local disk and re-run.
 ## First run is slow / downloads ~1 GB
 
 Expected. The first Detection run downloads the Cellpose-SAM model
-(`cpsam`, ~1.2 GB, one time, needs internet) and on a CPU-only machine
+(~1.2 GB, one time, needs internet) and on a CPU-only machine
 each Cellpose pass takes several minutes. CalLIOPE's own cell-filter
 checkpoint is bundled and never downloads.
 
-The model is saved to `~/.cellpose/models/cpsam`
-(`C:\Users\<you>\.cellpose\models\cpsam` on Windows,
-`/Users/<you>/.cellpose/models/cpsam` on macOS), or to the folder in the
+The file name depends on the installed cellpose: `cpsam` up to
+cellpose 4.1, `cpsam_v2` from 4.2 (`pip show cellpose` gives the
+version). It is saved to `~/.cellpose/models/<name>`
+(`C:\Users\<you>\.cellpose\models\<name>` on Windows,
+`/Users/<you>/.cellpose/models/<name>` on macOS), or to the folder in the
 `CELLPOSE_LOCAL_MODELS_PATH` environment variable if that is set. Tab 3
 checks for that file before every run and only asks "Download it during
-this run?" when it is missing.
+this run?" when it is missing. CalLIOPE 1.0 was validated with cellpose
+4.1 (`cpsam`).
 
 **Asked to download the Cellpose model on every run.** The download is
 not ending up in that file. Check whether it exists and is ~1.2 GB after
@@ -90,8 +93,8 @@ a run. If not, the download is being blocked (network proxy or
 firewall to huggingface.co, a full disk, or a sync/antivirus tool
 removing the folder). Any one of these fixes it:
 
-- Download `https://huggingface.co/mouseland/cellpose-sam/resolve/main/cpsam`
-  in a browser and save it as `~/.cellpose/models/cpsam` (no extension).
+- Download `https://huggingface.co/mouseland/cellpose-sam/resolve/main/<name>`
+  in a browser and save it as `~/.cellpose/models/<name>` (no extension).
 - Save the file anywhere and set Tab 3 → Advanced… → "Cellpose model
   file" to it.
 - Untick "Run Cellpose pass" in Tab 3 → Advanced… to detect with
