@@ -1394,8 +1394,11 @@ def cellpose_model_problem(cfg: dict) -> Optional[str]:
                 f"Cellpose model file not found: {model_path}")
     if not (Path(_cp_models.MODEL_DIR) / "cpsam").is_file():
         return (f"The Cellpose model (cpsam, ~1.2 GB) is not downloaded yet; "
-                f"detection will fetch it from huggingface.co into "
-                f"{_cp_models.MODEL_DIR}.")
+                f"detection will fetch it once from huggingface.co into "
+                f"{_cp_models.MODEL_DIR} and reuse it on later runs. If "
+                f"this message comes back every run, the download is not "
+                f"being saved: see 'Asked to download the Cellpose model "
+                f"on every run' in docs/troubleshooting.md.")
     return None
 
 

@@ -73,6 +73,7 @@ from .logic import summary_writer
 from ...gui_common import (
     AppState, attach_fig_toolbar, attach_resize_handle, drain_queue, format_roi_indices,
     report_stage_error, open_advanced, short_roi_label, spec_defaults,
+    wrap_to_width,
 )
 
 
@@ -404,27 +405,32 @@ class EventDetectionTab(ctk.CTkFrame):
         self.render_progress.pack(side="left", padx=12)
         self.status_var = tk.StringVar(
             value="Compute lowpass + derivative on tab 4 first.")
-        ctk.CTkLabel(row, textvariable=self.status_var,
-                     font=ctk.CTkFont(size=11, slant="italic"),
-                     wraplength=380, justify="left").pack(
-            side="left")
-        ctk.CTkButton(row, text="Advanced...", width=100,
-                      command=self._on_advanced).pack(side="right",
-                                                      padx=(0, 6))
-        self.prominence_btn = ctk.CTkButton(
-            row, text="Prominence distribution...", width=200,
-            command=self._on_open_prominence_popout, state="disabled")
-        self.prominence_btn.pack(side="right", padx=(0, 6))
-        self.summary_btn = ctk.CTkButton(
-            row, text="Save summary", width=110,
-            command=self._on_save_summary, state="disabled")
-        self.summary_btn.pack(side="right", padx=(0, 6))
+        status = ctk.CTkLabel(row, textvariable=self.status_var,
+                              font=ctk.CTkFont(size=11, slant="italic"),
+                              anchor="w", justify="left")
+        status.pack(side="left", fill="x", expand=True)
+        wrap_to_width(status)
+
+        # Action buttons get their own row so they fit on small screens.
+        btn_row = ctk.CTkFrame(header, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(btn_row, text="Reload from folder...", width=160,
+                      command=self._reload_from_folder).pack(side="left")
         self.export_btn = ctk.CTkButton(
-            row, text="Export figures", width=130,
+            btn_row, text="Export figures", width=130,
             command=self._on_export_figures, state="disabled")
-        self.export_btn.pack(side="right", padx=(0, 6))
-        ctk.CTkButton(row, text="Reload from folder...", width=160,
-                      command=self._reload_from_folder).pack(side="right")
+        self.export_btn.pack(side="left", padx=(6, 0))
+        self.summary_btn = ctk.CTkButton(
+            btn_row, text="Save summary", width=110,
+            command=self._on_save_summary, state="disabled")
+        self.summary_btn.pack(side="left", padx=(6, 0))
+        self.prominence_btn = ctk.CTkButton(
+            btn_row, text="Prominence distribution...", width=200,
+            command=self._on_open_prominence_popout, state="disabled")
+        self.prominence_btn.pack(side="left", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Advanced...", width=100,
+                      command=self._on_advanced).pack(side="left",
+                                                      padx=(6, 0))
 
         # ---- Onset source row ----
         # Default uses MAD-z + hysteresis on the Savitzky-Golay
@@ -442,12 +448,14 @@ class EventDetectionTab(ctk.CTkFrame):
             src_row, text="Suite2p spks (deconvolved)",
             value="spks", variable=self.onset_source_var,
         ).pack(side="left")
-        ctk.CTkLabel(
-            src_row,
-            text="  -- spks mode reads <plane0>/spks.npy (one onset "
+        spks_hint = ctk.CTkLabel(
+            header,
+            text="spks mode reads <plane0>/spks.npy (one onset "
                  "per MAD-z hysteresis crossing on the spike trace).",
             text_color="gray", font=ctk.CTkFont(size=11, slant="italic"),
-        ).pack(side="left", padx=(8, 0))
+            anchor="w", justify="left")
+        spks_hint.pack(fill="x", padx=8)
+        wrap_to_width(spks_hint)
 
         # Manual ROI subset row: when enabled, only those Suite2p ROI ids
         # (intersected with the cell-filter keep mask) feed the heatmap,
@@ -460,13 +468,14 @@ class EventDetectionTab(ctk.CTkFrame):
             variable=self.manual_subset_var,
         ).pack(side="left")
         self.manual_roi_var = tk.StringVar(value="")
-        ctk.CTkEntry(sub_row, textvariable=self.manual_roi_var, width=240).pack(
-            side="left", padx=(4, 4), fill="x", expand=True)
+        # Hint packed before the entry so the entry, not the hint, shrinks.
         ctk.CTkLabel(
             sub_row,
             text="(e.g. 0,3,5-9; ids outside the keep mask are skipped)",
             text_color="gray",
-        ).pack(side="left")
+        ).pack(side="right")
+        ctk.CTkEntry(sub_row, textvariable=self.manual_roi_var, width=120).pack(
+            side="left", padx=(4, 4), fill="x", expand=True)
 
         # Three stacked matplotlib panels, each in its own CTkFrame
         # wrap so the height is controllable. A draggable grip below
