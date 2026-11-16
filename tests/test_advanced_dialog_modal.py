@@ -17,7 +17,7 @@ def _pump(root, cond, timeout=3.0):
     return cond()
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")   # one Tk interpreter for the module
 def root():
     try:
         r = ctk.CTk()
@@ -34,6 +34,23 @@ def test_dialog_grabs_after_it_is_shown(root):
     assert root.grab_current() is None          # not grabbed while building
     assert _pump(root, lambda: root.grab_current() is dlg)
     assert len(dlg._entries) == 1               # the text field gets focus
+    dlg._on_cancel()
+
+
+def test_fields_stay_visible_in_a_narrow_dialog(root):
+    # Long labels and help text used to squeeze the entry column to zero
+    # width once the dialog was narrower than label + help text.
+    specs = [{"name": f"p{i}", "label": "a rather long parameter label " * 2,
+              "type": "float", "default": 1.0, "group": "G",
+              "help": "a long help sentence that would claim the width " * 4}
+             for i in range(3)]
+    dlg = gui_common.AdvancedDialog(root, "t", specs, {})
+    dlg.geometry("480x400")
+    _pump(root, lambda: False, timeout=1.0)
+    right = dlg.winfo_rootx() + dlg.winfo_width()
+    for e in dlg._entries:
+        assert e.winfo_ismapped() and e.winfo_width() > 60
+        assert e.winfo_rootx() + e.winfo_width() <= right
     dlg._on_cancel()
 
 
