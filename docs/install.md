@@ -46,8 +46,10 @@ pip install -e . --no-deps                # CalLIOPE itself; deps already satisf
 ```
 
 `requirements.txt` pins the plain PyPI `torch` wheel: the CPU build on
-Windows, the non-CUDA build on macOS (it can use the Apple GPU through
-PyTorch's MPS backend), and a CUDA 13 build on Linux.
+Windows, the non-CUDA build on macOS, and a CUDA 13 build on Linux. On
+macOS, by default only the Cellpose detection pass uses the Apple GPU
+(through PyTorch's MPS backend); Suite2p runs on the CPU unless its
+`torch_device` setting is overridden to `mps`.
 
 **NVIDIA GPU on Windows.** Reinstall the CUDA build afterwards
 (`--no-deps` keeps every other package at its locked version):
@@ -62,8 +64,8 @@ the CUDA 12.6 build does not support these GPUs.
 **NVIDIA GPU on Linux (x86-64).** PyPI's CUDA 13 build already uses
 Turing (RTX 20-series, T4) and newer GPUs, so there is nothing to
 reinstall; it needs NVIDIA driver 580 or newer. CUDA 13 no longer
-supports older Maxwell, Pascal and Volta GPUs (GTX 900/10-series,
-Titan V, V100). For those, in a fresh venv, install the CUDA 12.6 build
+supports older Pascal and Volta GPUs (GTX 10-series, Titan V, V100).
+For those, in a fresh venv, install the CUDA 12.6 build
 instead of `requirements.txt`, then let pip resolve the rest from
 `pyproject.toml`. Like the CPU-only recipe below, this skips the
 lockfile, so other packages can be newer than the tested set. ARM
@@ -73,6 +75,9 @@ lockfile, so other packages can be newer than the tested set. ARM
 pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 pip install -e .                          # resolves the remaining deps
 ```
+
+**Maxwell GPUs (GTX 900-series)** are untested on any OS: Cellpose runs
+in bfloat16 by default, which they may not support.
 
 **Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's
 `torch` is a CUDA build, and `requirements.txt` also pins its ~2.7 GB of
@@ -124,18 +129,24 @@ pip install -e .                            # Suite2p, cellpose, customtkinter +
 ## GPU acceleration (optional)
 
 The GPU paths — Tab 3's GPU dF/F (`use_gpu_dff`, first-N baseline mode)
-and Tab 7's GPU cross-correlation — need a CuPy wheel matching your CUDA
-toolkit (`nvcc --version` / `CUDA_PATH`); without it CalLIOPE falls back
-to the CPU / NumPy path automatically.
+and Tab 7's GPU cross-correlation — need CuPy; without it CalLIOPE falls
+back to the CPU / NumPy path automatically. Install exactly one CuPy
+package, matching the CUDA major version of your PyTorch
+(`python -c "import torch; print(torch.version.cuda)"`): 13 for the
+locked Linux install, 12 after the Windows `cu126` / `cu128` reinstall or
+the Linux `cu126` recipe.
 
 ```bash
-pip install -e ".[gpu-cuda11]"   # CUDA 11.2 – 11.8
 pip install -e ".[gpu-cuda12]"   # CUDA 12.x
+pip install cupy-cuda13x         # CUDA 13.x (no extra for it yet)
+pip install -e ".[gpu-cuda11]"   # CUDA 11.2 – 11.8 (older setups)
 ```
 
-> **CUDA 13.** CuPy ships wheels only for CUDA 11 / 12. The rest of the
-> pipeline (PyTorch, Suite2p) is fine on CUDA 13; for the GPU extra,
-> install the CUDA 12 toolkit alongside and use `".[gpu-cuda12]"`.
+> **No NVIDIA CUDA Toolkit of that major version installed?** For CUDA
+> 12 or 13, add CuPy's `ctk` extra to the same package to pull the CUDA
+> libraries from pip (CUDA 11 needs the toolkit), e.g.
+> `pip install "cupy-cuda13x[ctk]"` or `pip install "cupy-cuda12x[ctk]"`
+> (see CuPy's installation guide).
 
 ## NWB export (optional)
 
