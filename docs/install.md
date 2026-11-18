@@ -45,14 +45,33 @@ pip install -r requirements.txt           # exact tested versions (incl. PyTorch
 pip install -e . --no-deps                # CalLIOPE itself; deps already satisfied
 ```
 
-`requirements.txt` pins the plain PyPI `torch` wheel, which is the CPU
-build on Windows and macOS (it runs on any machine). For NVIDIA GPU
-acceleration on Windows, reinstall the CUDA build afterwards
-(`--no-deps` keeps every other package at its locked version). Skip
-this on Linux, where PyPI's `torch` is already a CUDA build:
+`requirements.txt` pins the plain PyPI `torch` wheel: the CPU build on
+Windows, the non-CUDA build on macOS (it can use the Apple GPU through
+PyTorch's MPS backend), and a CUDA 13 build on Linux.
+
+**NVIDIA GPU on Windows.** Reinstall the CUDA build afterwards
+(`--no-deps` keeps every other package at its locked version):
 
 ```bash
 pip install --force-reinstall --no-deps torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
+```
+
+For an RTX 50-series (Blackwell) card, use `cu128` in place of `cu126`;
+the CUDA 12.6 build does not support these GPUs.
+
+**NVIDIA GPU on Linux (x86-64).** PyPI's CUDA 13 build already uses
+Turing (RTX 20-series, T4) and newer GPUs, so there is nothing to
+reinstall; it needs NVIDIA driver 580 or newer. CUDA 13 no longer
+supports older Maxwell, Pascal and Volta GPUs (GTX 900/10-series,
+Titan V, V100). For those, in a fresh venv, install the CUDA 12.6 build
+instead of `requirements.txt`, then let pip resolve the rest from
+`pyproject.toml`. Like the CPU-only recipe below, this skips the
+lockfile, so other packages can be newer than the tested set. ARM
+(aarch64) Linux wheels cover fewer GPUs; check PyTorch's support matrix.
+
+```bash
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -e .                          # resolves the remaining deps
 ```
 
 **Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's

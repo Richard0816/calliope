@@ -7,11 +7,13 @@
 #   pip install -r requirements.txt
 #   pip install -e . --no-deps
 #
-# torch here is the plain PyPI wheel: the CPU build on Windows and macOS,
-# but on Linux PyPI serves a CUDA build plus ~2.7 GB of nvidia-* libraries
-# (pinned below), ~5.5 GB in all. For a small CPU-only Linux install see
-# docs/install.md. For NVIDIA GPU acceleration on Windows, afterwards
-# reinstall the CUDA build, e.g.:
+# torch here is the plain PyPI wheel: the CPU build on Windows, the non-CUDA
+# build on macOS (it can use the Apple GPU through MPS), and on Linux a
+# CUDA 13 build plus ~2.7 GB of nvidia-* libraries (pinned below), ~5.5 GB
+# in all. For a small CPU-only Linux install, or Linux on an NVIDIA GPU older
+# than Turing (CUDA 13 dropped them), see docs/install.md. For NVIDIA GPU
+# acceleration on Windows, afterwards reinstall the CUDA build (cu128 instead
+# of cu126 for an RTX 50-series card), e.g.:
 #   pip install --force-reinstall --no-deps torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 # (Regenerate with: uv export --locked --format requirements-txt --no-emit-project --no-dev)
 

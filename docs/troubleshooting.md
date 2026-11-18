@@ -111,7 +111,10 @@ removing the folder). Any one of these fixes it:
 machine with a working NVIDIA GPU and a matching CUDA runtime; it adds
 CuPy for Tab 3's GPU dF/F path and Tab 7's cross-correlation. Without one, CalLIOPE falls back to
 NumPy automatically — the extra is harmless but does nothing. Note the
-default `requirements.txt` `torch` is the **CPU** build on Windows and
-macOS (Linux already gets a CUDA build). On Windows, for GPU compute
-also reinstall the CUDA wheel:
-`pip install --force-reinstall --no-deps torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126`.
+default `requirements.txt` `torch` has no CUDA on Windows (the **CPU**
+build) or macOS (it can use the Apple GPU through MPS); Linux gets a
+CUDA 13 build. On Windows, for GPU compute also reinstall the CUDA wheel:
+`pip install --force-reinstall --no-deps torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126`
+(`cu128` in place of `cu126` for an RTX 50-series card). For a GTX
+10-series or older NVIDIA GPU, or a V100 / Titan V, on Linux, which
+CUDA 13 no longer supports, see `docs/install.md`.
