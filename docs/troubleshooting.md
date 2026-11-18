@@ -113,4 +113,4 @@ CuPy for Tab 3's GPU dF/F path and Tab 7's cross-correlation. Without one, CalLI
 NumPy automatically — the extra is harmless but does nothing. Note the
 default `requirements.txt` `torch` is the **CPU** build; for GPU compute
 also reinstall the CUDA wheel:
-`pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126`.
+`pip install --force-reinstall torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126`.

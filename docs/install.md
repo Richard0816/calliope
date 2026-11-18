@@ -50,7 +50,7 @@ build on Windows and macOS (it runs on any machine). For NVIDIA GPU
 acceleration, reinstall the CUDA build afterwards:
 
 ```bash
-pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+pip install --force-reinstall torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 **Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's
