@@ -411,9 +411,12 @@ class EventDetectionTab(ctk.CTkFrame):
         status.pack(side="left", fill="x", expand=True)
         wrap_to_width(status)
 
-        # Action buttons get their own row so they fit on small screens.
+        # Action buttons on two rows of their own: one row (~740 px) does
+        # not fit the content area at the app's 960 px minimum width.
         btn_row = ctk.CTkFrame(header, fg_color="transparent")
         btn_row.pack(fill="x", padx=8, pady=2)
+        btn_row2 = ctk.CTkFrame(header, fg_color="transparent")
+        btn_row2.pack(fill="x", padx=8, pady=2)
         ctk.CTkButton(btn_row, text="Reload from folder...", width=160,
                       command=self._reload_from_folder).pack(side="left")
         self.export_btn = ctk.CTkButton(
@@ -425,10 +428,10 @@ class EventDetectionTab(ctk.CTkFrame):
             command=self._on_save_summary, state="disabled")
         self.summary_btn.pack(side="left", padx=(6, 0))
         self.prominence_btn = ctk.CTkButton(
-            btn_row, text="Prominence distribution...", width=200,
+            btn_row2, text="Prominence distribution...", width=200,
             command=self._on_open_prominence_popout, state="disabled")
-        self.prominence_btn.pack(side="left", padx=(6, 0))
-        ctk.CTkButton(btn_row, text="Advanced...", width=100,
+        self.prominence_btn.pack(side="left")
+        ctk.CTkButton(btn_row2, text="Advanced...", width=100,
                       command=self._on_advanced).pack(side="left",
                                                       padx=(6, 0))
 

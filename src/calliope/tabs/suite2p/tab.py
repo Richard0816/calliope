@@ -1000,7 +1000,8 @@ class Suite2pTab(ctk.CTkFrame):
                 "Cellpose model download",
                 f"{problem}\n\nDownload it during this run? Choose No to "
                 f"cancel; to run without it, untick 'Run Cellpose pass' "
-                f"in Advanced (Sparsery only)."):
+                f"and 'Cellpose-SAM second pass on Vcorr' in Advanced "
+                f"(Sparsery only)."):
             return
 
         baseline_mode = self.baseline_var.get()
@@ -1360,6 +1361,11 @@ class Suite2pTab(ctk.CTkFrame):
 
         mask = load_keep_mask(plane0, N_total)
         N_kept = int(mask.sum())
+        from ...core import detection_run
+        removed = detection_run.reset_filtered_outputs(plane0, mask)
+        if removed:
+            print(f"[GUI] cell set changed: removed {', '.join(removed)} "
+                  f"(re-run Tab 4)")
         if N_kept == 0:
             print("[GUI] filtered dF/F: 0 ROIs survive the mask; "
                   "skipping filtered memmap")
@@ -1720,6 +1726,8 @@ class Suite2pTab(ctk.CTkFrame):
         if (popout is None or not popout.winfo_exists()
                 or getattr(popout, "_plane0", None) != Path(plane0)):
             try:
+                from ...core.detection_run import (
+                    keep_rule_kwargs as _keep_rule_kwargs)
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
                     on_iscell_changed=self._on_iscell_flipped,
@@ -1727,6 +1735,7 @@ class Suite2pTab(ctk.CTkFrame):
                         self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
                     on_checkpoint_trained=self._on_cellfilter_retrained,
+                    get_keep_rule=lambda: _keep_rule_kwargs(self._params),
                 )
             except Exception as e:
                 messagebox.showerror("Curation popout failed", str(e))

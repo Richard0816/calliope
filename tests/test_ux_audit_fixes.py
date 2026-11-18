@@ -377,10 +377,11 @@ def test_cellpose_model_problem(tmp_path, monkeypatch):
     assert "not downloaded" in sp.cellpose_model_problem({})
     assert "not found" in sp.cellpose_model_problem(
         {"cellpose_model_path": str(tmp_path / "nope")})
-    (tmp_path / "cpsam").write_bytes(b"x")
+    name = sp.cellpose_default_model()     # cpsam on 4.1, cpsam_v2 on 4.2+
+    (tmp_path / name).write_bytes(b"x")
     assert sp.cellpose_model_problem({}) is None
     assert sp.cellpose_model_problem(
-        {"cellpose_model_path": str(tmp_path / "cpsam")}) is None
+        {"cellpose_model_path": str(tmp_path / name)}) is None
 
 
 

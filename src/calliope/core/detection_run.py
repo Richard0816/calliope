@@ -712,6 +712,49 @@ def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
     return utils.resolve_live_mask(plane0, n_total)
 
 
+# Written by Tab 4 from the filtered dF/F, column for column, so they are
+# only valid for the keep mask the filtered memmap had at the time.
+DERIVED_DFF_FILES = ("r0p7_filtered_dff_lowpass.memmap.float32",
+                     "r0p7_filtered_dff_dt.memmap.float32")
+
+
+def reset_filtered_outputs(plane0: Path, mask: np.ndarray) -> list[str]:
+    """Call before rewriting the filtered dF/F with ``mask``.
+
+    If ``mask`` differs from the frozen ``r0p7_cell_mask_bool.npy``, the
+    Tab 4 low-pass / derivative memmaps belong to the old cell set:
+    with the same kept count they would still open, and ROI k's old
+    trace would be read as the new ROI k. Delete them so Tab 5 asks for
+    Tab 4 again. An empty ``mask`` also removes the filtered memmap and
+    freezes the empty mask, so nothing downstream keeps reading the
+    former cells.
+
+    Deletes before anything is rewritten: if a file is still mapped
+    (Windows refuses to delete it) this raises ``OSError`` and leaves
+    the recording as it was. Returns the names removed.
+    """
+    plane0 = Path(plane0)
+    mask = np.asarray(mask, dtype=bool)
+    frozen = plane0 / "r0p7_cell_mask_bool.npy"
+    try:
+        old = np.load(frozen)
+        same = old.shape == mask.shape and np.array_equal(old, mask)
+    except (OSError, ValueError):
+        same = False
+    names = [] if same else list(DERIVED_DFF_FILES)
+    if not mask.any():
+        names.append("r0p7_filtered_dff.memmap.float32")
+    removed = []
+    for n in names:
+        p = plane0 / n
+        if p.exists():
+            p.unlink()
+            removed.append(n)
+    if not mask.any():
+        np.save(frozen, mask)
+    return removed
+
+
 def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     """Slice ``r0p7_dff.memmap.float32`` down to ROIs that pass the
     cell-filter mask and write ``r0p7_filtered_dff.memmap.float32``
@@ -719,6 +762,8 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     sliced with (every filtered-memmap reader sizes against it via
     :func:`utils.resolve_filtered_mask`).
     Returns the filtered memmap path (or None if no ROIs survive).
+    Stale Tab 4 outputs are removed first: see
+    :func:`reset_filtered_outputs`.
     """
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
@@ -726,6 +771,7 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
 
     mask = _load_keep_mask(plane0, N_total)
     N_kept = int(mask.sum())
+    reset_filtered_outputs(plane0, mask)
     if N_kept == 0:
         return None
 

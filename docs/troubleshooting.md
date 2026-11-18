@@ -89,8 +89,9 @@ this run?" when it is missing.
 CalLIOPE 1.0 and its manuscript were validated on cellpose 4.1.1
 (`cpsam`); `cpsam_v2` masks from cellpose 4.2+ have not been compared
 with them. For exact reproduction of the paper, `pip install
-cellpose==4.1.1` (`requirements.txt` already pins it). Each run records
-`cellpose_version` and `model_name` in `ops.npy` → `cellpose_config`.
+cellpose==4.1.1` (`requirements.txt` and `uv.lock` already pin it). Each
+detection run records `cellpose_version`, `model_name` and `model_path`
+per Cellpose pass in its final `ops.npy` → `cellpose_passes`.
 
 **Asked to download the Cellpose model on every run.** The download is
 not ending up in that file. Check whether it exists and is ~1.2 GB after
@@ -102,8 +103,9 @@ removing the folder). Any one of these fixes it:
   in a browser and save it as `~/.cellpose/models/<name>` (no extension).
 - Save the file anywhere and set Tab 3 → Advanced… → "Cellpose model
   file" to it.
-- Untick "Run Cellpose pass" in Tab 3 → Advanced… to detect with
-  Sparsery only (no model needed).
+- Untick "Run Cellpose pass" (and "Cellpose-SAM second pass on Vcorr",
+  if ticked) in Tab 3 → Advanced… to detect with Sparsery only (no
+  model needed).
 
 ## GPU extra installed but nothing is faster
 

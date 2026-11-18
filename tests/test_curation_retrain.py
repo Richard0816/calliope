@@ -39,6 +39,8 @@ def _bare_popout(tmp_path, **hooks):
     pop._rec_id = "rec"
     pop._get_size_outlier_z = hooks.get("get_size_outlier_z")
     pop._get_ckpt_path = hooks.get("get_ckpt_path")
+    pop._get_keep_rule = hooks.get("get_keep_rule")
+    pop._reapply_failed = []
     pop._on_checkpoint_trained = hooks.get("on_checkpoint_trained")
     pop._on_iscell_changed = hooks.get("on_iscell_changed")
     pop._train_status_var = _Var()
@@ -64,9 +66,10 @@ def fake_train(monkeypatch, tmp_path):
     monkeypatch.setattr(P, "load_model_from_checkpoint",
                         lambda path, device: ("model", path))
 
-    def _predict(rec_id, model, device, plane0=None, size_outlier_z=None):
+    def _predict(rec_id, model, device, plane0=None, size_outlier_z=None,
+                 **rule):
         calls["predict"] = dict(rec_id=rec_id, model=model, plane0=plane0,
-                                size_outlier_z=size_outlier_z)
+                                size_outlier_z=size_outlier_z, **rule)
 
     monkeypatch.setattr(P, "predict_recording", _predict)
     calls["ckpt_dir"] = ckpt_dir
@@ -256,7 +259,8 @@ def test_retrain_scratch_choice_drops_warm_start(tmp_path, monkeypatch):
     monkeypatch.setattr(CP.threading, "Thread", _Thread)
     pop._poll_train_state = lambda: None
     pop._on_retrain()
-    assert started["args"] == (None, C.SIZE_OUTLIER_Z, True, None)
+    assert started["args"] == (None, C.SIZE_OUTLIER_Z, True, None,
+                               {"threshold": 0.5, "use_iscell": False})
 
 
 def _plane0(root, name, keep):
@@ -303,14 +307,15 @@ def test_reapply_repredicts_other_recordings_and_keeps_labels(
     predicted = []
     monkeypatch.setattr(
         P, "predict_recording",
-        lambda rec_id, model, device, plane0=None, size_outlier_z=None:
-            predicted.append(plane0))
+        lambda rec_id, model, device, plane0=None, size_outlier_z=None,
+        **rule: predicted.append((plane0, rule["threshold"])))
     labels = pd.DataFrame({"plane0_path": [str(other)], "ROI_number": [1],
                            "user_defined_cell": [0]})
     pop = _bare_popout(cur)
     pop._train_result = ("ok", "done.")
-    pop._reapply(tmp_path, "model", "cpu", labels, 4.0)
-    assert sorted(predicted) == sorted([other, nofilt])
+    pop._reapply(tmp_path, "model", "cpu", labels, 4.0,
+                 {"threshold": 0.7, "use_iscell": False})
+    assert sorted(predicted) == sorted([(other, 0.7), (nofilt, 0.7)])
     assert rewritten == [other]
     assert np.load(other / C.PREDICTED_MASK_NAME).tolist() == [True, False]
     assert pop._train_result[0] == "ok" and "2/2" in pop._train_result[1]

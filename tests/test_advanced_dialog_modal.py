@@ -60,3 +60,40 @@ def test_label_wraps_to_its_width(root):
     gui_common.wrap_to_width(lab)
     root.geometry("500x200")
     assert _pump(root, lambda: 0 < lab.cget("wraplength") <= 500)
+
+
+def test_closing_before_activation_cancels_the_timer(root):
+    # A pending _activate would outlive its Tcl command ("invalid
+    # command name") when the dialog closes within the first 100 ms.
+    dlg = gui_common.AdvancedDialog(root, "t", [{"name": "a", "type": "float",
+                                                 "default": 1.0}], {})
+    aid = dlg._activate_id
+    assert aid in root.tk.call("after", "info")
+    dlg._on_cancel()
+    assert aid not in root.tk.call("after", "info")
+
+
+def test_event_tab_buttons_fit_the_minimum_window(root):
+    # App minsize is 960 px; minus the 210 px sidebar, scrollbar and
+    # margins about 700 px is left for a tab.
+    from calliope.gui_common import AppState
+    from calliope.tabs.event_detection.tab import EventDetectionTab
+    win = ctk.CTkToplevel(root)
+    win.geometry("700x700")
+    tab = EventDetectionTab(win, AppState())
+    tab.pack(fill="both", expand=True)
+    _pump(root, lambda: False, timeout=1.0)
+    right = tab.winfo_rootx() + tab.winfo_width()
+    btns = [w for w in _walk(tab) if isinstance(w, ctk.CTkButton)
+            and w.winfo_ismapped()]
+    assert len(btns) >= 5
+    for b in btns:   # pack squeezes a button that doesn't fit, not moves it
+        assert b.winfo_width() >= b.winfo_reqwidth(), b.cget("text")
+        assert b.winfo_rootx() + b.winfo_width() <= right, b.cget("text")
+    win.destroy()
+
+
+def _walk(w):
+    for c in w.winfo_children():
+        yield c
+        yield from _walk(c)

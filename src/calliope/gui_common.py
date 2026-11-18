@@ -839,7 +839,7 @@ class AdvancedDialog(ctk.CTkToplevel):
         # focusing) before the window is mapped can leave keyboard input
         # with the main window on macOS, so fields look fine but ignore
         # typing.
-        self.after(100, self._activate)
+        self._activate_id = self.after(100, self._activate)
         # Catch the OS "X" close button so it cancels rather than just
         # destroying the window.
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
@@ -868,20 +868,31 @@ class AdvancedDialog(ctk.CTkToplevel):
         for hl in frame._helps:
             hl.configure(wraplength=max(40, help_px / s - 32))
 
+    def destroy(self) -> None:
+        # A pending _activate timer would outlive its Tcl command.
+        aid = getattr(self, "_activate_id", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+            self._activate_id = None
+        super().destroy()
+
     def _activate(self) -> None:
         """Raise, focus and grab the dialog once it is viewable, then put
         the cursor in the first text field."""
         if not self.winfo_exists():
             return
         if not self.winfo_viewable():
-            self.after(100, self._activate)
+            self._activate_id = self.after(100, self._activate)
             return
         self.lift()
         self.focus_force()
         try:
             self.grab_set()
         except tk.TclError:          # another grab still active; retry
-            self.after(100, self._activate)
+            self._activate_id = self.after(100, self._activate)
             return
         if self._entries:
             self._entries[0].focus_set()

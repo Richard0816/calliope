@@ -882,10 +882,14 @@ def run(
         print(f'[s+cp] cellpose pass (meanImg)')
     cp_dir = save_root / 'cellpose_pass'
     t_cp = time.time()
+    # What each executed Cellpose pass ran with (version, model, ...);
+    # copied into the final ops.npy because cellpose_pass/ is pruned.
+    cellpose_passes: dict[str, dict] = {}
     if cp_cfg.get('cellpose_enabled', True):
         cp_stat, _cp_ops, _cp_plane0 = run_cellpose_pass(
             cp_dir, shared_plane0, cp_cfg, verbose=verbose,
         )
+        cellpose_passes['meanImg'] = dict(_cp_ops.get('cellpose_config', {}))
     else:
         cp_stat = []
         if verbose:
@@ -950,6 +954,10 @@ def run(
                 # cellpose 4.x ignores it (only one model exists).
                 sam_cfg.setdefault('cellpose_model_type', 'cpsam')
                 sam_cfg.setdefault('cellpose_channel_input', 'Vcorr')
+                # Same model file as the primary pass, so a set
+                # 'Cellpose model file' is never bypassed by a download.
+                sam_cfg.setdefault('cellpose_model_path',
+                                   cp_cfg.get('cellpose_model_path', ''))
                 sam_cfg.setdefault('cellpose_diameter',
                                    cp_cfg.get('cellpose_diameter', 0))
                 sam_cfg.setdefault('cellpose_flow_threshold',
@@ -969,6 +977,8 @@ def run(
                     print(f'[s+cp] cellpose-SAM: {len(sam_stat)} ROIs '
                           f'({time.time() - t_sam:.1f}s)')
                 extra_passes.append(('cellpose_sam', sam_stat))
+                cellpose_passes['Vcorr'] = dict(
+                    _sam_ops.get('cellpose_config', {}))
             except Exception as e:
                 if verbose:
                     print(f'[s+cp] SAM-on-Vcorr failed ({e}); '
@@ -985,6 +995,9 @@ def run(
         detect_plane0=_sp_plane0,
         detection_settings=sp_settings,
     )
+    if cellpose_passes:
+        _final_ops['cellpose_passes'] = cellpose_passes
+        np.save(Path(final_plane0) / 'ops.npy', _final_ops, allow_pickle=True)
 
     if verbose:
         print(f'\n[s+cp] DONE.')

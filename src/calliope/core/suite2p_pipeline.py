@@ -1408,7 +1408,11 @@ def cellpose_model_problem(cfg: dict) -> Optional[str]:
     silently swap in cpsam), or the default cpsam model not downloaded
     yet (it will download ~1.2 GB from huggingface.co mid-run).
     """
-    if not cfg.get("cellpose_enabled", True) or not cellpose_sam_available():
+    # Either pass loads the same model (the SAM-on-Vcorr pass inherits
+    # cellpose_model_path), so check when either will run.
+    if not (cfg.get("cellpose_enabled", True)
+            or cfg.get("enable_sam_vcorr_pass", False)) \
+            or not cellpose_sam_available():
         return None
     model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
     if model_path:
@@ -1654,7 +1658,8 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
                 f"behind a proxy/firewall, copy the "
                 f"'{cellpose_default_model()}' model file there "
                 f"or set 'Cellpose model file' in Tab 3's Advanced, or "
-                f"untick 'Run Cellpose pass' to use Sparsery only.") from e
+                f"untick 'Run Cellpose pass' (and 'Cellpose-SAM second "
+                f"pass on Vcorr') to use Sparsery only.") from e
         eval_kwargs = dict(
             diameter=diameter,
             flow_threshold=flow_threshold,
@@ -1687,6 +1692,7 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
         "cellpose_version": cellpose_version(),
         "model_name": Path(str(getattr(model, "pretrained_model", "")
                                or model_type)).name,
+        "model_path": str(getattr(model, "pretrained_model", "") or ""),
         "model_type": model_type,
         "diameter_requested": cfg.get("cellpose_diameter", 0),
         "diameter_estimated": float(diams) if diams is not None else None,

@@ -254,7 +254,8 @@ class CurationPopout(ctk.CTkToplevel):
                  get_size_outlier_z: Optional[Callable[[], float]] = None,
                  get_ckpt_path: Optional[Callable[[], str]] = None,
                  on_checkpoint_trained: Optional[
-                     Callable[[Path], None]] = None) -> None:
+                     Callable[[Path], None]] = None,
+                 get_keep_rule: Optional[Callable[[], dict]] = None) -> None:
         """Build the popout.
 
         Optional parent hooks (all called on the Tk main thread):
@@ -273,6 +274,11 @@ class CurationPopout(ctk.CTkToplevel):
             Called with the new ``CHECKPOINT_DIR/best.pt`` after a
             Retrain that wrote one, so the parent can select it for
             later detection runs.
+        ``get_keep_rule``
+            Returns the parent's keep rule as ``{"threshold",
+            "use_iscell"}`` so the post-Retrain re-predict keeps the
+            same cells a detection run would. ``None`` -> p >= 0.5 on
+            the CNN score.
         """
         super().__init__(master)
         self.title("ROI curation")
@@ -298,6 +304,8 @@ class CurationPopout(ctk.CTkToplevel):
         self._rec_id = self._derive_recording_id(self._plane0)
         self._get_size_outlier_z = get_size_outlier_z
         self._get_ckpt_path = get_ckpt_path
+        self._get_keep_rule = get_keep_rule
+        self._reapply_failed: list[str] = []
         self._on_checkpoint_trained = on_checkpoint_trained
         self._csv_path = _curation_csv_path()
         # Listener fired after every successful flip so the parent
@@ -783,6 +791,26 @@ class CurationPopout(ctk.CTkToplevel):
                       f"({e}); using the default {_cfg.SIZE_OUTLIER_Z:g}.")
         return float(_cfg.SIZE_OUTLIER_Z)
 
+    def _keep_rule(self) -> dict:
+        """Keep rule for the post-Retrain re-predict (Tab 3's live
+        setting when it gives one)."""
+        rule = {"threshold": 0.5, "use_iscell": False}
+        hook = getattr(self, "_get_keep_rule", None)
+        if hook is not None:
+            try:
+                got = hook()
+                rule = {"threshold": float(got["threshold"]),
+                        "use_iscell": bool(got["use_iscell"])}
+            except Exception as e:
+                print(f"[curation] could not read Tab 3's keep rule ({e}); "
+                      f"using p >= 0.5.")
+        return rule
+
+    @staticmethod
+    def _describe_keep_rule(rule: dict) -> str:
+        return ("Suite2p iscell" if rule["use_iscell"]
+                else f"cell prob >= {rule['threshold']:g}")
+
     def _warm_start_ckpt(self) -> Optional[Path]:
         """Parent-selected checkpoint to warm-start Retrain from, or
         ``None`` (train from random init) when the parent gives none
@@ -806,6 +834,7 @@ class CurationPopout(ctk.CTkToplevel):
         # not touch Tk variables.
         warm_start = self._warm_start_ckpt()
         size_z = self._size_outlier_z()
+        keep_rule = self._keep_rule()
         # Tab 3 (the only parent that supplies the checkpoint hook)
         # also rewrites the filtered dF/F memmap on the (-1, -1)
         # sentinel and selects the new best.pt.
@@ -822,9 +851,12 @@ class CurationPopout(ctk.CTkToplevel):
                 f"training go into the next round.\n\n"
                 f"When it finishes, this recording (and any recordings "
                 f"under the re-apply folder) is re-predicted "
-                f"(size_outlier_z={size_z:g}) and "
+                f"(keep rule: {self._describe_keep_rule(keep_rule)}, "
+                f"size_outlier_z={size_z:g}) and "
                 f"{_cfg.PREDICTED_MASK_NAME} is overwritten; ROIs you "
-                f"labelled by hand keep your label.{parent_line}")
+                f"labelled by hand keep your label. Re-applied recordings "
+                f"whose cell set changes lose their Tab 4 low-pass output: "
+                f"re-run Tab 4, then events / clusters.{parent_line}")
         opts = self._ask_retrain_options(info, warm_start)
         if opts is None:
             return
@@ -835,7 +867,8 @@ class CurationPopout(ctk.CTkToplevel):
         self._train_status_var.set("Training... see console for epoch log")
         self._train_thread = threading.Thread(
             target=self._train_worker,
-            args=(warm_start, size_z, bool(opts.get("implicit")), reapply),
+            args=(warm_start, size_z, bool(opts.get("implicit")), reapply,
+                  keep_rule),
             daemon=True)
         self._train_thread.start()
         # Poll the worker so the status label flips back when done.
@@ -914,7 +947,8 @@ class CurationPopout(ctk.CTkToplevel):
     def _train_worker(self, warm_start: Optional[Path] = None,
                       size_outlier_z: Optional[float] = None,
                       implicit_positives: bool = False,
-                      reapply_root: Optional[str] = None) -> None:
+                      reapply_root: Optional[str] = None,
+                      keep_rule: Optional[dict] = None) -> None:
         """Run training, then immediately re-score the current
         recording's ROIs with the fresh checkpoint so Tab 3's panels
         + the popout's status bar reflect the new predictions
@@ -947,6 +981,9 @@ class CurationPopout(ctk.CTkToplevel):
         """
         from ...core.cellfilter import config as _cfg
         self._trained_ckpt = None
+        self._reapply_failed = []
+        if keep_rule is None:
+            keep_rule = {"threshold": 0.5, "use_iscell": False}
         if size_outlier_z is None:
             size_outlier_z = float(_cfg.SIZE_OUTLIER_Z)
         try:
@@ -991,7 +1028,7 @@ class CurationPopout(ctk.CTkToplevel):
             labels = load_labels(self._csv_path)
             predict_recording(self._rec_id, model, device,
                               plane0=self._plane0,
-                              size_outlier_z=size_outlier_z)
+                              size_outlier_z=size_outlier_z, **keep_rule)
             _apply_label_overrides(self._plane0, labels)
             self._train_result = (
                 "ok",
@@ -1003,14 +1040,18 @@ class CurationPopout(ctk.CTkToplevel):
             return
         if reapply_root:
             self._reapply(reapply_root, model, device, labels,
-                          size_outlier_z)
+                          size_outlier_z, keep_rule)
 
     def _reapply(self, root, model, device, labels,
-                 size_outlier_z: float) -> None:
+                 size_outlier_z: float, keep_rule: dict) -> None:
         """Re-predict every other finished plane0 under ``root`` with the
-        new model, keep its hand labels, and rewrite its filtered dF/F
-        memmap so downstream tabs see the new cell set. Worker thread;
-        amends ``self._train_result``."""
+        new model and the same keep rule, keep its hand labels, and
+        rewrite its filtered dF/F memmap so downstream tabs see the new
+        cell set (``compute_filtered_dff`` drops Tab 4 outputs made for
+        the old set). Worker thread; amends the message of
+        ``self._train_result`` but not its kind: the current recording
+        succeeded, so it still refreshes. Failures go to
+        ``self._reapply_failed`` for a separate warning."""
         from ...core import utils as _u
         from ...core.cellfilter.predict import predict_recording
         from ...core.detection_run import compute_filtered_dff
@@ -1018,14 +1059,15 @@ class CurationPopout(ctk.CTkToplevel):
         try:
             targets = _find_plane0s(Path(root), self._plane0)
         except Exception as e:
-            self._train_result = ("warn", f"{msg} Re-apply: could not "
-                                          f"scan {root}: {e}")
+            self._reapply_failed = [f"could not scan {root}: {e}"]
+            self._train_result = (kind, f"{msg} Re-apply skipped.")
             return
         failed = []
         for p0 in targets:
             try:
                 predict_recording(_u.infer_recording_id(p0), model, device,
-                                  plane0=p0, size_outlier_z=size_outlier_z)
+                                  plane0=p0, size_outlier_z=size_outlier_z,
+                                  **keep_rule)
                 _apply_label_overrides(p0, labels)
                 if (p0 / "r0p7_filtered_dff.memmap.float32").exists():
                     compute_filtered_dff(p0)
@@ -1033,11 +1075,10 @@ class CurationPopout(ctk.CTkToplevel):
                 failed.append(f"{p0}: {e}")
                 print(f"[curation] re-apply failed for {p0}: {e}")
         msg = (f"{msg} Re-applied to {len(targets) - len(failed)}/"
-               f"{len(targets)} other recording(s) under {root}; re-run "
-               f"their events / clusters to use the new cell set.")
-        if failed:
-            kind = "warn"
-            msg += " Failed:\n" + "\n".join(failed)
+               f"{len(targets)} other recording(s) under {root} "
+               f"({self._describe_keep_rule(keep_rule)}); where the cell "
+               f"set changed, re-run Tab 4, then events / clusters.")
+        self._reapply_failed = failed
         self._train_result = (kind, msg)
 
     def _poll_train_state(self) -> None:
@@ -1086,6 +1127,11 @@ class CurationPopout(ctk.CTkToplevel):
                     self._on_iscell_changed(-1, -1)
                 except Exception:
                     pass
+        failed = getattr(self, "_reapply_failed", None)
+        if failed:
+            messagebox.showwarning(
+                "Cell filter re-apply",
+                "Re-apply failed for:\n" + "\n".join(failed))
         self._train_thread = None
 
     # -- Lowpass overlay ----------------------------------------------------
