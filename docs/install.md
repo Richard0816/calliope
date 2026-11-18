@@ -47,10 +47,12 @@ pip install -e . --no-deps                # CalLIOPE itself; deps already satisf
 
 `requirements.txt` pins the plain PyPI `torch` wheel, which is the CPU
 build on Windows and macOS (it runs on any machine). For NVIDIA GPU
-acceleration, reinstall the CUDA build afterwards:
+acceleration on Windows, reinstall the CUDA build afterwards
+(`--no-deps` keeps every other package at its locked version). Skip
+this on Linux, where PyPI's `torch` is already a CUDA build:
 
 ```bash
-pip install --force-reinstall torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
+pip install --force-reinstall --no-deps torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 **Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's
