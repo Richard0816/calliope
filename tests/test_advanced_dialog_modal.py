@@ -84,10 +84,13 @@ def test_event_tab_buttons_fit_the_minimum_window(root):
     tab.pack(fill="both", expand=True)
     _pump(root, lambda: False, timeout=1.0)
     right = tab.winfo_rootx() + tab.winfo_width()
+    want = {"Reload from folder...", "Export figures", "Save summary",
+            "Prominence distribution...", "Advanced..."}
     btns = [w for w in _walk(tab) if isinstance(w, ctk.CTkButton)
-            and w.winfo_ismapped()]
-    assert len(btns) >= 5
-    for b in btns:   # pack squeezes a button that doesn't fit, not moves it
+            and w.cget("text") in want]
+    assert {b.cget("text") for b in btns} == want
+    for b in btns:
+        assert b.winfo_ismapped(), b.cget("text")   # pack squeezes a button that doesn't fit, not moves it
         assert b.winfo_width() >= b.winfo_reqwidth(), b.cget("text")
         assert b.winfo_rootx() + b.winfo_width() <= right, b.cget("text")
     win.destroy()

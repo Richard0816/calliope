@@ -67,20 +67,43 @@ def test_zero_cells_invalidates_old_filtered_data(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32",
-                    reason="only Windows refuses to delete a mapped file")
-def test_mapped_tab4_output_stops_before_anything_is_rewritten(tmp_path):
+                    reason="only Windows refuses to move a mapped file")
+@pytest.mark.parametrize("held_name", [DT, FILT])
+def test_a_mapped_file_leaves_the_recording_untouched(tmp_path, held_name):
+    # All or nothing: no partial deletion (LP must survive a held DT), and
+    # a held filtered memmap stops it before Tab 4 output is dropped.
     p = _plane0(tmp_path, live=[1, 0, 1], frozen=[1, 1, 0])
-    held = np.memmap(p / DT, np.float32, "r", shape=(6, 2))
+    held = np.asarray(np.memmap(p / held_name, np.float32, "r",
+                                shape=(6, 2))[:, 0])     # a view keeps it
     try:
         with pytest.raises(OSError):
             dr.compute_filtered_dff(p)
-        # Nothing rewritten: filtered memmap and frozen mask still agree.
+        for name in (FILT, LP, DT):
+            assert (p / name).exists(), name
+        assert not list(p.glob("*.stale"))
         assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 1, 0]
         filt = np.memmap(p / FILT, np.float32, "r", shape=(6, 2))
         assert filt[0].tolist() == [1.0, 1.0]
         del filt
     finally:
         del held
+
+
+def test_zero_cells_then_cells_again_regenerates(tmp_path):
+    p = _plane0(tmp_path, live=[0, 0, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    assert not (p / FILT).exists() and dr.has_filtered_outputs(p)
+    np.save(p / "predicted_cell_mask.npy", np.array([0, 1, 1], bool))
+    assert dr.compute_filtered_dff(p) is not None
+    filt = np.memmap(p / FILT, np.float32, "r", shape=(6, 2))
+    assert filt[0].tolist() == [1.0, 2.0]
+    del filt
+
+
+def test_rebuilding_full_dff_drops_tab4_output_even_with_same_mask(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    assert sorted(dr.reset_filtered_outputs(p, None)) == sorted([LP, DT])
+    assert (p / FILT).exists()
 
 
 # --- Retrain re-apply ----------------------------------------------------
@@ -111,6 +134,28 @@ def test_reapply_uses_keep_rule_and_failures_keep_current_result(
     assert kind == "ok"                      # current recording still refreshes
     assert "cell prob >= 0.9" in msg and "1/2" in msg
     assert len(me._reapply_failed) == 1 and "disk full" in me._reapply_failed[0]
+
+
+def test_reapply_regenerates_a_former_zero_cell_recording(tmp_path,
+                                                          monkeypatch):
+    from calliope.tabs.suite2p import curation_popout as cp
+    from calliope.core.cellfilter import predict as pr
+
+    p = _plane0(tmp_path, live=[0, 0, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)                   # now only the frozen mask
+    monkeypatch.setattr(cp, "_find_plane0s", lambda root, ex: [p])
+    monkeypatch.setattr(cp, "_apply_label_overrides", lambda p0, lab: 0)
+    monkeypatch.setattr(
+        pr, "predict_recording",
+        lambda *a, plane0, **k: np.save(plane0 / "predicted_cell_mask.npy",
+                                        np.array([1, 0, 1], bool)))
+    me = SimpleNamespace(_train_result=("ok", "done."), _plane0=tmp_path,
+                         _reapply_failed=[],
+                         _describe_keep_rule=cp.CurationPopout._describe_keep_rule)
+    cp.CurationPopout._reapply(me, tmp_path, None, None, [], 0.0,
+                               {"threshold": 0.5, "use_iscell": False})
+    assert (p / FILT).exists()
+    assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 0, 1]
 
 
 def test_keep_rule_comes_from_parent_or_defaults():

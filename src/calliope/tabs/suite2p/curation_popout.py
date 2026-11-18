@@ -1054,7 +1054,8 @@ class CurationPopout(ctk.CTkToplevel):
         ``self._reapply_failed`` for a separate warning."""
         from ...core import utils as _u
         from ...core.cellfilter.predict import predict_recording
-        from ...core.detection_run import compute_filtered_dff
+        from ...core.detection_run import (compute_filtered_dff,
+                                           has_filtered_outputs)
         kind, msg = self._train_result
         try:
             targets = _find_plane0s(Path(root), self._plane0)
@@ -1069,7 +1070,7 @@ class CurationPopout(ctk.CTkToplevel):
                                   plane0=p0, size_outlier_z=size_outlier_z,
                                   **keep_rule)
                 _apply_label_overrides(p0, labels)
-                if (p0 / "r0p7_filtered_dff.memmap.float32").exists():
+                if has_filtered_outputs(p0):
                     compute_filtered_dff(p0)
             except Exception as e:
                 failed.append(f"{p0}: {e}")

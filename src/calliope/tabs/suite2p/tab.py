@@ -1879,9 +1879,10 @@ class Suite2pTab(ctk.CTkFrame):
         """
         import gc
 
+        from ...core.detection_run import has_filtered_outputs
         src = plane0 / "r0p7_dff.memmap.float32"
-        filt = plane0 / "r0p7_filtered_dff.memmap.float32"
-        if not (src.exists() and filt.exists()):
+        # A zero-cell run keeps only its frozen mask: still regenerate.
+        if not (src.exists() and has_filtered_outputs(plane0)):
             return
         # Drop downstream tabs' cached handles on the filtered memmap so
         # Windows releases the file lock before we truncate it below.

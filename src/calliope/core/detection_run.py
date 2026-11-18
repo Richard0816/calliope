@@ -567,6 +567,9 @@ def compute_dff_memmaps(
     except Exception as _meta_exc:
         print(f"[meta] could not stamp dF/F params: {_meta_exc}")
 
+    # New full dF/F: Tab 4's low-pass / derivative are now stale even if
+    # the keep mask comes out the same.
+    reset_filtered_outputs(plane0, None)
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
@@ -718,7 +721,8 @@ DERIVED_DFF_FILES = ("r0p7_filtered_dff_lowpass.memmap.float32",
                      "r0p7_filtered_dff_dt.memmap.float32")
 
 
-def reset_filtered_outputs(plane0: Path, mask: np.ndarray) -> list[str]:
+def reset_filtered_outputs(plane0: Path,
+                           mask: Optional[np.ndarray]) -> list[str]:
     """Call before rewriting the filtered dF/F with ``mask``.
 
     If ``mask`` differs from the frozen ``r0p7_cell_mask_bool.npy``, the
@@ -729,30 +733,63 @@ def reset_filtered_outputs(plane0: Path, mask: np.ndarray) -> list[str]:
     freezes the empty mask, so nothing downstream keeps reading the
     former cells.
 
-    Deletes before anything is rewritten: if a file is still mapped
-    (Windows refuses to delete it) this raises ``OSError`` and leaves
-    the recording as it was. Returns the names removed.
+    ``mask=None`` means the full dF/F itself is being rebuilt: the Tab 4
+    files are dropped whatever the mask (same shape, new values).
+
+    All or nothing, before anything is rewritten: every file to delete,
+    plus the filtered memmap the caller is about to rewrite, is first
+    renamed aside. Windows refuses to rename (or delete) a file that is
+    still mapped, so if any rename fails the others are put back and
+    ``OSError`` is raised with the recording exactly as it was. Returns
+    the names removed.
     """
     plane0 = Path(plane0)
-    mask = np.asarray(mask, dtype=bool)
+    filt = plane0 / "r0p7_filtered_dff.memmap.float32"
     frozen = plane0 / "r0p7_cell_mask_bool.npy"
-    try:
-        old = np.load(frozen)
-        same = old.shape == mask.shape and np.array_equal(old, mask)
-    except (OSError, ValueError):
-        same = False
+    if mask is None:
+        same, empty = False, False
+    else:
+        mask = np.asarray(mask, dtype=bool)
+        empty = not mask.any()
+        try:
+            old = np.load(frozen)
+            same = old.shape == mask.shape and np.array_equal(old, mask)
+        except (OSError, ValueError):
+            same = False
     names = [] if same else list(DERIVED_DFF_FILES)
-    if not mask.any():
-        names.append("r0p7_filtered_dff.memmap.float32")
-    removed = []
-    for n in names:
-        p = plane0 / n
-        if p.exists():
-            p.unlink()
-            removed.append(n)
-    if not mask.any():
+    if empty:
+        names.append(filt.name)
+    doomed = [plane0 / n for n in names if (plane0 / n).exists()]
+    # The rewrite truncates the filtered memmap: check it is free too.
+    probe = ([filt] if mask is not None and not empty and filt.exists()
+             else [])
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for p in doomed + probe:
+            aside = p.with_name(p.name + ".stale")
+            p.replace(aside)
+            moved.append((p, aside))
+    except OSError:
+        for p, aside in reversed(moved):
+            aside.replace(p)
+        raise
+    for p, aside in moved:
+        if p in probe:
+            aside.replace(p)
+        else:
+            aside.unlink()
+    if empty:
         np.save(frozen, mask)
-    return removed
+    return [p.name for p in doomed]
+
+
+def has_filtered_outputs(plane0: Path) -> bool:
+    """True once a filtered dF/F has been written for ``plane0`` -- including
+    a zero-cell result, which leaves only the all-false frozen mask -- so a
+    later cell-set change knows to regenerate it."""
+    plane0 = Path(plane0)
+    return ((plane0 / "r0p7_filtered_dff.memmap.float32").exists()
+            or (plane0 / "r0p7_cell_mask_bool.npy").exists())
 
 
 def compute_filtered_dff(plane0: Path) -> Optional[Path]:

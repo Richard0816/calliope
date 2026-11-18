@@ -525,8 +525,8 @@ class LowpassTab(ctk.CTkFrame):
                                      shape=(T, N_total))
                     if len(roi_indices) == 1:
                         roi_idx = roi_indices[0]
-                        trace = np.asarray(full[:, roi_idx],
-                                           dtype=np.float32)
+                        trace = np.array(full[:, roi_idx],   # copy, not a
+                                         dtype=np.float32)   # mapped view
                         self._mean_dff = trace
                         excluded = "" if mask[roi_idx] \
                             else " [excluded by mask]"
@@ -555,7 +555,9 @@ class LowpassTab(ctk.CTkFrame):
             best_in_kept = int(np.argmax(probs_kept))
             best_orig = int(kept_idx[best_in_kept])
             best_score = float(probs_kept[best_in_kept])
-            trace = np.asarray(dff[:, best_in_kept], dtype=np.float32)
+            # A copy: a view would keep the filtered memmap mapped, and
+            # Windows then refuses Tab 3's rewrite after Promote/Retrain.
+            trace = np.array(dff[:, best_in_kept], dtype=np.float32)
             self._mean_dff = trace
             self._trace_label = (f"ROI {best_orig} (score {best_score:.3f})")
         elif source in ("mean", "median"):
