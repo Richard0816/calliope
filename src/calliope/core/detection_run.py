@@ -577,6 +577,7 @@ def compute_dff_memmaps(
             r=r, F=F, Fneu=Fneu,
             progress_cb=progress_cb):
         _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
+        generation.finish_dff_build(plane0)
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
@@ -615,6 +616,7 @@ def compute_dff_memmaps(
                 f"({time.time() - t0:.1f}s)")
     del dff_mm
     _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
+    generation.finish_dff_build(plane0)
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 
@@ -744,9 +746,11 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     mask = _load_keep_mask(plane0, N_total)
     N_kept = int(mask.sum())
     prev_hash = generation.frozen_mask_hash(plane0)
+    generation.dff_build_id(plane0)     # refuse a dF/F rebuild that didn't finish
     if N_kept == 0:
+        prev = generation.begin_filtered(plane0)
         np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
-        generation.stamp_filtered(plane0, mask, prev_hash)
+        generation.stamp_filtered(plane0, mask, prev_hash, prev)
         return None
 
     dff_path = plane0 / "r0p7_dff.memmap.float32"
@@ -755,6 +759,8 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
                     shape=(T, N_total))
     filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
                      shape=(T, N_kept))
+    # The file is now truncated: until stamped, readers must refuse it.
+    prev = generation.begin_filtered(plane0)
     chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)
@@ -762,7 +768,7 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     filt.flush()
     del filt, dff
     np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
-    generation.stamp_filtered(plane0, mask, prev_hash)
+    generation.stamp_filtered(plane0, mask, prev_hash, prev)
     return filtered_path
 
 

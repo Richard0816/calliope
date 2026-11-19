@@ -432,8 +432,9 @@ def write_events_sheets(
         },
         filename=filename,
     )
-    from . import generation as _gen
-    _gen.stamp_events(Path(plane0), generation)
+    if filename == DEFAULT_FILENAME:
+        from . import generation as _gen
+        _gen.stamp_events(Path(plane0), generation)
     return out
 
 

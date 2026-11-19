@@ -103,6 +103,7 @@ def compute_lowpass_and_dt(
     dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
     lp_mm = np.memmap(str(lp_path), dtype="float32", mode="w+", shape=(T, N))
     dt_mm = np.memmap(str(dt_path), dtype="float32", mode="w+", shape=(T, N))
+    generation.begin_lowpass(plane0)
 
     sos = None
     report_every = max(1, N // 20)
@@ -133,8 +134,6 @@ def compute_lowpass_and_dt(
     lp_mm.flush()
     dt_mm.flush()
     del lp_mm, dt_mm, src
-    generation.stamp_lowpass(plane0, gen)
-
     try:
         from . import recording_meta
         recording_meta.update_meta(
@@ -154,6 +153,7 @@ def compute_lowpass_and_dt(
             progress_cb(msg)
         else:
             print(msg)
+    generation.stamp_lowpass(plane0, gen)
 
     return {
         "cutoff_hz": float(cutoff_hz),
@@ -225,6 +225,8 @@ def render_lowpass_figures(
     matplotlib.use("Agg", force=False)
     import matplotlib.pyplot as plt
 
+    from . import generation
+    generation.check_filtered(Path(plane0))
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
     T, N = _load_kept_count_and_T(plane0)

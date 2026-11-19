@@ -908,6 +908,21 @@ def _write_pair_summary_csv(path, roisA, roisB, best_lag, max_corr,
                comments="", fmt=fmts)
 
 
+def _check_xcorr_inputs(plane0: Path, prefix: str, base_dir: Path) -> None:
+    """Refuse cluster lists / dF/F made for another cell set or dF/F.
+    Tab 6's own export folder carries a stamp; any other folder (e.g. hand-
+    made clusters) is only checked against the dF/F it is sliced from."""
+    from . import generation
+    from .utils import is_filtered_prefix
+    filtered = is_filtered_prefix(prefix)
+    if Path(base_dir) == Path(plane0) / f"{prefix}cluster_results":
+        generation.check_clusters(plane0, base_dir, filtered)
+    elif filtered:
+        generation.check_filtered(plane0)
+    else:
+        generation.dff_build_id(plane0)
+
+
 def run_cluster_xcorr_full_fast(
     plane0: Path,
     prefix: str,
@@ -960,6 +975,7 @@ def run_cluster_xcorr_full_fast(
     # Load the cell-filter mask (if any) so we can (a) interpret legacy
     # cluster .npy files as filtered positions and (b) translate Suite2p
     # ROI indices back into filtered positions for slicing dF/F.
+    _check_xcorr_inputs(plane0, prefix, base_dir)
     keep_mask = _load_keep_mask(plane0, prefix)
     clusters = _load_clusters_from_dir(base_dir, keep_mask=keep_mask)
     if len(clusters) < 1:
@@ -1171,6 +1187,7 @@ def run_cluster_xcorr_per_event_fast(
     if cluster_folder:
         base_dir = base_dir / cluster_folder
 
+    _check_xcorr_inputs(plane0, prefix, base_dir)
     keep_mask = _load_keep_mask(plane0, prefix)
     clusters = _load_clusters_from_dir(base_dir, keep_mask=keep_mask)
     if len(clusters) < 1:

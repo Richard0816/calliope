@@ -45,6 +45,7 @@ def _stub(tmp_path):
     s._linkage_plane0 = tmp_path
     s._prefix = "r0p7_filtered_"
     s._roi_ids = BUILT_ON.copy()
+    s._cluster_inputs = None   # linkage predates input tracking
     s._current_threshold = lambda: 1e9          # one cluster
     s._compute_visual_cluster_map = lambda T: {1: 1}
     s._visual_to_label = {1: 1}

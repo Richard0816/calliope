@@ -452,6 +452,8 @@ class LowpassTab(ctk.CTkFrame):
 
         self._compute_ready = filtered_path.exists()
         if self._compute_ready:
+            from ...core import generation
+            generation.check_filtered(plane0)   # raises: "re-run Tab 3"
             # Resolve the keep mask against the filtered memmap's on-disk
             # size, NOT the live predicted_cell_mask/iscell. Curation or a
             # "Promote to filter mask" after the memmap was written drifts

@@ -927,7 +927,8 @@ class EventDetectionTab(ctk.CTkFrame):
             return
         self._after_summary_write = publish if in_batch else None
         keys = ("fps", "T", "N_kept", "event_windows", "onsets_by_roi",
-                "event_monotonicity", "event_class", "kept_idx")
+                "event_monotonicity", "event_class", "kept_idx",
+                "generation")
         from ...core.offload import run_offloaded
         from ...core import event_detection_run as edr
         self._summary_job = run_offloaded(

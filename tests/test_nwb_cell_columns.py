@@ -73,6 +73,7 @@ def test_stale_event_windows_are_left_out(tmp_path):
     mm.flush()
     del mm
     generation.new_dff_build(plane0)
+    generation.finish_dff_build(plane0)
     detection_run.compute_filtered_dff(plane0)
     generation.stamp_lowpass(plane0, generation.check_filtered(plane0))
     summary_writer.write_events_sheets(

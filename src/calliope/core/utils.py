@@ -809,8 +809,14 @@ def no_rois_survive(plane0, on_error=None) -> bool:
         return False
     try:
         plane0 = Path(plane0)
+        # A stamped run knows its count; a zero-cell rewrite keeps the
+        # old memmap on disk, so its presence alone proves nothing.
+        from . import generation
+        n = generation.filtered_n_kept(plane0)
+        if n is not None:
+            return n == 0
         if (plane0 / "r0p7_filtered_dff.memmap.float32").exists():
-            return False  # only written when N_kept > 0
+            return False  # pre-stamp runs: only written when N_kept > 0
         mask_path = plane0 / "predicted_cell_mask.npy"
         if mask_path.exists():
             return int(np.load(mask_path).astype(bool).sum()) == 0

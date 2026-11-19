@@ -51,6 +51,8 @@ def import_suite2p(src: str, run_folder: str, ckpt_path: str = "",
     src_p, run = Path(src), Path(run_folder)
     plane0 = run.joinpath("detection", "final", "suite2p", "plane0")
     plane0.mkdir(parents=True, exist_ok=True)
+    from . import generation
+    generation.new_dff_build(plane0)     # ROIs about to be replaced
     if src_p.is_dir():
         missing = [f for f in _PLANE0_FILES if not (src_p / f).is_file()]
         if missing:

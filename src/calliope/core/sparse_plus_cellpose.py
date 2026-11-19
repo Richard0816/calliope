@@ -664,6 +664,10 @@ def merge_and_extract(sparsery_stat, cellpose_stat,
             print(f"    classifier failed ({e}); marking all as cells")
         iscell = np.ones((len(stat_arr), 2), dtype=np.float32)
 
+    # New ROIs: everything derived from the old ones is now refused
+    # until the dF/F is rebuilt (core.generation).
+    from . import generation
+    generation.new_dff_build(final_plane0)
     np.save(final_plane0 / 'stat.npy',   stat_arr,  allow_pickle=True)
     np.save(final_plane0 / 'F.npy',      F)
     np.save(final_plane0 / 'Fneu.npy',   Fneu)

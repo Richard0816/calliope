@@ -74,9 +74,14 @@ raw TIFFs and output folder to a local disk and re-run.
 
 The cell set or the dF/F of this recording changed after these results
 were computed (Promote, Retrain, a different keep rule, or a new
-detection), so they no longer line up with its ROIs. CalLIOPE refuses
-them rather than mix up traces. Re-run the tab the message names and the
-ones after it. Batch rows always rebuild everything in order.
+detection), or Tab 4 was re-run after these events were saved, so they
+no longer line up with its ROIs. CalLIOPE refuses them rather than mix
+up traces. Re-run the tab the message names and the ones after it.
+Batch rows always rebuild everything in order.
+
+"...did not finish; re-run Tab 3 / Tab 4" means that stage was
+interrupted (crash, closed window, full disk) while overwriting its
+files: run it again.
 
 ## First run is slow / downloads ~1 GB
 

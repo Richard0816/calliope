@@ -1218,19 +1218,35 @@ class CrossCorrelationTab(ctk.CTkFrame):
         # Prefer the in-memory publish from Tab 5 if it matches the
         # currently-loaded plane0 -- it's the freshest source. Otherwise
         # fall back to the EventWindows sheet on disk (cold-start path).
-        evts = self._event_windows_from_state()
+        from ...core import generation
+        try:
+            current = generation.check_lowpass(self._plane0)
+        except generation.StaleOutputError as e:
+            self.status_var.set(f"Event windows not loaded: {e}")
+            self._apply_event_windows([])
+            return
+        evts = self._event_windows_from_state(current)
         if evts is None:
+            try:
+                generation.check_events(self._plane0)
+            except generation.StaleOutputError as e:
+                self.status_var.set(f"Event windows not loaded: {e}")
+                self._apply_event_windows([])
+                return
             evts = _read_event_windows_from_summary(self._plane0)
         self._apply_event_windows(evts)
 
-    def _event_windows_from_state(self):
+    def _event_windows_from_state(self, current=None):
         """Return Tab 5's in-memory ``[(start_s, end_s), ...]`` for the
-        current plane0, or None if no matching publish is cached."""
+        current plane0, or None if no matching publish is cached (or it
+        was made from other low-pass traces than ``current``)."""
         results = getattr(self.state, "event_results", None) if self.state \
             else None
         if not results:
             return None
         if Path(results.get("plane0", "")) != Path(self._plane0):
+            return None
+        if results.get("generation") != current:
             return None
         ev = results.get("event_windows")
         if ev is None or len(ev) == 0:

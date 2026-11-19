@@ -41,6 +41,12 @@ def _plane0(tmp_path, live, frozen, T=6):
     return p
 
 
+def _rebuild(p):
+    """A completed full dF/F rebuild."""
+    gen.new_dff_build(p)
+    gen.finish_dff_build(p)
+
+
 def _stamp_tab4(p):
     """Tab 4 output made from the filtered dF/F as it is now."""
     gen.stamp_lowpass(p, gen.check_filtered(p))
@@ -76,7 +82,7 @@ def test_pre_stamp_run_accepted_until_its_cells_change(tmp_path):
     p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
     assert gen.check_lowpass(p) is None
     dr.compute_filtered_dff(p)                   # same cells: still fine
-    assert gen.check_lowpass(p) is not None
+    gen.check_lowpass(p)
     # ... until a stamped rewrite changes the cell set.
     np.save(p / "predicted_cell_mask.npy", np.array([1, 0, 1], bool))
     dr.compute_filtered_dff(p)
@@ -95,7 +101,7 @@ def test_dff_rebuild_makes_filtered_and_lowpass_stale(tmp_path):
     p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
     dr.compute_filtered_dff(p)
     _stamp_tab4(p)
-    gen.new_dff_build(p)                         # full dF/F rebuilt
+    _rebuild(p)                         # full dF/F rebuilt
     with pytest.raises(gen.StaleOutputError, match="re-run Tab 3"):
         gen.check_filtered(p)
     dr.compute_filtered_dff(p)                   # same mask, new dF/F
@@ -143,12 +149,12 @@ def test_lowpass_compute_refuses_stale_filtered_and_stamps(tmp_path):
     from calliope.core import lowpass_run
     p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
     dr.compute_filtered_dff(p)
-    gen.new_dff_build(p)
+    _rebuild(p)
     with pytest.raises(gen.StaleOutputError):
         lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
     dr.compute_filtered_dff(p)
     lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
-    assert gen.check_lowpass(p) == gen.check_filtered(p)
+    assert gen.check_lowpass(p).startswith(gen.check_filtered(p) + "|")
 
 
 def test_event_run_refuses_stale_lowpass(tmp_path):
@@ -165,7 +171,7 @@ def test_event_run_refuses_stale_lowpass(tmp_path):
 def test_event_sheets_and_nwb_follow_the_generation(tmp_path):
     from calliope.core import summary_writer
     p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
-    gen.new_dff_build(p)            # a stamped run: no pre-stamp leniency
+    _rebuild(p)            # a stamped run: no pre-stamp leniency
     dr.compute_filtered_dff(p)
     _stamp_tab4(p)
     summary_writer.write_events_sheets(
@@ -194,7 +200,7 @@ def test_clusters_follow_the_generation(tmp_path):
     udir.mkdir()
     gen.stamp_clusters(udir, gen.cluster_input(p, False))
     gen.check_clusters(p, udir, False)
-    gen.new_dff_build(p)
+    _rebuild(p)
     with pytest.raises(gen.StaleOutputError):
         gen.check_clusters(p, udir, False)
 
@@ -366,7 +372,7 @@ def test_clustering_refuses_stale_input_and_stamps_its_export(tmp_path):
     full[:] = rng.random((40, 5))
     full.flush()
     del full
-    gen.new_dff_build(p)
+    _rebuild(p)
     with pytest.raises(gen.StaleOutputError):
         clustering.load_filtered_dff(p, "r0p7_filtered_")
     dr.compute_filtered_dff(p)
@@ -388,7 +394,7 @@ def test_clustering_refuses_stale_input_and_stamps_its_export(tmp_path):
 def test_tab6_reload_refuses_stale_clusters(tmp_path, monkeypatch):
     from calliope.tabs.clustering import tab as ct
     p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
-    gen.new_dff_build(p)
+    _rebuild(p)
     dr.compute_filtered_dff(p)
     cdir = p / "r0p7_filtered_cluster_results"
     cdir.mkdir()
@@ -423,7 +429,7 @@ def test_tab6_gui_export_stamps_so_its_reload_is_accepted(tmp_path):
     from scipy.cluster.hierarchy import linkage
     from calliope.tabs.clustering import tab as ct
     p = _plane0(tmp_path, live=[1, 1, 1, 0], frozen=[1, 1, 1, 0])
-    gen.new_dff_build(p)
+    _rebuild(p)
     dr.compute_filtered_dff(p)
     Z = linkage(np.random.default_rng(0).random((3, 4)), "ward")
     me = SimpleNamespace(
@@ -467,3 +473,269 @@ def test_batch_asks_once_before_downloading_the_cellpose_model(
     (tmp_path / sp.cellpose_default_model()).unlink()
     asked.clear()
     assert bt.BatchTab._confirm_cellpose_model(me) is True and not asked
+
+
+# --- 4th review --------------------------------------------------------------
+
+def test_gui_render_sends_the_token_to_the_summary_write(tmp_path,
+                                                         monkeypatch):
+    # The GUI Render path built its own payload and dropped the token, so
+    # its workbook was stamped null and NWB left the events out.
+    from unittest.mock import MagicMock
+    from calliope.core import offload
+    from calliope.core import event_detection_run as edr
+    from calliope.tabs.event_detection.tab import EventDetectionTab
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    token = gen.stamp_lowpass(p, gen.check_filtered(p))
+    sent = {}
+    monkeypatch.setattr(offload, "run_offloaded",
+                        lambda *a, **k: sent.update(args=k["args"]))
+    me = MagicMock()
+    me._plane0 = p
+    me.state.batch_active = False
+    data = {"heatmap": np.zeros((2, 4)), "raster": np.zeros((2, 4)),
+            "N_kept": 2, "T": 6, "downsample": 1, "fps": 10.0,
+            "event_windows": [(0.1, 0.3)],
+            "onsets_by_roi": [np.array([0.2])] * 2, "kept_idx": [0, 1],
+            "event_class": ["x"], "event_monotonicity": [],
+            "diagnostics": {}, "event_counts": np.zeros(2),
+            "generation": token}
+    EventDetectionTab._on_render_done(me, data)
+    payload = sent["args"][1]
+    assert payload["generation"] == token
+    edr.write_event_summary_offload(str(p), payload)
+    assert gen.check_events(p) == token
+
+
+def test_pre_stamp_run_tab4_rerun_then_unchanged_promote(tmp_path):
+    # Tab 4 recomputed on a pre-stamp run, then Promote with no change:
+    # still current (it was refused before).
+    from calliope.core import lowpass_run
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
+    lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    gen.check_lowpass(p)
+    dr.compute_filtered_dff(p)
+    gen.check_lowpass(p)
+    np.save(p / "predicted_cell_mask.npy", np.array([1, 0, 1], bool))
+    dr.compute_filtered_dff(p)
+    with pytest.raises(gen.StaleOutputError):
+        gen.check_lowpass(p)
+
+
+def test_zero_cell_rewrite_is_skipped_by_batch(tmp_path):
+    from calliope.core import utils
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    assert not utils.no_rois_survive(p)
+    np.save(p / "predicted_cell_mask.npy", np.zeros(3, bool))
+    dr.compute_filtered_dff(p)
+    assert (p / FILT).exists()            # old memmap kept on disk ...
+    assert utils.no_rois_survive(p)       # ... but the stamp says 0 cells
+
+
+def test_interrupted_writes_are_refused(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    _stamp_tab4(p)
+    gen.begin_lowpass(p)                   # Tab 4 crashed mid-write
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_lowpass(p)
+    _stamp_tab4(p)
+    gen.begin_filtered(p)                  # Tab 3 crashed mid-write
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_filtered(p)
+    dr.compute_filtered_dff(p)             # re-running Tab 3 recovers
+    gen.check_filtered(p)
+    gen.new_dff_build(p)                   # detection / dF/F crashed
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_filtered(p)
+    with pytest.raises(gen.StaleOutputError):
+        dr.compute_filtered_dff(p)         # won't stamp a half-built dF/F
+
+
+def test_redetection_marks_the_build_pending_before_new_rois(tmp_path,
+                                                            monkeypatch):
+    from calliope.core import sparse_plus_cellpose as spc
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    seen = {}
+    real_save = np.save
+
+    def spy(path, *a, **k):
+        if str(path).endswith("stat.npy") and "build" not in seen:
+            try:
+                gen.check_filtered(p)
+                seen["build"] = "accepted"
+            except gen.StaleOutputError:
+                seen["build"] = "refused"
+        return real_save(path, *a, **k)
+
+    monkeypatch.setattr(spc.np, "save", spy)
+    import inspect
+    src = inspect.getsource(spc.merge_and_extract)
+    assert src.index("generation.new_dff_build(final_plane0)") < \
+        src.index("np.save(final_plane0 / 'stat.npy'")
+    gen.new_dff_build(p)                   # what merge_and_extract does first
+    spy(p / "stat.npy", np.array([], dtype=object), allow_pickle=True)
+    assert seen["build"] == "refused"
+
+
+def test_tab4_rerun_makes_old_events_stale(tmp_path):
+    from calliope.core import summary_writer
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    _stamp_tab4(p)
+    summary_writer.write_events_sheets(
+        p, event_windows=[(0.0, 0.3)], onsets_by_roi=[np.array([0.1])] * 2,
+        fps=10.0, roi_ids=[0, 1], generation=gen.check_lowpass(p))
+    gen.check_events(p)
+    _stamp_tab4(p)                         # Tab 4 again (other cutoff)
+    with pytest.raises(gen.StaleOutputError, match="re-run Tab 5"):
+        gen.check_events(p)
+
+
+def test_events_to_another_workbook_do_not_restamp(tmp_path):
+    from calliope.core import summary_writer
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    _stamp_tab4(p)
+    summary_writer.write_events_sheets(
+        p, event_windows=[(0.0, 0.3)], onsets_by_roi=[np.array([0.1])] * 2,
+        fps=10.0, roi_ids=[0, 1], generation="something else",
+        filename="other.xlsx")
+    assert not (p / gen.EVENTS_FILE).exists()
+
+
+def test_unstamped_full_dff_clusters_stale_after_rebuild(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    udir = p / "r0p7_cluster_results"
+    udir.mkdir()
+    gen.check_clusters(p, udir, False)     # pre-stamp run: accepted
+    _rebuild(p)
+    with pytest.raises(gen.StaleOutputError):
+        gen.check_clusters(p, udir, False)
+
+
+def test_unreadable_stamp_is_refused_not_taken_for_legacy(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    (p / gen.FILTERED_FILE).write_text("{not json", encoding="utf-8")
+    with pytest.raises(gen.StaleOutputError, match="unreadable"):
+        gen.check_lowpass(p)
+
+
+def test_stamp_writes_leave_no_temp_files(tmp_path):
+    for _ in range(3):
+        gen.stamp_lowpass(tmp_path, "g")
+    assert [f.name for f in tmp_path.iterdir()] == [gen.LOWPASS_FILE]
+
+
+def test_tab4_preview_refuses_out_of_date_filtered(tmp_path):
+    from unittest.mock import MagicMock
+    from calliope.tabs.lowpass.tab import LowpassTab
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    _rebuild(p)                            # filtered not rewritten
+    with pytest.raises(gen.StaleOutputError, match="re-run Tab 3"):
+        LowpassTab._load_data(MagicMock(), p)
+
+
+def test_tab7_checks_its_cluster_inputs(tmp_path):
+    from calliope.core import crosscorrelation as xc
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    cdir = p / "r0p7_filtered_cluster_results"
+    cdir.mkdir()
+    gen.stamp_clusters(cdir, gen.cluster_input(p, True))
+    xc._check_xcorr_inputs(p, "r0p7_filtered_", cdir)
+    np.save(p / "predicted_cell_mask.npy", np.array([1, 0, 1], bool))
+    dr.compute_filtered_dff(p)
+    with pytest.raises(gen.StaleOutputError):
+        xc._check_xcorr_inputs(p, "r0p7_filtered_", cdir)
+    with pytest.raises(gen.StaleOutputError):    # and the real runner
+        xc.run_cluster_xcorr_full_fast(p, prefix="r0p7_filtered_", fps=10.0,
+                                       cluster_folder="")
+
+
+def test_tab7_ignores_events_from_other_lowpass(tmp_path):
+    from calliope.tabs.crosscorrelation.tab import CrossCorrelationTab
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    me = SimpleNamespace(_plane0=p, state=SimpleNamespace(event_results={
+        "plane0": str(p), "event_windows": [(0.0, 1.0)],
+        "generation": "old|token"}))
+    assert CrossCorrelationTab._event_windows_from_state(me, "new|t") is None
+    assert CrossCorrelationTab._event_windows_from_state(me, "old|token") \
+        == [(0.0, 1.0)]
+
+
+def test_tab6_export_refuses_linkage_from_an_earlier_dff(tmp_path):
+    from scipy.cluster.hierarchy import linkage
+    from calliope.tabs.clustering import tab as ct
+    p = _plane0(tmp_path, live=[1, 1, 1, 0], frozen=[1, 1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    made_from = gen.cluster_input(p, True)
+    _rebuild(p)                            # same cells, new dF/F
+    dr.compute_filtered_dff(p)
+    me = SimpleNamespace(
+        _Z=linkage(np.random.default_rng(0).random((3, 4)), "ward"),
+        _plane0=p, _prefix="r0p7_filtered_", _cluster_inputs=made_from,
+        _current_threshold=lambda: 1e9, _visual_to_label={},
+        _compute_visual_cluster_map=lambda T: {1: 1},
+        _linkage_ids_current=lambda: np.array([0, 1, 2]),
+        _existing_cluster_dir=lambda pl, pr: pl / f"{pr}cluster_results")
+    with pytest.raises(ValueError, match="Re-run clustering"):
+        ct.ClusteringTab._export_clusters(me)
+
+
+def test_tab4_failing_mid_write_is_refused(tmp_path, monkeypatch):
+    from calliope.core import lowpass_run
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
+    dr.compute_filtered_dff(p)
+    lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    gen.check_lowpass(p)
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(lowpass_run.utils, "lowpass_causal_1d", boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_lowpass(p)
+
+
+def test_filtered_failing_mid_write_is_refused(tmp_path, monkeypatch):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    np.save(p / "predicted_cell_mask.npy", np.array([1, 0, 1], bool))
+    real = np.save
+
+    def save(path, *a, **k):
+        if str(path).endswith("r0p7_cell_mask_bool.npy"):
+            raise OSError("disk full")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(dr.np, "save", save)
+    with pytest.raises(OSError):
+        dr.compute_filtered_dff(p)       # memmap rewritten, mask not saved
+    monkeypatch.setattr(dr.np, "save", real)
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_filtered(p)
+
+
+def test_unfinished_dff_rebuild_stops_before_rewriting(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    np.save(p / "predicted_cell_mask.npy", np.array([1, 0, 1], bool))
+    gen.new_dff_build(p)                 # never finished
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        dr.compute_filtered_dff(p)
+    filt = np.memmap(p / FILT, np.float32, "r", shape=(6, 2))
+    assert filt[0].tolist() == [1.0, 1.0]          # untouched
+    del filt
+    assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 1, 0]

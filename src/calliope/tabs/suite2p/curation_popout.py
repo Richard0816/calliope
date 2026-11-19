@@ -855,7 +855,8 @@ class CurationPopout(ctk.CTkToplevel):
                 f"size_outlier_z={size_z:g}) and "
                 f"{_cfg.PREDICTED_MASK_NAME} is overwritten; ROIs you "
                 f"labelled by hand keep your label. Re-applied recordings "
-                f"whose cell set changes lose their Tab 4 low-pass output: "
+                f"whose cell set changes keep their old Tab 4 / 5 / 6 "
+                f"results on disk, but those are refused until re-run: "
                 f"re-run Tab 4, then events / clusters.{parent_line}")
         opts = self._ask_retrain_options(info, warm_start)
         if opts is None:

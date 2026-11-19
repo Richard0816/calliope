@@ -104,6 +104,8 @@ def compute_clustering_offload(plane0_str: str, prefix: str, *,
     """
     plane0 = Path(plane0_str)
     dff_mm, T, N, _ = load_filtered_dff(plane0, prefix)
+    from ...core import generation
+    inputs = generation.cluster_input(plane0, utils.is_filtered_prefix(prefix))
     Z = ward_linkage(dff_mm)
     view = utils.load_plane_view(plane0)
     Lx, Ly = int(view["Lx"]), int(view["Ly"])
@@ -115,7 +117,7 @@ def compute_clustering_offload(plane0_str: str, prefix: str, *,
         "Z": Z, "roi_ids": roi_ids,
         "dff_shape": tuple(int(x) for x in dff_mm.shape),
         "Lx": Lx, "Ly": Ly, "auto_frac": float(auto_frac),
-        "T": int(T), "N": int(N),
+        "T": int(T), "N": int(N), "inputs": inputs,
     }
 
 

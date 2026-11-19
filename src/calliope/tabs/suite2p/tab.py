@@ -994,6 +994,9 @@ class Suite2pTab(ctk.CTkFrame):
         problem = cellpose_model_problem(
             {**spec_defaults(self.PARAM_SPEC), **self._params})
         if problem and "not found" in problem:
+            # In a batch a modal would leave the queue waiting forever.
+            if in_batch and report_stage_error(self.state, problem):
+                return
             messagebox.showerror("Cellpose model", problem)
             return
         if problem and not in_batch and not messagebox.askyesno(
