@@ -93,3 +93,44 @@ def test_stale_event_windows_are_left_out(tmp_path):
     detection_run.compute_filtered_dff(plane0)
     nwb_export.export_recording_to_nwb(plane0, tmp_path / "b.nwb")
     assert n_events(tmp_path / "b.nwb") == 0
+
+
+def test_pixel_masks_round_trip_to_the_dense_masks(tmp_path):
+    # Sparse pixel_mask replaced the dense image_mask (9.3 GiB for 9520
+    # ROIs at 512 x 512). Read back from the file, every ROI must expand
+    # to exactly the dense mask the old export wrote, pixel for pixel.
+    from pynwb import NWBHDF5IO
+    plane0 = _plane0(tmp_path)
+    rng = np.random.default_rng(3)
+    stat = [
+        # duplicate pixel (last weight wins) + out-of-frame pixels dropped
+        {"ypix": np.array([7, 7, -1, 25, 8], "int32"),
+         "xpix": np.array([1, 1, 3, 3, 19], "int32"),
+         "lam": np.array([0.1, 0.9, 0.4, 0.4, 0.6], "float32")},
+        # lam length mismatch -> uniform weights
+        {"ypix": np.array([10, 11], "int32"), "xpix": np.array([10, 11], "int32"),
+         "lam": np.array([0.5], "float32")},
+        # only pixel out of frame -> empty ROI
+        {"ypix": np.array([LY + 3], "int32"), "xpix": np.array([0], "int32"),
+         "lam": np.array([1.0], "float32")},
+        # random blob
+        {"ypix": rng.integers(0, LY, 30).astype("int32"),
+         "xpix": rng.integers(0, LX, 30).astype("int32"),
+         "lam": rng.random(30).astype("float32")},
+    ]
+    np.save(plane0 / "stat.npy", np.array(stat, dtype=object), allow_pickle=True)
+    out = tmp_path / "pm.nwb"
+    nwb_export.export_recording_to_nwb(plane0, out)
+    with NWBHDF5IO(str(out), "r") as io:
+        ps = io.read().processing["ophys"].data_interfaces[
+            "ImageSegmentation"].plane_segmentations["PlaneSegmentation"]
+        assert "image_mask" not in ps.colnames
+        for i, s in enumerate(stat):
+            dense = np.zeros((LY, LX), np.float32)
+            for x, y, w in ps["pixel_mask"][i]:
+                dense[int(y), int(x)] = w
+            np.testing.assert_array_equal(
+                dense, nwb_export._build_image_mask(s, LY, LX))
+    # NWB rejects an empty pixel_mask: an empty ROI is one zero pixel.
+    assert nwb_export._build_pixel_mask(
+        {"ypix": [], "xpix": [], "lam": []}, LY, LX) == [(0, 0, 0.0)]

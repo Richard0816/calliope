@@ -18,7 +18,7 @@ Layout of the produced file::
 
     /general/devices/Microscope
     /general/optophysiology/ImagingPlane
-    /processing/ophys/ImageSegmentation/PlaneSegmentation   (per-ROI ImageMask + iscell prob)
+    /processing/ophys/ImageSegmentation/PlaneSegmentation   (per-ROI PixelMask + iscell prob)
     /processing/ophys/Fluorescence/{Fluorescence,Neuropil,DfOverF}  RoiResponseSeries
     /processing/ophys/Deconvolved/Deconvolved               RoiResponseSeries (OASIS)
     /intervals/events                                       (optional) population event windows
@@ -79,6 +79,28 @@ def _build_image_mask(s: dict, Ly: int, Lx: int) -> np.ndarray:
     ok = (ypix >= 0) & (ypix < Ly) & (xpix >= 0) & (xpix < Lx)
     mask[ypix[ok], xpix[ok]] = lam[ok]
     return mask
+
+
+def _build_pixel_mask(s: dict, Ly: int, Lx: int) -> list:
+    """The same ROI as :func:`_build_image_mask`, as NWB ``pixel_mask``
+    rows ``(x, y, weight)`` (x = column, y = row). Pixels outside the frame
+    are dropped and a pixel listed twice keeps its last weight, exactly as
+    the dense mask does, so expanding these rows gives that mask back.
+    A dense float32 mask per ROI needs N * Ly * Lx * 4 bytes (9.3 GiB for
+    9520 ROIs at 512 x 512); this needs only the ROI's own pixels."""
+    ypix = np.asarray(s.get("ypix", []), dtype=np.int64)
+    xpix = np.asarray(s.get("xpix", []), dtype=np.int64)
+    lam = np.asarray(s.get("lam", []), dtype=np.float32)
+    last = {}
+    if ypix.size:
+        if lam.size != ypix.size:  # uniform weight fallback
+            lam = np.ones(ypix.size, dtype=np.float32)
+        ok = (ypix >= 0) & (ypix < Ly) & (xpix >= 0) & (xpix < Lx)
+        for y, x, w in zip(ypix[ok], xpix[ok], lam[ok]):
+            last[(int(y), int(x))] = float(w)
+    # NWB rejects an empty pixel_mask; one zero-weight pixel expands to the
+    # same all-zero mask the dense export wrote for an empty ROI.
+    return [(x, y, w) for (y, x), w in last.items()] or [(0, 0, 0.0)]
 
 
 def _read_event_windows(plane0: Path) -> Optional[np.ndarray]:
@@ -344,8 +366,10 @@ def export_recording_to_nwb(
         description="Suite2p Sparsery + Cellpose ROIs curated by cellfilter",
         imaging_plane=imaging_plane,
     )
+    # Sparse pixel masks: dense (Ly, Lx) masks per ROI ran out of memory
+    # on large recordings (9520 ROIs at 512 x 512 = 9.3 GiB).
     for s in stat:
-        plane_seg.add_roi(image_mask=_build_image_mask(s, Ly, Lx))
+        plane_seg.add_roi(pixel_mask=_build_pixel_mask(s, Ly, Lx))
 
     # Per-ROI cell columns. suite2p's iscell.npy is (N, 2): column 0 is
     # the binary accept label (classifier decision, flipped by manual
