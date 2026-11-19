@@ -134,3 +134,19 @@ def test_pixel_masks_round_trip_to_the_dense_masks(tmp_path):
     # NWB rejects an empty pixel_mask: an empty ROI is one zero pixel.
     assert nwb_export._build_pixel_mask(
         {"ypix": [], "xpix": [], "lam": []}, LY, LX) == [(0, 0, 0.0)]
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32",
+                    reason="only Windows refuses to rewrite a mapped file")
+def test_export_releases_the_dff_memmaps(tmp_path):
+    # Export NWB left the full dF/F mapped, so rewriting it (re-running
+    # Tab 3) right afterwards failed with an OSError on Windows.
+    plane0 = _plane0(tmp_path)
+    for name, n in (("r0p7_dff.memmap.float32", N),):
+        mm = np.memmap(plane0 / name, np.float32, "w+", shape=(T, n))
+        mm[:] = 0.5
+        mm.flush()
+        del mm
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "r.nwb")
+    with open(plane0 / "r0p7_dff.memmap.float32", "r+b") as f:
+        f.truncate(16)

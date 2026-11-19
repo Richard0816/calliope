@@ -179,6 +179,24 @@ def _cell_columns(plane0: Path, iscell: Optional[np.ndarray], n: int):
     return cols
 
 
+def _release_mappings_after(fn):
+    """Collect garbage when ``fn`` returns. The pynwb objects that hold the
+    dF/F memmaps form reference cycles, so the mappings outlive the export
+    until the next collection; on Windows a mapped file can't be rewritten,
+    so e.g. re-running Tab 3 right after Export NWB failed."""
+    import functools
+    import gc
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            gc.collect()
+    return wrapper
+
+
+@_release_mappings_after
 def export_recording_to_nwb(
     plane0: PathLike,
     out_path: PathLike,
