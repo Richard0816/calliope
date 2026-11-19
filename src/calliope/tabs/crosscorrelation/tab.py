@@ -1234,7 +1234,7 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 self._apply_event_windows([])
                 return
             evts = _read_event_windows_from_summary(self._plane0)
-        self._apply_event_windows(evts)
+        self._apply_event_windows(evts, token=current)
 
     def _event_windows_from_state(self, current=None):
         """Return Tab 5's in-memory ``[(start_s, end_s), ...]`` for the
@@ -1253,10 +1253,12 @@ class CrossCorrelationTab(ctk.CTkFrame):
             return []
         return [(float(t0), float(t1)) for t0, t1 in ev]
 
-    def _apply_event_windows(self, evts) -> None:
-        """Update ``_event_windows`` and the dependent UI bits."""
+    def _apply_event_windows(self, evts, token=None) -> None:
+        """Update ``_event_windows`` and the dependent UI bits. ``token``
+        is the low-pass run the windows came from (checked before use)."""
         evts = list(evts) if evts else []
         self._event_windows = evts
+        self._event_token = token
         if not evts and self._plane0 is None:
             self.event_count_var.set("events: -")
         else:
@@ -1278,10 +1280,17 @@ class CrossCorrelationTab(ctk.CTkFrame):
             return
         if Path(results.get("plane0", "")) != Path(self._plane0):
             return
+        from ...core import generation
+        try:
+            current = generation.check_lowpass(self._plane0)
+        except generation.StaleOutputError:
+            current = object()                # nothing matches
+        if results.get("generation") != current:
+            return
         ev = results.get("event_windows")
         evts = ([(float(t0), float(t1)) for t0, t1 in ev]
                 if ev is not None else [])
-        self._apply_event_windows(evts)
+        self._apply_event_windows(evts, token=current)
 
     def _on_export_figures(self, quiet: bool = False) -> None:
         """Re-render Tab 7's violin pair plots into
@@ -1532,6 +1541,18 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 "No events",
                 "No event windows found in the recording summary "
                 "(*summary*.xlsx). Run event detection first.")
+            return
+        from ...core import generation
+        try:
+            current = generation.check_lowpass(self._plane0)
+        except generation.StaleOutputError as e:
+            messagebox.showerror("Event windows out of date", str(e))
+            return
+        if current != getattr(self, "_event_token", None):
+            messagebox.showerror(
+                "Event windows out of date",
+                "Tab 4 was re-run since these event windows were loaded; "
+                "re-run Tab 5, then refresh events here.")
             return
         if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "A run is already in progress.")

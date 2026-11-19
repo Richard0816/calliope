@@ -86,6 +86,11 @@ A **Batch runner** tab queues recordings and chains all eight stages.
 
 Changes that affect existing outputs, scripts or batch files:
 
+- **NWB ROI masks (v1.0.2).** `PlaneSegmentation` now stores sparse
+  `pixel_mask` rows `(x, y, weight)` instead of a dense `image_mask` per
+  ROI (dense masks needed 9.3 GiB for a 9,520-ROI 512 x 512 recording).
+  Scripts that read `image_mask` need to expand the pixel mask into an
+  `(Ly, Lx)` array themselves (see Tab 3's README).
 - **NWB export.** `iscell_prob` now holds the Suite2p classifier
   probability (`iscell.npy` column 1). The 0/1 accept label moved to a
   new `iscell` column. New columns: `cellfilter_prob` (CalLIOPE

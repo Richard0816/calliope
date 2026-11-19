@@ -137,10 +137,9 @@ def test_locked_filtered_memmap_leaves_stamps_consistent(tmp_path):
     try:
         with pytest.raises(OSError):
             dr.compute_filtered_dff(p)
-        # Marked pending before the file is touched: refused (fail closed),
-        # with the old data and mask still intact for the rerun.
-        with pytest.raises(gen.StaleOutputError, match="did not finish"):
-            gen.check_lowpass(p)
+        # The truncating open failed, so nothing changed: the previous
+        # generation still holds (no false refusal), data and mask intact.
+        assert gen.check_lowpass(p) is not None
         assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 1, 0]
     finally:
         del held
@@ -854,8 +853,13 @@ def test_reload_keeps_the_linkage_inputs(tmp_path):
     np.save(cdir / "linkage.npy",
             linkage(np.random.default_rng(0).random((3, 4)), "ward"))
     np.save(cdir / "threshold_used.npy", np.array([1.0]))
+    made_from = gen.cluster_input(p, True)
+    gen.stamp_clusters(cdir, made_from)
+    _rebuild(p)                            # newer dF/F, same cells
+    dr.compute_filtered_dff(p)
     out = reload_clustering_offload(str(p), "r0p7_filtered_", str(cdir))
-    assert out["inputs"] == gen.cluster_input(p, True)
+    assert out["inputs"] == made_from     # what the linkage was built on
+    assert out["inputs"] != gen.cluster_input(p, True)
 
 
 def test_unreadable_stamp_is_repaired_by_rerunning_tab3(tmp_path):
@@ -896,3 +900,57 @@ def test_v101_style_event_summary_call_still_counts(tmp_path):
         p, event_windows=[(0.0, 0.3)], onsets_by_roi=[np.array([0.1])] * 2,
         fps=10.0, roi_ids=[0, 1])
     assert gen.check_events(p) == gen.check_lowpass(p)
+
+
+def test_locked_first_tab4_file_keeps_the_previous_run(tmp_path):
+    import sys as _sys
+    from calliope.core import lowpass_run
+    if _sys.platform != "win32":
+        pytest.skip("only Windows refuses to truncate a mapped file")
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
+    dr.compute_filtered_dff(p)
+    lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    before = gen.check_lowpass(p)
+    held = np.asarray(np.memmap(p / LP, np.float32, "r", shape=(200, 2))[:, 0])
+    try:
+        with pytest.raises(OSError):
+            lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=2.0)
+        assert gen.check_lowpass(p) == before   # nothing was truncated
+    finally:
+        del held
+
+
+def test_explicit_none_token_is_kept(tmp_path):
+    # A pre-stamp render (token None) saved after Tab 4 was re-run must not
+    # be stamped with the new low-pass token.
+    from calliope.core import summary_writer
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    _stamp_tab4(p)                          # Tab 4 re-run after the render
+    summary_writer.write_events_sheets(
+        p, event_windows=[(0.0, 0.3)], onsets_by_roi=[np.array([0.1])] * 2,
+        fps=10.0, roi_ids=[0, 1], generation=None)
+    with pytest.raises(gen.StaleOutputError):
+        gen.check_events(p)
+
+
+def test_tab7_refuses_cached_windows_after_tab4_rerun(tmp_path, monkeypatch):
+    from calliope.tabs.crosscorrelation import tab as xt
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    old = gen.stamp_lowpass(p, gen.check_filtered(p))
+    errors = []
+    monkeypatch.setattr(xt.messagebox, "showerror",
+                        lambda *a, **k: errors.append(a))
+    me = SimpleNamespace(_plane0=p, _inputs_ready=lambda: True,
+                         _event_windows=[(0.0, 1.0)], _event_token=old)
+    _stamp_tab4(p)                          # Tab 4 re-run
+    xt.CrossCorrelationTab._on_run_per_event(me)
+    assert errors and "out of date" in errors[0][0]
+    # A broadcast from the old render is ignored too.
+    applied = []
+    me._apply_event_windows = lambda e, token=None: applied.append(e)
+    xt.CrossCorrelationTab._on_event_results_broadcast(
+        me, {"plane0": str(p), "event_windows": [(0.0, 1.0)],
+             "generation": old})
+    assert applied == []

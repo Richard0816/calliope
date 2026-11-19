@@ -137,8 +137,16 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
     thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
                            dtype=float).ravel()[0])
     _, T, N, _ = load_filtered_dff(plane0, prefix)
-    from ...core import generation
-    inputs = generation.cluster_input(plane0, utils.is_filtered_prefix(prefix))
+    # What the saved linkage was built from (its folder's stamp), not
+    # what is on disk now: export compares the two. None for an export
+    # made before stamps.
+    import json
+    try:
+        inputs = json.loads((cluster_dir / "generation.json")
+                            .read_text(encoding="utf-8"))
+        inputs = None if inputs.get("pending") else inputs
+    except (OSError, ValueError):
+        inputs = None
     # The loaded linkage was computed on N_kept ROIs; if the cell-filter
     # mask has changed since the export the shapes won't agree and any
     # downstream recolouring would be silently wrong.

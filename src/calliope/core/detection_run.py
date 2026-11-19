@@ -759,9 +759,19 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
                     shape=(T, N_total))
     # Pending before the file is first changed (opening with w+ already
     # truncates it): until stamped, readers must refuse it.
+    stamp_path = plane0 / generation.FILTERED_FILE
+    saved = generation.saved_stamp(stamp_path)
     prev = generation.begin_filtered(plane0)
-    filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
-                     shape=(T, N_kept))
+    try:
+        # The truncating open is the first change: if it fails (e.g.
+        # another tab still maps the file on Windows) nothing changed, so
+        # the previous generation still holds.
+        fh = open(filtered_path, "w+b")
+    except OSError:
+        generation.restore_stamp(stamp_path, saved)
+        raise
+    with fh:
+        filt = np.memmap(fh, dtype="float32", mode="w+", shape=(T, N_kept))
     chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)

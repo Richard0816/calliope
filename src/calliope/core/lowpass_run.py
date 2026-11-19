@@ -82,8 +82,10 @@ def compute_lowpass_and_dt(
     ``sg_poly``, ``fps``). Tab 5 (:mod:`core.event_detection_run`) reads
     it so its auto onset-backtrack window and frame rate match what was
     actually baked into these memmaps. The older ``lowpass`` section
-    (reserved; detection no longer stamps it) is left untouched. The stamp is best-effort: a metadata failure never fails
-    the compute.
+    (reserved; detection no longer stamps it) is left untouched. If that
+    metadata can't be written the compute fails and the run stays
+    pending (``core.generation``): Tab 5 would otherwise read the old
+    cutoff / fps against the new traces.
 
     ``progress_cb`` (if provided) is called with status strings such
     as ``"120/2350 ROIs (3.4s)"`` every ~5% of progress.
@@ -101,9 +103,21 @@ def compute_lowpass_and_dt(
 
     lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
     dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
+    stamp_path = plane0 / generation.LOWPASS_FILE
+    saved = generation.saved_stamp(stamp_path)
     generation.begin_lowpass(plane0)     # before w+ truncates anything
-    lp_mm = np.memmap(str(lp_path), dtype="float32", mode="w+", shape=(T, N))
-    dt_mm = np.memmap(str(dt_path), dtype="float32", mode="w+", shape=(T, N))
+    try:
+        lp_fh = open(lp_path, "w+b")
+    except OSError:
+        # Nothing truncated yet (e.g. still mapped on Windows): the
+        # previous Tab 4 run is still valid.
+        generation.restore_stamp(stamp_path, saved)
+        raise
+    # From here the low-pass file is truncated: a failure leaves the run
+    # pending (re-run Tab 4).
+    with lp_fh, open(dt_path, "w+b") as dt_fh:
+        lp_mm = np.memmap(lp_fh, dtype="float32", mode="w+", shape=(T, N))
+        dt_mm = np.memmap(dt_fh, dtype="float32", mode="w+", shape=(T, N))
 
     sos = None
     report_every = max(1, N // 20)

@@ -329,6 +329,12 @@ def write_filter_params_sheet(
     return write_sheet(plane0, "FilterParams", rows, filename=filename)
 
 
+# Default of write_events_sheets(generation=...): an omitted argument
+# (v1.0.1 signature) means "made from the current low-pass run"; an
+# explicit None means "made before stamps" and must stay None.
+_NO_TOKEN = object()
+
+
 def write_events_sheets(
     plane0,
     event_windows,  # iterable of (start_s, end_s) or (start, end) frames
@@ -340,7 +346,7 @@ def write_events_sheets(
     roi_ids: Optional[Sequence[int]] = None,
     extra_sheets: Optional[dict] = None,
     event_classes: Optional[Sequence[str]] = None,
-    generation=None,
+    generation=_NO_TOKEN,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
 
@@ -436,7 +442,7 @@ def write_events_sheets(
     )
     if filename == DEFAULT_FILENAME:
         from . import generation as _gen
-        if generation is None:
+        if generation is _NO_TOKEN:
             try:
                 generation = _gen.check_lowpass(Path(plane0))
             except _gen.StaleOutputError:

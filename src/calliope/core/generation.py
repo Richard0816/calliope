@@ -139,6 +139,23 @@ def dff_build_id(plane0: Path) -> Optional[str]:
 
 # --- filtered dF/F ----------------------------------------------------------
 
+def restore_stamp(path: Path, saved: Optional[bytes]) -> None:
+    """Put back a stamp file as it was (``saved`` = its bytes, or ``None``
+    if it didn't exist). For a write that failed before changing data."""
+    path = Path(path)
+    if saved is None:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_bytes(saved)
+    _retry(lambda: tmp.replace(path))
+
+
+def saved_stamp(path: Path) -> Optional[bytes]:
+    path = Path(path)
+    return path.read_bytes() if path.exists() else None
+
+
 def begin_filtered(plane0: Path) -> dict:
     """Call right before the filtered dF/F is first changed. Writes a
     pending record that keeps what the existing outputs belong to (the
