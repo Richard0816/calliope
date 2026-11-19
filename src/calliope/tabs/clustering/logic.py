@@ -137,6 +137,8 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
     thr = float(np.asarray(np.load(cluster_dir / "threshold_used.npy"),
                            dtype=float).ravel()[0])
     _, T, N, _ = load_filtered_dff(plane0, prefix)
+    from ...core import generation
+    inputs = generation.cluster_input(plane0, utils.is_filtered_prefix(prefix))
     # The loaded linkage was computed on N_kept ROIs; if the cell-filter
     # mask has changed since the export the shapes won't agree and any
     # downstream recolouring would be silently wrong.
@@ -162,7 +164,7 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
         "Z": Z, "roi_ids": roi_ids, "Lx": Lx, "Ly": Ly,
         "saved_threshold": thr,
         "zmax": zmax, "T": int(T), "N": int(N),
-        "cluster_dir": str(cluster_dir),
+        "cluster_dir": str(cluster_dir), "inputs": inputs,
     }
 
 

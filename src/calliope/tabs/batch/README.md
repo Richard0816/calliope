@@ -99,8 +99,11 @@ writes no `r0p7_filtered_dff.memmap.float32`, so the lowpass stage (and
 everything downstream) has nothing to read — the lowpass tab would error
 in `_on_compute` without publishing `set_lowpass_ready`, hanging the GUI
 batch forever. Immediately after detection, `_on_stage_done` calls
-`_detection_has_no_rois(plane0)` (mirrors the lowpass reader: filtered
-memmap present → ROIs exist; else count `predicted_cell_mask` / `iscell`).
+`_detection_has_no_rois(plane0)` (`utils.no_rois_survive`: the kept
+count stamped with the filtered dF/F when there is one -- a zero-cell
+rewrite keeps the old memmap on disk, so its presence proves nothing --
+else, for runs made before stamps, filtered memmap present → ROIs exist,
+else count `predicted_cell_mask` / `iscell`).
 If zero, `_skip_row_no_rois` marks `lowpass … spatial_propagation` as
 **skipped**, sets the row status to **`no_rois`**, and finalizes the row
 normally — so the detection folder + figures that *were* produced are

@@ -43,8 +43,7 @@ def _plane0(tmp_path, live, frozen, T=6):
 
 def _rebuild(p):
     """A completed full dF/F rebuild."""
-    gen.new_dff_build(p)
-    gen.finish_dff_build(p)
+    gen.finish_dff_build(p, gen.new_dff_build(p))
 
 
 def _stamp_tab4(p):
@@ -138,11 +137,16 @@ def test_locked_filtered_memmap_leaves_stamps_consistent(tmp_path):
     try:
         with pytest.raises(OSError):
             dr.compute_filtered_dff(p)
-        # The failed rewrite changed nothing: old generation still current.
-        assert gen.check_lowpass(p) is not None
+        # Marked pending before the file is touched: refused (fail closed),
+        # with the old data and mask still intact for the rerun.
+        with pytest.raises(gen.StaleOutputError, match="did not finish"):
+            gen.check_lowpass(p)
         assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 1, 0]
     finally:
         del held
+    dr.compute_filtered_dff(p)                  # rerun once released
+    with pytest.raises(gen.StaleOutputError, match="re-run Tab 4"):
+        gen.check_lowpass(p)                    # new cells: Tab 4 again
 
 
 def test_lowpass_compute_refuses_stale_filtered_and_stamps(tmp_path):
@@ -739,3 +743,156 @@ def test_unfinished_dff_rebuild_stops_before_rewriting(tmp_path):
     assert filt[0].tolist() == [1.0, 1.0]          # untouched
     del filt
     assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 1, 0]
+
+
+# --- final review --------------------------------------------------------------
+
+def test_tab5_publish_carries_the_token_tab7_needs(tmp_path):
+    # Tab 5 published its events without the token, so Tab 7 refused
+    # fresh events after an ordinary Render.
+    from unittest.mock import MagicMock
+    from calliope.tabs.event_detection.tab import EventDetectionTab
+    from calliope.tabs.crosscorrelation.tab import CrossCorrelationTab
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    token = gen.stamp_lowpass(p, gen.check_filtered(p))
+    me = MagicMock()
+    me._plane0 = p
+    EventDetectionTab._publish_event_results(
+        me, {"event_windows": [(0.1, 0.4)], "generation": token})
+    published = me.state.set_event_results.call_args[0][0]
+    tab7 = SimpleNamespace(_plane0=p,
+                           state=SimpleNamespace(event_results=published))
+    assert CrossCorrelationTab._event_windows_from_state(
+        tab7, gen.check_lowpass(p)) == [(0.1, 0.4)]
+
+
+def test_retry_after_interrupted_rewrite_keeps_old_outputs_stale(tmp_path,
+                                                                 monkeypatch):
+    # Pre-stamp run, Tab 4 output for mask A; Promote a same-count mask B
+    # that is interrupted after the new mask is saved; the retry must not
+    # declare the old (unstamped) Tab 4 output current again.
+    p = _plane0(tmp_path, live=[1, 0, 1], frozen=[1, 1, 0])
+    real = gen.stamp_filtered
+
+    def crash(*a, **k):
+        raise OSError("power cut")
+
+    monkeypatch.setattr(gen, "stamp_filtered", crash)
+    with pytest.raises(OSError):
+        dr.compute_filtered_dff(p)         # mask B saved, stamp pending
+    monkeypatch.setattr(gen, "stamp_filtered", real)
+    assert np.load(p / "r0p7_cell_mask_bool.npy").tolist() == [1, 0, 1]
+    dr.compute_filtered_dff(p)             # retry
+    with pytest.raises(gen.StaleOutputError):
+        gen.check_lowpass(p)
+
+
+def test_locked_tab4_output_leaves_it_pending_not_half_valid(tmp_path):
+    # begin_lowpass runs before the w+ opens: if the second file can't be
+    # opened after the first was truncated, the run is refused.
+    import sys as _sys
+    from calliope.core import lowpass_run
+    if _sys.platform != "win32":
+        pytest.skip("only Windows refuses to truncate a mapped file")
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
+    dr.compute_filtered_dff(p)
+    lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    held = np.asarray(np.memmap(p / DT, np.float32, "r", shape=(200, 2))[:, 0])
+    try:
+        with pytest.raises(OSError):
+            lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+        with pytest.raises(gen.StaleOutputError, match="did not finish"):
+            gen.check_lowpass(p)
+    finally:
+        del held
+
+
+def test_cluster_export_pending_while_rewriting(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    cdir = p / "r0p7_filtered_cluster_results"
+    cdir.mkdir()
+    gen.stamp_clusters(cdir, gen.cluster_input(p, True))
+    gen.begin_clusters(cdir)               # export interrupted
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_clusters(p, cdir, True)
+
+
+def test_finish_only_completes_its_own_build(tmp_path):
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    a = gen.new_dff_build(p)
+    gen.new_dff_build(p)                   # another writer started b
+    gen.finish_dff_build(p, a)             # a finishing must not complete b
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.dff_build_id(p)
+
+
+def test_nwb_refuses_an_unfinished_rebuild(tmp_path):
+    from calliope.core import nwb_export
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    np.save(p / "stat.npy", np.array([{"ypix": np.array([1]),
+                                       "xpix": np.array([1]),
+                                       "lam": np.array([1.0])}] * 3,
+                                     dtype=object), allow_pickle=True)
+    np.save(p / "ops.npy", {"Ly": 4, "Lx": 4, "fs": 10.0}, allow_pickle=True)
+    gen.new_dff_build(p)                   # detection stopped half-way
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        nwb_export.export_recording_to_nwb(p, tmp_path / "x.nwb")
+
+
+def test_reload_keeps_the_linkage_inputs(tmp_path):
+    from scipy.cluster.hierarchy import linkage
+    from calliope.tabs.clustering.logic import reload_clustering_offload
+    p = _plane0(tmp_path, live=[1, 1, 1, 0], frozen=[1, 1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    np.save(p / "ops.npy", {"Ly": 8, "Lx": 8}, allow_pickle=True)
+    cdir = p / "r0p7_filtered_cluster_results"
+    cdir.mkdir()
+    np.save(cdir / "linkage.npy",
+            linkage(np.random.default_rng(0).random((3, 4)), "ward"))
+    np.save(cdir / "threshold_used.npy", np.array([1.0]))
+    out = reload_clustering_offload(str(p), "r0p7_filtered_", str(cdir))
+    assert out["inputs"] == gen.cluster_input(p, True)
+
+
+def test_unreadable_stamp_is_repaired_by_rerunning_tab3(tmp_path):
+    # Pre-stamp Tab 4 output, then a stamp that became unreadable.
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    dr.compute_filtered_dff(p)
+    (p / gen.FILTERED_FILE).write_text("{oops", encoding="utf-8")
+    dr.compute_filtered_dff(p)             # the instructed rerun works
+    gen.check_filtered(p)
+    with pytest.raises(gen.StaleOutputError):   # but nothing older trusted
+        gen.check_lowpass(p)
+
+
+def test_tab4_metadata_failure_leaves_the_run_pending(tmp_path, monkeypatch):
+    from calliope.core import lowpass_run, recording_meta
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0], T=200)
+    dr.compute_filtered_dff(p)
+
+    def locked(*a, **k):
+        raise PermissionError("meta.json locked")
+
+    monkeypatch.setattr(recording_meta, "update_meta", locked)
+    with pytest.raises(RuntimeError, match="re-run Tab 4"):
+        lowpass_run.compute_lowpass_and_dt(p, fps=10.0, cutoff_hz=1.0)
+    with pytest.raises(gen.StaleOutputError, match="did not finish"):
+        gen.check_lowpass(p)
+
+
+def test_v101_style_event_summary_call_still_counts(tmp_path):
+    # Scripts using the v1.0.1 signature (no generation argument) write
+    # events from the current low-pass run; NWB must keep them.
+    from calliope.core import summary_writer
+    p = _plane0(tmp_path, live=[1, 1, 0], frozen=[1, 1, 0])
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    _stamp_tab4(p)
+    summary_writer.write_events_sheets(
+        p, event_windows=[(0.0, 0.3)], onsets_by_roi=[np.array([0.1])] * 2,
+        fps=10.0, roi_ids=[0, 1])
+    assert gen.check_events(p) == gen.check_lowpass(p)

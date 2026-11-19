@@ -570,14 +570,14 @@ def compute_dff_memmaps(
     # New full dF/F: everything derived from the old one (filtered dF/F,
     # Tab 4-6 outputs) is now out of date until rebuilt.
     from . import generation
-    generation.new_dff_build(plane0)
+    build = generation.new_dff_build(plane0)
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
             r=r, F=F, Fneu=Fneu,
             progress_cb=progress_cb):
         _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
-        generation.finish_dff_build(plane0)
+        generation.finish_dff_build(plane0, build)
         return {"fps": fps, "T": T, "N": N, "path": "gpu"}
 
     shape = (T, N)
@@ -616,7 +616,7 @@ def compute_dff_memmaps(
                 f"({time.time() - t0:.1f}s)")
     del dff_mm
     _warn_dff_drift(plane0, T, N, baseline_mode, progress_cb)
-    generation.finish_dff_build(plane0)
+    generation.finish_dff_build(plane0, build)
     return {"fps": fps, "T": T, "N": N, "path": "cpu"}
 
 
@@ -757,10 +757,11 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     filtered_path = plane0 / "r0p7_filtered_dff.memmap.float32"
     dff = np.memmap(str(dff_path), dtype="float32", mode="r",
                     shape=(T, N_total))
+    # Pending before the file is first changed (opening with w+ already
+    # truncates it): until stamped, readers must refuse it.
+    prev = generation.begin_filtered(plane0)
     filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
                      shape=(T, N_kept))
-    # The file is now truncated: until stamped, readers must refuse it.
-    prev = generation.begin_filtered(plane0)
     chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
     for t0 in range(0, T, chunk):
         t1 = min(T, t0 + chunk)

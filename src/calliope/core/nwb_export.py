@@ -186,11 +186,17 @@ def _release_mappings_after(fn):
     so e.g. re-running Tab 3 right after Export NWB failed."""
     import functools
     import gc
+    import traceback
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except BaseException as e:
+            # The traceback's frames still hold the exporter's locals:
+            # drop them so the collection below can free the memmaps.
+            traceback.clear_frames(e.__traceback__)
+            raise
         finally:
             gc.collect()
     return wrapper
@@ -269,6 +275,11 @@ def export_recording_to_nwb(
         )
     if out_path.exists() and not overwrite:
         raise FileExistsError(out_path)
+
+    # ROIs and traces from a detection / dF/F rebuild that didn't finish
+    # could belong to different runs: refuse (re-run Tab 3).
+    from . import generation
+    generation.dff_build_id(plane0)
 
     rec_id = recording_id or utils.infer_recording_id(plane0)
     meta = recording_meta.read_meta(plane0)

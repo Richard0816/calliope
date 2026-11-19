@@ -72,8 +72,7 @@ def test_stale_event_windows_are_left_out(tmp_path):
     mm[:] = 0.5
     mm.flush()
     del mm
-    generation.new_dff_build(plane0)
-    generation.finish_dff_build(plane0)
+    generation.finish_dff_build(plane0, generation.new_dff_build(plane0))
     detection_run.compute_filtered_dff(plane0)
     generation.stamp_lowpass(plane0, generation.check_filtered(plane0))
     summary_writer.write_events_sheets(
@@ -148,5 +147,26 @@ def test_export_releases_the_dff_memmaps(tmp_path):
         mm.flush()
         del mm
     nwb_export.export_recording_to_nwb(plane0, tmp_path / "r.nwb")
+    with open(plane0 / "r0p7_dff.memmap.float32", "r+b") as f:
+        f.truncate(16)
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32",
+                    reason="only Windows refuses to rewrite a mapped file")
+def test_failed_export_also_releases_the_dff_memmaps(tmp_path, monkeypatch):
+    from pynwb import NWBHDF5IO
+    plane0 = _plane0(tmp_path)
+    mm = np.memmap(plane0 / "r0p7_dff.memmap.float32", np.float32, "w+",
+                   shape=(T, N))
+    mm[:] = 0.5
+    mm.flush()
+    del mm
+
+    def fail(self, *a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(NWBHDF5IO, "write", fail)
+    with pytest.raises(OSError, match="disk full"):
+        nwb_export.export_recording_to_nwb(plane0, tmp_path / "r.nwb")
     with open(plane0 / "r0p7_dff.memmap.float32", "r+b") as f:
         f.truncate(16)

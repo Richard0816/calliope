@@ -340,13 +340,15 @@ def write_events_sheets(
     roi_ids: Optional[Sequence[int]] = None,
     extra_sheets: Optional[dict] = None,
     event_classes: Optional[Sequence[str]] = None,
-    generation: Optional[str] = None,
+    generation=None,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
 
     ``generation`` is the low-pass generation the events came from
     (``run_event_detection``'s ``data["generation"]``); it is stamped
     next to the workbook so NWB export / reload can tell stale sheets.
+    Callers that don't pass it (the v1.0.1 signature) get the current
+    low-pass run's token, as if the events were made from it.
 
 
     ``roi_ids[i]`` is the Suite2p ROI id of ``onsets_by_roi[i]`` (Tab 5's
@@ -434,6 +436,11 @@ def write_events_sheets(
     )
     if filename == DEFAULT_FILENAME:
         from . import generation as _gen
+        if generation is None:
+            try:
+                generation = _gen.check_lowpass(Path(plane0))
+            except _gen.StaleOutputError:
+                generation = None
         _gen.stamp_events(Path(plane0), generation)
     return out
 

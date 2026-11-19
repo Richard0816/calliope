@@ -117,10 +117,12 @@ def new_dff_build(plane0: Path) -> str:
     return build
 
 
-def finish_dff_build(plane0: Path) -> None:
+def finish_dff_build(plane0: Path, build_id: str) -> None:
+    """Mark ``build_id`` complete -- only if it is still the build on disk
+    (another writer may have started a newer one meanwhile)."""
     p = Path(plane0) / BUILD_FILE
     d = _read(p)
-    if d is not None:
+    if d is not None and d.get("build_id") == build_id:
         d["complete"] = True
         _write(p, d)
 
@@ -137,20 +139,29 @@ def dff_build_id(plane0: Path) -> Optional[str]:
 
 # --- filtered dF/F ----------------------------------------------------------
 
-def begin_filtered(plane0: Path) -> Optional[dict]:
-    """Call right before the filtered dF/F is overwritten. Returns the
-    previous stamp for :func:`stamp_filtered`."""
+def begin_filtered(plane0: Path) -> dict:
+    """Call right before the filtered dF/F is first changed. Writes a
+    pending record that keeps what the existing outputs belong to (the
+    frozen mask and dF/F build before this rewrite), so a retry after an
+    interruption still knows it. Returns it for :func:`stamp_filtered`."""
     plane0 = Path(plane0)
-    prev = _read(plane0 / FILTERED_FILE)
-    _write(plane0 / FILTERED_FILE, {"pending": True,
-                                    "legacy_ok": _legacy_ok(prev, plane0)})
-    return prev
-
-
-def _legacy_ok(prev: Optional[dict], plane0: Path) -> bool:
-    if prev is None:
-        return True        # never stamped: decided by stamp_filtered
-    return bool(prev.get("legacy_ok"))
+    try:
+        prev = _read(plane0 / FILTERED_FILE)
+    except StaleOutputError:
+        # Unreadable stamp: rewriting repairs it, but nothing older is
+        # trusted any more.
+        prev = {"legacy_ok": False, "mask_hash": None, "build_id": None}
+    if prev is not None and prev.get("pending"):
+        rec = prev                              # retry: keep the original
+    elif prev is None:                          # never stamped (pre-stamp run)
+        rec = {"pending": True, "legacy_ok": True,
+               "frozen_before": frozen_mask_hash(plane0), "build_before": None}
+    else:
+        rec = {"pending": True, "legacy_ok": bool(prev.get("legacy_ok")),
+               "frozen_before": prev.get("mask_hash"),
+               "build_before": prev.get("build_id")}
+    _write(plane0 / FILTERED_FILE, rec)
+    return rec
 
 
 def stamp_filtered(plane0: Path, mask, prev_mask_hash: Optional[str],
@@ -162,16 +173,21 @@ def stamp_filtered(plane0: Path, mask, prev_mask_hash: Optional[str],
     mh = mask_hash(mask)
     build = dff_build_id(plane0)
     if prev is None:
-        prev = _read(plane0 / FILTERED_FILE)
-        if prev is not None and prev.get("pending"):
-            prev = {"legacy_ok": prev.get("legacy_ok"), "mask_hash": None}
+        try:
+            prev = _read(plane0 / FILTERED_FILE)
+        except StaleOutputError:
+            prev = {"legacy_ok": False}
+    # Unstamped Tab 4/5/6 outputs from before stay usable only if neither
+    # the cells nor the dF/F changed since they were made.
     if prev is None:
-        # First stamped write. Unstamped Tab 4/5/6 outputs from before
-        # stay usable only if neither the cells nor the dF/F changed.
         legacy_ok = build is None and prev_mask_hash == mh
+    elif prev.get("pending"):
+        legacy_ok = (bool(prev.get("legacy_ok"))
+                     and prev.get("frozen_before") == mh
+                     and prev.get("build_before") == build)
     else:
         legacy_ok = (bool(prev.get("legacy_ok"))
-                     and prev.get("mask_hash", mh) in (mh, None)
+                     and prev.get("mask_hash") == mh
                      and prev_mask_hash == mh
                      and prev.get("build_id") == build)
     gen = hashlib.sha1(f"{mh}:{build}".encode()).hexdigest()
@@ -308,6 +324,11 @@ def cluster_input(plane0: Path, filtered: bool) -> dict:
     return {"build_id": dff_build_id(plane0)}
 
 
+def begin_clusters(cluster_dir: Path) -> None:
+    """Call before an export starts rewriting a cluster folder."""
+    _write(Path(cluster_dir) / CLUSTER_FILE, {"pending": True})
+
+
 def stamp_clusters(cluster_dir: Path, inputs: dict) -> None:
     _write(Path(cluster_dir) / CLUSTER_FILE, dict(inputs))
 
@@ -317,6 +338,10 @@ def check_clusters(plane0: Path, cluster_dir: Path, filtered: bool) -> None:
     the current dF/F (and cell set, for a filtered prefix)."""
     plane0 = Path(plane0)
     stamp = _read(Path(cluster_dir) / CLUSTER_FILE)
+    if stamp is not None and stamp.get("pending"):
+        raise StaleOutputError(
+            f"{plane0}: exporting these clusters did not finish; re-run "
+            f"Tab 6 clustering.")
     if filtered:
         gen = check_filtered(plane0)
         made_from = None if stamp is None else stamp.get("filtered")

@@ -955,6 +955,9 @@ class EventDetectionTab(ctk.CTkFrame):
                 # Tab 8 does not read them: its plots need the full rho
                 # curve + null distribution, so it re-runs the sweep.
                 "event_monotonicity": data.get("event_monotonicity"),
+                # Low-pass run these events came from: Tab 7 only uses
+                # them while that run is still current.
+                "generation": data.get("generation"),
             })
         except Exception as e:
             print(f"[GUI] publish event_results failed: {e}")

@@ -655,6 +655,8 @@ def run_clustering(
                 f"to export cluster ROI ids that cannot be translated to "
                 f"Suite2p indices.")
 
+    export_dir.mkdir(parents=True, exist_ok=True)
+    generation.begin_clusters(export_dir)
     for stale in export_dir.glob("C*_rois.npy"):
         stale.unlink()
     for vid in range(1, n_clusters + 1):

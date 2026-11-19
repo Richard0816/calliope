@@ -1484,6 +1484,7 @@ class ClusteringTab(ctk.CTkFrame):
 
         out_dir = self._existing_cluster_dir(self._plane0, self._prefix)
         out_dir.mkdir(parents=True, exist_ok=True)
+        generation.begin_clusters(out_dir)
         # Clear stale C*_rois.npy first so old runs don't poison crosscorr.
         for stale in out_dir.glob("C*_rois.npy"):
             stale.unlink()

@@ -101,9 +101,9 @@ def compute_lowpass_and_dt(
 
     lp_path = plane0 / "r0p7_filtered_dff_lowpass.memmap.float32"
     dt_path = plane0 / "r0p7_filtered_dff_dt.memmap.float32"
+    generation.begin_lowpass(plane0)     # before w+ truncates anything
     lp_mm = np.memmap(str(lp_path), dtype="float32", mode="w+", shape=(T, N))
     dt_mm = np.memmap(str(dt_path), dtype="float32", mode="w+", shape=(T, N))
-    generation.begin_lowpass(plane0)
 
     sos = None
     report_every = max(1, N // 20)
@@ -148,11 +148,11 @@ def compute_lowpass_and_dt(
             },
         )
     except Exception as e:
-        msg = f"[lowpass] meta.json lowpass_filtered stamp failed: {e}"
-        if progress_cb is not None:
-            progress_cb(msg)
-        else:
-            print(msg)
+        # Tab 5 reads the cutoff / fps from here: new memmaps with the old
+        # settings would shift event timing, so leave the run pending.
+        raise RuntimeError(
+            f"Tab 4 wrote the low-pass traces but could not record their "
+            f"settings in meta.json ({e}); re-run Tab 4.") from e
     generation.stamp_lowpass(plane0, gen)
 
     return {
