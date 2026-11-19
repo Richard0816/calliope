@@ -340,8 +340,14 @@ def write_events_sheets(
     roi_ids: Optional[Sequence[int]] = None,
     extra_sheets: Optional[dict] = None,
     event_classes: Optional[Sequence[str]] = None,
+    generation: Optional[str] = None,
 ) -> Path:
     """Write the "EventWindows", "EventOnsets" and "RoiEventTimes" sheets.
+
+    ``generation`` is the low-pass generation the events came from
+    (``run_event_detection``'s ``data["generation"]``); it is stamped
+    next to the workbook so NWB export / reload can tell stale sheets.
+
 
     ``roi_ids[i]`` is the Suite2p ROI id of ``onsets_by_roi[i]`` (Tab 5's
     ``kept_idx``). Every ``roi`` value written is that Suite2p id, so the
@@ -416,7 +422,7 @@ def write_events_sheets(
         roi_event_times[f"roi_{roi_ids[roi]}"] = padded
     roi_event_times_df = pd.DataFrame(roi_event_times)
 
-    return write_sheets(
+    out = write_sheets(
         plane0,
         {
             "EventWindows": win_rows,
@@ -426,6 +432,9 @@ def write_events_sheets(
         },
         filename=filename,
     )
+    from . import generation as _gen
+    _gen.stamp_events(Path(plane0), generation)
+    return out
 
 
 def write_event_monotonicity_sheet(

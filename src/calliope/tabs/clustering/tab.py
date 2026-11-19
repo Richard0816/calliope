@@ -641,30 +641,40 @@ class ClusteringTab(ctk.CTkFrame):
             poll_ms=POLL_MS,
         )
 
-    def _on_reload_clusters(self) -> None:
+    def _on_reload_clusters(self) -> bool:
         """Restore linkage + threshold from a previous Export *_rois.npy run.
 
         Skips the (expensive) Ward-linkage computation and snaps the
         slider to the saved threshold in manual mode. dF/F + stat + ops are
         still loaded fresh from disk so reclustering and the spatial map
-        keep working.
+        keep working. Refuses clusters saved for an earlier dF/F or cell
+        set. Returns True when the reload was started.
         """
         if self._job is not None and self._job.running():
             messagebox.showinfo("Busy", "Analysis already running.")
-            return
+            return False
         plane0 = Path(self.path_var.get())
         prefix = self.prefix_var.get().strip() or DEFAULT_PREFIX
         if not self._inputs_ready(plane0, prefix):
             messagebox.showerror(
                 "Not ready", f"plane0 missing required files: {plane0}")
-            return
+            return False
         if not self._has_existing_clusters(plane0, prefix):
             messagebox.showerror(
                 "No saved clusters",
                 f"Expected {self._existing_cluster_dir(plane0, prefix)} "
                 f"with linkage.npy + threshold_used.npy. Run analysis "
                 f"first and click 'Export *_rois.npy'.")
-            return
+            return False
+        from ...core import generation, utils as _cu
+        try:
+            generation.check_clusters(
+                plane0, self._existing_cluster_dir(plane0, prefix),
+                _cu.is_filtered_prefix(prefix))
+        except generation.StaleOutputError as e:
+            self.status_var.set("Saved clusters are out of date.")
+            messagebox.showerror("Saved clusters out of date", str(e))
+            return False
 
         self._prefix = prefix
         self.run_btn.configure(state="disabled")
@@ -684,6 +694,7 @@ class ClusteringTab(ctk.CTkFrame):
             done_kind="reloaded",
             poll_ms=POLL_MS,
         )
+        return True
 
     def _on_error(self, payload: str) -> None:
         self.progress.stop()
@@ -1477,6 +1488,9 @@ class ClusteringTab(ctk.CTkFrame):
         # ROI indices directly and skips the filtered-position translation
         # step it would otherwise apply.
         (out_dir / "_indices_are_suite2p").write_text("1")
+        from ...core import generation, utils as _cu
+        generation.stamp_clusters(out_dir, generation.cluster_input(
+            self._plane0, _cu.is_filtered_prefix(self._prefix)))
         return out_dir
 
     def _on_export(self) -> None:

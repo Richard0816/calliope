@@ -12,6 +12,11 @@ the user having to click each tab one recording at a time.
   **Reload queue**, optional **Scratch dir (SSD)** for fast intermediate I/O,
   **Apply settings to selected**, **Select all**, **+ Add row**,
   **Run all** / **Abort**.
+  **Run all** first checks every row's Cellpose model
+  (`BatchTab._confirm_cellpose_model`): a row whose "Cellpose model
+  file" doesn't exist stops the batch before it starts, and a default
+  model that isn't downloaded yet (~1.2 GB) is asked about once, since
+  Tab 3 never prompts during a batch.
   **Apply settings to selected** opens the Advanced params dialog and
   overwrites the params of the **checked** rows only (same selection the
   **Merge selected** button uses); **Select all** ticks/unticks every

@@ -410,7 +410,15 @@ def export_recording_to_nwb(
 
     # ---- optional population event windows ------------------------------
     if include_events:
-        windows = _read_event_windows(plane0)
+        # Only events made from the current low-pass traces (and so the
+        # current cell set): a stale workbook would label the wrong data.
+        from . import generation
+        try:
+            generation.check_events(plane0)
+            windows = _read_event_windows(plane0)
+        except generation.StaleOutputError as e:
+            print(f"[nwb] event windows left out: {e}")
+            windows = None
         if windows is not None:
             from pynwb.epoch import TimeIntervals
 

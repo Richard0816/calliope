@@ -361,6 +361,10 @@ def run_event_detection(
         raise FileNotFoundError(
             f"Missing low-pass memmaps in {plane0}. "
             "Run Tab 4 (or core.lowpass_run.run_lowpass) first.")
+    # Low-pass made for another cell set / dF/F would line up with the
+    # wrong ROIs: refuse it (StaleOutputError says to re-run Tab 4).
+    from . import generation
+    gen = generation.check_lowpass(plane0)
 
     # Size the memmaps against the mask they were *written* with (persisted
     # as r0p7_cell_mask_bool.npy), not whatever the live mask resolves to
@@ -559,6 +563,7 @@ def run_event_detection(
         "N_kept": N_kept,
         "downsample": downsample,
         "event_monotonicity": event_monotonicity,
+        "generation": gen,
     }
 
     if figures_dir is not None:
@@ -577,6 +582,7 @@ def run_event_detection(
             in_seconds=True,
             roi_ids=kept_idx,
             event_classes=data["event_class"],
+            generation=gen,
         )
         # One row per event; ``EventMonotonicity`` sheet stamps the
         # propagation-direction scalars next to the existing
@@ -646,7 +652,8 @@ def write_event_summary_offload(plane0_str: str, data: dict, *,
         onsets_by_roi=ons,
         fps=data.get("fps"), in_seconds=True, extra_sheets=extra,
         event_classes=data.get("event_class"),
-        roi_ids=data.get("kept_idx")))
+        roi_ids=data.get("kept_idx"),
+        generation=data.get("generation")))
 
 
 def export_event_figures_offload(plane0_str: str, params: dict,

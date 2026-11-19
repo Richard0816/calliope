@@ -567,9 +567,10 @@ def compute_dff_memmaps(
     except Exception as _meta_exc:
         print(f"[meta] could not stamp dF/F params: {_meta_exc}")
 
-    # New full dF/F: Tab 4's low-pass / derivative are now stale even if
-    # the keep mask comes out the same.
-    reset_filtered_outputs(plane0, None)
+    # New full dF/F: everything derived from the old one (filtered dF/F,
+    # Tab 4-6 outputs) is now out of date until rebuilt.
+    from . import generation
+    generation.new_dff_build(plane0)
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
@@ -715,77 +716,9 @@ def _load_keep_mask(plane0: Path, n_total: int) -> np.ndarray:
     return utils.resolve_live_mask(plane0, n_total)
 
 
-# Written by Tab 4 from the filtered dF/F, column for column, so they are
-# only valid for the keep mask the filtered memmap had at the time.
-DERIVED_DFF_FILES = ("r0p7_filtered_dff_lowpass.memmap.float32",
-                     "r0p7_filtered_dff_dt.memmap.float32")
-
-
-def reset_filtered_outputs(plane0: Path,
-                           mask: Optional[np.ndarray]) -> list[str]:
-    """Call before rewriting the filtered dF/F with ``mask``.
-
-    If ``mask`` differs from the frozen ``r0p7_cell_mask_bool.npy``, the
-    Tab 4 low-pass / derivative memmaps belong to the old cell set:
-    with the same kept count they would still open, and ROI k's old
-    trace would be read as the new ROI k. Delete them so Tab 5 asks for
-    Tab 4 again. An empty ``mask`` also removes the filtered memmap and
-    freezes the empty mask, so nothing downstream keeps reading the
-    former cells.
-
-    ``mask=None`` means the full dF/F itself is being rebuilt: the Tab 4
-    files are dropped whatever the mask (same shape, new values).
-
-    All or nothing, before anything is rewritten: every file to delete,
-    plus the filtered memmap the caller is about to rewrite, is first
-    renamed aside. Windows refuses to rename (or delete) a file that is
-    still mapped, so if any rename fails the others are put back and
-    ``OSError`` is raised with the recording exactly as it was. Returns
-    the names removed.
-    """
-    plane0 = Path(plane0)
-    filt = plane0 / "r0p7_filtered_dff.memmap.float32"
-    frozen = plane0 / "r0p7_cell_mask_bool.npy"
-    if mask is None:
-        same, empty = False, False
-    else:
-        mask = np.asarray(mask, dtype=bool)
-        empty = not mask.any()
-        try:
-            old = np.load(frozen)
-            same = old.shape == mask.shape and np.array_equal(old, mask)
-        except (OSError, ValueError):
-            same = False
-    names = [] if same else list(DERIVED_DFF_FILES)
-    if empty:
-        names.append(filt.name)
-    doomed = [plane0 / n for n in names if (plane0 / n).exists()]
-    # The rewrite truncates the filtered memmap: check it is free too.
-    probe = ([filt] if mask is not None and not empty and filt.exists()
-             else [])
-    moved: list[tuple[Path, Path]] = []
-    try:
-        for p in doomed + probe:
-            aside = p.with_name(p.name + ".stale")
-            p.replace(aside)
-            moved.append((p, aside))
-    except OSError:
-        for p, aside in reversed(moved):
-            aside.replace(p)
-        raise
-    for p, aside in moved:
-        if p in probe:
-            aside.replace(p)
-        else:
-            aside.unlink()
-    if empty:
-        np.save(frozen, mask)
-    return [p.name for p in doomed]
-
-
 def has_filtered_outputs(plane0: Path) -> bool:
     """True once a filtered dF/F has been written for ``plane0`` -- including
-    a zero-cell result, which leaves only the all-false frozen mask -- so a
+    a zero-cell result, which freezes only the all-false mask -- so a
     later cell-set change knows to regenerate it."""
     plane0 = Path(plane0)
     return ((plane0 / "r0p7_filtered_dff.memmap.float32").exists()
@@ -798,18 +731,22 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     plus ``r0p7_cell_mask_bool.npy``, the keep mask this memmap was
     sliced with (every filtered-memmap reader sizes against it via
     :func:`utils.resolve_filtered_mask`).
-    Returns the filtered memmap path (or None if no ROIs survive).
-    Stale Tab 4 outputs are removed first: see
-    :func:`reset_filtered_outputs`.
+    Returns the filtered memmap path (or None if no ROIs survive: then
+    only the all-false mask is frozen). Stamps the result's generation
+    (:mod:`calliope.core.generation`) so outputs made from an earlier
+    cell set or dF/F are refused instead of misread.
     """
     plane0 = Path(plane0)
     F = np.load(plane0 / "F.npy", mmap_mode="r")
     N_total, T = F.shape
 
+    from . import generation
     mask = _load_keep_mask(plane0, N_total)
     N_kept = int(mask.sum())
-    reset_filtered_outputs(plane0, mask)
+    prev_hash = generation.frozen_mask_hash(plane0)
     if N_kept == 0:
+        np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
+        generation.stamp_filtered(plane0, mask, prev_hash)
         return None
 
     dff_path = plane0 / "r0p7_dff.memmap.float32"
@@ -825,6 +762,7 @@ def compute_filtered_dff(plane0: Path) -> Optional[Path]:
     filt.flush()
     del filt, dff
     np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
+    generation.stamp_filtered(plane0, mask, prev_hash)
     return filtered_path
 
 

@@ -415,6 +415,10 @@ def load_filtered_dff(plane0: Path, prefix: str):
         raise FileNotFoundError(f"Missing dF/F memmap: {dff_path}")
 
     if is_filtered:
+        # Refuse a filtered dF/F made before the latest dF/F rebuild or for
+        # a cell set that has since been re-frozen.
+        from . import generation
+        generation.check_filtered(plane0)
         # Size against the mask the memmap was written with (persisted as
         # r0p7_cell_mask_bool.npy), cross-checked against the file size, so
         # a drifted predicted_cell_mask/iscell can't request a wrong-shaped
@@ -610,7 +614,10 @@ def run_clustering(
     method = str(params.get("method", "ward"))
     target_counts = tuple(params.get("target_counts", (4, 5)))
 
+    from . import generation
     dff, T, N_kept, keep_mask = load_filtered_dff(plane0, prefix)
+    cluster_inputs = generation.cluster_input(
+        plane0, utils.is_filtered_prefix(prefix))
     dff_arr = np.asarray(dff)
     Z = ward_linkage(dff_arr, method=method)
 
@@ -668,6 +675,7 @@ def run_clustering(
     # prefix, identity for an unfiltered one), so the marker telling
     # core.crosscorrelation to skip its legacy translation is now true.
     (export_dir / "_indices_are_suite2p").write_text("1")
+    generation.stamp_clusters(export_dir, cluster_inputs)
 
     _base_colors = resolve_palette(palette, n_colors=max(1, n_clusters))
     # resolve_palette caps categorical palettes (e.g. tab10 -> 10) at their

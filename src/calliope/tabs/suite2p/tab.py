@@ -1354,42 +1354,21 @@ class Suite2pTab(ctk.CTkFrame):
     def _run_filtered_dff(self, plane0: Path) -> None:
         """Slice r0p7_dff.memmap.float32 down to ROIs that pass the
         cell-filter mask (or suite2p iscell as a fallback) and write
-        r0p7_filtered_dff.memmap.float32.
+        r0p7_filtered_dff.memmap.float32 + the frozen
+        r0p7_cell_mask_bool.npy (authoritative for every filtered reader)
+        and their generation stamp, via
+        ``detection_run.compute_filtered_dff``.
         """
+        from ...core import detection_run
         F = np.load(plane0 / "F.npy", mmap_mode="r")
         N_total, T = F.shape
-
-        mask = load_keep_mask(plane0, N_total)
+        out = detection_run.compute_filtered_dff(plane0)
+        mask = np.load(plane0 / "r0p7_cell_mask_bool.npy")
         N_kept = int(mask.sum())
-        from ...core import detection_run
-        removed = detection_run.reset_filtered_outputs(plane0, mask)
-        if removed:
-            print(f"[GUI] cell set changed: removed {', '.join(removed)} "
-                  f"(re-run Tab 4)")
-        if N_kept == 0:
+        if out is None:
             print("[GUI] filtered dF/F: 0 ROIs survive the mask; "
                   "skipping filtered memmap")
             return
-
-        dff_path = plane0 / "r0p7_dff.memmap.float32"
-        filtered_path = plane0 / "r0p7_filtered_dff.memmap.float32"
-        dff = np.memmap(str(dff_path), dtype="float32", mode="r",
-                        shape=(T, N_total))
-        filt = np.memmap(str(filtered_path), dtype="float32", mode="w+",
-                         shape=(T, N_kept))
-        from ...core import utils
-        chunk = max(1, min(T, utils.DFF_TIME_CHUNK))
-        for t0 in range(0, T, chunk):
-            t1 = min(T, t0 + chunk)
-            filt[t0:t1, :] = dff[t0:t1, :][:, mask]
-        filt.flush()
-        del filt, dff
-        # Persist the exact mask this memmap was sliced with. This file is
-        # AUTHORITATIVE, not a legacy copy: utils.resolve_filtered_mask
-        # trusts it first to size every r0p7_filtered_* reader (the
-        # WinError 8 fix), and clustering / event detection / cross-
-        # correlation read it directly. Never drop this save.
-        np.save(plane0 / "r0p7_cell_mask_bool.npy", mask)
         print(f"[GUI] r0p7_filtered_dff.memmap.float32 written "
               f"(T={T}, N_kept={N_kept}/{N_total})  "
               f"+ r0p7_cell_mask_bool.npy")

@@ -59,3 +59,36 @@ def test_cell_columns(tmp_path):
         np.testing.assert_allclose(ps["cellfilter_prob"].data[:],
                                    [0.8, 0.1, 0.7, 0.3], rtol=1e-6)
         assert list(ps["kept"].data[:]) == [1, 0, 1, 0]
+
+
+def test_stale_event_windows_are_left_out(tmp_path):
+    # Event windows from a cell set that has since changed would label the
+    # wrong data: export them only while their generation is current.
+    from calliope.core import detection_run, generation, summary_writer
+    from pynwb import NWBHDF5IO
+    plane0 = _plane0(tmp_path)
+    mm = np.memmap(plane0 / "r0p7_dff.memmap.float32", np.float32, "w+",
+                   shape=(T, N))
+    mm[:] = 0.5
+    mm.flush()
+    del mm
+    generation.new_dff_build(plane0)
+    detection_run.compute_filtered_dff(plane0)
+    generation.stamp_lowpass(plane0, generation.check_filtered(plane0))
+    summary_writer.write_events_sheets(
+        plane0, event_windows=[(0.5, 1.5)],
+        onsets_by_roi=[np.array([1.0])] * 3, fps=10.0, roi_ids=[0, 1, 2],
+        generation=generation.check_lowpass(plane0))
+
+    def n_events(out):
+        with NWBHDF5IO(str(out), "r") as io:
+            iv = io.read().intervals
+            return len(iv["events"]) if iv and "events" in iv else 0
+
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "a.nwb")
+    assert n_events(tmp_path / "a.nwb") == 1
+    np.save(plane0 / "predicted_cell_mask.npy",
+            np.array([1, 0, 0, 1], dtype=bool))
+    detection_run.compute_filtered_dff(plane0)
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "b.nwb")
+    assert n_events(tmp_path / "b.nwb") == 0

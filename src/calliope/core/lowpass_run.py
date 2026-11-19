@@ -88,11 +88,14 @@ def compute_lowpass_and_dt(
     ``progress_cb`` (if provided) is called with status strings such
     as ``"120/2350 ROIs (3.4s)"`` every ~5% of progress.
     """
+    from . import generation
     plane0 = Path(plane0)
     src_path = plane0 / "r0p7_filtered_dff.memmap.float32"
     if not src_path.exists():
         raise FileNotFoundError(
             f"Missing {src_path.name}; run Tab 3 first.")
+    # Refuse an out-of-date filtered dF/F; remember which one we read.
+    gen = generation.check_filtered(plane0)
     T, N = _load_kept_count_and_T(plane0)
     src = np.memmap(str(src_path), dtype="float32", mode="r", shape=(T, N))
 
@@ -130,6 +133,7 @@ def compute_lowpass_and_dt(
     lp_mm.flush()
     dt_mm.flush()
     del lp_mm, dt_mm, src
+    generation.stamp_lowpass(plane0, gen)
 
     try:
         from . import recording_meta

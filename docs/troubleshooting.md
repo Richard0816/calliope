@@ -70,6 +70,14 @@ popout if you want the QC numbers.
 The recording (or its `detection/` output) is on a network drive. Move the
 raw TIFFs and output folder to a local disk and re-run.
 
+## "...made for a different cell set or dF/F; re-run Tab 4" (or Tab 3 / Tab 6)
+
+The cell set or the dF/F of this recording changed after these results
+were computed (Promote, Retrain, a different keep rule, or a new
+detection), so they no longer line up with its ROIs. CalLIOPE refuses
+them rather than mix up traces. Re-run the tab the message names and the
+ones after it. Batch rows always rebuild everything in order.
+
 ## First run is slow / downloads ~1 GB
 
 Expected. The first Detection run downloads the Cellpose-SAM model

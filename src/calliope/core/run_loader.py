@@ -71,6 +71,9 @@ class RunInventory:
     has_clusters: bool = False     # a linkage.npy under *cluster_results
     has_xcorr: bool = False        # a cross_correlation_* output dir
     manifest: Optional[dict] = None
+    # Why present low-pass memmaps were not loaded (made for an earlier
+    # cell set / dF/F, see core.generation); None when current or absent.
+    lowpass_stale: Optional[str] = None
 
     @property
     def any_stage(self) -> bool:
@@ -100,6 +103,13 @@ def scan_run(run_folder: Path) -> RunInventory:
         plane0,
         ("r0p7_filtered_dff_lowpass.memmap.float32",
          "r0p7_filtered_dff_dt.memmap.float32"))
+    if inv.has_lowpass:
+        from . import generation
+        try:
+            generation.check_lowpass(plane0)
+        except generation.StaleOutputError as e:
+            inv.has_lowpass = False
+            inv.lowpass_stale = str(e)
     # Clustering / xcorr nest under a prefix-named *cluster_results dir.
     # Glob rather than hard-code the prefix so we match whatever the run
     # used (r0p7_, r0p7_filtered_, ...).

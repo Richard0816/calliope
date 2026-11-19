@@ -723,6 +723,8 @@ class PipelineApp(ctk.CTk):
         if inv.has_lowpass:
             self.state_obj.set_lowpass_ready(inv.plane0)
             loaded.append("lowpass + derivative")
+        elif inv.lowpass_stale:
+            skipped.append(f"lowpass ({inv.lowpass_stale})")
         else:
             skipped.append("lowpass (filtered memmaps absent)")
 
@@ -738,13 +740,20 @@ class PipelineApp(ctk.CTk):
 
         # 5/6. Clusters + xcorr -- best effort via each tab's own reload,
         #      which re-reads its files now that plane0 is published.
+        clusters_ok = False
         if inv.has_clusters:
             try:
-                self.clustering_tab._on_reload_clusters()
-                loaded.append("clusters")
+                clusters_ok = bool(self.clustering_tab._on_reload_clusters())
+                if clusters_ok:
+                    loaded.append("clusters")
+                else:
+                    skipped.append("clusters (not reloaded; see message)")
             except Exception as e:
                 skipped.append(f"clusters ({e})")
-        if inv.has_xcorr:
+        # Cross-correlation reads the cluster ROI lists: skip it with them.
+        if inv.has_xcorr and not clusters_ok:
+            skipped.append("cross-correlation (needs current clusters)")
+        elif inv.has_xcorr:
             try:
                 self.xcorr_tab._on_reload_inputs()
                 loaded.append("cross-correlation inputs")

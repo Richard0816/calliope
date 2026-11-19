@@ -1337,6 +1337,32 @@ class BatchTab(ctk.CTkFrame):
         except Exception:
             pass
 
+    def _confirm_cellpose_model(self) -> bool:
+        """One up-front decision on the Cellpose model for every row.
+
+        A row whose 'Cellpose model file' doesn't exist stops the batch
+        before it starts; a model that isn't downloaded yet needs one Yes
+        (it is then fetched once by the first row that runs Cellpose).
+        """
+        from ...core.suite2p_pipeline import cellpose_model_problem
+        problems = []
+        for r in self._rows:
+            pr = cellpose_model_problem(self._effective_row_params(r))
+            if pr and pr not in problems:
+                problems.append(pr)
+        missing = [p for p in problems if "not found" in p]
+        if missing:
+            messagebox.showerror("Cellpose model", "\n".join(missing))
+            return False
+        if problems and not messagebox.askyesno(
+                "Cellpose model download",
+                f"{problems[0]}\n\nAllow this download during the batch? "
+                f"Choose No to cancel; to run without it, untick 'Run "
+                f"Cellpose pass' and 'Cellpose-SAM second pass on Vcorr' "
+                f"in the batch defaults (Sparsery only)."):
+            return False
+        return True
+
     def _on_run_all(self) -> None:
         if getattr(self, "_batch_active", False):
             messagebox.showinfo("Busy", "A batch run is already in progress.")
@@ -1382,6 +1408,11 @@ class BatchTab(ctk.CTkFrame):
                     "- Or just accept the slowdown.\n\n"
                     "Run anyway?"):
                 return
+        # Cellpose model, asked once here: during the batch Tab 3 never
+        # prompts, so a missing model would otherwise download (~1.2 GB)
+        # mid-run without asking.
+        if not self._confirm_cellpose_model():
+            return
         # Single overwrite confirmation up front. Tab 1's _on_force_rerun
         # would otherwise pop a "this will overwrite existing outputs"
         # dialog per row, which is annoying when the user has 30 of them.
