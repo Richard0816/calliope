@@ -138,15 +138,21 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
                            dtype=float).ravel()[0])
     _, T, N, _ = load_filtered_dff(plane0, prefix)
     # What the saved linkage was built from (its folder's stamp), not
-    # what is on disk now: export compares the two. None for an export
-    # made before stamps.
+    # what is on disk now: export compares the two. A clustering saved
+    # before stamps (no stamp, or one recording a pre-stamp input) was
+    # just accepted by the reload's check against the CURRENT inputs, so
+    # those are what it stands for from here on.
     import json
+    from ...core import generation
     try:
         inputs = json.loads((cluster_dir / "generation.json")
                             .read_text(encoding="utf-8"))
-        inputs = None if inputs.get("pending") else inputs
     except (OSError, ValueError):
         inputs = None
+    if (not isinstance(inputs, dict) or inputs.get("pending")
+            or not inputs or any(v is None for v in inputs.values())):
+        inputs = generation.cluster_input(
+            plane0, utils.is_filtered_prefix(prefix))
     # The loaded linkage was computed on N_kept ROIs; if the cell-filter
     # mask has changed since the export the shapes won't agree and any
     # downstream recolouring would be silently wrong.

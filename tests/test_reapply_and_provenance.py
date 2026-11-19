@@ -954,3 +954,55 @@ def test_tab7_refuses_cached_windows_after_tab4_rerun(tmp_path, monkeypatch):
         me, {"plane0": str(p), "event_windows": [(0.0, 1.0)],
              "generation": old})
     assert applied == []
+
+
+
+def _reload_and_export(p, cdir):
+    """Reload a saved clustering, then export it, as Tab 6 does."""
+    from scipy.cluster.hierarchy import linkage
+    from calliope.tabs.clustering import tab as ct
+    from calliope.tabs.clustering.logic import reload_clustering_offload
+    out = reload_clustering_offload(str(p), "r0p7_filtered_", str(cdir))
+    me = SimpleNamespace(
+        _Z=linkage(np.random.default_rng(0).random((3, 4)), "ward"),
+        _plane0=p, _prefix="r0p7_filtered_", _cluster_inputs=out["inputs"],
+        _current_threshold=lambda: 1e9, _visual_to_label={},
+        _compute_visual_cluster_map=lambda T: {1: 1},
+        _linkage_ids_current=lambda: np.array([0, 1, 2]),
+        _existing_cluster_dir=lambda pl, pr: pl / f"{pr}cluster_results")
+    return out, lambda: ct.ClusteringTab._export_clusters(me)
+
+
+def _saved_clusters(p):
+    from scipy.cluster.hierarchy import linkage
+    np.save(p / "ops.npy", {"Ly": 8, "Lx": 8}, allow_pickle=True)
+    cdir = p / "r0p7_filtered_cluster_results"
+    cdir.mkdir(exist_ok=True)
+    np.save(cdir / "linkage.npy",
+            linkage(np.random.default_rng(0).random((3, 4)), "ward"))
+    np.save(cdir / "threshold_used.npy", np.array([1.0]))
+    return cdir
+
+
+def test_pre_stamp_clustering_reload_then_rebuild_is_refused(tmp_path):
+    # Unstamped (pre-v1.0.2) clustering, reloaded, then the dF/F is
+    # rebuilt with the same cells: exporting the old linkage must fail.
+    p = _plane0(tmp_path, live=[1, 1, 1, 0], frozen=[1, 1, 1, 0])
+    cdir = _saved_clusters(p)
+    out, export = _reload_and_export(p, cdir)
+    _rebuild(p)
+    dr.compute_filtered_dff(p)
+    with pytest.raises(ValueError, match="Re-run clustering"):
+        export()
+
+
+def test_null_stamped_clustering_after_unchanged_rewrite_exports(tmp_path):
+    # A clustering stamped against a pre-stamp filtered dF/F ({"filtered":
+    # null}), then an unchanged rewrite: still valid, so export works.
+    p = _plane0(tmp_path, live=[1, 1, 1, 0], frozen=[1, 1, 1, 0])
+    cdir = _saved_clusters(p)
+    gen.stamp_clusters(cdir, gen.cluster_input(p, True))   # {"filtered": None}
+    dr.compute_filtered_dff(p)                             # unchanged rewrite
+    gen.check_clusters(p, cdir, True)
+    out, export = _reload_and_export(p, cdir)
+    gen.check_clusters(p, export(), True)
