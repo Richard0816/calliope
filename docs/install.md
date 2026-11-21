@@ -64,8 +64,9 @@ the CUDA 12.6 build does not support these GPUs.
 **NVIDIA GPU on Linux (x86-64).** PyPI's CUDA 13 build already uses
 Turing (RTX 20-series, T4) and newer GPUs, so there is nothing to
 reinstall; it needs NVIDIA driver 580 or newer. CUDA 13 no longer
-supports older Pascal and Volta GPUs (GTX 10-series, Titan V, V100).
-For those, in a fresh venv, install the CUDA 12.6 build
+supports older Pascal and Volta GPUs (GTX 10-series, Titan V, V100),
+nor Maxwell (GTX 900-series; check PyTorch's support matrix for which
+builds still include it). For those, in a fresh venv, install the CUDA 12.6 build
 instead of `requirements.txt`, then let pip resolve the rest from
 `pyproject.toml`. Like the CPU-only recipe below, this skips the
 lockfile, so other packages can be newer than the tested set. ARM
@@ -76,8 +77,10 @@ pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytor
 pip install -e .                          # resolves the remaining deps
 ```
 
-**Maxwell GPUs (GTX 900-series)** are untested on any OS: Cellpose runs
-in bfloat16 by default, which they may not support.
+**Older GPUs (compute capability below 8.0: Maxwell/GTX 900, Pascal,
+Turing)** lack bfloat16, which Cellpose uses by default, so CalLIOPE runs
+Cellpose in float32 on them (slower, more GPU memory). Maxwell is still
+untested on real hardware.
 
 **Linux: CPU-only install (laptops, no NVIDIA GPU).** On Linux, PyPI's
 `torch` is a CUDA build, and `requirements.txt` also pins its ~2.7 GB of

@@ -137,7 +137,7 @@ def test_nwb_worker_does_not_touch_tk(monkeypatch, tmp_path):
     from calliope.core import nwb_export
     monkeypatch.setattr(nwb_export, "nwb_available", lambda: True)
     monkeypatch.setattr(nwb_export, "export_recording_to_nwb",
-                        lambda plane0, out: out)
+                        lambda plane0, out, notes=None: out)
     monkeypatch.setattr(tab_mod.filedialog, "asksaveasfilename",
                         lambda **_k: str(tmp_path / "x.nwb"))
     started = []
@@ -159,7 +159,7 @@ def test_nwb_worker_does_not_touch_tk(monkeypatch, tmp_path):
     main = threading.main_thread()
     assert all(t is main for t in btn.threads + status.threads)
     kind, payload = stub._log_queue.get_nowait()
-    assert kind == "nwb_done" and payload.endswith("x.nwb")
+    assert kind == "nwb_done" and payload[0].endswith("x.nwb") and payload[1] == []
 
 
 def test_zdrift_and_cache_toggles_are_param_spec_fields():
@@ -168,3 +168,42 @@ def test_zdrift_and_cache_toggles_are_param_spec_fields():
     assert d["keep_registration_cache"] is False
     groups = {e["name"]: e["group"] for e in Suite2pTab.PARAM_SPEC}
     assert groups["keep_registration_cache"] == "Re-detect"
+
+
+def test_tab3_nwb_done_warns_when_parts_were_left_out(monkeypatch):
+    from types import SimpleNamespace
+    from calliope.tabs.suite2p import tab as t3
+    shown = []
+    monkeypatch.setattr(t3.messagebox, "showwarning", lambda *a, **k: shown.append(a))
+    status = []
+    me = SimpleNamespace(status_var=SimpleNamespace(set=status.append),
+                         nwb_btn=SimpleNamespace(configure=lambda **k: None))
+    t3.Suite2pTab._on_nwb_done(me, ("x.nwb", []))
+    assert not shown and status[-1] == "NWB -> x.nwb"
+    t3.Suite2pTab._on_nwb_done(me, ("x.nwb", ["event windows left out: stale"]))
+    assert shown and "event windows left out" in shown[0][1]
+    assert status[-1].endswith("(incomplete)")
+
+
+
+
+def test_batch_logs_nwb_notes(monkeypatch, tmp_path):
+    # Batch tab: each part left out of the .nwb is a WARNING line in the log.
+    from calliope.core import nwb_export
+    from calliope.tabs.batch import tab as bt
+
+    def fake_export(plane0, out, recording_id=None, notes=None):
+        notes.append("event windows left out: stale")
+        return out
+
+    monkeypatch.setattr(nwb_export, "nwb_available", lambda: True)
+    monkeypatch.setattr(nwb_export, "export_recording_to_nwb", fake_export)
+    log = []
+    plane0 = tmp_path / "rec" / "final" / "suite2p" / "plane0"
+    me = SimpleNamespace(
+        _current_row=SimpleNamespace(identifier="rec"),
+        _effective_row_params=lambda row: {"export_nwb": True},
+        _row_results={"plane0": str(plane0)}, _append_log=log.append)
+    bt.BatchTab._maybe_export_nwb_for_row(me)
+    assert "  [nwb] WARNING: event windows left out: stale" in log
+    assert log[-1] == "  [nwb] done (incomplete)"

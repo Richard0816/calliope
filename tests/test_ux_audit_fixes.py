@@ -620,3 +620,38 @@ def test_lag_violin_pvalues_are_bh_fdr_corrected():
     raw = [out[k][0] for k in tested]
     assert np.allclose([out[k][1] for k in tested], _bh_fdr(raw))
     assert all(out[k][1] >= out[k][0] for k in tested)
+
+
+@pytest.mark.parametrize("cap, cuda, expect", [
+    ((5, 2), True, False),   # Maxwell / GTX 900: no bfloat16
+    ((7, 5), True, False),   # Turing
+    ((8, 6), True, True),    # Ampere
+    (None, False, True),     # no CUDA: Cellpose keeps its default
+])
+def test_cellpose_bfloat16_only_on_capable_gpus(tmp_path, monkeypatch, cap, cuda, expect):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: cap)
+    assert sp._bfloat16_ok() is expect
+    plane0 = tmp_path / "shared"
+    plane0.mkdir()
+    np.save(plane0 / "ops.npy", {"meanImg": np.random.rand(32, 32),
+                                 "Ly": 32, "Lx": 32}, allow_pickle=True)
+    seen = {}
+
+    class FakeModel:
+        def __init__(self, gpu=False, pretrained_model="cpsam_v2", **kw):
+            seen.update(kw)
+            self.pretrained_model = "cpsam_v2"
+
+        def eval(self, img, **kw):
+            m = np.zeros(img.shape[:2], int)
+            m[4:9, 4:9] = 1
+            return m, None, None
+
+    monkeypatch.setattr(sp._cp_models, "CellposeModel", FakeModel)
+    monkeypatch.setattr(sp, "cellpose_model_problem", lambda cfg: None)
+    sp.run_cellpose_pass(tmp_path / "cp", plane0, {}, verbose=False)
+    # capable GPU / no CUDA: the keyword is not passed at all, so
+    # Cellpose keeps its own default; older GPUs get an explicit False
+    assert seen == ({} if expect else {"use_bfloat16": False})

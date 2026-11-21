@@ -85,13 +85,17 @@ def test_stale_event_windows_are_left_out(tmp_path):
             iv = io.read().intervals
             return len(iv["events"]) if iv and "events" in iv else 0
 
-    nwb_export.export_recording_to_nwb(plane0, tmp_path / "a.nwb")
+    notes = []
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "a.nwb", notes=notes)
     assert n_events(tmp_path / "a.nwb") == 1
+    assert notes == []
     np.save(plane0 / "predicted_cell_mask.npy",
             np.array([1, 0, 0, 1], dtype=bool))
     detection_run.compute_filtered_dff(plane0)
-    nwb_export.export_recording_to_nwb(plane0, tmp_path / "b.nwb")
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "b.nwb", notes=notes)
     assert n_events(tmp_path / "b.nwb") == 0
+    # the GUI is told, not only the console
+    assert len(notes) == 1 and notes[0].startswith("event windows left out")
 
 
 def test_pixel_masks_round_trip_to_the_dense_masks(tmp_path):
@@ -170,3 +174,34 @@ def test_failed_export_also_releases_the_dff_memmaps(tmp_path, monkeypatch):
         nwb_export.export_recording_to_nwb(plane0, tmp_path / "r.nwb")
     with open(plane0 / "r0p7_dff.memmap.float32", "r+b") as f:
         f.truncate(16)
+
+
+def test_fresh_detection_export_is_not_flagged_incomplete(tmp_path):
+    # Straight after detection (Tabs 4/5 never run, so no event sheets),
+    # nothing was left out: no "(incomplete)" warning.
+    from calliope.core import detection_run, generation
+    plane0 = _plane0(tmp_path)
+    mm = np.memmap(plane0 / "r0p7_dff.memmap.float32", np.float32, "w+",
+                   shape=(T, N))
+    mm[:] = 0.5
+    mm.flush()
+    del mm
+    generation.finish_dff_build(plane0, generation.new_dff_build(plane0))
+    detection_run.compute_filtered_dff(plane0)
+    notes = []
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "a.nwb", notes=notes)
+    assert notes == []
+
+
+def test_unreadable_dff_is_reported(tmp_path):
+    from pynwb import NWBHDF5IO
+    plane0 = _plane0(tmp_path)
+    # too short for (T, N): np.memmap refuses it
+    np.zeros(5, np.float32).tofile(plane0 / "r0p7_dff.memmap.float32")
+    notes = []
+    nwb_export.export_recording_to_nwb(plane0, tmp_path / "a.nwb", notes=notes)
+    assert len(notes) == 1 and notes[0].startswith("dF/F left out")
+    with NWBHDF5IO(str(tmp_path / "a.nwb"), "r") as io:
+        series = (io.read().processing["ophys"].data_interfaces["Fluorescence"]
+                  .roi_response_series)
+        assert "Fluorescence" in series and "DfOverF" not in series

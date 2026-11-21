@@ -202,6 +202,12 @@ def _release_mappings_after(fn):
     return wrapper
 
 
+def _note(notes, msg):
+    print(f"[nwb] {msg}")
+    if notes is not None:
+        notes.append(msg)
+
+
 @_release_mappings_after
 def export_recording_to_nwb(
     plane0: PathLike,
@@ -212,6 +218,7 @@ def export_recording_to_nwb(
     include_events: bool = True,
     overwrite: bool = True,
     subject_metadata: Optional[dict] = None,
+    notes: Optional[list] = None,
 ) -> Path:
     """Export a finished ``plane0`` folder to an ``.nwb`` file.
 
@@ -241,6 +248,10 @@ def export_recording_to_nwb(
         Export NWB button and the batch export do not pass it, so their
         files carry the placeholder, which nwbinspector flags for DANDI.
         Pass it from your own script for DANDI-bound exports.
+    notes : list, optional
+        Receives one message per part of the recording left out of the
+        file (stale event windows, an unreadable dF/F memmap), so a GUI
+        can show them; they are printed either way.
 
     Returns
     -------
@@ -318,7 +329,7 @@ def export_recording_to_nwb(
                 str(dff_path), dtype="float32", mode="r", shape=(T, N)
             )
         except (OSError, ValueError) as exc:
-            print(f"[nwb] could not open dF/F memmap ({exc}); skipping DfOverF")
+            _note(notes, f"dF/F left out: could not open the dF/F memmap ({exc})")
             dff = None
 
     gcamp = meta.get("extraction", {}).get("gcamp_variant_label")
@@ -466,12 +477,13 @@ def export_recording_to_nwb(
         # Only events made from the current low-pass traces (and so the
         # current cell set): a stale workbook would label the wrong data.
         from . import generation
-        try:
-            generation.check_events(plane0)
-            windows = _read_event_windows(plane0)
-        except generation.StaleOutputError as e:
-            print(f"[nwb] event windows left out: {e}")
-            windows = None
+        windows = _read_event_windows(plane0)
+        if windows is not None:
+            try:
+                generation.check_events(plane0)
+            except generation.StaleOutputError as e:
+                _note(notes, f"event windows left out: {e}")
+                windows = None
         if windows is not None:
             from pynwb.epoch import TimeIntervals
 

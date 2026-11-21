@@ -2687,9 +2687,12 @@ class BatchTab(ctk.CTkFrame):
             ident = row.identifier
             out_nwb = plane0.parents[3] / f"{ident}.nwb"
             self._append_log(f"  [nwb] exporting -> {out_nwb.name}")
+            notes = []
             nwb_export.export_recording_to_nwb(
-                plane0, out_nwb, recording_id=ident)
-            self._append_log("  [nwb] done")
+                plane0, out_nwb, recording_id=ident, notes=notes)
+            for n in notes:
+                self._append_log(f"  [nwb] WARNING: {n}")
+            self._append_log("  [nwb] done" + (" (incomplete)" if notes else ""))
         except Exception as e:  # noqa: BLE001
             self._append_log(f"  [nwb] export failed ({e}); continuing")
 

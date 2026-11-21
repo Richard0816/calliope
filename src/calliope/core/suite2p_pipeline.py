@@ -1378,6 +1378,20 @@ def cellpose_sam_available() -> bool:
     return not hasattr(_cp_models, "Cellpose")
 
 
+def _bfloat16_ok() -> bool:
+    """Cellpose 4 runs in bfloat16 by default; GPUs below compute
+    capability 8.0 (e.g. Maxwell/GTX 900, Pascal, Turing) lack native
+    bfloat16, so Cellpose must fall back to float32 there. True when there
+    is no CUDA device (CPU/MPS keep Cellpose's own default)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True
+        return torch.cuda.get_device_capability(0) >= (8, 0)
+    except Exception:
+        return True
+
+
 def cellpose_default_model() -> str:
     """Name of the model ``CellposeModel()`` loads by default: ``cpsam``
     up to cellpose 4.1, ``cpsam_v2`` from 4.2. Read from the signature so
@@ -1646,10 +1660,11 @@ def run_cellpose_pass(save_dir: Path, shared_plane0: Path, cfg: dict,
         if problem and "not found" in problem:
             raise RuntimeError(problem)
         model_path = str(cfg.get("cellpose_model_path", "") or "").strip()
+        kw = {} if _bfloat16_ok() else {"use_bfloat16": False}
         try:
             model = (_cp_models.CellposeModel(gpu=True,
-                                              pretrained_model=model_path)
-                     if model_path else _cp_models.CellposeModel(gpu=True))
+                                              pretrained_model=model_path, **kw)
+                     if model_path else _cp_models.CellposeModel(gpu=True, **kw))
         except Exception as e:
             raise RuntimeError(
                 f"Couldn't load the Cellpose model ({e}). On first use it "

@@ -2108,16 +2108,25 @@ class Suite2pTab(ctk.CTkFrame):
         # log queue and the main-thread handlers below update the UI.
         def worker():
             try:
-                path = nwb_export.export_recording_to_nwb(plane0, Path(out))
-                self._log_queue.put(("nwb_done", str(path)))
+                notes = []
+                path = nwb_export.export_recording_to_nwb(plane0, Path(out),
+                                                          notes=notes)
+                self._log_queue.put(("nwb_done", (str(path), notes)))
             except Exception as e:  # noqa: BLE001
                 self._log_queue.put(("nwb_error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_nwb_done(self, path: str) -> None:
-        self.status_var.set(f"NWB -> {path}")
+    def _on_nwb_done(self, result) -> None:
+        path, notes = result
         self.nwb_btn.configure(state="normal")
+        if notes:
+            self.status_var.set(f"NWB -> {path} (incomplete)")
+            messagebox.showwarning(
+                "NWB written with parts left out",
+                f"{path}\n\n" + "\n".join(f"- {n}" for n in notes))
+        else:
+            self.status_var.set(f"NWB -> {path}")
 
     def _on_nwb_error(self, msg: str) -> None:
         self.status_var.set("NWB export failed")

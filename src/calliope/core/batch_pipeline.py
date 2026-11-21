@@ -391,9 +391,12 @@ def run_recording(
             if nwb_export.nwb_available():
                 out_nwb = Path(save_folder) / f"{rec_id}.nwb"
                 _emit(f"nwb: exporting -> {out_nwb.name}")
+                notes = []
                 nwb_export.export_recording_to_nwb(
-                    Path(plane0), out_nwb, recording_id=rec_id)
-                _emit("nwb: done")
+                    Path(plane0), out_nwb, recording_id=rec_id, notes=notes)
+                for n in notes:
+                    _emit(f"nwb: WARNING: {n}")
+                _emit("nwb: done" + (" (incomplete)" if notes else ""))
             else:
                 _emit("nwb: export_nwb set but pynwb not installed; "
                       "skipping (pip install 'calliope[nwb]')")
