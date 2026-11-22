@@ -1712,7 +1712,8 @@ class Suite2pTab(ctk.CTkFrame):
                     keep_rule_kwargs as _keep_rule_kwargs)
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
-                    on_iscell_changed=self._on_iscell_flipped,
+                    on_iscell_changed=lambda i, v, p=Path(plane0): (
+                        self._on_iscell_flipped(i, v, plane0=p)),
                     get_size_outlier_z=lambda: float(
                         self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
@@ -1803,7 +1804,8 @@ class Suite2pTab(ctk.CTkFrame):
         self._append_log(
             f"[GUI] cell-filter checkpoint set to retrained {ckpt_path}")
 
-    def _on_iscell_flipped(self, roi_idx: int, new_value: int) -> None:
+    def _on_iscell_flipped(self, roi_idx: int, new_value: int,
+                           plane0: Optional[Path] = None) -> None:
         """Listener fired by the popout after a successful classification
         flip. Reload the keep mask from the freshly-written iscell.npy
         and repaint both panels so Tab 3 stays in sync with the new
@@ -1817,6 +1819,17 @@ class Suite2pTab(ctk.CTkFrame):
         """
         c = self._panel_cache
         if c is None:
+            return
+        if plane0 is not None and Path(plane0) != Path(c["plane0"]):
+            # A curation window left open on a recording Tab 3 no longer
+            # shows: never rewrite (or repaint) the current one for it.
+            if roi_idx == -1 and new_value == -1:
+                messagebox.showwarning(
+                    "Filtered dF/F not updated",
+                    f"This curation window belongs to {plane0}, which Tab 3 "
+                    f"no longer shows. Its mask is saved; reopen that "
+                    f"recording in Tab 3 and click 'Promote to filter "
+                    f"mask' again to update its filtered dF/F.")
             return
         try:
             c["keep"] = load_keep_mask(c["plane0"], c["n_total"])

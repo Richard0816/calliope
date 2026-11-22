@@ -101,3 +101,16 @@ def test_unchanged_promote_keeps_handles(tmp_path, monkeypatch):
     fake._filtered_matches_keep = s2p_tab.Suite2pTab._filtered_matches_keep
     s2p_tab.Suite2pTab._regenerate_after_promote(fake, p)
     assert calls == {"run": 0, "published": 0, "released": 0}
+
+
+def test_stale_window_never_rewrites_current_recording(tmp_path, monkeypatch):
+    warned = []
+    monkeypatch.setattr(s2p_tab.messagebox, "showwarning",
+                        lambda *a, **k: warned.append(a))
+    regen = []
+    fake = SimpleNamespace(
+        _panel_cache={"plane0": tmp_path / "current", "n_total": 4},
+        _redraw_with_bg=lambda: None,
+        _regenerate_after_promote=lambda p: regen.append(p))
+    s2p_tab.Suite2pTab._on_iscell_flipped(fake, -1, -1, plane0=tmp_path / "old")
+    assert regen == [] and len(warned) == 1
