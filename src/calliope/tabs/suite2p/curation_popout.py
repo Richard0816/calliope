@@ -708,6 +708,14 @@ class CurationPopout(ctk.CTkToplevel):
         predictions for un-touched ROIs are preserved.
         """
         if not self._flipped:
+            # Nothing new to promote: the mask is already saved, so just
+            # retry the filtered dF/F rewrite (a cancelled failure leaves
+            # it on the old cell set).
+            if self._on_iscell_changed is not None:
+                try:
+                    self._on_iscell_changed(-1, -1)
+                except Exception:
+                    pass
             return
         if self._iscell is None:
             # Retry: a reused popout may predate a fixed/re-written file.

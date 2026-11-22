@@ -1868,21 +1868,30 @@ class Suite2pTab(ctk.CTkFrame):
             return
         # Drop downstream tabs' cached handles on the filtered memmap so
         # Windows releases the file lock before we truncate it below.
-        try:
-            self.state.release_memmaps()
-        except Exception:
-            pass
-        gc.collect()
-        try:
-            self._run_filtered_dff(plane0)
-        except Exception as e:
-            messagebox.showwarning(
-                "Filtered dF/F not updated",
-                f"The promotion was saved, but the filtered dF/F memmap "
-                f"could not be regenerated:\n{e}\n\nClose any open "
-                f"cross-correlation / cluster popouts and re-run Tab 3 "
-                f"'filtered dF/F' to apply the new cell set downstream.")
-            return
+        # Retry re-slices from the mask already saved on disk, so hand
+        # promotions survive (unlike "Apply to this recording", which
+        # replaces the keep rule).
+        while True:
+            try:
+                self.state.release_memmaps()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                self._run_filtered_dff(plane0)
+                break
+            except Exception as e:
+                if not messagebox.askretrycancel(
+                        "Filtered dF/F not updated",
+                        f"The promotion was saved, but the filtered dF/F "
+                        f"memmap could not be regenerated:\n{e}\n\n"
+                        f"Close any open cross-correlation / cluster "
+                        f"popouts or other programs using it, then "
+                        f"Retry. If you cancel, Tabs 4-8 stay on the old "
+                        f"cell set (Panel 3 shows [!]); click 'Promote "
+                        f"to filter mask' again (curation window still "
+                        f"open) to retry."):
+                    return
         # Re-fire the plane0 channel so memmap-reading tabs (lowpass
         # n_kept, etc.) reload from the rewritten memmap. set_plane0
         # re-publishes unconditionally, so the same path still refreshes.
