@@ -1866,6 +1866,11 @@ class Suite2pTab(ctk.CTkFrame):
         # A zero-cell run keeps only its frozen mask: still regenerate.
         if not (src.exists() and has_filtered_outputs(plane0)):
             return
+        # An unchanged Promote (flips undone, or a retry with nothing
+        # pending) would rewrite identical data, and releasing the
+        # memmaps would still discard Tab 6's in-memory linkage.
+        if self._filtered_matches_keep(plane0):
+            return
         # Drop downstream tabs' cached handles on the filtered memmap so
         # Windows releases the file lock before we truncate it below.
         # Retry re-slices from the mask already saved on disk, so hand
@@ -1885,12 +1890,13 @@ class Suite2pTab(ctk.CTkFrame):
                         "Filtered dF/F not updated",
                         f"The promotion was saved, but the filtered dF/F "
                         f"memmap could not be regenerated:\n{e}\n\n"
-                        f"Close any open cross-correlation / cluster "
-                        f"popouts or other programs using it, then "
-                        f"Retry. If you cancel, Tabs 4-8 stay on the old "
-                        f"cell set (Panel 3 shows [!]); click 'Promote "
-                        f"to filter mask' again (curation window still "
-                        f"open) to retry."):
+                        f"Close other programs using it (e.g. a "
+                        f"standalone Tab 6 window), then Retry. To close "
+                        f"a popout in this window first, Cancel, close "
+                        f"it, and click 'Promote to filter mask' again "
+                        f"(curation window still open).\n\nUntil it is "
+                        f"rewritten, Tabs 4-8 use the old cell set, or "
+                        f"refuse the file if this write got partway."):
                     return
         # Re-fire the plane0 channel so memmap-reading tabs (lowpass
         # n_kept, etc.) reload from the rewritten memmap. set_plane0
@@ -1901,6 +1907,21 @@ class Suite2pTab(ctk.CTkFrame):
             pass
         # The rewrite resynced the frozen mask: drop Panel 3's [!] suffix.
         self._redraw_with_bg()
+
+    @staticmethod
+    def _filtered_matches_keep(plane0: Path) -> bool:
+        """True when the filtered dF/F is complete, current, and frozen to
+        exactly the mask a rewrite would use -- i.e. rewriting it would
+        change nothing. Any doubt returns False (rewrite)."""
+        from ...core import detection_run, generation
+        try:
+            generation.check_filtered(plane0, need_cells=False)
+            n_total = np.load(plane0 / "F.npy", mmap_mode="r").shape[0]
+            keep = detection_run._load_keep_mask(plane0, n_total)
+            frozen = generation.frozen_mask_hash(plane0)
+            return frozen is not None and generation.mask_hash(keep) == frozen
+        except Exception:
+            return False
 
     @staticmethod
     def _pipeline_kept_n(plane0, n_total) -> Optional[int]:
