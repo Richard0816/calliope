@@ -804,8 +804,8 @@ class CurationPopout(ctk.CTkToplevel):
             old_n, new_n = _kept_counts(self._plane0, self._n_total)
             if not messagebox.askyesno(
                     "Resync filtered dF/F",
-                    f"The filtered dF/F that Tabs 4-8 read keeps {old_n} "
-                    f"ROIs, but the saved keep mask now keeps {new_n}.\n\n"
+                    f"The filtered dF/F that Tabs 4-8 read was written for {old_n} "
+                    f"ROIs (or is half-written); the saved keep mask keeps {new_n}.\n\n"
                     f"Rewrite the filtered dF/F to the saved mask? Results "
                     f"already computed in Tab 4 (low-pass), Tab 5 (events), "
                     f"Tab 6 (clusters) and Tab 7 (cross-correlation) will "

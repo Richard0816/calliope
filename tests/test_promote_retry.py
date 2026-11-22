@@ -61,7 +61,7 @@ def test_promote_with_nothing_flipped_confirms_then_resyncs(tmp_path, monkeypatc
     assert seen == [] and asked == [] and status
     np.save(p / "predicted_cell_mask.npy", np.array([1, 1, 1, 1], bool))
     CurationPopout._on_promote(pop)              # drift, user says No
-    assert seen == [] and "keeps 3" in asked[0] and "now keeps 4" in asked[0]
+    assert seen == [] and "written for 3" in asked[0] and "mask keeps 4" in asked[0]
     answer[0] = True
     CurationPopout._on_promote(pop)              # drift, user says Yes
     assert seen == [(-1, -1)]
@@ -173,3 +173,10 @@ def test_callback_follows_repoint(tmp_path, monkeypatch):
     s2p_tab.Suite2pTab._repoint_after_copy(fake, scratch, final)
     cb(-1, -1)
     assert regen == [final]
+
+
+def test_popout_wired_through_curation_callback():
+    import inspect
+    src = inspect.getsource(s2p_tab.Suite2pTab)
+    assert "on_iscell_changed=self._curation_callback(owner)" in src
+    assert 'owner["w"] = popout' in src
