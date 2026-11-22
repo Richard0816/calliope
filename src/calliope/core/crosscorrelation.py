@@ -952,25 +952,51 @@ def _windows_id(event_windows) -> str:
     return hashlib.sha1(json.dumps(w).encode()).hexdigest()
 
 
-def _begin_xcorr(out_root: Path) -> None:
-    """Mark ``out_root`` pending, then clear the previous run's pair /
-    event folders so the stamp written at the end covers only this run.
-    Only folders this module writes are removed (``<pair>/<pair>_summary.csv``
-    and ``eventNNNN_*``); anything else a user put there is kept."""
+def generated_dirs(out_root: Path) -> Optional[set]:
+    """Names of the subfolders the last completed run wrote into
+    ``out_root`` (from its stamp), or None for outputs made before stamps
+    listed them. Readers use only these, so other folders a user keeps
+    there are never read as results."""
+    from . import generation
+    try:
+        stamp = generation._read(Path(out_root) / XCORR_STAMP)
+    except generation.StaleOutputError:
+        return None
+    if not stamp or stamp.get("pending") or "dirs" not in stamp:
+        return None
+    return set(stamp["dirs"])
+
+
+def _begin_xcorr(out_root: Path) -> set:
+    """Mark ``out_root`` pending, then remove the previous run's folders
+    (those its stamp lists; for older runs, ``<pair>/<pair>_summary.csv``
+    and ``eventNNNN_*``). Generated folders are replaced whole; any other
+    folder is kept. Returns the names kept, so the stamp written at the end
+    lists only this run's folders."""
     import re
     import shutil
     from . import generation
     out_root = Path(out_root)
+    previous = generated_dirs(out_root)
     generation._write(out_root / XCORR_STAMP, {"pending": True})
     for d in out_root.iterdir():
-        if d.is_dir() and (re.match(r"event\d{4}_", d.name)
-                           or (d / f"{d.name}_summary.csv").exists()):
+        if not d.is_dir():
+            continue
+        ours = (d.name in previous if previous is not None
+                else (re.match(r"event\d{4}_", d.name)
+                      or (d / f"{d.name}_summary.csv").exists()))
+        if ours:
             shutil.rmtree(d)
+    return {d.name for d in out_root.iterdir() if d.is_dir()}
 
 
-def _stamp_xcorr(out_root: Path, inputs: str, event_windows=None) -> None:
+def _stamp_xcorr(out_root: Path, inputs: str, event_windows=None,
+                 kept: frozenset = frozenset()) -> None:
     from . import generation
-    d = {"inputs": inputs}
+    out_root = Path(out_root)
+    d = {"inputs": inputs,
+         "dirs": sorted(x.name for x in out_root.iterdir()
+                        if x.is_dir() and x.name not in kept)}
     if event_windows is not None:
         d["events"] = _windows_id(event_windows)
     generation._write(Path(out_root) / XCORR_STAMP, d)
@@ -1071,7 +1097,7 @@ def run_cluster_xcorr_full_fast(
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
     inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
-    _begin_xcorr(out_root)
+    kept = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
 
@@ -1234,7 +1260,7 @@ def run_cluster_xcorr_full_fast(
         cluster_Z.clear()
         _release_gpu_pools()
 
-    _stamp_xcorr(out_root, inputs_id)
+    _stamp_xcorr(out_root, inputs_id, kept=kept)
     return out_root
 
 
@@ -1290,7 +1316,7 @@ def run_cluster_xcorr_per_event_fast(
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
     inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
-    _begin_xcorr(out_root)
+    kept = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
     cluster_names = _xcorr_cluster_names(cluster_rois_s2p)
@@ -1367,7 +1393,7 @@ def run_cluster_xcorr_per_event_fast(
     if gpu_ok:
         _release_gpu_pools()
 
-    _stamp_xcorr(out_root, inputs_id, event_windows)
+    _stamp_xcorr(out_root, inputs_id, event_windows, kept=kept)
     return out_root
 
 
@@ -1482,10 +1508,11 @@ def _pick_representative_event_dir(per_event_root: Path) -> Optional[Path]:
     for the most pair data). Returns None if no event subfolder carries pairs.
     """
     per_event_root = Path(per_event_root)
+    ours = generated_dirs(per_event_root)
     best: Optional[Path] = None
     best_key = (-1, -1)
     for d in sorted(per_event_root.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or (ours is not None and d.name not in ours):
             continue
         csvs = list(d.glob("*/*_summary.csv"))
         if not csvs:

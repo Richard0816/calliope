@@ -140,9 +140,11 @@ def _natural_pair_key(name: str) -> tuple[int, int]:
 
 
 def _load_pair_data(xcorr_root: Path) -> dict[str, pd.DataFrame]:
+    from ...core.crosscorrelation import generated_dirs
+    ours = generated_dirs(xcorr_root)
     pair_data: dict[str, pd.DataFrame] = {}
     for d in sorted(xcorr_root.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or (ours is not None and d.name not in ours):
             continue
         csvs = list(d.glob("*_summary.csv"))
         if not csvs:

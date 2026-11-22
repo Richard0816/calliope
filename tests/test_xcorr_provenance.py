@@ -218,3 +218,29 @@ def test_rerun_keeps_folders_it_did_not_write(tmp_path):
     (mine / "plot.png").write_text("keep me")
     out = _full(p)
     assert (mine / "plot.png").read_text() == "keep me"
+
+
+def test_backup_folders_are_kept_but_never_read(tmp_path):
+    from calliope.tabs.crosscorrelation.tab import _load_pair_data
+    p, cdir = _recording(tmp_path)
+    out = _full(p)
+    backup = out / "backup"
+    backup.mkdir()
+    (backup / "C1xC1_summary.csv").write_text("zero_lag_corr,best_lag_sec\n9,9\n")
+    out = _full(p)
+    assert (backup / "C1xC1_summary.csv").exists()          # kept
+    assert "backup" not in _load_pair_data(out)             # not read
+    assert set(_load_pair_data(out)) == xc.generated_dirs(out)
+
+
+def test_representative_event_ignores_other_folders(tmp_path):
+    p, cdir = _recording(tmp_path)
+    w = [(2.0, 6.0)]
+    out = xc.run_cluster_xcorr_per_event_fast(
+        p, PFX, 10.0, "", w, max_lag_seconds=0.5, use_gpu=False)
+    big = out / "zz_backup" / "C1xC2"                       # more CSVs
+    big.mkdir(parents=True)
+    for k in range(5):
+        (big / f"x{k}_summary.csv").write_text("a\n1\n")
+    rep = xc._pick_representative_event_dir(out)
+    assert rep is not None and rep.name.startswith("event0000_")

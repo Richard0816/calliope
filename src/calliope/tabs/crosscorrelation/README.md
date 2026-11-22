@@ -274,6 +274,16 @@ A long full-recording run on a large cluster set can take minutes. The run execu
 The violin PNG/SVG is rendered separately into the `calliope_figures`
 tree (`full.png` / `per_event.png`), not into the cluster-results tree above.
 
+Each output folder also holds `xcorr_generation.json`. It records:
+- the clusters, dF/F and (per event) event windows the run was computed
+  from;
+- the subfolders the run wrote.
+
+The violin window and the figure export refuse outputs made from other
+inputs, and read only the folders listed there. A rerun replaces those
+folders whole, so don't keep your own files inside a `C{i}xC{j}/` or
+`event…/` folder. Other folders you add beside them are kept and ignored.
+
 (See `core/crosscorrelation.py: _write_pair_summary_csv` and the two `run_*_fast` functions for the exact layout.)
 
 ---
