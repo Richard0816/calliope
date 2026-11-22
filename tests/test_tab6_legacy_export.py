@@ -61,3 +61,13 @@ def test_export_after_legacy_reload_and_unchanged_rewrite(tmp_path):
     detection_run.compute_filtered_dff(p)        # unchanged keep rule
     out = export()
     assert (out / "C1_rois.npy").exists()
+
+
+def test_unfiltered_prefix_rebuild_refused(tmp_path):
+    p = _legacy_plane0(tmp_path, [1, 0, 1, 1])
+    made_from = generation.cluster_input(p, False)
+    assert made_from == {"build_id": None}
+    b = generation.new_dff_build(p)
+    generation.finish_dff_build(p, b)
+    now = generation.cluster_input(p, False)
+    assert not inputs_still_match(p, made_from, now)
