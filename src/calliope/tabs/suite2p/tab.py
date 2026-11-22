@@ -1710,20 +1710,32 @@ class Suite2pTab(ctk.CTkFrame):
             try:
                 from ...core.detection_run import (
                     keep_rule_kwargs as _keep_rule_kwargs)
+                # Read the window's recording when the callback fires, so
+                # _repoint_after_copy (scratch -> final) carries over.
+                owner: dict = {}
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
-                    on_iscell_changed=self._on_iscell_flipped,
+                    on_iscell_changed=self._curation_callback(owner),
                     get_size_outlier_z=lambda: float(
                         self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
                     on_checkpoint_trained=self._on_cellfilter_retrained,
                     get_keep_rule=lambda: _keep_rule_kwargs(self._params),
+                    retry_filtered_rewrite=True,
                 )
             except Exception as e:
                 messagebox.showerror("Curation popout failed", str(e))
                 return
+            owner["w"] = popout
             self._curation_popout = popout
         popout.show_roi(roi_idx)
+
+    def _curation_callback(self, owner: dict):
+        """Popout callback that reports the window's recording as of the
+        call (``owner["w"]``, set once built), so a scratch -> final
+        repoint carries over."""
+        return lambda i, v: self._on_iscell_flipped(
+            i, v, plane0=getattr(owner.get("w"), "_plane0", None))
 
     def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
         """BatchTab calls this after a row's scratch->HDD copy so we
@@ -1802,7 +1814,8 @@ class Suite2pTab(ctk.CTkFrame):
         self._append_log(
             f"[GUI] cell-filter checkpoint set to retrained {ckpt_path}")
 
-    def _on_iscell_flipped(self, roi_idx: int, new_value: int) -> None:
+    def _on_iscell_flipped(self, roi_idx: int, new_value: int,
+                           plane0: Optional[Path] = None) -> None:
         """Listener fired by the popout after a successful classification
         flip. Reload the keep mask from the freshly-written iscell.npy
         and repaint both panels so Tab 3 stays in sync with the new
@@ -1816,6 +1829,17 @@ class Suite2pTab(ctk.CTkFrame):
         """
         c = self._panel_cache
         if c is None:
+            return
+        if plane0 is not None and Path(plane0) != Path(c["plane0"]):
+            # A curation window left open on a recording Tab 3 no longer
+            # shows: never rewrite (or repaint) the current one for it.
+            if roi_idx == -1 and new_value == -1:
+                messagebox.showwarning(
+                    "Filtered dF/F not updated",
+                    f"This curation window belongs to {plane0}, which Tab 3 "
+                    f"no longer shows. Its mask is saved; reopen that "
+                    f"recording in Tab 3 and click 'Promote to filter "
+                    f"mask' again to update its filtered dF/F.")
             return
         try:
             c["keep"] = load_keep_mask(c["plane0"], c["n_total"])
@@ -1866,23 +1890,38 @@ class Suite2pTab(ctk.CTkFrame):
         # A zero-cell run keeps only its frozen mask: still regenerate.
         if not (src.exists() and has_filtered_outputs(plane0)):
             return
+        # An unchanged Promote (flips undone, or a retry with nothing
+        # pending) would rewrite identical data, and releasing the
+        # memmaps would still discard Tab 6's in-memory linkage.
+        if self._filtered_matches_keep(plane0):
+            return
         # Drop downstream tabs' cached handles on the filtered memmap so
         # Windows releases the file lock before we truncate it below.
-        try:
-            self.state.release_memmaps()
-        except Exception:
-            pass
-        gc.collect()
-        try:
-            self._run_filtered_dff(plane0)
-        except Exception as e:
-            messagebox.showwarning(
-                "Filtered dF/F not updated",
-                f"The promotion was saved, but the filtered dF/F memmap "
-                f"could not be regenerated:\n{e}\n\nClose any open "
-                f"cross-correlation / cluster popouts and re-run Tab 3 "
-                f"'filtered dF/F' to apply the new cell set downstream.")
-            return
+        # Retry re-slices from the mask already saved on disk, so hand
+        # promotions survive (unlike "Apply to this recording", which
+        # replaces the keep rule).
+        while True:
+            try:
+                self.state.release_memmaps()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                self._run_filtered_dff(plane0)
+                break
+            except Exception as e:
+                if not messagebox.askretrycancel(
+                        "Filtered dF/F not updated",
+                        f"The promotion was saved, but the filtered dF/F "
+                        f"memmap could not be regenerated:\n{e}\n\n"
+                        f"Close other programs using it (e.g. a "
+                        f"standalone Tab 6 window), then Retry. To close "
+                        f"a popout in this window first, Cancel, close "
+                        f"it, and click 'Promote to filter mask' again "
+                        f"(curation window still open).\n\nUntil it is "
+                        f"rewritten, Tabs 4-8 use the old cell set, or "
+                        f"refuse the file if this write got partway."):
+                    return
         # Re-fire the plane0 channel so memmap-reading tabs (lowpass
         # n_kept, etc.) reload from the rewritten memmap. set_plane0
         # re-publishes unconditionally, so the same path still refreshes.
@@ -1892,6 +1931,13 @@ class Suite2pTab(ctk.CTkFrame):
             pass
         # The rewrite resynced the frozen mask: drop Panel 3's [!] suffix.
         self._redraw_with_bg()
+
+    @staticmethod
+    def _filtered_matches_keep(plane0: Path) -> bool:
+        """Rewriting the filtered dF/F would change nothing (see
+        :func:`curation_popout.filtered_matches_keep`)."""
+        from .curation_popout import filtered_matches_keep
+        return filtered_matches_keep(plane0)
 
     @staticmethod
     def _pipeline_kept_n(plane0, n_total) -> Optional[int]:

@@ -227,6 +227,75 @@ def _find_plane0s(root: Path, exclude: Path) -> list[Path]:
                    and _norm_path(f.parent) != ex})
 
 
+def filtered_matches_keep(plane0: Path) -> bool:
+    """True when the filtered dF/F is complete, current, and frozen to
+    exactly the mask a rewrite would use -- i.e. rewriting it would
+    change nothing. Any doubt returns False (rewrite). Light imports
+    only: it runs every time the popout opens."""
+    from ...core import generation, utils
+    plane0 = Path(plane0)
+    try:
+        generation.check_filtered(plane0, need_cells=False)
+        n_total, T = np.load(plane0 / "F.npy", mmap_mode="r").shape
+        keep = utils.resolve_live_mask(plane0, n_total)
+        frozen = generation.frozen_mask_hash(plane0)
+        if frozen is None or generation.mask_hash(keep) != frozen:
+            return False
+        n_kept = int(keep.sum())
+        # Zero-cell runs keep no memmap; otherwise it must be whole.
+        return n_kept == 0 or (
+            plane0 / "r0p7_filtered_dff.memmap.float32"
+        ).stat().st_size == 4 * T * n_kept
+    except Exception:
+        return False
+
+
+def _filtered_rewrite_pending(plane0: Path) -> bool:
+    """A filtered dF/F exists but no longer matches the saved keep mask
+    (a Promote whose rewrite failed and was cancelled, or drift)."""
+    plane0 = Path(plane0)
+    return ((plane0 / "r0p7_dff.memmap.float32").exists()
+            and ((plane0 / "r0p7_filtered_dff.memmap.float32").exists()
+                 or (plane0 / "r0p7_cell_mask_bool.npy").exists())
+            and not filtered_matches_keep(plane0))
+
+
+def _kept_counts(plane0: Path, n_total: int) -> tuple:
+    """(ROIs kept by the frozen filtered mask, by the saved live mask);
+    "?" where unreadable."""
+    from ...core import utils
+    out = []
+    for load in (lambda: np.load(Path(plane0) / "r0p7_cell_mask_bool.npy"),
+                 lambda: utils.resolve_live_mask(plane0, n_total)):
+        try:
+            out.append(int(np.asarray(load(), bool).sum()))
+        except Exception:
+            out.append("?")
+    return tuple(out)
+
+
+def _hover_tip(widget, text: str) -> None:
+    """Minimal hover tooltip."""
+    tip = {}
+
+    def show(_e):
+        w = tip["w"] = tk.Toplevel(widget)
+        w.wm_overrideredirect(True)
+        w.wm_geometry(f"+{widget.winfo_rootx()}"
+                      f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+        tk.Label(w, text=text, wraplength=320, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1
+                 ).pack()
+
+    def hide(_e):
+        w = tip.pop("w", None)
+        if w is not None:
+            w.destroy()
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+
+
 class CurationPopout(ctk.CTkToplevel):
     """Toplevel curation window for one Suite2p ROI.
 
@@ -255,7 +324,8 @@ class CurationPopout(ctk.CTkToplevel):
                  get_ckpt_path: Optional[Callable[[], str]] = None,
                  on_checkpoint_trained: Optional[
                      Callable[[Path], None]] = None,
-                 get_keep_rule: Optional[Callable[[], dict]] = None) -> None:
+                 get_keep_rule: Optional[Callable[[], dict]] = None,
+                 retry_filtered_rewrite: bool = False) -> None:
         """Build the popout.
 
         Optional parent hooks (all called on the Tk main thread):
@@ -305,6 +375,9 @@ class CurationPopout(ctk.CTkToplevel):
         self._get_size_outlier_z = get_size_outlier_z
         self._get_ckpt_path = get_ckpt_path
         self._get_keep_rule = get_keep_rule
+        # The host rewrites the filtered dF/F on the (-1, -1) sentinel
+        # (Tab 3 does; the standalone curation app does not).
+        self._retry_rewrite = retry_filtered_rewrite
         self._reapply_failed: list[str] = []
         self._on_checkpoint_trained = on_checkpoint_trained
         self._csv_path = _curation_csv_path()
@@ -462,11 +535,21 @@ class CurationPopout(ctk.CTkToplevel):
         self._retrain_btn.pack(side="left", padx=(20, 0))
         # Promote stays disabled until the user has flipped at least
         # one ROI; it overlays those flips onto predicted_cell_mask.npy
-        # so downstream tabs honour them without a full retrain.
+        # so downstream tabs honour them without a full retrain. It
+        # starts enabled when an earlier promoted mask never reached the
+        # filtered dF/F (rewrite failed and was cancelled), as a retry.
         self._promote_btn = ctk.CTkButton(
             btn_frame, text="Promote to filter mask", width=200,
-            state="disabled", command=self._on_promote)
+            state="normal" if (self._retry_rewrite
+                                and _filtered_rewrite_pending(self._plane0))
+            else "disabled", command=self._on_promote)
         self._promote_btn.pack(side="left", padx=(6, 0))
+        if self._retry_rewrite:
+            _hover_tip(self._promote_btn,
+                       "Promotes this session's flips. With nothing "
+                       "flipped, it resyncs the filtered dF/F to the saved "
+                       "mask (clears Panel 3's [!] drift); you confirm "
+                       "first.")
 
         self._train_status_var = tk.StringVar(value="")
         ctk.CTkLabel(btn_frame, textvariable=self._train_status_var
@@ -708,6 +791,30 @@ class CurationPopout(ctk.CTkToplevel):
         predictions for un-touched ROIs are preserved.
         """
         if not self._flipped:
+            # Nothing new to promote: the mask is already saved, so just
+            # retry the filtered dF/F rewrite (a cancelled failure leaves
+            # it on the old cell set, as does keep-mask drift).
+            if not (self._retry_rewrite
+                    and self._on_iscell_changed is not None):
+                return
+            if not _filtered_rewrite_pending(self._plane0):
+                self._train_status_var.set(
+                    "Filtered dF/F already matches the saved mask")
+                return
+            old_n, new_n = _kept_counts(self._plane0, self._n_total)
+            if not messagebox.askyesno(
+                    "Resync filtered dF/F",
+                    f"The filtered dF/F that Tabs 4-8 read was written for {old_n} "
+                    f"ROIs (or is half-written); the saved keep mask keeps {new_n}.\n\n"
+                    f"Rewrite the filtered dF/F to the saved mask? Results "
+                    f"already computed in Tab 4 (low-pass), Tab 5 (events), "
+                    f"Tab 6 (clusters) and Tab 7 (cross-correlation) will "
+                    f"need re-running."):
+                return
+            try:
+                self._on_iscell_changed(-1, -1)
+            except Exception:
+                pass
             return
         if self._iscell is None:
             # Retry: a reused popout may predate a fixed/re-written file.
