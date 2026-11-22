@@ -614,8 +614,13 @@ def _read_event_windows_from_summary(plane0: Path):
         import openpyxl  # noqa
     except Exception:
         return []
-    candidates = sorted(plane0.glob("*summary*.xlsx"))
+    # Only the default workbook: its EventWindows sheet is the one stamped
+    # with the low-pass run it came from (and locked by the caller).
+    from ...core import summary_writer
+    candidates = [summary_writer.summary_path(plane0)]
     for path in candidates:
+        if not path.exists():
+            continue
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         except Exception:
@@ -1192,10 +1197,10 @@ class CrossCorrelationTab(ctk.CTkFrame):
             state="normal" if plane0 is not None else "disabled")
         self.export_figs_btn.configure(
             state="normal" if plane0 is not None else "disabled")
-        if ok:
-            self.status_var.set(f"Ready. ({plane0})")
-        else:
-            self.status_var.set("Cluster files or dF/F memmap missing.")
+        note = getattr(self, "_events_note", None)
+        base = (f"Ready. ({plane0})" if ok
+                else "Cluster files or dF/F memmap missing.")
+        self.status_var.set(base + (f"  |  {note}" if note else ""))
 
     def _inputs_ready(self) -> bool:
         if self._plane0 is None:
@@ -1211,7 +1216,14 @@ class CrossCorrelationTab(ctk.CTkFrame):
                      if "manual_combined" not in f.stem.lower()]
         return len(roi_files) >= 1
 
+    def _events_status(self, msg: str) -> None:
+        """Status from event loading, remembered so a caller setting the
+        overall readiness status (``_set_plane0``) can keep it visible."""
+        self._events_note = msg
+        self.status_var.set(msg)
+
     def _on_refresh_events(self) -> None:
+        self._events_note = None
         if self._plane0 is None:
             self._apply_event_windows([])
             return
@@ -1222,19 +1234,39 @@ class CrossCorrelationTab(ctk.CTkFrame):
         try:
             current = generation.check_lowpass(self._plane0)
         except generation.StaleOutputError as e:
-            self.status_var.set(f"Event windows not loaded: {e}")
+            self._events_status(f"Event windows not loaded: {e}")
             self._apply_event_windows([])
             return
         evts = self._event_windows_from_state(current)
+        from_disk, held = evts is None, True
         if evts is None:
+            from ...core import summary_writer
             try:
-                generation.check_events(self._plane0)
-            except generation.StaleOutputError as e:
-                self.status_var.set(f"Event windows not loaded: {e}")
+                # On the Tk thread: don't hang the GUI behind a Tab 5 write.
+                with summary_writer.locked(self._plane0, timeout_s=2.0) as held:
+                    generation.check_events(self._plane0)
+                    evts = _read_event_windows_from_summary(self._plane0)
+            except TimeoutError:
+                self._events_status("Event windows not loaded: Tab 5 is "
+                                    "still writing the summary; refresh again.")
                 self._apply_event_windows([])
                 return
-            evts = _read_event_windows_from_summary(self._plane0)
+            except generation.StaleOutputError as e:
+                self._events_status(f"Event windows not loaded: {e}")
+                self._apply_event_windows([])
+                return
         self._apply_event_windows(evts, token=current)
+        if from_disk and not held:
+            self._events_status("Event windows read without the summary lock "
+                                "(recording folder not writable to you).")
+        elif from_disk and not evts:
+            default = summary_writer.summary_path(self._plane0)
+            others = [x.name for x in self._plane0.glob("*summary*.xlsx")
+                      if x != default]
+            if others:
+                self._events_status(
+                    f"No events in {default.name}; {', '.join(others)} not "
+                    f"used (no provenance stamp). Re-run Tab 5.")
 
     def _event_windows_from_state(self, current=None):
         """Return Tab 5's in-memory ``[(start_s, end_s), ...]`` for the

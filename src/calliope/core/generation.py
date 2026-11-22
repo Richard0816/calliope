@@ -307,6 +307,11 @@ def check_lowpass(plane0: Path) -> Optional[str]:
 
 # --- Tab 5 ---------------------------------------------------------------------
 
+def begin_events(plane0: Path) -> None:
+    """Mark the event sheets as being rewritten (until ``stamp_events``)."""
+    _write(Path(plane0) / EVENTS_FILE, {"pending": True})
+
+
 def stamp_events(plane0: Path, token: Optional[str]) -> None:
     _write(Path(plane0) / EVENTS_FILE, {"lowpass": token})
 
@@ -317,6 +322,10 @@ def check_events(plane0: Path) -> Optional[str]:
     plane0 = Path(plane0)
     token = check_lowpass(plane0)
     stamp = _read(plane0 / EVENTS_FILE)
+    if stamp is not None and stamp.get("pending"):
+        raise StaleOutputError(
+            f"{plane0}: the last event-summary write did not finish; "
+            f"re-run Tab 5.")
     if stamp is None:
         if token is None:
             return None          # pre-stamp events on pre-stamp low-pass

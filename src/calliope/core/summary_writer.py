@@ -130,14 +130,18 @@ def write_sheet(
     return write_sheets(plane0, {sheet_name: data}, filename=filename)
 
 
-def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path:
+def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME,
+                 *, _before=None, _after=None) -> Path:
     """Write multiple sheets in a single workbook open. ``sheets`` maps
-    sheet_name -> DataFrame/dict/records."""
+    sheet_name -> DataFrame/dict/records. ``_before`` / ``_after`` run
+    while the workbook lock is held (provenance committed with the data)."""
     path = summary_path(plane0, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tab 5 writes from a background process, so two writers can overlap;
     # each rewrites the whole file, and the loser's sheets would vanish.
     with _workbook_lock(path):
+        if _before is not None:
+            _before()
         exists = path.exists()
         with pd.ExcelWriter(
             path, engine="openpyxl", mode="a" if exists else "w",
@@ -155,7 +159,23 @@ def write_sheets(plane0, sheets: dict, filename: str = DEFAULT_FILENAME) -> Path
                         f"{len(df)} rows x {df.shape[1]} columns exceed Excel's "
                         f"sheet limit; full table in {csv.name}"]})
                 df.to_excel(w, sheet_name=name, index=False)
+        if _after is not None:
+            _after()
     return path
+
+
+@contextlib.contextmanager
+def locked(plane0, filename: str = DEFAULT_FILENAME, timeout_s: float = 30.0):
+    """Hold the workbook lock while reading sheets together with their
+    stamp, so a concurrent writer can't swap one between the two reads.
+    Raises ``TimeoutError`` if a writer keeps it longer than ``timeout_s``.
+    Not reentrant: don't write the workbook while holding it. Yields True,
+    or False when the folder isn't writable to us and the read is unlocked
+    (fine for a read-only copy; a writer with other permissions could still
+    be mid-write)."""
+    path = summary_path(plane0, filename)
+    with _workbook_lock(path, timeout_s, read_only_ok=True) as held:
+        yield held
 
 
 # Excel's hard limits (1,048,576 rows incl. the header row; 16,384 columns).
@@ -164,10 +184,23 @@ _XLSX_MAX_COLS = 16_384
 
 
 @contextlib.contextmanager
-def _workbook_lock(path: Path, timeout_s: float = 300.0):
+def _workbook_lock(path: Path, timeout_s: float = 300.0,
+                   read_only_ok: bool = False):
     """Cross-process exclusive lock on ``<workbook>.lock`` (OS-released if
-    the holder dies, so no stale locks)."""
-    with open(str(path) + ".lock", "a+b") as fh:
+    the holder dies, so no stale locks). Not reentrant. With
+    ``read_only_ok`` (readers only), a folder where the lock file can't be
+    created yields False and reads without it (another account that can
+    write there could still be writing: callers say so)."""
+    try:
+        fh = open(str(path) + ".lock", "a+b")
+    except OSError as e:
+        import errno
+        if not read_only_ok or e.errno not in (errno.EACCES, errno.EPERM,
+                                               errno.EROFS):
+            raise
+        yield False
+        return
+    with fh:
         deadline = time.monotonic() + timeout_s
         while True:
             try:
@@ -184,7 +217,7 @@ def _workbook_lock(path: Path, timeout_s: float = 300.0):
                     raise TimeoutError(f"{path} is locked by another writer")
                 time.sleep(0.2)
         try:
-            yield
+            yield True
         finally:
             if os.name == "nt":
                 fh.seek(0)
@@ -430,7 +463,21 @@ def write_events_sheets(
         roi_event_times[f"roi_{roi_ids[roi]}"] = padded
     roi_event_times_df = pd.DataFrame(roi_event_times)
 
-    out = write_sheets(
+    hooks = {}
+    if filename == DEFAULT_FILENAME:
+        # The stamp NWB export / Tab 7 trust is committed under the same
+        # lock as the sheets it describes: pending first, so a crash
+        # mid-write fails closed, and the final token only after the write.
+        from . import generation as _gen
+        if generation is _NO_TOKEN:
+            try:
+                generation = _gen.check_lowpass(Path(plane0))
+            except _gen.StaleOutputError:
+                generation = None
+        token = generation
+        hooks = dict(_before=lambda: _gen.begin_events(Path(plane0)),
+                     _after=lambda: _gen.stamp_events(Path(plane0), token))
+    return write_sheets(
         plane0,
         {
             "EventWindows": win_rows,
@@ -439,16 +486,8 @@ def write_events_sheets(
             **(extra_sheets or {}),
         },
         filename=filename,
+        **hooks,
     )
-    if filename == DEFAULT_FILENAME:
-        from . import generation as _gen
-        if generation is _NO_TOKEN:
-            try:
-                generation = _gen.check_lowpass(Path(plane0))
-            except _gen.StaleOutputError:
-                generation = None
-        _gen.stamp_events(Path(plane0), generation)
-    return out
 
 
 def write_event_monotonicity_sheet(

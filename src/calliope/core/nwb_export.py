@@ -476,14 +476,25 @@ def export_recording_to_nwb(
     if include_events:
         # Only events made from the current low-pass traces (and so the
         # current cell set): a stale workbook would label the wrong data.
-        from . import generation
-        windows = _read_event_windows(plane0)
-        if windows is not None:
-            try:
-                generation.check_events(plane0)
-            except generation.StaleOutputError as e:
-                _note(notes, f"event windows left out: {e}")
-                windows = None
+        from . import generation, summary_writer
+        windows = None
+        try:
+            with summary_writer.locked(plane0) as held:
+                windows = _read_event_windows(plane0)
+                if windows is not None and not held:
+                    _note(notes, "event windows read without the workbook "
+                                 "lock (no write access to the recording "
+                                 "folder); export from an account that can "
+                                 "write it to be sure they are current")
+                if windows is not None:
+                    try:
+                        generation.check_events(plane0)
+                    except generation.StaleOutputError as e:
+                        _note(notes, f"event windows left out: {e}")
+                        windows = None
+        except TimeoutError:
+            _note(notes, "event windows left out: the summary workbook "
+                         "stayed locked by another writer; export again")
         if windows is not None:
             from pynwb.epoch import TimeIntervals
 
