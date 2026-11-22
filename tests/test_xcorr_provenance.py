@@ -244,3 +244,26 @@ def test_representative_event_ignores_other_folders(tmp_path):
         (big / f"x{k}_summary.csv").write_text("a\n1\n")
     rep = xc._pick_representative_event_dir(out)
     assert rep is not None and rep.name.startswith("event0000_")
+
+
+def test_interrupted_run_keeps_the_folder_listing(tmp_path):
+    # A run that dies right after marking itself pending must not make the
+    # next run fall back to the name rule and delete a kept folder.
+    p, cdir = _recording(tmp_path)
+    out = _full(p)
+    notes = out / "event0001_notes"
+    notes.mkdir()
+    (notes / "n.txt").write_text("keep")
+    xc._begin_xcorr(out)                 # interrupted here
+    out = _full(p)
+    assert (notes / "n.txt").exists()
+
+
+def test_a_kept_folder_reused_by_the_run_is_listed(tmp_path):
+    from calliope.tabs.crosscorrelation.tab import _load_pair_data
+    p, cdir = _recording(tmp_path)
+    root = cdir / "cross_correlation_full"
+    (root / "C1xC2").mkdir(parents=True)  # same name as a pair the run writes
+    out = _full(p)
+    assert "C1xC2" in xc.generated_dirs(out)
+    assert "C1xC2" in _load_pair_data(out)

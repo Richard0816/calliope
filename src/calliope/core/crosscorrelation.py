@@ -971,14 +971,22 @@ def _begin_xcorr(out_root: Path) -> set:
     """Mark ``out_root`` pending, then remove the previous run's folders
     (those its stamp lists; for older runs, ``<pair>/<pair>_summary.csv``
     and ``eventNNNN_*``). Generated folders are replaced whole; any other
-    folder is kept. Returns the names kept, so the stamp written at the end
-    lists only this run's folders."""
+    folder is kept. The pending stamp keeps the previous listing, so a run
+    interrupted here doesn't lose track of which folders are generated.
+    Returns an empty set the runner fills with the folders it writes."""
     import re
     import shutil
     from . import generation
     out_root = Path(out_root)
-    previous = generated_dirs(out_root)
-    generation._write(out_root / XCORR_STAMP, {"pending": True})
+    try:
+        old = generation._read(out_root / XCORR_STAMP) or {}
+    except generation.StaleOutputError:
+        old = {}
+    previous = set(old["dirs"]) if "dirs" in old else None
+    generation._write(out_root / XCORR_STAMP,
+                      {"pending": True,
+                       **({"dirs": sorted(previous)} if previous is not None
+                          else {})})
     for d in out_root.iterdir():
         if not d.is_dir():
             continue
@@ -987,16 +995,15 @@ def _begin_xcorr(out_root: Path) -> set:
                       or (d / f"{d.name}_summary.csv").exists()))
         if ours:
             shutil.rmtree(d)
-    return {d.name for d in out_root.iterdir() if d.is_dir()}
+    return set()
 
 
 def _stamp_xcorr(out_root: Path, inputs: str, event_windows=None,
-                 kept: frozenset = frozenset()) -> None:
+                 written=()) -> None:
+    """Commit the run: its inputs and the folders it wrote (``written``)."""
     from . import generation
     out_root = Path(out_root)
-    d = {"inputs": inputs,
-         "dirs": sorted(x.name for x in out_root.iterdir()
-                        if x.is_dir() and x.name not in kept)}
+    d = {"inputs": inputs, "dirs": sorted(set(written))}
     if event_windows is not None:
         d["events"] = _windows_id(event_windows)
     generation._write(Path(out_root) / XCORR_STAMP, d)
@@ -1097,7 +1104,7 @@ def run_cluster_xcorr_full_fast(
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
     inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
-    kept = _begin_xcorr(out_root)
+    written = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
 
@@ -1167,6 +1174,7 @@ def run_cluster_xcorr_full_fast(
             roisB = cluster_rois_s2p[cB]
             pair_dir = out_root / f"{cA}x{cB}"
             pair_dir.mkdir(exist_ok=True)
+            written.add(pair_dir.name)
             summary_path = pair_dir / f"{cA}x{cB}_summary.csv"
 
             best_lag, max_c, z0 = batch_xcorr_clusters(
@@ -1260,7 +1268,7 @@ def run_cluster_xcorr_full_fast(
         cluster_Z.clear()
         _release_gpu_pools()
 
-    _stamp_xcorr(out_root, inputs_id, kept=kept)
+    _stamp_xcorr(out_root, inputs_id, written=written)
     return out_root
 
 
@@ -1316,7 +1324,7 @@ def run_cluster_xcorr_per_event_fast(
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
     inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
-    kept = _begin_xcorr(out_root)
+    written = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
     cluster_names = _xcorr_cluster_names(cluster_rois_s2p)
@@ -1338,6 +1346,7 @@ def run_cluster_xcorr_per_event_fast(
         )
         ev_dir = out_root / ev_label
         ev_dir.mkdir(exist_ok=True)
+        written.add(ev_label)
 
         # Crop dF/F for all ROIs once per event and z-score per cluster.
         clip = np.asarray(dff[f0:f1, :], dtype=np.float32, order="C")
@@ -1393,7 +1402,7 @@ def run_cluster_xcorr_per_event_fast(
     if gpu_ok:
         _release_gpu_pools()
 
-    _stamp_xcorr(out_root, inputs_id, event_windows, kept=kept)
+    _stamp_xcorr(out_root, inputs_id, event_windows, written=written)
     return out_root
 
 
