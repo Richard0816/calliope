@@ -1718,6 +1718,7 @@ class Suite2pTab(ctk.CTkFrame):
                     get_ckpt_path=lambda: self.ckpt_var.get(),
                     on_checkpoint_trained=self._on_cellfilter_retrained,
                     get_keep_rule=lambda: _keep_rule_kwargs(self._params),
+                    retry_filtered_rewrite=True,
                 )
             except Exception as e:
                 messagebox.showerror("Curation popout failed", str(e))
@@ -1910,24 +1911,10 @@ class Suite2pTab(ctk.CTkFrame):
 
     @staticmethod
     def _filtered_matches_keep(plane0: Path) -> bool:
-        """True when the filtered dF/F is complete, current, and frozen to
-        exactly the mask a rewrite would use -- i.e. rewriting it would
-        change nothing. Any doubt returns False (rewrite)."""
-        from ...core import detection_run, generation
-        try:
-            generation.check_filtered(plane0, need_cells=False)
-            n_total, T = np.load(plane0 / "F.npy", mmap_mode="r").shape
-            keep = detection_run._load_keep_mask(plane0, n_total)
-            frozen = generation.frozen_mask_hash(plane0)
-            if frozen is None or generation.mask_hash(keep) != frozen:
-                return False
-            n_kept = int(keep.sum())
-            # Zero-cell runs keep no memmap; otherwise it must be whole.
-            return n_kept == 0 or (
-                plane0 / "r0p7_filtered_dff.memmap.float32"
-            ).stat().st_size == 4 * T * n_kept
-        except Exception:
-            return False
+        """Rewriting the filtered dF/F would change nothing (see
+        :func:`curation_popout.filtered_matches_keep`)."""
+        from .curation_popout import filtered_matches_keep
+        return filtered_matches_keep(plane0)
 
     @staticmethod
     def _pipeline_kept_n(plane0, n_total) -> Optional[int]:

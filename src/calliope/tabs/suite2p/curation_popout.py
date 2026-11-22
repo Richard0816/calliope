@@ -227,18 +227,37 @@ def _find_plane0s(root: Path, exclude: Path) -> list[Path]:
                    and _norm_path(f.parent) != ex})
 
 
-def _filtered_rewrite_pending(plane0: Path) -> bool:
-    """A filtered dF/F exists but no longer matches the saved keep mask
-    (a Promote whose rewrite failed and was cancelled). Never raises."""
+def filtered_matches_keep(plane0: Path) -> bool:
+    """True when the filtered dF/F is complete, current, and frozen to
+    exactly the mask a rewrite would use -- i.e. rewriting it would
+    change nothing. Any doubt returns False (rewrite). Light imports
+    only: it runs every time the popout opens."""
+    from ...core import generation, utils
+    plane0 = Path(plane0)
     try:
-        from ...core.detection_run import has_filtered_outputs
-        from .tab import Suite2pTab
-        plane0 = Path(plane0)
-        return ((plane0 / "r0p7_dff.memmap.float32").exists()
-                and has_filtered_outputs(plane0)
-                and not Suite2pTab._filtered_matches_keep(plane0))
+        generation.check_filtered(plane0, need_cells=False)
+        n_total, T = np.load(plane0 / "F.npy", mmap_mode="r").shape
+        keep = utils.resolve_live_mask(plane0, n_total)
+        frozen = generation.frozen_mask_hash(plane0)
+        if frozen is None or generation.mask_hash(keep) != frozen:
+            return False
+        n_kept = int(keep.sum())
+        # Zero-cell runs keep no memmap; otherwise it must be whole.
+        return n_kept == 0 or (
+            plane0 / "r0p7_filtered_dff.memmap.float32"
+        ).stat().st_size == 4 * T * n_kept
     except Exception:
         return False
+
+
+def _filtered_rewrite_pending(plane0: Path) -> bool:
+    """A filtered dF/F exists but no longer matches the saved keep mask
+    (a Promote whose rewrite failed and was cancelled, or drift)."""
+    plane0 = Path(plane0)
+    return ((plane0 / "r0p7_dff.memmap.float32").exists()
+            and ((plane0 / "r0p7_filtered_dff.memmap.float32").exists()
+                 or (plane0 / "r0p7_cell_mask_bool.npy").exists())
+            and not filtered_matches_keep(plane0))
 
 
 class CurationPopout(ctk.CTkToplevel):
@@ -269,7 +288,8 @@ class CurationPopout(ctk.CTkToplevel):
                  get_ckpt_path: Optional[Callable[[], str]] = None,
                  on_checkpoint_trained: Optional[
                      Callable[[Path], None]] = None,
-                 get_keep_rule: Optional[Callable[[], dict]] = None) -> None:
+                 get_keep_rule: Optional[Callable[[], dict]] = None,
+                 retry_filtered_rewrite: bool = False) -> None:
         """Build the popout.
 
         Optional parent hooks (all called on the Tk main thread):
@@ -319,6 +339,9 @@ class CurationPopout(ctk.CTkToplevel):
         self._get_size_outlier_z = get_size_outlier_z
         self._get_ckpt_path = get_ckpt_path
         self._get_keep_rule = get_keep_rule
+        # The host rewrites the filtered dF/F on the (-1, -1) sentinel
+        # (Tab 3 does; the standalone curation app does not).
+        self._retry_rewrite = retry_filtered_rewrite
         self._reapply_failed: list[str] = []
         self._on_checkpoint_trained = on_checkpoint_trained
         self._csv_path = _curation_csv_path()
@@ -481,7 +504,8 @@ class CurationPopout(ctk.CTkToplevel):
         # filtered dF/F (rewrite failed and was cancelled), as a retry.
         self._promote_btn = ctk.CTkButton(
             btn_frame, text="Promote to filter mask", width=200,
-            state="normal" if _filtered_rewrite_pending(self._plane0)
+            state="normal" if (self._retry_rewrite
+                                and _filtered_rewrite_pending(self._plane0))
             else "disabled", command=self._on_promote)
         self._promote_btn.pack(side="left", padx=(6, 0))
 
@@ -728,7 +752,7 @@ class CurationPopout(ctk.CTkToplevel):
             # Nothing new to promote: the mask is already saved, so just
             # retry the filtered dF/F rewrite (a cancelled failure leaves
             # it on the old cell set).
-            if self._on_iscell_changed is not None:
+            if self._retry_rewrite and self._on_iscell_changed is not None:
                 try:
                     self._on_iscell_changed(-1, -1)
                 except Exception:

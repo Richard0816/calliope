@@ -47,8 +47,11 @@ def test_cancel_leaves_downstream_untouched(tmp_path, monkeypatch):
 
 def test_promote_with_nothing_flipped_retries_rewrite():
     seen = []
-    pop = SimpleNamespace(_flipped=set(),
+    pop = SimpleNamespace(_flipped=set(), _retry_rewrite=True,
                           _on_iscell_changed=lambda i, v: seen.append((i, v)))
+    CurationPopout._on_promote(pop)
+    assert seen == [(-1, -1)]
+    pop._retry_rewrite = False          # standalone curation app
     CurationPopout._on_promote(pop)
     assert seen == [(-1, -1)]
 
