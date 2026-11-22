@@ -76,6 +76,15 @@ def test_unchanged_mask_skips_rewrite(tmp_path):
     assert not s2p_tab.Suite2pTab._filtered_matches_keep(p)
 
 
+def test_reopened_popout_offers_retry_only_when_pending(tmp_path):
+    import numpy as np
+    from calliope.tabs.suite2p.curation_popout import _filtered_rewrite_pending
+    p = _plane0(tmp_path, [1, 0, 1, 1])
+    assert not _filtered_rewrite_pending(p)
+    np.save(p / "predicted_cell_mask.npy", np.array([1, 1, 1, 1], bool))
+    assert _filtered_rewrite_pending(p)
+
+
 def test_truncated_filtered_file_is_rewritten(tmp_path):
     p = _plane0(tmp_path, [1, 0, 1, 1])
     with open(p / "r0p7_filtered_dff.memmap.float32", "r+b") as fh:

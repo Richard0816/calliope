@@ -227,6 +227,20 @@ def _find_plane0s(root: Path, exclude: Path) -> list[Path]:
                    and _norm_path(f.parent) != ex})
 
 
+def _filtered_rewrite_pending(plane0: Path) -> bool:
+    """A filtered dF/F exists but no longer matches the saved keep mask
+    (a Promote whose rewrite failed and was cancelled). Never raises."""
+    try:
+        from ...core.detection_run import has_filtered_outputs
+        from .tab import Suite2pTab
+        plane0 = Path(plane0)
+        return ((plane0 / "r0p7_dff.memmap.float32").exists()
+                and has_filtered_outputs(plane0)
+                and not Suite2pTab._filtered_matches_keep(plane0))
+    except Exception:
+        return False
+
+
 class CurationPopout(ctk.CTkToplevel):
     """Toplevel curation window for one Suite2p ROI.
 
@@ -462,10 +476,13 @@ class CurationPopout(ctk.CTkToplevel):
         self._retrain_btn.pack(side="left", padx=(20, 0))
         # Promote stays disabled until the user has flipped at least
         # one ROI; it overlays those flips onto predicted_cell_mask.npy
-        # so downstream tabs honour them without a full retrain.
+        # so downstream tabs honour them without a full retrain. It
+        # starts enabled when an earlier promoted mask never reached the
+        # filtered dF/F (rewrite failed and was cancelled), as a retry.
         self._promote_btn = ctk.CTkButton(
             btn_frame, text="Promote to filter mask", width=200,
-            state="disabled", command=self._on_promote)
+            state="normal" if _filtered_rewrite_pending(self._plane0)
+            else "disabled", command=self._on_promote)
         self._promote_btn.pack(side="left", padx=(6, 0))
 
         self._train_status_var = tk.StringVar(value="")
