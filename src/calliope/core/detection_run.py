@@ -528,7 +528,22 @@ def compute_dff_memmaps(
     Tries the GPU path first when ``params.use_gpu_dff`` is enabled
     and the baseline is ``first_n``. Falls back to per-ROI CPU.
     """
+    from . import generation
     plane0 = Path(plane0)
+    # Claim the recording before reading anything the dF/F is built from,
+    # so another builder can't swap the ROIs between our read and our stamp.
+    build = generation.new_dff_build(plane0)
+    try:
+        return _compute_dff(plane0, build, params, baseline_mode=baseline_mode,
+                            baseline_min=baseline_min, progress_cb=progress_cb)
+    except BaseException:
+        generation.abort_dff_build(plane0, build)
+        raise
+
+
+def _compute_dff(plane0, build, params, *, baseline_mode, baseline_min,
+                 progress_cb):
+    """Body of :func:`compute_dff_memmaps` for claimed build ``build``."""
     F = np.load(plane0 / "F.npy", allow_pickle=False)
     Fneu = np.load(plane0 / "Fneu.npy", allow_pickle=False)
     if F.shape != Fneu.shape or F.ndim != 2:
@@ -569,8 +584,15 @@ def compute_dff_memmaps(
 
     # New full dF/F: everything derived from the old one (filtered dF/F,
     # Tab 4-6 outputs) is now out of date until rebuilt.
+    return _build_dff(plane0, build, params, baseline_mode, baseline_min,
+                      fps, r, F, Fneu, T, N, perc, win_sec, progress_cb)
+
+
+def _build_dff(plane0, build, params, baseline_mode, baseline_min, fps, r,
+               F, Fneu, T, N, perc, win_sec, progress_cb):
+    """The dF/F write itself (GPU if available, else CPU), for build
+    ``build`` of ``plane0``; marks it complete when done."""
     from . import generation
-    build = generation.new_dff_build(plane0)
     if _maybe_run_dff_gpu(
             plane0, params, baseline_mode=baseline_mode,
             baseline_min=baseline_min, fps=fps,
