@@ -260,6 +260,42 @@ def _filtered_rewrite_pending(plane0: Path) -> bool:
             and not filtered_matches_keep(plane0))
 
 
+def _kept_counts(plane0: Path, n_total: int) -> tuple:
+    """(ROIs kept by the frozen filtered mask, by the saved live mask);
+    "?" where unreadable."""
+    from ...core import utils
+    out = []
+    for load in (lambda: np.load(Path(plane0) / "r0p7_cell_mask_bool.npy"),
+                 lambda: utils.resolve_live_mask(plane0, n_total)):
+        try:
+            out.append(int(np.asarray(load(), bool).sum()))
+        except Exception:
+            out.append("?")
+    return tuple(out)
+
+
+def _hover_tip(widget, text: str) -> None:
+    """Minimal hover tooltip."""
+    tip = {}
+
+    def show(_e):
+        w = tip["w"] = tk.Toplevel(widget)
+        w.wm_overrideredirect(True)
+        w.wm_geometry(f"+{widget.winfo_rootx()}"
+                      f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+        tk.Label(w, text=text, wraplength=320, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1
+                 ).pack()
+
+    def hide(_e):
+        w = tip.pop("w", None)
+        if w is not None:
+            w.destroy()
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+
+
 class CurationPopout(ctk.CTkToplevel):
     """Toplevel curation window for one Suite2p ROI.
 
@@ -508,6 +544,12 @@ class CurationPopout(ctk.CTkToplevel):
                                 and _filtered_rewrite_pending(self._plane0))
             else "disabled", command=self._on_promote)
         self._promote_btn.pack(side="left", padx=(6, 0))
+        if self._retry_rewrite:
+            _hover_tip(self._promote_btn,
+                       "Promotes this session's flips. With nothing "
+                       "flipped, it resyncs the filtered dF/F to the saved "
+                       "mask (clears Panel 3's [!] drift); you confirm "
+                       "first.")
 
         self._train_status_var = tk.StringVar(value="")
         ctk.CTkLabel(btn_frame, textvariable=self._train_status_var
@@ -751,12 +793,28 @@ class CurationPopout(ctk.CTkToplevel):
         if not self._flipped:
             # Nothing new to promote: the mask is already saved, so just
             # retry the filtered dF/F rewrite (a cancelled failure leaves
-            # it on the old cell set).
-            if self._retry_rewrite and self._on_iscell_changed is not None:
-                try:
-                    self._on_iscell_changed(-1, -1)
-                except Exception:
-                    pass
+            # it on the old cell set, as does keep-mask drift).
+            if not (self._retry_rewrite
+                    and self._on_iscell_changed is not None):
+                return
+            if not _filtered_rewrite_pending(self._plane0):
+                self._train_status_var.set(
+                    "Filtered dF/F already matches the saved mask")
+                return
+            old_n, new_n = _kept_counts(self._plane0, self._n_total)
+            if not messagebox.askyesno(
+                    "Resync filtered dF/F",
+                    f"The filtered dF/F that Tabs 4-8 read keeps {old_n} "
+                    f"ROIs, but the saved keep mask now keeps {new_n}.\n\n"
+                    f"Rewrite the filtered dF/F to the saved mask? Results "
+                    f"already computed in Tab 4 (low-pass), Tab 5 (events), "
+                    f"Tab 6 (clusters) and Tab 7 (cross-correlation) will "
+                    f"need re-running."):
+                return
+            try:
+                self._on_iscell_changed(-1, -1)
+            except Exception:
+                pass
             return
         if self._iscell is None:
             # Retry: a reused popout may predate a fixed/re-written file.

@@ -1715,8 +1715,7 @@ class Suite2pTab(ctk.CTkFrame):
                 owner: dict = {}
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
-                    on_iscell_changed=lambda i, v: self._on_iscell_flipped(
-                        i, v, plane0=getattr(owner.get("w"), "_plane0", None)),
+                    on_iscell_changed=self._curation_callback(owner),
                     get_size_outlier_z=lambda: float(
                         self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
@@ -1730,6 +1729,13 @@ class Suite2pTab(ctk.CTkFrame):
             owner["w"] = popout
             self._curation_popout = popout
         popout.show_roi(roi_idx)
+
+    def _curation_callback(self, owner: dict):
+        """Popout callback that reports the window's recording as of the
+        call (``owner["w"]``, set once built), so a scratch -> final
+        repoint carries over."""
+        return lambda i, v: self._on_iscell_flipped(
+            i, v, plane0=getattr(owner.get("w"), "_plane0", None))
 
     def _repoint_after_copy(self, scratch: Path, final: Path) -> None:
         """BatchTab calls this after a row's scratch->HDD copy so we
