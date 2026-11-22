@@ -35,3 +35,29 @@ def test_changed_cell_set_still_refused(tmp_path):
     np.save(p / "predicted_cell_mask.npy", np.array([1, 1, 1, 1], bool))
     detection_run.compute_filtered_dff(p)
     assert not inputs_still_match(p, made_from, generation.cluster_input(p, True))
+
+
+def _fake_tab(p, made_from):
+    from types import SimpleNamespace
+    from calliope.tabs.clustering.tab import ClusteringTab
+    from calliope.core import utils
+    prefix = "r0p7_filtered_"
+    Z = np.array([[0, 1, 1.0, 2], [2, 3, 2.0, 3]])   # 3 leaves
+    ids = np.where(np.load(p / "r0p7_cell_mask_bool.npy"))[0]
+    fake = SimpleNamespace(
+        _Z=Z, _plane0=p, _prefix=prefix, _cluster_inputs=made_from,
+        _visual_to_label={1: 1},
+        _current_threshold=lambda: 5.0,
+        _compute_visual_cluster_map=lambda T: {1: 1},
+        _linkage_ids_current=lambda: ids,
+        _existing_cluster_dir=lambda plane0, pre: plane0 / f"{pre}cluster_results")
+    assert utils.is_filtered_prefix(prefix)
+    return ClusteringTab._export_clusters.__get__(fake)
+
+
+def test_export_after_legacy_reload_and_unchanged_rewrite(tmp_path):
+    p = _legacy_plane0(tmp_path, [1, 0, 1, 1])
+    export = _fake_tab(p, generation.cluster_input(p, True))
+    detection_run.compute_filtered_dff(p)        # unchanged keep rule
+    out = export()
+    assert (out / "C1_rois.npy").exists()
