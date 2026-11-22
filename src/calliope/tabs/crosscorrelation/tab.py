@@ -1319,6 +1319,18 @@ class CrossCorrelationTab(ctk.CTkFrame):
                     f"Run the full-recording cross-correlation first.\n\n"
                     f"Expected:\n{full_dir}")
             return
+        full_ok = self._xcorr_output_ok(prefix, cfolder, full_dir, quiet=quiet)
+        if full_ok is None:
+            return
+        # Per-event outputs are exported only when they match the current
+        # clusters / dF/F AND the event windows Tab 7 has loaded now.
+        windows = list(getattr(self, "_event_windows", None) or [])
+        per_event_ok = None
+        if per_event_dir.is_dir() and windows:
+            per_event_ok = self._xcorr_output_ok(
+                prefix, cfolder, per_event_dir, event_windows=windows,
+                quiet=True)
+        unverified = full_ok is False or per_event_ok is False
         from ...core.utils import save_folder_for_plane0
         save_folder = save_folder_for_plane0(self._plane0)
         figures_root = save_folder / "calliope_figures"
@@ -1339,13 +1351,16 @@ class CrossCorrelationTab(ctk.CTkFrame):
             # representative event (same choice as the headless runner).
             from ...core.crosscorrelation import _pick_representative_event_dir
             ev_dir = (_pick_representative_event_dir(per_event_dir)
-                      if per_event_dir.is_dir() else None)
+                      if per_event_ok is not None else None)
             if ev_dir is not None:
                 _save_violin_pair(
                     _load_pair_data(ev_dir),
                     save_path=xc_dir / "per_event.png",
                     title_suffix=f"per event: {ev_dir.name}")
                 n_files += 2
+            else:      # don't leave an earlier export's per-event figure
+                for ext in (".png", ".svg"):
+                    (xc_dir / f"per_event{ext}").unlink(missing_ok=True)
             manifest_path = write_export_manifest(
                 figures_root,
                 rec_id=rec_id, params={
@@ -1355,7 +1370,13 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 plane0=self._plane0, ckpt_path=None,
             )
             self.status_var.set(
-                f"Exported xcorr figures -> {xc_dir}")
+                f"Exported xcorr figures -> {xc_dir}"
+                + ("  (from outputs made before provenance stamps: not "
+                   "verified against the current clusters)" if unverified
+                   else "")
+                + ("" if ev_dir is not None or not per_event_dir.is_dir()
+                   else "  (per-event figure left out: out of date or no "
+                        "current event windows)"))
             if not quiet:
                 messagebox.showinfo(
                     "Export complete",
@@ -1366,6 +1387,28 @@ class CrossCorrelationTab(ctk.CTkFrame):
             self.status_var.set(f"Export failed: {e}")
             if not quiet:
                 messagebox.showerror("Export failed", str(e))
+
+    def _xcorr_output_ok(self, prefix: str, cfolder: str, out_root: Path,
+                         event_windows=None, quiet: bool = False):
+        """True / False (made before provenance stamps: shown with a
+        warning) when ``out_root`` matches the current clusters and dF/F;
+        None (after telling the user) when it was made from other inputs."""
+        from ...core import generation
+        from ...core.crosscorrelation import check_xcorr_output
+        base_dir = self._plane0 / f"{prefix}cluster_results" / cfolder
+        try:
+            ok = check_xcorr_output(self._plane0, prefix, base_dir, out_root,
+                                    event_windows=event_windows)
+        except (generation.StaleOutputError, OSError, ValueError) as e:
+            self.status_var.set(f"Cross-correlation outputs out of date: {e}")
+            if not quiet:
+                messagebox.showerror("Cross-correlation out of date", str(e))
+            return None
+        if not ok:
+            self.status_var.set(
+                f"{out_root.name}: made before provenance stamps; can't "
+                f"confirm it matches the current clusters (re-run to check).")
+        return ok
 
     def _on_violin(self) -> None:
         """Open a violin-plot window over the per-pair summary CSVs from the
@@ -1382,6 +1425,8 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 "No outputs",
                 f"Run the full-recording cross-correlation first.\n\n"
                 f"Expected:\n{xcorr_root}")
+            return
+        if self._xcorr_output_ok(prefix, cfolder, xcorr_root) is None:
             return
         try:
             # Resolve recording id robustly (handles both old
