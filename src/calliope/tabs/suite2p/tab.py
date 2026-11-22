@@ -1710,10 +1710,13 @@ class Suite2pTab(ctk.CTkFrame):
             try:
                 from ...core.detection_run import (
                     keep_rule_kwargs as _keep_rule_kwargs)
+                # Read the window's recording when the callback fires, so
+                # _repoint_after_copy (scratch -> final) carries over.
+                owner: dict = {}
                 popout = CurationPopout(
                     self.winfo_toplevel(), plane0, stat, ops_view,
-                    on_iscell_changed=lambda i, v, p=Path(plane0): (
-                        self._on_iscell_flipped(i, v, plane0=p)),
+                    on_iscell_changed=lambda i, v: self._on_iscell_flipped(
+                        i, v, plane0=getattr(owner.get("w"), "_plane0", None)),
                     get_size_outlier_z=lambda: float(
                         self._params.get("size_outlier_z", SIZE_OUTLIER_Z)),
                     get_ckpt_path=lambda: self.ckpt_var.get(),
@@ -1724,6 +1727,7 @@ class Suite2pTab(ctk.CTkFrame):
             except Exception as e:
                 messagebox.showerror("Curation popout failed", str(e))
                 return
+            owner["w"] = popout
             self._curation_popout = popout
         popout.show_roi(roi_idx)
 

@@ -114,3 +114,14 @@ def test_stale_window_never_rewrites_current_recording(tmp_path, monkeypatch):
         _regenerate_after_promote=lambda p: regen.append(p))
     s2p_tab.Suite2pTab._on_iscell_flipped(fake, -1, -1, plane0=tmp_path / "old")
     assert regen == [] and len(warned) == 1
+
+
+def test_matching_window_still_rewrites(tmp_path, monkeypatch):
+    regen = []
+    fake = SimpleNamespace(
+        _panel_cache={"plane0": tmp_path, "n_total": 4},
+        _redraw_with_bg=lambda: None,
+        _regenerate_after_promote=lambda p: regen.append(p))
+    monkeypatch.setattr(s2p_tab, "load_keep_mask", lambda p, n: None)
+    s2p_tab.Suite2pTab._on_iscell_flipped(fake, -1, -1, plane0=tmp_path)
+    assert regen == [tmp_path]
