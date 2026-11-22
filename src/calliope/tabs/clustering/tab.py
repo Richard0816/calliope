@@ -1477,7 +1477,9 @@ class ClusteringTab(ctk.CTkFrame):
         inputs = generation.cluster_input(
             self._plane0, _cu.is_filtered_prefix(self._prefix))
         made_from = getattr(self, "_cluster_inputs", None)
-        if made_from is not None and made_from != inputs:
+        from .logic import inputs_still_match
+        if made_from is not None and not inputs_still_match(
+                self._plane0, made_from, inputs):
             raise ValueError(
                 "The dF/F changed since this clustering ran (a rebuild or "
                 "a new cell set). Re-run clustering, then export.")
