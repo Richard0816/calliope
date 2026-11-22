@@ -954,13 +954,17 @@ def _windows_id(event_windows) -> str:
 
 def _begin_xcorr(out_root: Path) -> None:
     """Mark ``out_root`` pending, then clear the previous run's pair /
-    event folders so the stamp written at the end covers only this run."""
+    event folders so the stamp written at the end covers only this run.
+    Only folders this module writes are removed (``<pair>/<pair>_summary.csv``
+    and ``eventNNNN_*``); anything else a user put there is kept."""
+    import re
     import shutil
     from . import generation
     out_root = Path(out_root)
     generation._write(out_root / XCORR_STAMP, {"pending": True})
     for d in out_root.iterdir():
-        if d.is_dir():
+        if d.is_dir() and (re.match(r"event\d{4}_", d.name)
+                           or (d / f"{d.name}_summary.csv").exists()):
             shutil.rmtree(d)
 
 

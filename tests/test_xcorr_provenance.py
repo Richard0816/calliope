@@ -208,3 +208,13 @@ def test_per_event_stamp_without_windows_is_refused(tmp_path):
     xc._stamp_xcorr(out, xc._xcorr_inputs_id(p, PFX, cdir))   # no "events"
     with pytest.raises(gen.StaleOutputError, match="other event windows"):
         xc.check_xcorr_output(p, PFX, cdir, out, event_windows=w)
+
+
+def test_rerun_keeps_folders_it_did_not_write(tmp_path):
+    p, cdir = _recording(tmp_path)
+    out = _full(p)
+    mine = out / "my_notes"
+    mine.mkdir()
+    (mine / "plot.png").write_text("keep me")
+    out = _full(p)
+    assert (mine / "plot.png").read_text() == "keep me"
