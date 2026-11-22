@@ -998,6 +998,16 @@ def _begin_xcorr(out_root: Path) -> set:
     return set()
 
 
+def _fresh_dir(d: Path) -> None:
+    """A folder this run writes: start it empty (generated folders are
+    replaced whole), so nothing an interrupted earlier run left inside it
+    is read as this run's result."""
+    import shutil
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir()
+
+
 def _stamp_xcorr(out_root: Path, inputs: str, event_windows=None,
                  written=()) -> None:
     """Commit the run: its inputs and the folders it wrote (``written``)."""
@@ -1173,7 +1183,7 @@ def run_cluster_xcorr_full_fast(
             roisA = cluster_rois_s2p[cA]
             roisB = cluster_rois_s2p[cB]
             pair_dir = out_root / f"{cA}x{cB}"
-            pair_dir.mkdir(exist_ok=True)
+            _fresh_dir(pair_dir)
             written.add(pair_dir.name)
             summary_path = pair_dir / f"{cA}x{cB}_summary.csv"
 
@@ -1345,7 +1355,7 @@ def run_cluster_xcorr_per_event_fast(
             f"{s_sec:.2f}s_{e_sec:.2f}s".replace(".", "p")
         )
         ev_dir = out_root / ev_label
-        ev_dir.mkdir(exist_ok=True)
+        _fresh_dir(ev_dir)
         written.add(ev_label)
 
         # Crop dF/F for all ROIs once per event and z-score per cluster.

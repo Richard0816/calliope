@@ -267,3 +267,36 @@ def test_a_kept_folder_reused_by_the_run_is_listed(tmp_path):
     out = _full(p)
     assert "C1xC2" in xc.generated_dirs(out)
     assert "C1xC2" in _load_pair_data(out)
+
+
+def test_folder_left_by_an_interrupted_run_is_emptied_on_reuse(tmp_path):
+    # Run 1 (window A) completes. Run 2 (windows A, B) is interrupted after
+    # creating B's folder with a pair. Run 3 (window B only) reuses that
+    # unlisted folder: none of run 2's leftovers may be read as its result.
+    from calliope.tabs.crosscorrelation.tab import _load_pair_data
+    p, cdir = _recording(tmp_path)
+    out = xc.run_cluster_xcorr_per_event_fast(
+        p, PFX, 10.0, "", [(2.0, 6.0)], max_lag_seconds=0.5, use_gpu=False)
+    xc._begin_xcorr(out)                          # run 2 starts...
+    left = out / "event0000_10p00s_14p00s" / "C9xC9"
+    left.mkdir(parents=True)                      # ...writes, then dies
+    (left / "C9xC9_summary.csv").write_text("zero_lag_corr,best_lag_sec\n9,9\n")
+    out = xc.run_cluster_xcorr_per_event_fast(
+        p, PFX, 10.0, "", [(10.0, 14.0)], max_lag_seconds=0.5, use_gpu=False)
+    ev = out / "event0000_10p00s_14p00s"
+    assert ev.name in xc.generated_dirs(out)
+    assert "C9xC9" not in _load_pair_data(ev)
+
+
+def test_pair_folder_left_by_an_interrupted_run_is_emptied_on_reuse(tmp_path):
+    # An interrupted full run left C1xC2/ holding a stray summary that sorts
+    # before the real one; the next run must replace the folder whole.
+    from calliope.tabs.crosscorrelation.tab import _load_pair_data
+    p, cdir = _recording(tmp_path)
+    root = cdir / "cross_correlation_full"
+    left = root / "C1xC2"
+    left.mkdir(parents=True)
+    (left / "0old_summary.csv").write_text("zero_lag_corr,best_lag_sec\n9,9\n")
+    out = _full(p)
+    assert not (out / "C1xC2" / "0old_summary.csv").exists()
+    assert (_load_pair_data(out)["C1xC2"]["zero_lag_corr"] != 9).all()
