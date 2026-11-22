@@ -1256,17 +1256,22 @@ class CrossCorrelationTab(ctk.CTkFrame):
                 self._apply_event_windows([])
                 return
         self._apply_event_windows(evts, token=current)
-        if from_disk and not held:
-            self._events_status("Event windows read without the summary lock "
-                                "(recording folder not writable to you).")
-        elif from_disk and not evts:
+        if not from_disk:
+            return
+        notes = []
+        if not held:
+            notes.append("Event windows read without the summary lock "
+                         "(recording folder not writable to you).")
+        if not evts:
             default = summary_writer.summary_path(self._plane0)
             others = [x.name for x in self._plane0.glob("*summary*.xlsx")
                       if x != default]
             if others:
-                self._events_status(
-                    f"No events in {default.name}; {', '.join(others)} not "
-                    f"used (no provenance stamp). Re-run Tab 5.")
+                notes.append(f"No events in {default.name}; "
+                             f"{', '.join(others)} not used (no provenance "
+                             f"stamp). Re-run Tab 5.")
+        if notes:
+            self._events_status(" ".join(notes))
 
     def _event_windows_from_state(self, current=None):
         """Return Tab 5's in-memory ``[(start_s, end_s), ...]`` for the

@@ -334,3 +334,31 @@ def test_selecting_a_folder_keeps_the_event_message(tmp_path, monkeypatch):
     me._on_refresh_events = lambda: t7.CrossCorrelationTab._on_refresh_events(me)
     t7.CrossCorrelationTab._set_plane0(me, p)
     assert status[-1].startswith("Ready.") and "old_summary.xlsx not used" in status[-1]
+
+
+def test_read_only_and_alternate_workbook_messages_both_show(tmp_path, monkeypatch):
+    import builtins
+    import errno
+    from types import SimpleNamespace
+    from calliope.tabs.crosscorrelation import tab as t7
+    p = _plane0(tmp_path)
+    _write(p, windows=())
+    summary_writer.write_events_sheets(
+        p, event_windows=[(3.0, 4.0)], onsets_by_roi=[np.array([3.5])] * N,
+        roi_ids=list(range(N)), filename="old_summary.xlsx")
+
+    def no_lock_file(path, *a, **k):
+        if str(path).endswith(".lock"):
+            raise PermissionError(errno.EACCES, "read-only", str(path))
+        return builtins.open(path, *a, **k)
+
+    monkeypatch.setattr(summary_writer, "open", no_lock_file, raising=False)
+    status = []
+    me = SimpleNamespace(_plane0=p, state=None,
+                         status_var=SimpleNamespace(set=status.append),
+                         _event_windows_from_state=lambda cur: None,
+                         _apply_event_windows=lambda ev, token=None: None)
+    me._events_status = lambda m: t7.CrossCorrelationTab._events_status(me, m)
+    t7.CrossCorrelationTab._on_refresh_events(me)
+    assert "without the summary lock" in status[-1]
+    assert "old_summary.xlsx not used" in status[-1]
