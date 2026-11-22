@@ -76,6 +76,13 @@ def test_unchanged_mask_skips_rewrite(tmp_path):
     assert not s2p_tab.Suite2pTab._filtered_matches_keep(p)
 
 
+def test_truncated_filtered_file_is_rewritten(tmp_path):
+    p = _plane0(tmp_path, [1, 0, 1, 1])
+    with open(p / "r0p7_filtered_dff.memmap.float32", "r+b") as fh:
+        fh.truncate(8)
+    assert not s2p_tab.Suite2pTab._filtered_matches_keep(p)
+
+
 def test_unchanged_promote_keeps_handles(tmp_path, monkeypatch):
     p = _plane0(tmp_path, [1, 0, 1, 1])
     fake, calls = _fake_tab(fail_times=0)

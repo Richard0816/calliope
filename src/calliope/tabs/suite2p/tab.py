@@ -1916,10 +1916,16 @@ class Suite2pTab(ctk.CTkFrame):
         from ...core import detection_run, generation
         try:
             generation.check_filtered(plane0, need_cells=False)
-            n_total = np.load(plane0 / "F.npy", mmap_mode="r").shape[0]
+            n_total, T = np.load(plane0 / "F.npy", mmap_mode="r").shape
             keep = detection_run._load_keep_mask(plane0, n_total)
             frozen = generation.frozen_mask_hash(plane0)
-            return frozen is not None and generation.mask_hash(keep) == frozen
+            if frozen is None or generation.mask_hash(keep) != frozen:
+                return False
+            n_kept = int(keep.sum())
+            # Zero-cell runs keep no memmap; otherwise it must be whole.
+            return n_kept == 0 or (
+                plane0 / "r0p7_filtered_dff.memmap.float32"
+            ).stat().st_size == 4 * T * n_kept
         except Exception:
             return False
 
