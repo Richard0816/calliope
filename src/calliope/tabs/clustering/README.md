@@ -184,6 +184,7 @@ The button is enabled only when both files exist for the active prefix:
 2. `thr = float(np.load(threshold_used.npy)[0])` — the cut at which the user clicked Export.
 3. `_, T, N, _ = load_filtered_dff(...)` — only to read the current column count.
 4. **Validation:** `Z.shape[0] + 1 == N`, and the ordered Suite2p ids the linkage was built on (`linkage_roi_ids.npy`; for older exports, the sorted union of the `C*_rois.npy` files when the `_indices_are_suite2p` marker is present) must equal the current kept ids (`core.clustering.linkage_roi_ids`). A promotion can swap kept ROIs at the same count (`[0,1,3]` → `[0,2,3]`), so the count alone is not enough. On a mismatch the reload aborts with a clear error rather than silently misaligning ROIs to dendrogram leaves.
+   The payload's `inputs` records what the linkage stands for: its folder's `generation.json` stamp, or, for a clustering saved before stamps, the current inputs (`{"filtered": None}` on an unstamped run). Export compares that with the inputs on disk via `logic.inputs_still_match`, which also accepts `{"filtered": None}` against a later stamp with `legacy_ok` -- an unchanged keep-rule rewrite in the main GUI while a standalone Tab 6 window holds the reload no longer makes Export refuse (the same rule `generation.check_clusters` applies to saved clusters).
 5. `Lx`, `Ly` from `utils.load_plane_view`.
 6. `zmax = max(Z[:, 2])` for slider calibration.
 

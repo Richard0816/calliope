@@ -182,6 +182,20 @@ def reload_clustering_offload(plane0_str: str, prefix: str,
     }
 
 
+def inputs_still_match(plane0: Path, made_from: dict, now: dict) -> bool:
+    """Whether a clustering made from ``made_from`` still describes the
+    inputs ``now`` on disk. A reload of a pre-stamp clustering records
+    ``{"filtered": None}``; an unchanged rewrite since then stamps the same
+    data with a real generation and ``legacy_ok``, which is the same rule
+    :func:`generation.check_clusters` applies to saved clusters."""
+    if made_from == now:
+        return True
+    from ...core import generation
+    return (set(made_from) == {"filtered"} == set(now)
+            and made_from["filtered"] is None
+            and generation._legacy_accepted(Path(plane0), now["filtered"]))
+
+
 def build_label_image(stat, Ly: int, Lx: int) -> np.ndarray:
     """Return a ``(Ly, Lx)`` int32 array where each painted pixel
     holds ``filtered_idx + 1`` (0 = background).
