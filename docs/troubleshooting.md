@@ -83,6 +83,24 @@ Batch rows always rebuild everything in order.
 interrupted (crash, closed window, full disk) while overwriting its
 files: run it again.
 
+## "Another process is rebuilding this recording's ROIs / dF/F"
+
+Only one process at a time may rebuild a recording's ROIs or full
+dF/F: for example, the GUI and a batch run, or two CalLIOPE windows, on
+the same recording folder. Wait for the other one to finish, then try
+again. If that process crashed, the recording is released automatically.
+
+**Known limitation: don't run two writers on one recording at once.**
+This check covers rebuilding the ROIs and dF/F, but not every
+combination. These cases are not guarded:
+- the gap between Tab 3's ROI merge and its dF/F step;
+- a Promote or re-apply running while another process rebuilds;
+- two threads in one process;
+- an import or merge that fails before its dF/F step: another process
+  sees "busy" until the failed worker exits.
+Never run two CalLIOPE processes that write the same recording folder
+at the same time.
+
 ## First run is slow / downloads ~1 GB
 
 Expected. The first Detection run downloads the Cellpose-SAM model

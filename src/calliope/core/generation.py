@@ -108,23 +108,88 @@ def frozen_mask_hash(plane0: Path) -> Optional[str]:
 
 # --- full dF/F ------------------------------------------------------------
 
+class DffBuildBusy(RuntimeError):
+    """Another process is rebuilding this recording's dF/F right now."""
+
+
+# plane0 -> {"cm": entered busy-lock context, "builds": live build ids}
+_BUSY: dict = {}
+
+
+def _claim_builder(plane0: Path) -> None:
+    """Hold <plane0>/r0p7_dff_build.busy.lock for the whole build (from
+    ``new_dff_build`` to ``finish_dff_build`` / ``abort_dff_build``), so
+    two processes can never write one recording's ROIs or dF/F at once.
+    The OS frees it if the holder dies. Re-entrant within a process."""
+    key = str(Path(plane0).resolve())
+    if key in _BUSY:
+        return
+    from .summary_writer import _workbook_lock
+    cm = _workbook_lock(Path(plane0) / "r0p7_dff_build.busy", timeout_s=2.0)
+    try:
+        cm.__enter__()
+    except TimeoutError:
+        raise DffBuildBusy(
+            f"{plane0}: another process is rebuilding this recording's "
+            f"ROIs / dF/F; wait for it to finish, then try again.") from None
+    _BUSY[key] = {"cm": cm, "builds": set()}
+
+
+def _release_builder(plane0: Path, build_id: Optional[str] = None) -> None:
+    """Drop ``build_id`` (all builds if None); free the recording for other
+    processes once this process has no live build of it left."""
+    key = str(Path(plane0).resolve())
+    entry = _BUSY.get(key)
+    if entry is None:
+        return
+    if build_id is None:
+        entry["builds"].clear()
+    else:
+        entry["builds"].discard(build_id)
+    if not entry["builds"]:
+        del _BUSY[key]
+        entry["cm"].__exit__(None, None, None)
+
+
+def abort_dff_build(plane0: Path, build_id: Optional[str] = None) -> None:
+    """A build that failed: leave its stamp pending (downstream refused)
+    and, once no other build of it is live here, let other processes
+    rebuild."""
+    _release_builder(plane0, build_id)
+
+
 def new_dff_build(plane0: Path) -> str:
     """Call before overwriting anything the full dF/F depends on (detection
     outputs, or the dF/F memmap itself). Until :func:`finish_dff_build`,
-    everything downstream is refused."""
+    everything downstream is refused. Raises ``DffBuildBusy`` if another
+    process is mid-build on the same recording."""
     build = uuid.uuid4().hex
-    _write(Path(plane0) / BUILD_FILE, {"build_id": build, "complete": False})
+    _claim_builder(plane0)
+    # A new build supersedes any earlier one of this recording in this
+    # process (e.g. the ROI merge's, finished by the dF/F build that follows).
+    _BUSY[str(Path(plane0).resolve())]["builds"] = {build}
+    try:
+        _write(Path(plane0) / BUILD_FILE,
+               {"build_id": build, "complete": False})
+    except BaseException:
+        _release_builder(plane0, build)
+        raise
     return build
 
 
 def finish_dff_build(plane0: Path, build_id: str) -> None:
     """Mark ``build_id`` complete -- only if it is still the build on disk
-    (another writer may have started a newer one meanwhile)."""
+    (another writer may have started a newer one meanwhile). The builder
+    lock (see ``_claim_builder``) keeps other processes from starting one
+    until this returns; it is released here."""
     p = Path(plane0) / BUILD_FILE
-    d = _read(p)
-    if d is not None and d.get("build_id") == build_id:
-        d["complete"] = True
-        _write(p, d)
+    try:
+        d = _read(p)
+        if d is not None and d.get("build_id") == build_id:
+            d["complete"] = True
+            _write(p, d)
+    finally:
+        _release_builder(plane0, build_id)
 
 
 def dff_build_id(plane0: Path) -> Optional[str]:
