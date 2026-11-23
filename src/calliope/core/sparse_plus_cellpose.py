@@ -151,12 +151,16 @@ HARD_CAP = 60000
 # covered by the union of sparsery ROIs.
 CELLPOSE_MERGE_MAX_OVERLAP = 0.3
 
-# Rough peak of Suite2p detection relative to its binned movie (the float32
-# movie plus the normalised / downsampled copies Sparsery makes). UNCALIBRATED:
-# the only evidence is one 1024x1024 x 10,923-frame in vivo run (10.7 GiB binned)
-# that died with roughly 15 GiB committable, so the true factor is >= ~1.4 and its
-# upper bound is unknown. That is why check_detection_memory only warns.
-DETECTION_MEM_FACTOR = 2.0
+# Extra memory Suite2p detection (the Sparsery pass) commits: a fixed part plus
+# a multiple of the binned float32 movie. PROVISIONAL (3 points, 1 movie): first
+# 300 / 1000 / 2000 frames of one 1024x1024 in vivo movie, bin size 4, private
+# bytes sampled every 0.5 s (2026-11-22). The Sparsery-stage rise was 2.73 GiB at
+# 0.29 GiB binned, 4.94 at 0.98 and >= 8.87 at 1.95 (that run was stopped at 92%
+# commit), i.e. ~1.8 GiB + 3.2-4.0 x binned. Later stages (Cellpose, extraction)
+# are not modelled; they peaked higher (10.1 vs 7.7 GiB private at 1000 frames).
+# That is why check_detection_memory only warns.
+DETECTION_MEM_FIXED_BYTES = 2 * 2**30
+DETECTION_MEM_FACTOR = 4.0
 
 
 def available_commit_bytes() -> int | None:
@@ -192,15 +196,17 @@ def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
 
     Uses Suite2p's own binning rule (``bin_size = max(1, nframes // nbins,
     round(tau * fs))`` unless ``detection.bin_size`` is set) and
-    ``DETECTION_MEM_FACTOR``. Warns above 80% of the memory that can still be
-    committed, and always warns (even when not verbose) above 100%. It never
-    stops the run: the factor is uncalibrated. Returns the estimate in bytes.
+    ``DETECTION_MEM_FIXED_BYTES + DETECTION_MEM_FACTOR x`` the binned float32
+    movie. Warns above 80% of the memory that can still be committed, and always
+    warns (even when not verbose) above 100%. It never stops the run: the
+    estimate is provisional. Returns the estimate in bytes.
     """
     det = settings.get("detection", {}) or {}
     bin_size = det.get("bin_size") or max(
         1, nframes // max(1, int(det.get("nbins") or 5000)),
         int(round(float(settings.get("tau", 1.0)) * float(settings.get("fs", 10.0)))))
-    need = int(DETECTION_MEM_FACTOR * (nframes // int(bin_size)) * Ly * Lx * 4)
+    need = int(DETECTION_MEM_FIXED_BYTES
+               + DETECTION_MEM_FACTOR * (nframes // int(bin_size)) * Ly * Lx * 4)
     avail = available_commit_bytes()
     if avail is None:
         return need
@@ -209,7 +215,7 @@ def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
            f"bin size {bin_size}) but only {gb(avail):.1f} GB can still be committed "
            f"(RAM + page file).")
     if need > avail:
-        print(f"[s+cp] WARNING: {msg} The {DETECTION_MEM_FACTOR:g}x estimate is uncalibrated, but "
+        print(f"[s+cp] WARNING: {msg} The estimate is provisional (3 points, 1 movie), but "
               "this run may fail in detection. To be safe, close other programs, enlarge the page "
               "file on an NTFS drive, or crop/split the recording.", flush=True)
     elif verbose and need > 0.8 * avail:

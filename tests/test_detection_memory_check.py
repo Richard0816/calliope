@@ -13,17 +13,19 @@ def test_estimate_follows_suite2p_binning(monkeypatch):
     monkeypatch.setattr(spc, "available_commit_bytes", lambda: 2**50)
     # bin_size = max(1, 10923 // 5000, round(0.25 * 15.17)) = 4 -> 2730 binned frames
     need = spc.check_detection_memory(1024, 1024, 10923, SETTINGS, verbose=False)
-    assert need == int(spc.DETECTION_MEM_FACTOR * 2730 * 1024 * 1024 * 4)
+    assert need == int(spc.DETECTION_MEM_FIXED_BYTES
+                       + spc.DETECTION_MEM_FACTOR * 2730 * 1024 * 1024 * 4)
+    assert (spc.DETECTION_MEM_FIXED_BYTES, spc.DETECTION_MEM_FACTOR) == (2 * 2**30, 4.0)
 
 
 def test_warns_but_never_stops_when_commit_is_short(monkeypatch, capsys):
-    # The factor is uncalibrated, so over the limit it warns (even when not
+    # The estimate is provisional, so over the limit it warns (even when not
     # verbose) and the run goes on.
     monkeypatch.setattr(spc, "available_commit_bytes", lambda: 10 * 2**30)
     spc.check_detection_memory(1024, 1024, 10923, SETTINGS, verbose=False)
     out = capsys.readouterr().out
     assert "WARNING" in out and "can still be committed" in out
-    assert "uncalibrated" in out and "may fail" in out
+    assert "provisional (3 points, 1 movie)" in out and "may fail" in out
 
 
 def test_warns_near_the_limit_and_passes_when_ample(monkeypatch, capsys):
