@@ -1416,8 +1416,11 @@ def run_cluster_xcorr_per_event_fast(
     return out_root
 
 
-class XcorrAborted(Exception):
-    """Raised inside the offload child when the user requests an abort."""
+class XcorrAborted(BaseException):
+    """Raised inside the offload child when the user requests an abort.
+
+    A ``BaseException`` so the runners' ``except Exception`` guards around
+    ``progress_cb`` let it through (as ``KeyboardInterrupt`` would)."""
 
 
 def run_cluster_xcorr_offload(mode: str, plane0_str: str, *,
