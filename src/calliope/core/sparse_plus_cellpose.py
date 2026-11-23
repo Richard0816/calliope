@@ -191,16 +191,19 @@ def check_detection_memory(Ly: int, Lx: int, nframes: int, settings: dict,
     """Estimate Suite2p detection's peak memory and warn if it may not fit.
 
     Uses Suite2p's own binning rule (``bin_size = max(1, nframes // nbins,
-    round(tau * fs))`` unless ``detection.bin_size`` is set) and
+    round(tau * fs))`` unless ``detection.bin_size`` is set; Suite2p's
+    ``bin_movie`` then allocates ``min(nbins, nframes // bin_size)`` frames) and
     ``DETECTION_MEM_FACTOR``. Warns above 80% of the memory that can still be
     committed, and always warns (even when not verbose) above 100%. It never
     stops the run: the factor is uncalibrated. Returns the estimate in bytes.
     """
     det = settings.get("detection", {}) or {}
+    nbins = max(1, int(det.get("nbins") or 5000))
     bin_size = det.get("bin_size") or max(
-        1, nframes // max(1, int(det.get("nbins") or 5000)),
+        1, nframes // nbins,
         int(round(float(settings.get("tau", 1.0)) * float(settings.get("fs", 10.0)))))
-    need = int(DETECTION_MEM_FACTOR * (nframes // int(bin_size)) * Ly * Lx * 4)
+    nbinned = min(nbins, nframes // int(bin_size))
+    need = int(DETECTION_MEM_FACTOR * nbinned * Ly * Lx * 4)
     avail = available_commit_bytes()
     if avail is None:
         return need
