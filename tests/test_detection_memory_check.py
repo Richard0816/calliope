@@ -35,3 +35,14 @@ def test_warns_near_the_limit_and_passes_when_ample(monkeypatch, capsys):
     monkeypatch.setattr(spc, "available_commit_bytes", lambda: 10 * need)
     spc.check_detection_memory(1024, 1024, 10923, SETTINGS)
     assert capsys.readouterr().out == ""
+
+
+def test_binned_frames_capped_at_nbins_like_suite2p(monkeypatch):
+    # Suite2p's bin_movie allocates min(nbins, nframes // bin_size) frames:
+    # nbins 2500 -> bin_size max(1, 4, 4) = 4, 10923 // 4 = 2730 -> 2500.
+    monkeypatch.setattr(spc, "available_commit_bytes", lambda: 2**50)
+    s = {"tau": 0.25, "fs": 15.17, "detection": {"nbins": 2500, "bin_size": None}}
+    capped = spc.check_detection_memory(1024, 1024, 10923, s, verbose=False)
+    full = spc.check_detection_memory(1024, 1024, 10923, SETTINGS, verbose=False)
+    # Only the binned-movie term differs (any fixed part cancels).
+    assert full - capped == int(spc.DETECTION_MEM_FACTOR * (2730 - 2500) * 1024 * 1024 * 4)
