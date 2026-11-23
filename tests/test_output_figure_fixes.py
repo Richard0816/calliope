@@ -85,7 +85,9 @@ def test_tab7_export_plots_a_real_event(tmp_path, monkeypatch):
     monkeypatch.setattr(em, "write_export_manifest", lambda *a, **k: tmp_path / "m.json")
     var = lambda v: SimpleNamespace(get=lambda: v, set=lambda *_: None)
     stub = SimpleNamespace(_plane0=plane0, prefix_var=var("r0p7_filtered_"),
-                           cfolder_var=var(""), status_var=var(""))
+                           cfolder_var=var(""), status_var=var(""),
+                           _event_windows=[(0.0, 1.0)])
+    stub._xcorr_output_ok = lambda *a, **k: t7.CrossCorrelationTab._xcorr_output_ok(stub, *a, **k)
     t7.CrossCorrelationTab._on_export_figures(stub, quiet=True)
     pe, title = seen["per_event.png"]
     assert set(pe) == {"C1xC1"} and "event0003_x" in title

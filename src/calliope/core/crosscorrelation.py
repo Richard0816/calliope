@@ -923,6 +923,129 @@ def _check_xcorr_inputs(plane0: Path, prefix: str, base_dir: Path) -> None:
         generation.dff_build_id(plane0)
 
 
+XCORR_STAMP = "xcorr_generation.json"
+
+
+def _xcorr_inputs_id(plane0: Path, prefix: str, base_dir: Path) -> str:
+    """Identity of what a Tab 7 run is computed from: the cluster
+    assignment (Suite2p ids per cluster), the dF/F it slices, and the lag
+    sign convention (positive best_lag_sec = first cluster leads)."""
+    import hashlib
+    import json
+    from . import generation
+    from .utils import is_filtered_prefix
+    plane0, base_dir = Path(plane0), Path(base_dir)
+    clusters = _load_clusters_from_dir(
+        base_dir, keep_mask=_load_keep_mask(plane0, prefix))
+    data = (generation.check_filtered(plane0) if is_filtered_prefix(prefix)
+            else generation.dff_build_id(plane0))
+    payload = {"prefix": prefix, "data": data, "lag_sign": "first_leads",
+               "clusters": {str(k): sorted(int(i) for i in np.ravel(v))
+                            for k, v in clusters.items()}}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _windows_id(event_windows) -> str:
+    import hashlib
+    import json
+    w = [[round(float(s), 6), round(float(e), 6)] for s, e in event_windows]
+    return hashlib.sha1(json.dumps(w).encode()).hexdigest()
+
+
+def generated_dirs(out_root: Path) -> Optional[set]:
+    """Names of the subfolders the last completed run wrote into
+    ``out_root`` (from its stamp), or None for outputs made before stamps
+    listed them. Readers use only these, so other folders a user keeps
+    there are never read as results."""
+    from . import generation
+    try:
+        stamp = generation._read(Path(out_root) / XCORR_STAMP)
+    except generation.StaleOutputError:
+        return None
+    if not stamp or stamp.get("pending") or "dirs" not in stamp:
+        return None
+    return set(stamp["dirs"])
+
+
+def _begin_xcorr(out_root: Path) -> set:
+    """Mark ``out_root`` pending, then remove the previous run's folders
+    (those its stamp lists; for older runs, ``<pair>/<pair>_summary.csv``
+    and ``eventNNNN_*``). Generated folders are replaced whole; any other
+    folder is kept. The pending stamp keeps the previous listing, so a run
+    interrupted here doesn't lose track of which folders are generated.
+    Returns an empty set the runner fills with the folders it writes."""
+    import re
+    import shutil
+    from . import generation
+    out_root = Path(out_root)
+    try:
+        old = generation._read(out_root / XCORR_STAMP) or {}
+    except generation.StaleOutputError:
+        old = {}
+    previous = set(old["dirs"]) if "dirs" in old else None
+    generation._write(out_root / XCORR_STAMP,
+                      {"pending": True,
+                       **({"dirs": sorted(previous)} if previous is not None
+                          else {})})
+    for d in out_root.iterdir():
+        if not d.is_dir():
+            continue
+        ours = (d.name in previous if previous is not None
+                else (re.match(r"event\d{4}_", d.name)
+                      or (d / f"{d.name}_summary.csv").exists()))
+        if ours:
+            shutil.rmtree(d)
+    return set()
+
+
+def _fresh_dir(d: Path) -> None:
+    """A folder this run writes: start it empty (generated folders are
+    replaced whole), so nothing an interrupted earlier run left inside it
+    is read as this run's result."""
+    import shutil
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir()
+
+
+def _stamp_xcorr(out_root: Path, inputs: str, event_windows=None,
+                 written=()) -> None:
+    """Commit the run: its inputs and the folders it wrote (``written``)."""
+    from . import generation
+    out_root = Path(out_root)
+    d = {"inputs": inputs, "dirs": sorted(set(written))}
+    if event_windows is not None:
+        d["events"] = _windows_id(event_windows)
+    generation._write(Path(out_root) / XCORR_STAMP, d)
+
+
+def check_xcorr_output(plane0: Path, prefix: str, base_dir: Path,
+                       out_root: Path, event_windows=None) -> bool:
+    """True when ``out_root`` (a Tab 7 output folder) was computed from the
+    current clusters in ``base_dir`` and the current dF/F (and, if given,
+    these ``event_windows``). False when it predates these stamps and so
+    can't be checked. Raises ``StaleOutputError`` when it was made from
+    other inputs or the run never finished."""
+    from . import generation
+    stamp = generation._read(Path(out_root) / XCORR_STAMP)
+    if stamp is None:
+        return False
+    if stamp.get("pending"):
+        raise generation.StaleOutputError(
+            f"{out_root}: the cross-correlation run did not finish; "
+            f"re-run it.")
+    if stamp.get("inputs") != _xcorr_inputs_id(plane0, prefix, base_dir):
+        raise generation.StaleOutputError(
+            f"{out_root}: computed from other clusters or dF/F than the "
+            f"current ones; re-run the cross-correlation.")
+    if (event_windows is not None
+            and stamp.get("events") != _windows_id(event_windows)):
+        raise generation.StaleOutputError(
+            f"{out_root}: computed for other event windows than the "
+            f"current ones; re-run the per-event cross-correlation.")
+    return True
+
+
 def run_cluster_xcorr_full_fast(
     plane0: Path,
     prefix: str,
@@ -990,6 +1113,8 @@ def run_cluster_xcorr_full_fast(
 
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
+    inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
+    written = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
 
@@ -1058,7 +1183,8 @@ def run_cluster_xcorr_full_fast(
             roisA = cluster_rois_s2p[cA]
             roisB = cluster_rois_s2p[cB]
             pair_dir = out_root / f"{cA}x{cB}"
-            pair_dir.mkdir(exist_ok=True)
+            _fresh_dir(pair_dir)
+            written.add(pair_dir.name)
             summary_path = pair_dir / f"{cA}x{cB}_summary.csv"
 
             best_lag, max_c, z0 = batch_xcorr_clusters(
@@ -1152,6 +1278,7 @@ def run_cluster_xcorr_full_fast(
         cluster_Z.clear()
         _release_gpu_pools()
 
+    _stamp_xcorr(out_root, inputs_id, written=written)
     return out_root
 
 
@@ -1206,6 +1333,8 @@ def run_cluster_xcorr_per_event_fast(
 
     out_root = base_dir / output_subdir
     out_root.mkdir(parents=True, exist_ok=True)
+    inputs_id = _xcorr_inputs_id(plane0, prefix, base_dir)
+    written = _begin_xcorr(out_root)
 
     gpu_ok = bool(use_gpu and cp is not None)
     cluster_names = _xcorr_cluster_names(cluster_rois_s2p)
@@ -1226,7 +1355,8 @@ def run_cluster_xcorr_per_event_fast(
             f"{s_sec:.2f}s_{e_sec:.2f}s".replace(".", "p")
         )
         ev_dir = out_root / ev_label
-        ev_dir.mkdir(exist_ok=True)
+        _fresh_dir(ev_dir)
+        written.add(ev_label)
 
         # Crop dF/F for all ROIs once per event and z-score per cluster.
         clip = np.asarray(dff[f0:f1, :], dtype=np.float32, order="C")
@@ -1282,6 +1412,7 @@ def run_cluster_xcorr_per_event_fast(
     if gpu_ok:
         _release_gpu_pools()
 
+    _stamp_xcorr(out_root, inputs_id, event_windows, written=written)
     return out_root
 
 
@@ -1396,10 +1527,11 @@ def _pick_representative_event_dir(per_event_root: Path) -> Optional[Path]:
     for the most pair data). Returns None if no event subfolder carries pairs.
     """
     per_event_root = Path(per_event_root)
+    ours = generated_dirs(per_event_root)
     best: Optional[Path] = None
     best_key = (-1, -1)
     for d in sorted(per_event_root.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or (ours is not None and d.name not in ours):
             continue
         csvs = list(d.glob("*/*_summary.csv"))
         if not csvs:
