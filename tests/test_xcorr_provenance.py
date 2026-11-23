@@ -300,3 +300,18 @@ def test_pair_folder_left_by_an_interrupted_run_is_emptied_on_reuse(tmp_path):
     out = _full(p)
     assert not (out / "C1xC2" / "0old_summary.csv").exists()
     assert (_load_pair_data(out)["C1xC2"]["zero_lag_corr"] != 9).all()
+
+
+@pytest.mark.parametrize("mode", ["full", "per_event"])
+def test_abort_stops_the_run(tmp_path, mode):
+    # The runners guard progress_cb with `except Exception`; the Abort
+    # button's XcorrAborted must get through and end the run as aborted.
+    import threading
+    p, _ = _recording(tmp_path)
+    evt = threading.Event()
+    evt.set()
+    res = xc.run_cluster_xcorr_offload(
+        mode, str(p), event_windows=[(2.0, 6.0), (6.0, 9.0)], abort_evt=evt,
+        prefix=PFX, fps=10.0, cluster_folder="", max_lag_seconds=0.5,
+        use_gpu=False)
+    assert res == {"mode": mode, "aborted": True, "out": None}
