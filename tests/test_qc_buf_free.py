@@ -36,21 +36,59 @@ def _old_gif(frames, path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _capture_movies(monkeypatch):
+    """Record every stack handed to make_qc_gif (still encoding it)."""
+    seen, real = [], pp.make_qc_gif
+    monkeypatch.setattr(pp, "make_qc_gif",
+                        lambda movie, *a, **k: (seen.append(movie.copy()),
+                                                real(movie, *a, **k)))
+    return seen
+
+
 @pytest.mark.parametrize("ds", [1, 3, 4, 20])
-def test_group_gif_bytes_match_np_stack(tmp_path, ds):
+def test_group_gif_bytes_match_np_stack(tmp_path, monkeypatch, ds):
     # 7 + 6 frames: with ds=3 or 4 the global sample stride crosses the file
     # boundary, so the order across files is part of what's checked.
     srcs = [_raw(tmp_path / "rec_00001.tif", 7, 0),
             _raw(tmp_path / "rec_00002.tif", 6, 1)]
+    movies = _capture_movies(monkeypatch)
     res = pp.preprocess_tiff_group(srcs, tmp_path / "data",
                                    qc_params=dict(QC, downsample_t=ds))
     whole = np.concatenate([tifffile.imread(str(p)) for p in res.shifted_paths])
+    # The sampled array itself, not just the GIF (whose normalisation would
+    # hide a constant offset).
+    assert movies[0].dtype == np.uint16
+    np.testing.assert_array_equal(movies[0], whole[::ds])
     assert Path(res.qc_gif).read_bytes() == _old_gif(whole[::ds],
                                                      tmp_path / "ref.gif")
     # Rerun reusing the shifted files (the scan-only branch): same bytes.
     res2 = pp.preprocess_tiff_group(srcs, tmp_path / "data",
                                     qc_params=dict(QC, downsample_t=ds))
     assert Path(res2.qc_gif).read_bytes() == (tmp_path / "ref.gif").read_bytes()
+    np.testing.assert_array_equal(movies[1], whole[::ds])
+
+
+def test_group_input_shrunk_between_passes_has_no_unwritten_slots(
+        tmp_path, monkeypatch):
+    # The second input is also the first one's output path, so writing the
+    # first output cuts it from 6 pages to 2 after pass 1 counted 8 in all.
+    rec = tmp_path / "data" / "rec"
+    rec.mkdir(parents=True)
+    a = _raw(rec / "raw.tif", 2, 0)
+    b = _raw(rec / "00_shifted_raw.tif", 6, 1)
+    movies = _capture_movies(monkeypatch)
+    res = pp.preprocess_tiff_group([a, b], tmp_path / "data",
+                                   recording_name="rec",
+                                   qc_params=dict(QC, downsample_t=1))
+    whole = np.concatenate([tifffile.imread(str(p)) for p in res.shifted_paths])
+    assert len(whole) == 4
+    np.testing.assert_array_equal(movies[0], whole)
+
+
+def test_qc_put_refuses_a_frame_past_the_counted_stack():
+    qc = pp._qc_put(None, 0, np.zeros((8, 10), np.uint16), 1)
+    with pytest.raises(ValueError, match="change between passes"):
+        pp._qc_put(qc, 1, np.zeros((8, 10), np.uint16), 1)
 
 
 def test_streaming_shift_gif_bytes_match_np_stack(tmp_path):
@@ -66,13 +104,15 @@ def test_streaming_shift_gif_bytes_match_np_stack(tmp_path):
 
 
 def test_empty_and_mismatched_frames():
-    e = pp._qc_finish(None, (8, 10))
+    e = pp._qc_finish(None, 0, 1, (8, 10))
     assert e.shape == (0, 8, 10) and e.dtype == np.uint16
     qc = pp._qc_put(None, 0, np.zeros((8, 10), np.uint16), 2)
     with pytest.raises(ValueError):
         pp._qc_put(qc, 1, np.zeros((1, 10), np.uint16), 2)
 
 
+@pytest.mark.skipif(tracemalloc.is_tracing(),
+                    reason="needs its own tracemalloc session (-X tracemalloc)")
 def test_streaming_peak_memory_is_one_qc_stack(tmp_path):
     # 300 frames of 128x128 at stride 1: the QC stack (9.8 MB) dominates
     # everything else the streaming shift holds (one frame, a float64 sum).

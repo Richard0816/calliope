@@ -313,7 +313,7 @@ def _shift_tiff_streaming(
     if sum_arr is None:
         raise ValueError(f"shift: source TIFF {src_tiff} has no pages")
     mean = (sum_arr / max(1, n_pages)).astype(np.float32)
-    qc_frames = _qc_finish(qc, sum_arr.shape)
+    qc_frames = _qc_finish(qc, i + 1, qc_step, sum_arr.shape)
     return mean, qc_frames, n_pages
 
 
@@ -327,6 +327,10 @@ def _qc_put(qc: Optional[np.ndarray], k: int, frame: np.ndarray,
     recording at downsample_t=4)."""
     if qc is None:
         qc = np.empty((n, *frame.shape), dtype=np.uint16)
+    if k >= qc.shape[0]:
+        raise ValueError(f"QC frame {k} but the page-count scan sized the "
+                         f"stack for {qc.shape[0]}; did an input TIFF change "
+                         f"between passes?")
     if frame.shape != qc.shape[1:]:
         raise ValueError(f"QC frame {k} has shape {frame.shape}, "
                          f"expected {qc.shape[1:]}")
@@ -334,11 +338,15 @@ def _qc_put(qc: Optional[np.ndarray], k: int, frame: np.ndarray,
     return qc
 
 
-def _qc_finish(qc: Optional[np.ndarray], shape_yx) -> np.ndarray:
-    """The filled QC stack; a (0, Y, X) array when no frame was sampled."""
+def _qc_finish(qc: Optional[np.ndarray], frames_seen: int, step: int,
+               shape_yx) -> np.ndarray:
+    """The filled part of the QC stack: the ``ceil(frames_seen / step)``
+    slots actually written, so no uninitialized slot can reach the GIF if a
+    file came out shorter than its pass-1 page count. A (0, Y, X) array when
+    no frame was sampled."""
     if qc is None:
         return np.empty((0, *shape_yx), dtype=np.uint16)
-    return qc
+    return qc[:-(-frames_seen // step)]
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +986,7 @@ def preprocess_tiff_group(
     log(f"[2/2]   mean over {total_frames} frames ({Y}x{X})")
 
     log("[2/2] Writing QC gif")
-    movie = _qc_finish(qc, (Y, X))
+    movie = _qc_finish(qc, qc_index, downsample_t, (Y, X))
     make_qc_gif(movie, gif_path, downsample_t=1, **qc_kwargs)
 
     log(f"Done. Output -> {out_dir}")
