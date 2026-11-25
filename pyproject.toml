@@ -114,6 +114,8 @@ include = [
     "src/calliope/**",
     "pyproject.toml",
     "README.md",
+    "LICENSE",
+    "NOTICE",
     ".gitignore",
 ]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
