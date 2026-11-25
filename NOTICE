@@ -1,0 +1,19 @@
+CalLIOPE
+Copyright (c) 2026 Richard Jiang
+
+CalLIOPE's own source code is licensed under the MIT License (see LICENSE).
+
+CalLIOPE does not include or redistribute third-party code. It depends on
+other packages that pip installs separately and that users obtain under
+their own licenses, including:
+
+  - Suite2p (pinned at 1.0.0.1): GNU General Public License v3 (GPL-3.0).
+    CalLIOPE imports Suite2p at runtime.
+  - fastremap and fill-voids: GNU Lesser General Public License v3
+    (LGPL-3.0), installed as dependencies of cellpose.
+  - Cellpose, PyTorch, NumPy, SciPy and the other dependencies: permissive
+    licenses (BSD, MIT, Apache 2.0 and similar).
+
+Anyone who redistributes CalLIOPE bundled with Suite2p, for example in a
+frozen executable or a container image, must comply with GPL-3.0 for the
+combined work. The pinned dependency versions are in requirements.txt.

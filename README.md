@@ -124,4 +124,8 @@ Changes that affect existing outputs, scripts or batch files:
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
+
+## Third-party licenses
+
+CalLIOPE depends on Suite2p (GPL-3.0, pinned at 1.0.0.1) and on other packages, including fastremap and fill-voids (LGPL-3.0, installed with cellpose). pip installs these separately and you obtain them under their own licenses. CalLIOPE does not include their code. If you redistribute CalLIOPE bundled with Suite2p, GPL-3.0 applies to the combined work. See [NOTICE](NOTICE).
