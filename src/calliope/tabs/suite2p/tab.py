@@ -50,8 +50,9 @@ What the user sees
 Threading
 ---------
 Detection takes minutes. The button handler ``_on_run`` snapshots
-form values, swaps stdout/stderr to a ``QueueWriter`` so library
-prints land in the GUI log, and launches a worker thread. The main
+form values and launches a worker thread, which routes its own
+stdout/stderr (only that thread's) to a ``QueueWriter`` so library
+prints land in the GUI log. The main
 thread polls the queue every POLL_MS and updates the log + figures.
 
 Writes r0p7_dff and r0p7_filtered_dff memmaps under <out_dir>/detection/
@@ -60,7 +61,6 @@ final/suite2p/plane0/.
 
 from __future__ import annotations
 
-import contextlib
 import queue
 import threading
 import time
@@ -90,7 +90,8 @@ from ...core.scale import FOV_UM_REFERENCE
 from ...core.utils import DEFAULT_FPS
 from ...gui_common import (
     AppState, QueueWriter, attach_fig_toolbar, attach_resize_handle,
-    drain_queue, open_advanced, report_stage_error, spec_defaults,
+    drain_queue, open_advanced, redirect_thread_output, report_stage_error,
+    spec_defaults,
     wrap_to_width,
 )
 
@@ -1182,8 +1183,10 @@ class Suite2pTab(ctk.CTkFrame):
                     params.get("sam_cellprob_threshold", -1.0)),
             }
 
-        with contextlib.redirect_stdout(writer), \
-                contextlib.redirect_stderr(writer):
+        # This worker thread's prints only: contextlib.redirect_stdout would
+        # swap sys.stdout for the whole process and swallow every other
+        # thread's prints (batch status lines) for the length of the run.
+        with redirect_thread_output(writer):
             print("[GUI] running sparse_plus_cellpose in a child process...")
             from ...core import sparse_plus_cellpose as spc
             from ...core.offload import call_in_child

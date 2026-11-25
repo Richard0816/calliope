@@ -43,8 +43,11 @@ importable module without pulling in the rest of the GUI.
 from __future__ import annotations
 
 # Standard-library bits we'll need.
+import contextlib
 import io        # Provides the ``TextIOBase`` base class for QueueWriter.
 import queue     # Thread-safe FIFO queue used by QueueWriter.
+import sys
+import threading
 import tkinter as tk
 from pathlib import Path  # Modern object-oriented filesystem path API.
 from tkinter import filedialog, messagebox, ttk
@@ -1414,6 +1417,106 @@ def restyle_matplotlib_toolbar(tb) -> None:
 # ---------------------------------------------------------------------------
 # Worker-thread stdout/stderr capture
 # ---------------------------------------------------------------------------
+
+class _ThreadRoutedStream(io.TextIOBase):
+    """Stand-in for ``sys.stdout`` / ``sys.stderr`` that sends each write to
+    the writer registered for the calling thread, or to the original stream
+    for every other thread. See :func:`redirect_thread_output`."""
+
+    def __init__(self, fallback) -> None:
+        # ``fallback`` is None under pythonw (no console), where a bare
+        # print() is a silent no-op; keep it one for unrouted threads.
+        self.fallback = fallback
+        self.routes: dict = {}   # thread ident -> writer
+
+    def _target(self):
+        return self.routes.get(threading.get_ident(), self.fallback)
+
+    def write(self, s: str) -> int:
+        t = self._target()
+        return len(s) if t is None else t.write(s)
+
+    def flush(self) -> None:
+        t = self._target()
+        if t is not None:
+            t.flush()
+
+    def isatty(self) -> bool:
+        t = self._target()
+        return (t is self.fallback and t is not None
+                and bool(getattr(t, "isatty", lambda: False)()))
+
+    def fileno(self) -> int:
+        if self._target() is not self.fallback or self.fallback is None:
+            raise io.UnsupportedOperation("fileno")
+        return self.fallback.fileno()
+
+    def writable(self) -> bool:
+        return True
+
+    # Unrelated threads may use the rest of the stream interface while a
+    # route is active (sys.stdout.buffer.write, .encoding): hand it to the
+    # calling thread's target. TextIOBase defines encoding/errors as None,
+    # so those two are explicit; anything else falls to __getattr__.
+    @property
+    def encoding(self):
+        return getattr(self._target(), "encoding", None)
+
+    @property
+    def errors(self):
+        return getattr(self._target(), "errors", None)
+
+    def __getattr__(self, name):
+        if name in ("routes", "fallback"):   # not set yet: no recursion
+            raise AttributeError(name)
+        t = self._target()
+        if t is None:
+            raise AttributeError(name)
+        return getattr(t, name)
+
+
+_route_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def redirect_thread_output(writer):
+    """Send ``print`` output (stdout and stderr) from THIS thread only to
+    ``writer`` for the duration of the block.
+
+    ``contextlib.redirect_stdout`` swaps the process-wide ``sys.stdout``, so
+    a worker thread using it also captured every other thread's prints (the
+    Tk main thread, the batch runner) for as long as it ran. Here
+    ``sys.stdout``/``sys.stderr`` become a router that looks up the calling
+    thread; other threads keep writing to the original streams. Concurrent
+    and nested uses are fine; the originals come back when the last ends.
+
+    Don't mix it with ``contextlib.redirect_stdout`` on another thread of the
+    same process: that one saves and restores ``sys.stdout`` wholesale and
+    can drop the router mid-run. Calliope has none left in the GUI process
+    (the detection child redirects inside its own process).
+    """
+    me = threading.get_ident()
+    with _route_lock:
+        streams = []
+        for name in ("stdout", "stderr"):
+            cur = getattr(sys, name)
+            if not isinstance(cur, _ThreadRoutedStream):
+                cur = _ThreadRoutedStream(cur)
+                setattr(sys, name, cur)
+            streams.append((name, cur, cur.routes.get(me)))
+            cur.routes[me] = writer
+    try:
+        yield writer
+    finally:
+        with _route_lock:
+            for name, router, prev in streams:
+                if prev is None:
+                    router.routes.pop(me, None)
+                else:
+                    router.routes[me] = prev
+                if not router.routes and getattr(sys, name) is router:
+                    setattr(sys, name, router.fallback)
+
 
 class QueueWriter(io.TextIOBase):
     """File-like object that line-buffers writes onto a queue.Queue as
