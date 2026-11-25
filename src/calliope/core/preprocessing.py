@@ -290,7 +290,8 @@ def _shift_tiff_streaming(
     # folding mean accumulator + QC frame sampling into the same loop.
     _log(f"[shift] streaming write {dst_tiff.name}")
     sum_arr: Optional[np.ndarray] = None
-    qc_buf: list[np.ndarray] = []
+    qc: Optional[np.ndarray] = None
+    qc_n = -(-n_pages // qc_step)  # ceil: frames 0, step, 2*step, ...
     with tifffile.TiffFile(str(src_tiff)) as tf, \
             tifffile.TiffWriter(str(dst_tiff), bigtiff=True) as tw:
         for i, page in enumerate(tf.pages):
@@ -304,20 +305,40 @@ def _shift_tiff_streaming(
             if sum_arr is None:
                 sum_arr = np.zeros(frame.shape, dtype=np.float64)
             sum_arr += frame
-            # QC: ``.copy()`` because ``frame`` is reassigned next loop.
             if i % qc_step == 0:
-                qc_buf.append(frame.copy())
+                qc = _qc_put(qc, i // qc_step, frame, qc_n)
             if (i + 1) % 2000 == 0:
                 _log(f"[shift]   write {i + 1}/{n_pages}")
 
     if sum_arr is None:
         raise ValueError(f"shift: source TIFF {src_tiff} has no pages")
     mean = (sum_arr / max(1, n_pages)).astype(np.float32)
-    qc_frames = (
-        np.stack(qc_buf, axis=0) if qc_buf
-        else np.empty((0, *sum_arr.shape), dtype=np.uint16)
-    )
+    qc_frames = _qc_finish(qc, sum_arr.shape)
     return mean, qc_frames, n_pages
+
+
+def _qc_put(qc: Optional[np.ndarray], k: int, frame: np.ndarray,
+            n: int) -> np.ndarray:
+    """Copy ``frame`` into slot ``k`` of the (n, Y, X) uint16 QC stack.
+
+    The stack is allocated once, at the first frame, at its final size, and
+    frames are written straight into it. Collecting a list and calling
+    ``np.stack`` held two full copies at once (about 7.9 GiB on a 13 GB
+    recording at downsample_t=4)."""
+    if qc is None:
+        qc = np.empty((n, *frame.shape), dtype=np.uint16)
+    if frame.shape != qc.shape[1:]:
+        raise ValueError(f"QC frame {k} has shape {frame.shape}, "
+                         f"expected {qc.shape[1:]}")
+    qc[k] = frame
+    return qc
+
+
+def _qc_finish(qc: Optional[np.ndarray], shape_yx) -> np.ndarray:
+    """The filled QC stack; a (0, Y, X) array when no frame was sampled."""
+    if qc is None:
+        return np.empty((0, *shape_yx), dtype=np.uint16)
+    return qc
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +900,9 @@ def preprocess_tiff_group(
     log(f"[2/2] Writing {len(srcs)} shifted TIFFs into {out_dir} "
         f"(+ mean + QC accumulation)")
     sum_arr: Optional[np.ndarray] = None
-    qc_buf: list[np.ndarray] = []
+    qc: Optional[np.ndarray] = None
+    # ceil: global frames 0, ds, 2*ds, ... of the concatenated stack.
+    qc_n = -(-sum(page_counts) // downsample_t)
     total_frames = 0
     # ``qc_index`` is the global frame counter across files so the
     # ``i % downsample_t == 0`` sample pattern continues seamlessly
@@ -918,7 +941,7 @@ def preprocess_tiff_group(
                         sum_arr = np.zeros(frame.shape, dtype=np.float64)
                     sum_arr += frame
                     if qc_index % downsample_t == 0:
-                        qc_buf.append(frame.copy())
+                        qc = _qc_put(qc, qc_index // downsample_t, frame, qc_n)
                     qc_index += 1
                     if (i + 1) % 2000 == 0:
                         log(f"[2/2]     scan {i + 1}/{n_pages}")
@@ -939,7 +962,7 @@ def preprocess_tiff_group(
                     sum_arr = np.zeros(frame.shape, dtype=np.float64)
                 sum_arr += frame
                 if qc_index % downsample_t == 0:
-                    qc_buf.append(frame.copy())
+                    qc = _qc_put(qc, qc_index // downsample_t, frame, qc_n)
                 qc_index += 1
                 if (i + 1) % 2000 == 0:
                     log(f"[2/2]     write {i + 1}/{n_pages}")
@@ -955,10 +978,7 @@ def preprocess_tiff_group(
     log(f"[2/2]   mean over {total_frames} frames ({Y}x{X})")
 
     log("[2/2] Writing QC gif")
-    movie = (
-        np.stack(qc_buf, axis=0) if qc_buf
-        else np.empty((0, Y, X), dtype=np.uint16)
-    )
+    movie = _qc_finish(qc, (Y, X))
     make_qc_gif(movie, gif_path, downsample_t=1, **qc_kwargs)
 
     log(f"Done. Output -> {out_dir}")
